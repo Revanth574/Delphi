@@ -18,6 +18,8 @@
 //! Does **not** depend on any module above it in the hierarchy.
 
 pub mod error;
+pub mod hardware;
+pub mod model;
 pub mod router;
 
 pub use error::InferenceError;

@@ -7,6 +7,7 @@ description = "Delphi OS Wayland compositor built on Smithay"
 
 [dependencies]
 smithay = { workspace = true }
+calloop = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

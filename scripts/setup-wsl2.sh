@@ -177,7 +177,7 @@ fi
 # ── 8. llama.cpp build dependencies ──────────────────────────────────────────
 
 section "8/10 — llama.cpp build dependencies"
-for pkg in cmake libcurl4-openssl-dev; do
+for pkg in cmake libcurl4-openssl-dev libclang-dev libpixman-1-dev; do
     install_apt "$pkg"
 done
 info "llama.cpp build deps ready"

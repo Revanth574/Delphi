@@ -43,7 +43,24 @@ notify = "8"
 walkdir = "2"
 
 # Wayland compositor
-smithay = "0.7"
+# DECISION: renderer_pixman disabled — requires libpixman-1-dev which may
+# not be installed. GL renderer is primary; pixman can be added later for
+# software-only fallback.
+smithay = { version = "0.7", features = [
+    "backend_winit",
+    "backend_drm",
+    "backend_egl",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "renderer_gl",
+    "renderer_multi",
+    "wayland_frontend",
+    "desktop",
+] }
+
+# Event loop
+calloop = "0.14"
 
 # Protobuf serialization (IPC)
 prost = "0.13"
@@ -57,6 +74,12 @@ rand = "0.9"
 
 # SQLite
 rusqlite = { version = "0.35", features = ["bundled"] }
+
+# LLM inference (local)
+llama-cpp-2 = "0.1"
+
+# Platform directories
+dirs = "6"
 
 # Benchmarks
 criterion = "0.5"

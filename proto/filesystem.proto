@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: MIT
+// Delphi OS — Semantic file system IPC messages.
+//
+// Used for communication between the DIE orchestrator and the
+// semantic-fs indexing/search service. The DIE NEVER accesses files
+// directly — all file operations go through these messages.
+
+syntax = "proto3";
+package delphi.filesystem;
+
+// A request to search the semantic file index.
+message SearchRequest {
+  // Natural language query (e.g., "tax return 2024").
+  string query = 1;
+  // Maximum number of results to return.
+  uint32 max_results = 2;
+  // Filter to specific file extensions (e.g., ["pdf", "md"]).
+  repeated string file_types = 3;
+  // Restrict to a specific time range (optional).
+  TimeRange time_range = 4;
+  // Restrict search to specific directory paths (optional).
+  repeated string paths = 5;
+}
+
+// A single file that matched a search query.
+message SearchResult {
+  // Absolute path to the file.
+  string path = 1;
+  // Filename without directory.
+  string filename = 2;
+  // Text snippet showing the matching content.
+  string snippet = 3;
+  // BM25 relevance score.
+  float score = 4;
+  // Detected file type (e.g., "pdf", "markdown", "python").
+  string file_type = 5;
+  // Last modification timestamp (UTC, seconds since epoch).
+  int64 modified_timestamp = 6;
+  // File size in bytes.
+  uint64 size_bytes = 7;
+}
+
+// A batch of search results.
+message SearchResponse {
+  // Matched files, sorted by relevance.
+  repeated SearchResult results = 1;
+  // Total number of matches (may exceed results.len() if capped by max_results).
+  uint32 total_matches = 2;
+  // Time taken to execute the search in milliseconds.
+  uint32 search_time_ms = 3;
+}
+
+// Current state of the file index.
+message IndexStatus {
+  // Total number of files discovered on disk.
+  uint64 total_files = 1;
+  // Number of files that have been indexed.
+  uint64 indexed_files = 2;
+  // Size of the index on disk in bytes.
+  uint64 index_size_bytes = 3;
+  // Timestamp of last index update (UTC, seconds since epoch).
+  int64 last_updated = 4;
+  // True if the indexer is currently processing files.
+  bool is_indexing = 5;
+}
+
+// A filesystem change event detected by the watcher.
+message FileEvent {
+  // Path affected by the event.
+  string path = 1;
+  // What happened to the file.
+  FileEventType event_type = 2;
+  // When the event occurred (UTC, seconds since epoch).
+  int64 timestamp = 3;
+  // For renames: the original path before the rename.
+  string old_path = 4;
+}
+
+// Types of filesystem events.
+enum FileEventType {
+  FILE_EVENT_TYPE_UNSPECIFIED = 0;
+  CREATED = 1;
+  MODIFIED = 2;
+  DELETED = 3;
+  RENAMED = 4;
+}
+
+// A time range filter for search queries.
+message TimeRange {
+  // Start of range (UTC, seconds since epoch). 0 = no lower bound.
+  int64 start = 1;
+  // End of range (UTC, seconds since epoch). 0 = no upper bound.
+  int64 end = 2;
+}

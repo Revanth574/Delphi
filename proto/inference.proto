@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MIT
+// Delphi OS — Inference subsystem IPC messages.
+//
+// Used for communication between the DIE orchestrator and the
+// three-tier inference scheduler. All inference requests and responses
+// flow through these messages via D-Bus + protobuf serialization.
+
+syntax = "proto3";
+package delphi.inference;
+
+// The inference tier determines WHERE a model runs.
+enum InferenceTier {
+  INFERENCE_TIER_UNSPECIFIED = 0;
+  // Small models always running locally (Qwen3 7B / Llama 3.1 8B).
+  LOCAL_SMALL = 1;
+  // Medium models local or cloud (Qwen3 30B / DeepSeek-V3-Lite / Claude Sonnet).
+  LOCAL_MEDIUM = 2;
+  // Large models via cloud with ZKQP privacy (Claude Opus / GPT-5.4 / Gemini 3.1 Pro).
+  CLOUD = 3;
+}
+
+// A request to run inference on a prompt.
+message InferenceRequest {
+  // The user's prompt or instruction.
+  string prompt = 1;
+  // Maximum tokens to generate.
+  uint32 max_tokens = 2;
+  // Sampling temperature (0.0 = deterministic, 1.0 = creative).
+  float temperature = 3;
+  // Preferred inference tier. The router may override based on hardware.
+  InferenceTier tier = 4;
+  // Optional system prompt for instruction-tuned models.
+  string system_prompt = 5;
+  // Conversation ID for multi-turn context.
+  string conversation_id = 6;
+}
+
+// A response from the inference engine (may be partial for streaming).
+message InferenceResponse {
+  // Generated text (full or partial chunk).
+  string text = 1;
+  // Number of tokens consumed (prompt + completion).
+  uint32 tokens_used = 2;
+  // Wall-clock latency of this response in milliseconds.
+  uint32 latency_ms = 3;
+  // The tier that actually serviced this request.
+  InferenceTier tier_used = 4;
+  // The specific model that generated the response.
+  string model_name = 5;
+  // True if this is a streaming partial response (more chunks coming).
+  bool is_partial = 6;
+}
+
+// Metadata about a loaded or available model.
+message ModelInfo {
+  // Human-readable model name (e.g., "Qwen3-7B-Q4_K_M").
+  string name = 1;
+  // Filesystem path to the model file.
+  string path = 2;
+  // Total parameter count.
+  uint64 parameter_count = 3;
+  // Quantization format (e.g., "Q4_K_M", "Q8_0", "FP16").
+  string quantization = 4;
+  // VRAM required to load the model in megabytes.
+  uint32 vram_required_mb = 5;
+  // Which inference tier this model belongs to.
+  InferenceTier tier = 6;
+}
+
+// Hardware capabilities detected at boot, used by the model router
+// to decide which tier can run locally.
+message HardwareProfile {
+  // Total system RAM in megabytes.
+  uint64 total_ram_mb = 1;
+  // Currently available RAM in megabytes.
+  uint64 available_ram_mb = 2;
+  // GPU device name (empty if no discrete GPU).
+  string gpu_name = 3;
+  // GPU VRAM in megabytes (0 if no discrete GPU).
+  uint32 gpu_vram_mb = 4;
+  // Whether a Neural Processing Unit is available.
+  bool has_npu = 5;
+  // Number of logical CPU cores.
+  uint32 cpu_cores = 6;
+}

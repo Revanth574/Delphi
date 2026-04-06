@@ -17,12 +17,21 @@
 //!                    Fortress (encryption at rest)
 //! ```
 //!
+//! # Modules
+//!
+//! - [`indexer`] — Tantivy-backed full-text indexing and search
+//! - [`watcher`] — Filesystem event watching for incremental re-indexing
+//! - [`ignore`] — `.delphiignore` pattern matching
+//! - [`error`] — Error types
+//!
 //! # Performance Budget
 //!
 //! Semantic file search must return results in **< 500ms** for 1M files.
 
 pub mod error;
+pub mod ignore;
 pub mod indexer;
+pub mod watcher;
 
 pub use error::SemanticFsError;
 

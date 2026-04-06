@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: MIT
+// Delphi OS — Compositor IPC messages.
+//
+// Used for communication between the DIE orchestrator and the
+// Smithay Wayland compositor. Window mode state and desktop
+// notifications flow through these messages.
+
+syntax = "proto3";
+package delphi.compositor;
+
+// The four UI modes — each window has its own mode (colored dot in title bar).
+enum WindowModeType {
+  WINDOW_MODE_TYPE_UNSPECIFIED = 0;
+  DIRECT = 1;
+  ASSISTED = 2;
+  AUTONOMOUS = 3;
+  FOCUS = 4;
+}
+
+// Notification urgency levels.
+enum NotificationUrgency {
+  NOTIFICATION_URGENCY_UNSPECIFIED = 0;
+  LOW = 1;
+  NORMAL = 2;
+  HIGH = 3;
+  CRITICAL = 4;
+}
+
+// The current mode of a specific window.
+message WindowMode {
+  // Compositor-assigned window identifier.
+  uint64 window_id = 1;
+  // The active mode for this window.
+  WindowModeType mode = 2;
+}
+
+// A request to change a window's AI mode.
+message ModeChangeRequest {
+  // Target window identifier.
+  uint64 window_id = 1;
+  // The new mode to switch to.
+  WindowModeType new_mode = 2;
+  // Which module or user action triggered the change.
+  string source = 3;
+}
+
+// A request to show a desktop notification.
+message NotificationRequest {
+  // Notification title.
+  string title = 1;
+  // Notification body text.
+  string body = 2;
+  // How urgently the notification should be presented.
+  NotificationUrgency urgency = 3;
+  // The window that triggered the notification (0 = system-level).
+  uint64 source_window_id = 4;
+  // Interactive action buttons on the notification.
+  repeated NotificationAction actions = 5;
+}
+
+// An action button on a notification.
+message NotificationAction {
+  // Button label shown to the user.
+  string label = 1;
+  // Identifier sent back when the user clicks this action.
+  string action_id = 2;
+}

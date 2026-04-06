@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MIT
+// Delphi OS — Orchestrator IPC messages.
+//
+// Used for communication between the Living Surface UI and the DIE
+// orchestrator. User intents flow down, task progress flows up.
+
+syntax = "proto3";
+package delphi.orchestrator;
+
+// The four UI modes from CLAUDE.md Section 1.
+enum UiMode {
+  UI_MODE_UNSPECIFIED = 0;
+  DIRECT = 1;
+  ASSISTED = 2;
+  AUTONOMOUS = 3;
+  FOCUS = 4;
+}
+
+// Where the user intent originated.
+enum IntentSource {
+  INTENT_SOURCE_UNSPECIFIED = 0;
+  COMMAND_BAR = 1;
+  VOICE = 2;
+  API = 3;
+}
+
+// Execution status of a task step.
+enum StepStatus {
+  STEP_STATUS_UNSPECIFIED = 0;
+  PENDING = 1;
+  RUNNING = 2;
+  COMPLETED = 3;
+  FAILED = 4;
+  SKIPPED = 5;
+}
+
+// The inference tier for a specific task step.
+enum TaskTier {
+  TASK_TIER_UNSPECIFIED = 0;
+  TIER_LOCAL_SMALL = 1;
+  TIER_LOCAL_MEDIUM = 2;
+  TIER_CLOUD = 3;
+}
+
+// A user's natural language request, captured from the command bar, voice, or API.
+message UserIntent {
+  // The raw text of the user's request.
+  string raw_text = 1;
+  // Where this intent came from.
+  IntentSource source = 2;
+  // Conversation ID for multi-turn context.
+  string conversation_id = 3;
+  // The UI mode active when the intent was issued.
+  UiMode mode = 4;
+  // When the intent was captured (UTC, seconds since epoch).
+  int64 timestamp = 5;
+}
+
+// A plan of steps the orchestrator will execute to fulfill an intent.
+message TaskPlan {
+  // Unique ID linking to the original UserIntent.
+  string intent_id = 1;
+  // Ordered steps to execute.
+  repeated TaskStep steps = 2;
+  // Estimated total time in milliseconds.
+  uint64 estimated_duration_ms = 3;
+  // Estimated cloud API cost in cents (0 if fully local).
+  uint32 estimated_cost_cents = 4;
+  // If true, the user must confirm before execution begins.
+  bool requires_confirmation = 5;
+}
+
+// A single step within a task plan.
+message TaskStep {
+  // Unique step identifier.
+  string step_id = 1;
+  // Human-readable description of what this step does.
+  string description = 2;
+  // Which specialist handles this step (e.g., "code", "web", "files").
+  string specialist = 3;
+  // Which inference tier this step requires.
+  TaskTier tier = 4;
+  // Step IDs that must complete before this step can start.
+  repeated string depends_on = 5;
+  // Current execution status.
+  StepStatus status = 6;
+}
+
+// Real-time progress update for a running task.
+message TaskProgress {
+  // Which intent this update belongs to.
+  string intent_id = 1;
+  // Which step is reporting progress.
+  string step_id = 2;
+  // Current status of the step.
+  StepStatus status = 3;
+  // Completion percentage (0.0 to 100.0).
+  float progress_percent = 4;
+  // Human-readable status message.
+  string message = 5;
+  // When this update was generated (UTC, seconds since epoch).
+  int64 timestamp = 6;
+}
+
+// A record of an AI action for the undo timeline.
+// Every action in Assisted/Autonomous mode creates one of these.
+message ActionRecord {
+  // Unique action identifier.
+  string action_id = 1;
+  // Which intent triggered this action.
+  string intent_id = 2;
+  // Human-readable description of what was done.
+  string description = 3;
+  // When the action was performed (UTC, seconds since epoch).
+  int64 timestamp = 4;
+  // Whether this action can be undone.
+  bool reversible = 5;
+  // Command to execute to reverse this action.
+  string undo_command = 6;
+  // When the undo window expires (UTC, seconds since epoch).
+  int64 expires_at = 7;
+}

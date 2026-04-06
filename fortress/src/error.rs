@@ -35,6 +35,27 @@ pub enum FortressError {
     /// The vault is locked or inaccessible.
     #[error("vault inaccessible: {0}")]
     VaultInaccessible(String),
+
+    /// A permission check failed.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
+    /// Audit chain integrity verification failed.
+    #[error("audit chain broken: {0}")]
+    AuditIntegrity(String),
+
+    /// Configuration file error.
+    #[error("config error: {0}")]
+    Config(String),
+
+    /// File I/O error within the fortress subsystem.
+    #[error("fortress I/O error: {path} — {reason}")]
+    Io {
+        /// Path involved.
+        path: String,
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 #[cfg(test)]

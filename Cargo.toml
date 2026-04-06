@@ -7,6 +7,7 @@ members = [
     "ssi/sdk-rust",
     "fortress",
     "semantic-fs",
+    "proto",
 ]
 
 [workspace.package]
@@ -37,8 +38,25 @@ zbus = "5"
 # Search
 tantivy = "0.25"
 
+# File system watching + traversal
+notify = "8"
+walkdir = "2"
+
 # Wayland compositor
 smithay = "0.7"
+
+# Protobuf serialization (IPC)
+prost = "0.13"
+prost-types = "0.13"
+
+# Cryptography
+aes-gcm = "0.10"
+argon2 = "0.5"
+sha2 = "0.10"
+rand = "0.9"
+
+# SQLite
+rusqlite = { version = "0.35", features = ["bundled"] }
 
 # Benchmarks
 criterion = "0.5"
@@ -47,3 +65,4 @@ criterion = "0.5"
 fortress = { path = "fortress" }
 die-inference = { path = "die/inference" }
 semantic-fs = { path = "semantic-fs" }
+delphi-proto = { path = "proto" }

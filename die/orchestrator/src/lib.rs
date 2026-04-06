@@ -29,6 +29,7 @@
 
 pub mod error;
 pub mod planner;
+pub mod timeline;
 
 pub use error::OrchestratorError;
 

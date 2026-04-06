@@ -9,8 +9,13 @@ description = "Delphi OS security subsystem: encryption, ZK proofs, TPM, federat
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 zbus = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

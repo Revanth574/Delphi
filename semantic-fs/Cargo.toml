@@ -8,6 +8,8 @@ description = "Semantic file system with full-text and vector search for Delphi 
 [dependencies]
 fortress = { workspace = true }
 tantivy = { workspace = true }
+notify = { workspace = true }
+walkdir = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

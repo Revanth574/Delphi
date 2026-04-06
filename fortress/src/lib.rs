@@ -19,8 +19,11 @@
 //!
 //! No module above fortress in the hierarchy may be imported here.
 
+pub mod audit;
 pub mod encryption;
 pub mod error;
+pub mod permissions;
+pub mod vault;
 
 pub use error::FortressError;
 

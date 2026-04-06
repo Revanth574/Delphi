@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: MIT
+// Delphi OS — Fortress security subsystem IPC messages.
+//
+// Used for credential requests, permission checks, and audit logging.
+// The Fortress is the ONLY module with access to raw cryptographic keys.
+// All other modules receive opaque capability tokens.
+
+syntax = "proto3";
+package delphi.fortress;
+
+// Types of credentials stored in the vault.
+enum CredentialType {
+  CREDENTIAL_TYPE_UNSPECIFIED = 0;
+  PASSWORD = 1;
+  TOKEN = 2;
+  API_KEY = 3;
+  CERTIFICATE = 4;
+}
+
+// Permission tiers — escalating levels of user confirmation required.
+enum PermissionTier {
+  PERMISSION_TIER_UNSPECIFIED = 0;
+  // AI can do this autonomously without user involvement.
+  AUTONOMOUS = 1;
+  // AI must ask the user for confirmation before proceeding.
+  CONFIRM = 2;
+  // Requires biometric verification (fingerprint, face).
+  BIOMETRIC = 3;
+  // Requires physical hardware interaction (TPM, security key).
+  HARDWARE = 4;
+}
+
+// Result of a permission check or audit entry.
+enum PermissionResult {
+  PERMISSION_RESULT_UNSPECIFIED = 0;
+  ALLOWED = 1;
+  DENIED = 2;
+  PENDING = 3;
+}
+
+// A request to retrieve a credential from the vault.
+message CredentialRequest {
+  // The service the credential belongs to (e.g., "anthropic-api").
+  string service_name = 1;
+  // What type of credential to retrieve.
+  CredentialType credential_type = 2;
+  // Why the credential is needed (logged in audit trail).
+  string purpose = 3;
+}
+
+// Response to a credential request. The actual secret is delivered
+// through a separate secure channel — this message only confirms access.
+message CredentialResponse {
+  // Opaque identifier for the granted credential session.
+  string credential_id = 1;
+  // Whether access was granted.
+  bool granted = 2;
+  // When this credential session expires (UTC, seconds since epoch).
+  int64 expires_at = 3;
+  // If denied, explains why.
+  string denial_reason = 4;
+}
+
+// An entry in the append-only audit log.
+message AuditEntry {
+  // Unique identifier for this audit entry.
+  string action_id = 1;
+  // When the action occurred (UTC, seconds since epoch).
+  int64 timestamp = 2;
+  // Which module performed the action.
+  string module = 3;
+  // What action was performed.
+  string action = 4;
+  // What the action targeted (file path, service name, etc.).
+  string target = 5;
+  // The permission tier that was required.
+  PermissionTier permission_tier = 6;
+  // Whether the action was allowed or denied.
+  PermissionResult result = 7;
+  // SHA-256 hash of the previous entry (chain integrity).
+  bytes proof_hash = 8;
+}
+
+// A request to check whether an action is permitted.
+message PermissionCheck {
+  // The action to check (e.g., "read_file", "send_email", "delete_file").
+  string action = 1;
+  // The target of the action (e.g., file path, email address).
+  string target = 2;
+  // The permission tier being requested.
+  PermissionTier requested_tier = 3;
+  // Which module is requesting permission.
+  string module = 4;
+}
+
+// The result of a permission check.
+message PermissionCheckResult {
+  // Whether the action is allowed at the requested tier.
+  bool allowed = 1;
+  // The actual tier required (may differ from requested).
+  PermissionTier actual_tier = 2;
+  // Explanation of the decision.
+  string reason = 3;
+}

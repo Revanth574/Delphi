@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: MIT
+// Delphi OS Living Surface — application entry point
+
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+
+import "./i18n/index.ts";
+import "./main.css";
+import { App } from "./app.tsx";
+
+const root = document.getElementById("root");
+if (root) {
+  createRoot(root).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@delphi/shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Delphi OS Living Surface UI — four-mode shell with command bar and action timeline",
+  "type": "module",
+  "scripts": {
+    "dev": "echo 'Shell dev server not yet configured'",
+    "build": "echo 'Shell build not yet configured'",
+    "lint": "echo 'Shell linting not yet configured'",
+    "test": "echo 'Shell tests not yet configured'"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Delphi OS Wayland compositor built on Smithay"
+
+[dependencies]
+smithay = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }

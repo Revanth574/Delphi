@@ -1,0 +1,22 @@
+[package]
+name = "die-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Central planning agent for the Delphi Intelligence Engine"
+
+[dependencies]
+fortress = { workspace = true }
+die-inference = { workspace = true }
+semantic-fs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }

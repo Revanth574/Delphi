@@ -1,0 +1,17 @@
+[package]
+name = "fortress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Delphi OS security subsystem: encryption, ZK proofs, TPM, federated sync"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "semantic-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Semantic file system with full-text and vector search for Delphi OS"
+
+[dependencies]
+fortress = { workspace = true }
+tantivy = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }

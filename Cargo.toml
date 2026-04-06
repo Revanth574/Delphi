@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "compositor",
+    "die/orchestrator",
+    "die/inference",
+    "ssi/sdk-rust",
+    "fortress",
+    "semantic-fs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/delphi-os/delphi"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization & config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# D-Bus IPC
+zbus = "5"
+
+# Search
+tantivy = "0.25"
+
+# Wayland compositor
+smithay = "0.7"
+
+# Benchmarks
+criterion = "0.5"
+
+# Internal workspace crates
+fortress = { path = "fortress" }
+die-inference = { path = "die/inference" }
+semantic-fs = { path = "semantic-fs" }

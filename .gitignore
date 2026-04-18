@@ -20,6 +20,8 @@ Desktop.ini
 
 # Claude Code
 .claude/
+.claude-flow/
+.mcp.json
 
 # IDE
 .vscode/

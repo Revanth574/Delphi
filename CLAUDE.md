@@ -94,6 +94,20 @@ Privacy is mathematical, not promissory. The seven-layer Fortress architecture p
 
 The user's explicit request overrides any AI prediction, suggestion, or optimization. Delphi does not surveil, log, report, filter, or judge legal user activity. The AI serves the user without judgment, restriction, or moral authority.
 
+### The Growth Model: Born with the Machine, Grows with the User
+
+Delphi is not a static tool. It is born the moment the computer first boots and grows alongside the user:
+
+| Stage | Timeline | Capabilities |
+|-------|----------|-------------|
+| **Newborn** | Day 1 | Knows nothing about this user. General-purpose capabilities only. Asks preferences during onboarding. Operates primarily in Direct mode. |
+| **Infant** | Week 1 | Has learned basic patterns — daily routine, common apps, file locations. Begins anticipating simple needs. |
+| **Child** | Month 1 | Understands work/personal boundaries, communication styles per contact. Handles routine tasks autonomously. |
+| **Adolescent** | Month 6 | Deep understanding of professional domain, coding style, creative preferences. Handles complex multi-step workflows independently. |
+| **Adult** | Year 1+ | Functions as a true cognitive extension. Handles novel tasks by combining learned patterns with internet research. |
+
+This growth trajectory must be reflected in all code: features should degrade gracefully when the learning model is new/empty, and improve naturally as data accumulates. **NEVER** require a mature learning model for basic functionality.
+
 ---
 
 ## Section 2: Technology Stack
@@ -127,6 +141,22 @@ The user's explicit request overrides any AI prediction, suggestion, or optimiza
 | Semantic embeddings | sentence-transformers (Python) or candle (Rust) with all-MiniLM-L6-v2 | latest |
 | Browser automation | Playwright (headless Chromium) | latest |
 | Benchmarking | criterion | 0.5.x |
+
+### Additional Dependencies (Phase 1+)
+
+| Component | Technology | Version | Notes |
+|-----------|-----------|---------|-------|
+| AT-SPI bindings | atspi | latest | SSI auto-generation from accessibility trees |
+| Database | rusqlite (bundled) | 0.35.x | Action timeline, learning patterns |
+| HTTP client | reqwest + rustls | 0.12.x | Cloud inference, web browsing |
+| HTML parsing | scraper | latest | Web content extraction |
+| PDF text extraction | pdf-extract | latest | Semantic-fs PDF indexing |
+| Audio playback | rodio or cpal | latest | Voice output playback |
+| Process management | tokio::process | (part of tokio) | Playwright, Piper, Whisper subprocess management |
+| Regex | regex | latest | PII detection in ZKQP |
+| UUID | uuid (v4 feature) | latest | Action IDs, task IDs, pattern IDs |
+| Filesystem watching | notify | 8.x | Already in use for semantic-fs |
+| Template engine | minijinja | latest | Code generation templates in the builder |
 
 ### Encryption & Security
 
@@ -215,6 +245,53 @@ The user's explicit request overrides any AI prediction, suggestion, or optimiza
 - **ALL** timestamps must be UTC ISO 8601 — no local time, no Unix timestamps in user-facing code.
 - **ALL** user-facing text must support RTL languages from day one.
 
+### Subprocess Management Pattern
+
+All external process integrations (Playwright, Whisper, Piper, llama-cli) must follow the established pattern:
+
+1. Spawn process with piped stdin/stdout via `tokio::process::Command`
+2. Communicate via JSON lines over stdio (one JSON object per line)
+3. Enforce configurable timeouts on every operation (send AND receive)
+4. Set `kill_on_drop(true)` so the process is cleaned up if the engine is dropped
+5. Graceful degradation: if the subprocess binary is missing, return a clear error with installation instructions — do not crash
+
+### D-Bus Service Pattern
+
+All D-Bus services must follow this pattern:
+
+1. Interface name: `org.delphi.{ServiceName}`
+2. All methods return `Result` types (never panic on D-Bus calls)
+3. All signals include a timestamp
+4. Service wrapper lives in the `services` crate, actual logic lives in the domain crate
+5. Services must be independently startable (for testing) and collectively startable (via `delphi-daemon`)
+6. Use `std::sync::Mutex` (not `tokio::sync`) for `!Send` types (rusqlite, tantivy) in zbus interfaces
+
+### WebSocket Bridge Pattern
+
+All shell-to-backend communication goes through the WebSocket bridge:
+
+1. Shell sends JSON: `{"id": N, "method": "service.method_name", "params": {...}}`
+2. Bridge returns JSON: `{"id": N, "result": {...}}` or `{"id": N, "error": {"code": N, "message": "..."}}`
+3. Streaming responses use the same ID with `"partial": true` until final message with `"partial": false`
+4. Bridge must not buffer — forward partial responses immediately for real-time UI updates
+5. TypeScript client uses a pending-promise `Map<id, {resolve, reject}>` for request-response correlation
+
+### The "Best Answer" Rule
+
+When the AI has both a predicted/pattern-based answer and a fresh/computed answer, **ALWAYS** prefer the fresh answer. Learned patterns should accelerate execution, not override explicit computation. If the user asks "what's the weather?" and the pattern says "they always want Chennai weather," but the user might be traveling — still ASK or compute, don't assume. User's explicit request > predicted pattern. Always.
+
+### Accessibility Rules (WCAG 2.1 AA Minimum)
+
+- **ALL** shell components must have ARIA labels for screen readers
+- **ALL** interactive elements must be keyboard-navigable (Tab order, Enter to activate, Escape to dismiss)
+- **ALL** text must meet 4.5:1 contrast ratio against its background
+- **ALL** animations must respect `prefers-reduced-motion` media query
+- **ALL** notifications must be announced to screen readers via `aria-live` regions
+- Voice input must work as a **COMPLETE** alternative to keyboard/mouse — every action achievable by voice
+- The onboarding flow must be fully completable by a blind user using screen reader + keyboard
+- Focus management: when modals/overlays open, focus moves to them; when they close, focus returns to the trigger element
+- Error messages must be programmatically associated with their input fields
+
 ---
 
 ## Section 4: Architecture Rules
@@ -228,6 +305,34 @@ Violations of these boundaries break the entire system:
 3. **The Fortress NEVER exposes raw keys or decrypted data to any other module.** It provides opaque capability tokens.
 4. **The Inference Scheduler NEVER makes decisions about WHAT to infer.** It only manages HOW and WHEN inference runs (resource scheduling). The orchestrator decides what.
 5. **The SSI layer NEVER trusts app-reported capabilities.** It validates by testing each capability before adding to the manifest.
+
+#### Learning Engine Boundaries
+
+- The learning observer **MUST NOT** record events for disabled categories (even temporarily, even for "analysis")
+- The learning engine **MUST NOT** access file contents — it observes metadata only (app name, file path, timestamp, action type)
+- Pattern suggestions **MUST** go through the shell as notifications — the learning engine cannot execute actions directly
+- **ALL** learning data **MUST** be encrypted via Fortress — never plaintext on disk
+
+#### ZKQP Boundaries
+
+- **ALL** Tier 3 cloud queries **MUST** pass through ZKQP — no direct cloud calls from any module
+- ZKQP **MUST NOT** modify the semantic content of queries — only strip/replace identifying information
+- The local PII-to-placeholder mapping table **MUST** be encrypted and stored only in memory (never disk)
+- If ZKQP cannot adequately anonymize a query (privacy score > 80), it **MUST** pause and ask the user
+
+#### Builder Boundaries
+
+- The builder **MUST NOT** execute generated code outside of a sandboxed environment
+- Generated projects **MUST** be placed in a user-specified output directory — never in system directories
+- The builder **MUST NOT** install system-level packages without Tier 2 (Confirm) permission
+- Build artifacts (`node_modules/`, `target/`, `venv/`) **MUST** be excluded from semantic-fs indexing
+
+#### SSI Boundaries
+
+- SSI auto-generation **MUST NOT** execute discovered capabilities without user consent
+- SSI manifests are APPROXIMATIONS — the confidence score must be presented to the user
+- SSI **MUST NOT** scan apps in Focus mode
+- SSI execution of app capabilities **MUST** go through the action timeline (for undo support)
 
 ### Dependency Direction (STRICT)
 
@@ -253,9 +358,15 @@ ssi              (standalone — communicates via D-Bus)
 fortress         (foundation — no internal dependencies)
   ↑
 die-inference    (depends on: fortress)
+die-browser      (standalone — subprocess management only)
+die-voice        (standalone — subprocess management only)
 semantic-fs      (depends on: fortress)
   ↑
-die-orchestrator (depends on: die-inference, semantic-fs, fortress)
+die-orchestrator (depends on: die-inference, die-browser, semantic-fs, fortress)
+  ↑
+delphi-services  (depends on: die-inference, die-orchestrator, semantic-fs, fortress)
+  ↑
+shell-bridge     (depends on: delphi-services, die-inference, die-orchestrator, semantic-fs)
 ```
 
 Adding a dependency that creates a cycle is a **compilation error** (Cargo enforces this) and a **design error** (fix the architecture, not the dependency).
@@ -268,6 +379,25 @@ Adding a dependency that creates a cycle is a **compilation error** (Cargo enfor
 - All network operations must have configurable timeouts and retry logic with exponential backoff.
 - All background tasks must be cancellable and report progress.
 - All caches must have configurable size limits and LRU eviction.
+
+### Conversation Memory Architecture
+
+- Conversations are stored as a chain of `(user_message, assistant_response, timestamp, context_snapshot)` tuples
+- Storage: SQLite database in Fortress-encrypted data directory
+- Conversation context includes: active files, running apps, current project, recent actions — so when the user says "that thing from yesterday," the system can resolve the reference
+- Conversation history is searchable: "what did I ask about convergence last week?" queries the conversation database
+- Memory tiering: last 24 hours = full context available, last 7 days = summarized, older = keyword-searchable only
+- Conversation data is part of the "forget" system: "forget today" purges today's conversations too
+- Conversations **NEVER** leave the device — not even in summarized form. Cloud queries are stateless (each is independent, no conversation history sent to cloud)
+
+### Knowledge Graph Architecture (for Capability #17)
+
+- Personal knowledge graph stored in LanceDB (vector embeddings) + SQLite (relationships)
+- Nodes: concepts, people, projects, files, facts, opinions
+- Edges: "relates to," "contradicts," "supports," "created by," "part of"
+- Populated from: documents the user reads (opt-in), notes they write, conversations with Delphi, web research results
+- Queryable: "what do I know about non-IID convergence?" returns relevant nodes with source citations
+- NOT a replacement for file search — this is conceptual/semantic, file search is path/content
 
 ---
 
@@ -283,43 +413,55 @@ delphi/
 ├── compositor/                 # Wayland compositor (Smithay, Rust)
 │   ├── src/
 │   └── Cargo.toml
+├── services/                   # D-Bus service wrappers [Phase 1]
+├── shell-bridge/               # WebSocket bridge (React ↔ D-Bus) [Phase 1]
+├── proto/                      # Protobuf IPC definitions [Phase 0]
 ├── shell/                      # Living Surface UI (React 19)
 │   ├── src/
 │   │   ├── modes/              # Direct, Assisted, Autonomous, Focus
 │   │   ├── components/         # Topbar, dock, window manager, settings
-│   │   ├── command-bar/        # Alt+Space command interface
+│   │   ├── command-bar/        # Alt+Space command interface [Phase 0/1]
+│   │   ├── services/           # WebSocket client (delphi-client.ts) [Phase 1]
+│   │   ├── timeline/           # Action timeline UI [Phase 2]
+│   │   ├── onboarding/         # Learning mode / first-boot [Phase 2]
 │   │   └── action-timeline/    # Undo system UI
 │   └── package.json
 ├── die/                        # Delphi Intelligence Engine
-│   ├── orchestrator/           # Central planning agent (Rust)
-│   ├── inference/              # Three-tier inference manager
-│   │   ├── src/
-│   │   ├── local/              # llama.cpp integration
-│   │   ├── cloud/              # API clients (Anthropic, OpenAI, Google)
-│   │   └── router/             # Model selection logic
-│   ├── specialists/            # Domain specialist models
-│   ├── memory/                 # Hot/warm/cold memory tiers (LanceDB)
-│   ├── learning/               # Universal learning engine
+│   ├── orchestrator/           # Central brain + task planner (Rust) [Phase 0/1]
+│   │   └── src/
+│   │       ├── brain.rs        # Web-augmented inference [Phase 1]
+│   │       ├── apps.rs         # Cross-app orchestration [Phase 2]
+│   │       ├── planner.rs      # Intent decomposition [Phase 0]
+│   │       └── timeline.rs     # Action timeline [Phase 0]
+│   ├── inference/              # Three-tier inference manager [Phase 0/1]
+│   │   └── src/
+│   │       ├── router.rs       # Model selection logic [Phase 1]
+│   │       └── cloud.rs        # Cloud API client [Phase 1]
+│   ├── browser/                # Headless Chromium (Playwright) [Phase 1]
+│   ├── builder/                # Full-stack project builder [Phase 2]
+│   ├── voice/                  # Whisper STT + Piper TTS [Phase 1]
+│   ├── learning/               # Universal learning engine [Phase 0/2]
 │   │   ├── observer/           # Action observation system
 │   │   ├── modeler/            # Procedural model builder
 │   │   └── executor/           # Learned task execution
-│   ├── browser/                # Headless Chromium agent (Playwright)
-│   ├── voice/                  # Whisper.cpp + Piper TTS
-│   └── planner/                # Goal/timeline management
+│   ├── specialists/            # Domain specialist models [future]
+│   ├── memory/                 # Hot/warm/cold memory tiers (LanceDB) [future]
+│   └── planner/                # Goal/timeline management [future]
 ├── ssi/                        # Semantic System Interface
-│   ├── spec/                   # SSI standard specification
-│   ├── auto-gen/               # Auto-manifest generation
-│   ├── sdk-python/             # Python SSI SDK
-│   ├── sdk-js/                 # JavaScript SSI SDK
-│   └── sdk-rust/               # Rust SSI SDK
+│   ├── auto-gen/               # AT-SPI + D-Bus + .desktop scanners [Phase 2]
+│   ├── sdk-rust/               # Rust SSI SDK [Phase 0]
+│   ├── sdk-python/             # Python SSI SDK [future]
+│   ├── sdk-js/                 # JavaScript SSI SDK [future]
+│   └── spec/                   # SSI standard specification
 ├── fortress/                   # Security system
 │   ├── src/
+│   │   ├── zkqp/              # Zero-Knowledge Query Protocol [Phase 2]
+│   │   └── ...existing...
 │   ├── encryption/             # LUKS2, AES-256-GCM, PQC
-│   ├── zkqp/                   # Zero-Knowledge Query Protocol
-│   ├── fhe/                    # Homomorphic encryption
-│   ├── zksnark/                # Audit chain (Circom + snarkjs)
-│   ├── tpm/                    # Hardware security module
-│   └── federated-sync/         # Cross-device sync
+│   ├── fhe/                    # Homomorphic encryption [future]
+│   ├── zksnark/                # Audit chain (Circom + snarkjs) [future]
+│   ├── tpm/                    # Hardware security module [future]
+│   └── federated-sync/         # Cross-device sync [future]
 ├── semantic-fs/                # Semantic file system
 │   ├── src/
 │   ├── indexer/                # Tantivy + sentence-transformers
@@ -494,6 +636,94 @@ When any error occurs during implementation, follow this exact sequence. No skip
 | Application crate (`die-orchestrator`) | `anyhow` | `anyhow::Result` at boundaries, `thiserror` internally |
 | Tests | `.unwrap()` / `.expect()` | Allowed only in tests |
 
+### Required Error Messages (Phase 2+ Modules)
+
+**ZKQP:**
+- `"Privacy score too high ({score}/100): this query contains {details}. Send sanitized version instead? [Show sanitized] [Send anyway] [Cancel]"`
+- `"Cloud provider unavailable. Retrying with alternate provider... (attempt {n}/3)"`
+
+**SSI:**
+- `"Could not scan {app_name}: accessibility tree unavailable. The app may not support AT-SPI. Manual manifest creation available."`
+- `"Capability {name} has low confidence ({pct}%). Execute anyway? [Yes, try it] [No]"`
+
+**Builder:**
+- `"Build failed: {error}. Attempting fix {n}/3: {description}..."`
+- `"Generated code has {n} type errors. Feeding errors back to inference for correction..."`
+
+**Learning:**
+- `"Pattern detected: you {description} {count} times. Automate this? [Yes] [Not now] [Never for this pattern]"`
+- `"Learning paused: Focus mode active. No events are being recorded."`
+
+**Orchestrator:**
+- `"Task chain step {n}/{total} failed: {reason}. Retrying with alternative approach... (attempt {n}/3)"`
+- `"Checkpoint reached (step {n}/{total}). Progress: {summary}. Continue? [Yes] [Review steps] [Cancel]"`
+
+### Session Recovery Protocol (MANDATORY on every session start)
+
+When starting any new Claude Code session — continuation after context compaction, fresh start, or resumption after a break — execute this protocol BEFORE any other action:
+
+1. **Read `PROGRESS.md`** in the project root. This is the breadcrumb trail. It names the current phase, task, sub-step, and status.
+2. **Check recent git history:** `git log --oneline -20`. Cross-reference the latest commits with PROGRESS.md claims.
+3. **Verify current state with tests:** `cargo test --workspace --quiet` (and `cd shell && pnpm test` if shell work is active). If tests fail that PROGRESS.md claimed were green, that is the first problem to solve — do not proceed with new work on top of broken state.
+4. **Check for uncommitted work in progress:** `git status` and `git diff`. Reconcile against PROGRESS.md's `## Notes` section.
+5. **Verify phase/task/step matches reality.** If PROGRESS.md says "Task 3A.2 step 3 in progress" but the file it references does not exist, PROGRESS.md is stale — the recovery session's first duty is to reconstruct truth from git + filesystem, not from PROGRESS.md.
+6. **Resume from the exact point indicated.** Do not re-run completed work. Do not skip forward. Do not re-plan — the plan exists in PROGRESS.md and the referenced spec sections.
+
+**PROGRESS.md format (canonical):**
+
+```
+# Delphi OS — Progress State
+
+Last updated: YYYY-MM-DD HH:MM UTC
+Current phase: {Phase N / Phase NA / Phase NB}
+Current task: {N.M} — {task name}
+Current step: {step description}
+Status: {not started | in progress | blocked | complete}
+Tests passing: {total} ({rust} Rust + {ts} TypeScript)
+
+## Completed phases
+- Phase 0: bootstrap — {tag} — {test count}
+- Phase 1: ... — {tag} — {test count}
+
+## Active work
+- Last action: {what was just done}
+- Next action: {what to do on resume}
+- Files touched: {list}
+
+## Capability tracker
+(mirror of CLAUDE.md Section 11 capability table)
+
+## Fortress tracker
+(mirror of CLAUDE.md Section 11 fortress table)
+
+## Notes
+- Blockers: {any}
+- WIP: {any uncommitted work}
+- Decisions: {any pending design decisions}
+```
+
+**Update PROGRESS.md triggers:**
+- After every task completion (e.g. 3A.1 → 3A.2 boundary)
+- Before ending a session (even a short one)
+- Immediately when encountering a blocker
+- After every git tag
+- After every phase-end verification protocol run
+
+### Phase-end Verification Protocol (MANDATORY at end of every phase)
+
+A phase is not "complete" until all of these steps pass in order. Do not skip any step. Do not declare the phase done and then come back to a skipped step later.
+
+1. **Compilation check:** `cargo check --workspace` — must succeed with zero errors, zero warnings.
+2. **Lint check:** `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings treated as zero.
+3. **Test suite (Rust):** `cargo test --workspace` — 100% pass rate, no `#[ignore]` added to hide failures.
+4. **Shell verification:** `cd shell && pnpm test && pnpm build` — all Vitest suites pass, build produces output.
+5. **Integration connectivity check:** verify each D-Bus service added this phase starts and responds on its interface (even with a stub backend). Document the service name and interface in PROGRESS.md.
+6. **Capability + Fortress tracker update:** edit CLAUDE.md Section 11 tables — mark affected rows as built, tested, or deferred. Never leave a shipped capability marked "not started".
+7. **PROGRESS.md final update:** status = complete, phase = {next phase} (ready), tests passing = final count, completed phases = append entry with git tag.
+8. **Git commit + tag:** commit with Conventional Commits, then `git tag v{x}.{y}.{z}-phase{n}` matching the phase. Record the tag in PROGRESS.md's completed phases list.
+
+If any step fails, the phase is not done. Fix the failure (per Section 8 Error Resolution Protocol — root cause, not workaround), then re-run the protocol from step 1.
+
 ---
 
 ## Section 9: Performance Budgets
@@ -509,7 +739,20 @@ When any error occurs during implementation, follow this exact sequence. No skip
 | Memory baseline (no AI active) | **< 500MB** |
 | Memory with Tier 1 model (7B 4-bit) | **< 2GB** |
 
-These are targets. Measure with `criterion` benchmarks and track in CI.
+### Phase 2+ Performance Budgets
+
+| Operation | Budget |
+|-----------|--------|
+| SSI app scan (per app) | **< 2 seconds** |
+| ZKQP query sanitization | **< 50ms** (must not add noticeable latency) |
+| Learning pattern detection (per 50-event batch) | **< 200ms** |
+| Builder project scaffolding | **< 5 seconds** (code generation may take longer via inference) |
+| Cross-app capability execution | **< 3 seconds** per step |
+| Action timeline query (last 24 hours) | **< 100ms** |
+| Onboarding step transition | **< 200ms** (instant feel) |
+| Web page content extraction | **< 2 seconds** per page |
+
+All are targets. Measure with `criterion` benchmarks and track in CI.
 
 ---
 
@@ -523,6 +766,14 @@ These are targets. Measure with `criterion` benchmarks and track in CI.
 6. **ALL** IPC messages containing user data must be encrypted in transit (even localhost).
 7. The Fortress module must be the **ONLY** module with access to raw cryptographic keys.
 8. Every Autonomous mode action must generate a logged, reversible entry in the action timeline.
+
+### ZKQP Implementation Rules
+
+1. The PII detection regex set must cover: email addresses, phone numbers, physical addresses, IP addresses, full names (proper nouns adjacent to context clues), project/company names (from user's known entities list), geographic locations, dates that could identify events
+2. The mapping table (PII to placeholder) exists **ONLY** in memory — never serialized to disk, never logged, cleared when the query completes
+3. When multiple cloud providers are available, sub-queries **MUST** be distributed across different providers
+4. The privacy score algorithm must be deterministic and auditable — the user can ask "why did this score 65?" and get a specific answer
+5. ZKQP is **ALWAYS** active for Tier 3 queries — there is no "disable ZKQP" option (this is non-negotiable security)
 
 ---
 
@@ -545,6 +796,67 @@ These are targets. Measure with `criterion` benchmarks and track in CI.
 8. **Prefer Rust over Python** for all performance-critical paths. Use Python only for ML model integration where the ecosystem requires it.
 9. All Rust binaries must be statically linked where possible for deployment simplicity.
 
+### Offline-First Design Rules
+
+Every feature must define its offline behavior. The rule: **degrade, don't break.**
+
+| Feature | Online | Offline |
+|---------|--------|---------|
+| AI inference | Tier 1/2/3 available | Tier 1 local only |
+| File search | Full semantic + web augmentation | Local Tantivy only |
+| Web browsing | Full capability | Cached pages only, clear "offline" indicator |
+| Learning engine | Full observation + cloud pattern analysis | Local observation + local pattern detection |
+| Voice | STT + TTS (both local, always work) | Same — fully local |
+| Builder | Full stack with cloud inference for code gen | Limited to template scaffolding only |
+| ZKQP | Active (cloud queries flowing) | Not needed (no cloud queries) |
+| Action timeline | Full logging + cloud sync | Local logging only |
+| SSI | Full scanning | Local scanning only (no web-based discovery) |
+
+When transitioning from online to offline: queue all pending cloud operations, notify the user "Switched to offline mode — local AI only", continue all local operations without interruption. When connectivity returns: process queued operations in order, notify "Back online — full capabilities restored."
+
+### Capability Implementation Tracker
+
+The spec (`DELPHI_COMPLETE_SPEC.md`) defines 18 capabilities. Track status explicitly:
+
+| # | Capability | Status | Phase |
+|---|-----------|--------|-------|
+| 1 | Behavioral learning engine | Built + wiring in Phase 2 | 0+2 |
+| 2 | Deep internet agency | Built (die-browser) | 1 |
+| 3 | Multi-specialty reasoning | Partial — router exists, specialist mesh needed | 3 |
+| 4 | Infinite task chaining | Built (orchestrator brain + checkpoints) | 1+2 |
+| 5 | Conversational presence | Partial — voice I/O exists, persistent conversation memory needed | 3 |
+| 6 | Goal and planning architecture | Not started | 3 |
+| 7 | Full-stack builder | Phase 2 Task 2.4 | 2 |
+| 8 | Client/company workspace adaptation | Not started | 3 |
+| 9 | Sovereign local intelligence | Partial — Fortress + ZKQP in Phase 2 | 0+2 |
+| 10 | Non-interference philosophy | Encoded in iron laws (no code needed) | 0 |
+| 11 | Endurance and resilience | Partial — checkpointing exists, rolling context needed | 3 |
+| 12 | Ambient environmental awareness | Not started | 3 |
+| 13 | Predictive crisis prevention | Not started | 3 |
+| 14 | Relationship intelligence | Not started | 3 |
+| 15 | Cross-device federated sync | Not started | 3 |
+| 16 | Temporal intelligence | Not started | 3 |
+| 17 | Knowledge synthesis engine | Not started | 3 |
+| 18 | Generative workspace creation | Not started | 3 |
+
+Phase 3 must address capabilities 3, 5, 6, 8, 11, 12, 13, 14, 15, 16, 17, 18.
+
+### Fortress Security Layer Tracker
+
+The spec defines a seven-layer security architecture:
+
+| Layer | Name | Status | Phase |
+|-------|------|--------|-------|
+| 1 | Hardware root of trust (TPM) | Not started — requires TPM hardware access | 3 |
+| 2 | Full-disk encryption (LUKS2 + hidden volumes) | Partial — LUKS2 basic, hidden volumes not implemented | 3 |
+| 3 | Zero-Knowledge Query Protocol (ZKQP) | Phase 2 Task 2.3 | 2 |
+| 4 | Fully Homomorphic Encryption (FHE) | Not started — requires Microsoft SEAL/OpenFHE integration | 3+ |
+| 5 | Federated behavioral sync (UrbanFL-derived) | Not started | 3 |
+| 6 | zk-SNARK audit proofs | Not started — requires Circom/snarkjs integration | 3+ |
+| 7 | Post-quantum cryptography (CRYSTALS-Kyber/Dilithium) | Not started | 3 |
+
+Currently implemented: AES-256-GCM vault (Layer 2 partial), Argon2id key derivation, SHA-256 audit chain (Layer 6 precursor), 4-tier permission model.
+
 ---
 
 ## Section 12: The Iron Laws of Delphi
@@ -566,3 +878,9 @@ These are targets. Measure with `criterion` benchmarks and track in CI.
 7. **Born simple, grows complex.** Day-one Delphi is a beautiful, fast desktop with a smart command bar. It earns complexity through the user's trust and engagement, not by overwhelming them at first boot.
 
 8. **Fix the problem, don't flee from it.** When encountering an error, compilation failure, dependency issue, or unexpected behavior: DIAGNOSE first, FIX the root cause, and only then move on. Never skip a failing approach and jump to an alternative unless you can explicitly prove the alternative is technically superior — not just easier. "It didn't work so I tried something else" is not acceptable. "It failed because X, I attempted fixes A, B, C, the root cause is unfixable due to Y, and alternative Z is superior because [specific technical reasons]" is acceptable.
+
+9. **Best answer over predicted pattern.** When Delphi has both a learned pattern ("user always wants X") and a fresh computation/explicit request, the fresh answer wins. Patterns accelerate — they never override. If there's any ambiguity between what the user asked and what the pattern predicts, serve the explicit request. Ask for clarification only if the request itself is genuinely ambiguous, never because it conflicts with a learned pattern.
+
+10. **Offline means degraded, never broken.** If internet connectivity is lost, if a cloud service is down, if an API key expires — the OS continues working. Every feature has a local fallback. The user must never see a blank screen, a hanging interface, or a "service unavailable" error that blocks their work. Degrade visibly (show "offline" indicator) but NEVER break.
+
+11. **Never skip, never assume, always verify.** Before starting any session, verify state (read PROGRESS.md, check git log, run the test suite). Before claiming a task complete, run its tests — not later, now. Before moving to the next task, update PROGRESS.md with the current status. Before declaring a phase done, execute the phase-end verification protocol in its entirety — all 8 steps, in order, no substitutions. Never say "I'll run tests later" or "that change is obviously fine" or "PROGRESS.md still looks right". Verification takes seconds; false assumptions take days to untangle. The cost asymmetry is absolute: verify.

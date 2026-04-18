@@ -4,10 +4,16 @@ members = [
     "compositor",
     "die/orchestrator",
     "die/inference",
+    "die/browser",
+    "die/voice",
+    "die/learning",
+    "die/builder",
     "ssi/sdk-rust",
     "fortress",
     "semantic-fs",
     "proto",
+    "services",
+    "shell-bridge",
 ]
 
 [workspace.package]
@@ -78,6 +84,13 @@ rusqlite = { version = "0.35", features = ["bundled"] }
 # LLM inference (local)
 llama-cpp-2 = "0.1"
 
+# HTTP client (cloud API calls)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# WebSocket
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
 # Platform directories
 dirs = "6"
 
@@ -86,6 +99,12 @@ criterion = "0.5"
 
 # Internal workspace crates
 fortress = { path = "fortress" }
+die-browser = { path = "die/browser" }
 die-inference = { path = "die/inference" }
+die-voice = { path = "die/voice" }
+die-learning = { path = "die/learning" }
+die-builder = { path = "die/builder" }
+die-orchestrator = { path = "die/orchestrator" }
 semantic-fs = { path = "semantic-fs" }
 delphi-proto = { path = "proto" }
+delphi-services = { path = "services" }

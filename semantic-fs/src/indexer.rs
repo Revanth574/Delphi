@@ -540,7 +540,7 @@ mod tests {
 
         // Write some invalid UTF-8
         let binary_path = dir.join("image.bin");
-        fs::write(&binary_path, &[0xFF, 0xFE, 0x00, 0x01, 0x80, 0x90]).unwrap();
+        fs::write(&binary_path, [0xFF, 0xFE, 0x00, 0x01, 0x80, 0x90]).unwrap();
 
         // Should not error — just skip
         indexer.index_file(&binary_path).unwrap();

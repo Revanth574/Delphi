@@ -1,0 +1,22 @@
+[package]
+name = "delphi-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "D-Bus service layer for Delphi OS — bridges shell UI to Rust backends"
+
+[dependencies]
+die-inference = { workspace = true }
+die-orchestrator = { path = "../die/orchestrator" }
+semantic-fs = { workspace = true }
+fortress = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

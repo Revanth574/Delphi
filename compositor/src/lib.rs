@@ -31,6 +31,7 @@
 pub mod error;
 pub mod handlers;
 pub mod input;
+pub mod render;
 pub mod state;
 pub mod window;
 pub mod winit_backend;

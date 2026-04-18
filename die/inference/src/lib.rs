@@ -17,6 +17,7 @@
 //! Depends on [`fortress`] for secure credential storage (cloud API keys).
 //! Does **not** depend on any module above it in the hierarchy.
 
+pub mod cloud;
 pub mod error;
 pub mod hardware;
 pub mod model;

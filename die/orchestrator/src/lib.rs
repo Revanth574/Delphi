@@ -27,6 +27,8 @@
 //! - [`die_inference`] — AI model routing and execution
 //! - [`semantic_fs`] — file search and knowledge retrieval
 
+pub mod apps;
+pub mod brain;
 pub mod error;
 pub mod planner;
 pub mod timeline;
@@ -59,5 +61,15 @@ mod tests {
         let fs_err = semantic_fs::SemanticFsError::Search("query failed".to_string());
         let orch_err: OrchestratorError = fs_err.into();
         assert!(orch_err.to_string().contains("query failed"));
+
+        // Verify browser → orchestrator conversion.
+        let browser_err = die_browser::BrowserError::Timeout { seconds: 60 };
+        let orch_err: OrchestratorError = browser_err.into();
+        assert!(orch_err.to_string().contains("60"));
+
+        // Verify learning → orchestrator conversion.
+        let learning_err = die_learning::LearningError::ObserverPaused;
+        let orch_err: OrchestratorError = learning_err.into();
+        assert!(orch_err.to_string().contains("paused"));
     }
 }

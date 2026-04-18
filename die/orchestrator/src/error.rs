@@ -9,7 +9,9 @@
 //! Per CLAUDE.md Section 8: orchestrator errors must **never** crash
 //! the OS. They degrade gracefully to the next available tier or mode.
 
+use die_browser::BrowserError;
 use die_inference::InferenceError;
+use die_learning::LearningError;
 use fortress::FortressError;
 use semantic_fs::SemanticFsError;
 
@@ -49,6 +51,14 @@ pub enum OrchestratorError {
     /// Security subsystem error (propagated from fortress).
     #[error("security error: {0}")]
     Security(#[from] FortressError),
+
+    /// Browser engine error (propagated from die-browser).
+    #[error("browser error: {0}")]
+    Browser(#[from] BrowserError),
+
+    /// Learning engine error (propagated from die-learning).
+    #[error("learning error: {0}")]
+    Learning(#[from] LearningError),
 }
 
 #[cfg(test)]
@@ -74,6 +84,20 @@ mod tests {
         let err = FortressError::VaultInaccessible("locked".to_string());
         let orch_err: OrchestratorError = err.into();
         assert!(orch_err.to_string().contains("locked"));
+    }
+
+    #[test]
+    fn browser_error_converts() {
+        let err = BrowserError::Timeout { seconds: 30 };
+        let orch_err: OrchestratorError = err.into();
+        assert!(orch_err.to_string().contains("30"));
+    }
+
+    #[test]
+    fn learning_error_converts() {
+        let err = LearningError::ObserverPaused;
+        let orch_err: OrchestratorError = err.into();
+        assert!(orch_err.to_string().contains("paused"));
     }
 
     #[test]

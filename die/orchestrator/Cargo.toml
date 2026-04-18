@@ -7,11 +7,14 @@ description = "Central planning agent for the Delphi Intelligence Engine"
 
 [dependencies]
 fortress = { workspace = true }
+die-browser = { workspace = true }
 die-inference = { workspace = true }
+die-learning = { workspace = true }
 semantic-fs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = "1"
 toml = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

@@ -101,6 +101,7 @@ impl XdgShellHandler for Delphi {
         );
 
         self.windows.insert(wl_surface.clone(), win);
+        self.toplevels.insert(wl_surface.clone(), surface.clone());
         self.stacking_order.push(wl_surface.clone());
         self.focus_surface(Some(&wl_surface));
 
@@ -126,6 +127,7 @@ impl XdgShellHandler for Delphi {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
         self.windows.remove(wl_surface);
+        self.toplevels.remove(wl_surface);
         self.stacking_order.retain(|s| s != wl_surface);
 
         if self.focused_surface.as_ref() == Some(wl_surface) {

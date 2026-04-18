@@ -9,6 +9,73 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Title bar height in pixels (server-side decoration).
+pub const TITLE_BAR_HEIGHT: i32 = 30;
+
+/// Window border width for resize hit detection.
+pub const BORDER_WIDTH: i32 = 4;
+
+/// Mode badge circle diameter in pixels.
+pub const MODE_BADGE_SIZE: i32 = 12;
+
+/// Close button width in title bar.
+pub const CLOSE_BUTTON_WIDTH: i32 = 30;
+
+/// Title bar background color (dark gray-blue).
+pub const TITLE_BAR_COLOR: [f32; 4] = [0.15, 0.15, 0.20, 1.0];
+
+/// Focused title bar color (slightly brighter).
+pub const TITLE_BAR_FOCUSED_COLOR: [f32; 4] = [0.20, 0.20, 0.28, 1.0];
+
+/// Close button color (red).
+pub const CLOSE_BUTTON_COLOR: [f32; 4] = [0.85, 0.20, 0.20, 1.0];
+
+/// Result of hit-testing a point against a window.
+///
+/// # Examples
+///
+/// ```
+/// use compositor::window::HitZone;
+///
+/// let zone = HitZone::TitleBar;
+/// assert_ne!(zone, HitZone::ClientArea);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitZone {
+    /// The window title bar (drag to move).
+    TitleBar,
+    /// The close button in the title bar.
+    CloseButton,
+    /// The client content area.
+    ClientArea,
+    /// A resize edge.
+    ResizeEdge(ResizeEdge),
+    /// Outside the window entirely.
+    Outside,
+}
+
+/// Which edge of the window is being resized.
+///
+/// # Examples
+///
+/// ```
+/// use compositor::window::ResizeEdge;
+///
+/// let edge = ResizeEdge::Right;
+/// assert_ne!(edge, ResizeEdge::Left);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    /// Left edge.
+    Left,
+    /// Right edge.
+    Right,
+    /// Top edge.
+    Top,
+    /// Bottom edge.
+    Bottom,
+}
+
 /// The four UI modes from the Delphi spec.
 ///
 /// Each window has its own mode. Modes operate independently
@@ -177,6 +244,91 @@ impl WindowState {
             && py >= self.y
             && py < self.y + self.height
     }
+
+    /// Hit-test a point against this window's zones.
+    ///
+    /// Returns which part of the window the point falls in:
+    /// title bar, close button, client area, resize edge, or outside.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use compositor::window::{WindowState, HitZone};
+    ///
+    /// let win = WindowState::new(10, 10, 200, 200);
+    /// assert_eq!(win.hit_test(50, 15), HitZone::TitleBar);
+    /// assert_eq!(win.hit_test(50, 100), HitZone::ClientArea);
+    /// ```
+    #[must_use]
+    pub fn hit_test(&self, px: i32, py: i32) -> HitZone {
+        // Check resize edges first (extend slightly outside window).
+        if let Some(edge) = self.check_resize_edge(px, py) {
+            return HitZone::ResizeEdge(edge);
+        }
+
+        if !self.contains(px, py) {
+            return HitZone::Outside;
+        }
+
+        // Close button (top-right of title bar).
+        if py < self.y + TITLE_BAR_HEIGHT
+            && px >= self.x + self.width - CLOSE_BUTTON_WIDTH
+        {
+            return HitZone::CloseButton;
+        }
+
+        // Title bar.
+        if py < self.y + TITLE_BAR_HEIGHT {
+            return HitZone::TitleBar;
+        }
+
+        HitZone::ClientArea
+    }
+
+    /// Check if a point is on a resize edge of this window.
+    #[must_use]
+    fn check_resize_edge(&self, px: i32, py: i32) -> Option<ResizeEdge> {
+        let bw = BORDER_WIDTH;
+        let in_x = px >= self.x - bw && px < self.x + self.width + bw;
+        let in_y = py >= self.y - bw && py < self.y + self.height + bw;
+
+        if !in_x || !in_y {
+            return None;
+        }
+
+        if px < self.x && in_y {
+            Some(ResizeEdge::Left)
+        } else if px >= self.x + self.width && in_y {
+            Some(ResizeEdge::Right)
+        } else if py < self.y && in_x {
+            Some(ResizeEdge::Top)
+        } else if py >= self.y + self.height && in_x {
+            Some(ResizeEdge::Bottom)
+        } else {
+            None
+        }
+    }
+
+    /// Get the client area rectangle (below the title bar).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use compositor::window::WindowState;
+    ///
+    /// let win = WindowState::new(10, 10, 800, 600);
+    /// let (cx, cy, cw, ch) = win.client_rect();
+    /// assert_eq!(cy, 10 + 30); // Below title bar.
+    /// ```
+    #[must_use]
+    pub fn client_rect(&self) -> (i32, i32, i32, i32) {
+        (
+            self.x,
+            self.y + TITLE_BAR_HEIGHT,
+            self.width,
+            (self.height - TITLE_BAR_HEIGHT).max(0),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +380,60 @@ mod tests {
         // Gray should have R ≈ G ≈ B.
         assert!((c[0] - c[1]).abs() < 0.05);
         assert!((c[1] - c[2]).abs() < 0.1);
+    }
+
+    #[test]
+    fn hit_test_title_bar() {
+        let win = WindowState::new(10, 10, 200, 200);
+        // Inside title bar (y < 10 + 30 = 40).
+        assert_eq!(win.hit_test(50, 20), HitZone::TitleBar);
+    }
+
+    #[test]
+    fn hit_test_close_button() {
+        let win = WindowState::new(10, 10, 200, 200);
+        // Close button: top-right corner of title bar.
+        assert_eq!(win.hit_test(200, 20), HitZone::CloseButton);
+    }
+
+    #[test]
+    fn hit_test_client_area() {
+        let win = WindowState::new(10, 10, 200, 200);
+        // Below title bar.
+        assert_eq!(win.hit_test(50, 100), HitZone::ClientArea);
+    }
+
+    #[test]
+    fn hit_test_outside() {
+        let win = WindowState::new(10, 10, 200, 200);
+        assert_eq!(win.hit_test(500, 500), HitZone::Outside);
+    }
+
+    #[test]
+    fn hit_test_resize_edge_right() {
+        let win = WindowState::new(10, 10, 200, 200);
+        // Just outside right edge.
+        assert_eq!(
+            win.hit_test(211, 100),
+            HitZone::ResizeEdge(ResizeEdge::Right),
+        );
+    }
+
+    #[test]
+    fn client_rect_below_title_bar() {
+        let win = WindowState::new(10, 10, 800, 600);
+        let (cx, cy, cw, ch) = win.client_rect();
+        assert_eq!(cx, 10);
+        assert_eq!(cy, 10 + TITLE_BAR_HEIGHT);
+        assert_eq!(cw, 800);
+        assert_eq!(ch, 600 - TITLE_BAR_HEIGHT);
+    }
+
+    #[test]
+    fn title_bar_constants_reasonable() {
+        const { assert!(TITLE_BAR_HEIGHT > 0) };
+        const { assert!(BORDER_WIDTH > 0) };
+        const { assert!(MODE_BADGE_SIZE > 0) };
+        const { assert!(CLOSE_BUTTON_WIDTH > 0) };
     }
 }

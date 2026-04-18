@@ -21,6 +21,9 @@
 //! by testing each capability before adding to the manifest.
 
 pub mod error;
+pub mod generator;
+pub mod manifest;
+pub mod scanner;
 
 pub use error::SsiError;
 

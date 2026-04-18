@@ -9,8 +9,10 @@ description = "Semantic System Interface — Rust SDK for Delphi OS app integrat
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = "1"
 thiserror = { workspace = true }
 zbus = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

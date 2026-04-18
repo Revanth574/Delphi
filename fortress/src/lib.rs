@@ -24,6 +24,7 @@ pub mod encryption;
 pub mod error;
 pub mod permissions;
 pub mod vault;
+pub mod zkqp;
 
 pub use error::FortressError;
 

@@ -18,7 +18,7 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Clock, Monotonic};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::selection::data_device::DataDeviceState;
-use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState};
 use smithay::wayland::shm::ShmState;
 
 use crate::window::{UiMode, WindowState};
@@ -61,6 +61,9 @@ pub struct Delphi {
 
     /// Per-surface window state (mode, position, size).
     pub windows: HashMap<WlSurface, WindowState>,
+
+    /// XDG toplevel handles for each surface (for close, configure).
+    pub toplevels: HashMap<WlSurface, ToplevelSurface>,
 
     /// Ordered list of surfaces for stacking (back to front).
     pub stacking_order: Vec<WlSurface>,
@@ -151,6 +154,7 @@ impl Delphi {
             data_device_state,
             seat,
             windows: HashMap::new(),
+            toplevels: HashMap::new(),
             stacking_order: Vec::new(),
             focused_surface: None,
             clock,

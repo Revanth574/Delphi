@@ -884,3 +884,134 @@ Currently implemented: AES-256-GCM vault (Layer 2 partial), Argon2id key derivat
 10. **Offline means degraded, never broken.** If internet connectivity is lost, if a cloud service is down, if an API key expires — the OS continues working. Every feature has a local fallback. The user must never see a blank screen, a hanging interface, or a "service unavailable" error that blocks their work. Degrade visibly (show "offline" indicator) but NEVER break.
 
 11. **Never skip, never assume, always verify.** Before starting any session, verify state (read PROGRESS.md, check git log, run the test suite). Before claiming a task complete, run its tests — not later, now. Before moving to the next task, update PROGRESS.md with the current status. Before declaring a phase done, execute the phase-end verification protocol in its entirety — all 8 steps, in order, no substitutions. Never say "I'll run tests later" or "that change is obviously fine" or "PROGRESS.md still looks right". Verification takes seconds; false assumptions take days to untangle. The cost asymmetry is absolute: verify.
+
+12. **Verify, don't fabricate.** When you don't know, say so and check. When you think you know, verify anyway. When you've verified, cite the source (file line, command output, documentation URL). Plausible-sounding answers generated from memory are the primary failure mode of AI-assisted development. Rigorous verification is the cure. For a project of Delphi's scope and importance, this rule has no exceptions.
+
+---
+
+## Section 13: Anti-hallucination protocol (MANDATORY FOR EVERY SESSION)
+
+This project is too important to accept plausible-sounding fabrications. Every claim in code and in session reports must be verifiable. These rules are absolute.
+
+### 13.1 The verification hierarchy
+
+When you need to reference external facts (crate names, API signatures, library behavior, version numbers, command syntax, best practices), follow this hierarchy from HIGHEST to LOWEST trust:
+
+1. **The source code itself.** Read the actual file. Run `cargo doc --open` for Rust. View the repo on GitHub. This is the only trusted source.
+2. **Official documentation.** docs.rs for Rust, MDN for web, the project's README. Trust but verify against source code for version-specific details.
+3. **Package registry metadata.** `cargo search <name>` on crates.io, `npm view <package>`. Trust for existence and version, not for API details.
+4. **Verified web search.** Only recent (within 6 months) results from official sources. Low trust for implementation details.
+5. **Memory / training data.** LOWEST TRUST. Never use as the primary source for code-level decisions.
+
+### 13.2 The "I don't know" rule (NON-NEGOTIABLE)
+
+When uncertain about any of the following, STOP and verify before proceeding:
+
+- Crate name, version, or API signature
+- Whether a library supports a specific feature
+- Current recommended practice for a technology
+- Whether a command or flag exists
+- Whether a file path or environment variable is correct
+- Whether an external service or API is currently available
+- Whether a dependency will compile on the target platform
+
+**What to do when uncertain:**
+1. State the uncertainty explicitly in the session output: "I'm not certain whether X works — let me verify."
+2. Run the verification command (cargo search, npm view, read the file, curl the docs).
+3. Only write code after verification passes.
+4. If verification shows the approach doesn't work, follow Iron Law #8 (diagnose root cause, don't flee to alternatives).
+
+**Saying "I don't know, let me check" is ALWAYS correct. Fabricating a plausible answer is ALWAYS wrong.**
+
+### 13.3 Forbidden patterns
+
+These patterns indicate hallucination and are strictly prohibited:
+
+- Writing code that imports a crate without first verifying the crate name in Cargo.toml or on crates.io
+- Calling a function or method without first reading its actual signature
+- Assuming a library supports a feature without testing or documentation
+- Writing "This should work" or "This is the standard approach" without verification
+- Referencing version numbers from memory (always verify current version)
+- Using example code from training data without adapting it to actual library versions
+- Asserting test counts or line counts without running the actual count commands
+
+### 13.4 Self-audit protocol (run at end of every significant work block)
+
+Before declaring any task, subtask, or phase complete, run this audit:
+
+```bash
+# Compile check
+cargo check --workspace
+
+# Clippy must be clean
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Tests must actually run and pass (not just compile)
+cargo test --workspace 2>&1 | tee /tmp/test_results.txt
+grep "test result:" /tmp/test_results.txt
+
+# Count actual tests by crate (prevent false counts)
+for dir in */; do
+  if [ -f "$dir/Cargo.toml" ]; then
+    cd "$dir"
+    count=$(cargo test --no-run 2>&1 | grep -c "test " || echo 0)
+    echo "$dir: $count tests"
+    cd ..
+  fi
+done
+```
+
+**Report the OUTPUT of these commands, not a summary. If you claim "950 tests pass," include the literal test result line showing that count. Any discrepancy between claimed and actual is a hallucination that must be corrected immediately.**
+
+### 13.5 Session report integrity
+
+When writing session summary reports:
+
+- Every number (test count, line count, crate count) must come from a command you just ran
+- Every file created must be verified with `ls` or `find` that it actually exists
+- Every commit claimed must be verified with `git log --oneline`
+- Every feature claimed to work must have a corresponding passing test
+- Do NOT write "the system can now do X" unless there's a test proving it
+- When unsure whether something works end-to-end, say "component X was built; end-to-end integration with Y is not yet verified"
+
+### 13.6 Cross-reference rule
+
+When implementing anything that crosses module boundaries (shell → bridge → D-Bus → backend):
+
+1. First verify the FROM side's actual API (read the file)
+2. Then verify the TO side's actual API (read the file)
+3. Then verify the serialization format on both sides matches (read the proto files)
+4. THEN write the integration code
+5. Then write an integration test that actually exercises the full path
+6. Only mark complete when the integration test passes
+
+"I think the APIs match" is hallucination. "I verified by reading X line Y in both files and confirming the schema matches" is rigor.
+
+### 13.7 Dependency addition protocol
+
+Before adding any dependency to Cargo.toml or package.json:
+
+```bash
+# For Rust
+cargo search <crate> | head -5          # Verify crate exists and current version
+cargo info <crate>                      # Read description, check maintenance status
+# View the crate's actual docs at https://docs.rs/<crate>
+
+# For npm
+npm view <package>                      # Verify package exists
+npm view <package> versions --json | tail -5  # Check recent versions
+```
+
+If the crate/package doesn't return results, DO NOT INVENT ONE. Search for the correct name. If you can't find it, say so explicitly and ask the user.
+
+### 13.8 The "ingenuity through rigor" principle
+
+Innovation in Delphi comes from careful engineering, not from fast guessing. The novel contributions listed in DELPHI_COMPLETE_SPEC.md are publishable BECAUSE they are rigorously designed and implemented. A hallucinated implementation is worse than no implementation — it creates technical debt that will surface at the worst possible moment (during a demo, in production, during a security audit).
+
+When tempted to take a shortcut:
+- "I'll just assume the API looks like X" → NO. Read the actual API.
+- "This should probably work" → NO. Test it.
+- "I'll add a TODO for this edge case" → NO. Either handle it or don't claim the feature works.
+- "I remember this pattern from another project" → NO. Verify it applies here.
+
+Rigor is not in tension with innovation. Rigor is what makes innovation real.

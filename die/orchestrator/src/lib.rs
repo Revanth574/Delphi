@@ -31,6 +31,7 @@ pub mod apps;
 pub mod brain;
 pub mod conversation;
 pub mod error;
+pub mod goals;
 pub mod planner;
 pub mod reference;
 pub mod timeline;

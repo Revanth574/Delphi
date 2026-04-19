@@ -94,6 +94,9 @@ futures-util = "0.3"
 # Platform directories
 dirs = "6"
 
+# Date and time (UTC handling, Duration math, RFC3339 parsing)
+chrono = { version = "0.4", features = ["serde"] }
+
 # Benchmarks
 criterion = "0.5"
 

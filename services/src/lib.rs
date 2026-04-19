@@ -12,6 +12,7 @@
 //! - [`timeline`] — Action timeline with 24-hour undo
 //! - [`learning`] — Learning engine suggestions
 //! - [`conversation`] — Persistent conversation memory with FTS search
+//! - [`goals`] — Goal graph with deadline intelligence and timeline estimation
 //!
 //! # Architecture
 //!
@@ -21,11 +22,12 @@
 //!                                           die-inference / semantic-fs / die-orchestrator
 //! ```
 //!
-//! All 6 interfaces are registered on the session bus under
+//! All 7 interfaces are registered on the session bus under
 //! `org.delphi.Services`.
 
 pub mod conversation;
 pub mod file_search;
+pub mod goals;
 pub mod inference;
 pub mod learning;
 pub mod mode;

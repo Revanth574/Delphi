@@ -1,11 +1,11 @@
 # Delphi OS — Progress State
 
-Last updated: 2026-04-19 (Phase 1+2 committed, ground truth re-verified, Section 13 anti-hallucination protocol landed)
-Current phase: Phase 3A (ready — task 3A.1 is next)
-Current task: 3A.1 — Persistent conversation memory (not yet started)
-Current step: Begin `die/orchestrator/src/conversation.rs` — SQLite schema, reference resolution, memory tiering, "forget today", D-Bus `org.delphi.Conversation`, 25+ tests
-Status: not started (baseline and ground truth re-verified this session)
-Tests passing: **1,023 verified 2026-04-19** (950 Rust + 73 TypeScript), 0 failures, 0 clippy warnings
+Last updated: 2026-04-19 (Task 3A.1 complete — persistent conversation memory shipped, self-audit re-run)
+Current phase: Phase 3A (in progress — task 3A.1 complete, task 3A.2 is next)
+Current task: 3A.2 — Goal and planning architecture (not yet started)
+Current step: Begin `die/orchestrator/src/goals.rs` — DAG (explicit + inferred), deadline warnings, stale detection, D-Bus `org.delphi.Goals`, ≥20 tests
+Status: not started (3A.1 just landed at commit `2d67a29`)
+Tests passing: **1,082 verified 2026-04-19** (1,009 Rust + 73 TypeScript), 0 failures, 0 clippy warnings
 
 ## Completed phases
 
@@ -14,13 +14,15 @@ Tests passing: **1,023 verified 2026-04-19** (950 Rust + 73 TypeScript), 0 failu
 - Phase 0 continuation: Wayland compositor, local LLM inference — commit `53a2205` — no tag
 - Phase 1+2 (combined, granular split infeasible due to interwoven files — see commit body): inference router, voice, browser, bridge, services, compositor rendering, shell command-bar/timeline/onboarding, die-learning, die-builder, SSI auto-gen, fortress/ZKQP, cross-app orchestration DAG — commit `90a25f8` — tag `v0.3.0-phase2`
 - Phase 3A infrastructure: CLAUDE.md Session Recovery Protocol + Phase-end Verification Protocol + Iron Law #11, PROGRESS.md, .gitignore (.claude-flow/, .mcp.json) — commit `4e4f32e` — no tag
+- Phase 3A Task 0 (pre-3A.1): CLAUDE.md Section 13 anti-hallucination protocol + Iron Law #12 — commit `dae8bf2` — no tag
+- Phase 3A Task 3A.1: persistent conversation memory (`die/orchestrator/src/{conversation,reference}.rs` + `services/src/conversation.rs`; SQLite + FTS5 + WAL, 9-method ConversationStore, ReferenceEntity resolution, 24h/7d/older memory tiering, D-Bus `org.delphi.Conversation`, 49 new tests) — commit `2d67a29` — no tag (end-of-phase-3A tag is `v0.4.0-phase3a`)
 
 ## Active work
 
-- **Last action (2026-04-19):** ran Part 5 ground-truth verification per Section 13. `cargo check --workspace` clean in 27.53s, `cargo clippy --workspace --all-targets -- -D warnings` clean (0 warnings) in 10.32s, `cargo test --workspace` = **950 passed / 0 failed / 0 ignored** across 26 test-result lines, `cd shell && pnpm test` = **73 passed / 0 failed** across 9 files in 12.89s. Total **1,023 tests passing**. Raw logs at `/tmp/delphi_check.log`, `/tmp/delphi_clippy.log`, `/tmp/delphi_test.log`, `/tmp/shell_test.log`. Added Section 13 anti-hallucination protocol + Iron Law #12 to CLAUDE.md.
-- **Next action:** begin Task 3A.1 implementation. Module `die/orchestrator/src/conversation.rs` + `die/orchestrator/src/reference.rs` + services/conversation.rs D-Bus wrapper. Target ≥25 tests.
-- **Uncommitted WIP:** `die/orchestrator/Cargo.toml` — `dirs` workspace dep added in preparation for `ConversationStore::default_path()` (no other changes).
-- **Verification gap closed:** Prior session's claim of 1,023 tests was re-verified 2026-04-19 with the exact same count. Match is real, not asserted — see `/tmp/delphi_test.log` grep output.
+- **Last action (2026-04-19):** landed Task 3A.1 — persistent conversation memory. Files: `die/orchestrator/src/conversation.rs` (1,198 LOC, 24 tests), `die/orchestrator/src/reference.rs` (498 LOC, 14 tests), `services/src/conversation.rs` (335 LOC, 11 tests). Committed at `2d67a29` with 2,037 insertions. Ran Section 13.4 self-audit in WSL: `cargo check --workspace` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (0 warnings), `cargo test --workspace` = **1,009 passed / 0 failed / 0 ignored** across 26 suites, `cd shell && pnpm test --run` = **73 passed / 0 failed** across 9 files. Total **1,082 tests passing**. 3A.1 directly added 49 unit tests (24 conversation + 14 reference + 11 D-Bus services) and 4 doctests (2 conversation + 1 reference + 1 services, verified by fence count). The remaining +6 vs. the prior-session baseline of 950 Rust tests is not directly attributable to the three new files; source not investigated this session (possible causes: interaction of new re-exports with existing doctests, or a miscount in the prior baseline). No failures either way.
+- **Next action:** begin Task 3A.2 — goal and planning architecture. Module `die/orchestrator/src/goals.rs` — DAG with explicit + inferred goals, deadline warnings, stale detection, D-Bus `org.delphi.Goals` wrapper in `services/src/goals.rs`. Target ≥20 tests.
+- **Uncommitted WIP:** none.
+- **Verification gap closed:** 3A.1 claim of 49 new tests verified by `grep -cE '^\s*#\[(tokio::)?test\]'` on the three new files (24 + 14 + 11). Test counts in this PROGRESS entry come from the current session's `cargo test --workspace` grep output, not from memory.
 
 ## Workspace crate layout (13 Cargo members + shell React app)
 
@@ -49,7 +51,7 @@ ssi/sdk-rust/           # Rust SSI SDK
 | 2 | Deep internet agency | Phase 1 complete (built + tested) | 1 |
 | 3 | Multi-specialty reasoning | Partial — router exists; specialist mesh → Phase 3 | 3 |
 | 4 | Infinite task chaining | Phase 1+2 complete (brain + checkpoints + apps) | 1+2 |
-| 5 | Conversational presence | Partial — voice I/O exists; persistent conversation memory = **Task 3A.1** | 3A |
+| 5 | Conversational presence | **Task 3A.1 complete** — persistent memory + FTS + reference resolution + memory tiering shipped at `2d67a29`; voice I/O from Phase 1 | 3A |
 | 6 | Goal and planning architecture | **Task 3A.2** | 3A |
 | 7 | Full-stack builder | Phase 2 complete (built + tested) | 2 |
 | 8 | Client/company workspace adaptation | Not started | 3B |
@@ -81,7 +83,7 @@ Currently implemented: AES-256-GCM vault, Argon2id key derivation, SHA-256 audit
 ## Phase 3A task list
 
 - **3A.0** — verification baseline + commit/tag Phase 1+2 ✅ **complete** (combined into `v0.3.0-phase2`)
-- **3A.1** — Persistent conversation memory (`die/orchestrator/src/conversation.rs`, `reference.rs` + `services/src/conversation.rs` — SQLite with FTS5, reference resolution, memory tiering, "forget today"/"forget topic", D-Bus `org.delphi.Conversation`, ≥25 tests) — **IN PROGRESS**
+- **3A.1** — Persistent conversation memory (`die/orchestrator/src/conversation.rs` + `reference.rs` + `services/src/conversation.rs` — SQLite with FTS5 + WAL, reference resolution, memory tiering, "forget today"/"forget topic"/"forget older than", D-Bus `org.delphi.Conversation`, 49 tests) — ✅ **complete** at commit `2d67a29`
 - **3A.2** — Goal and planning architecture (`die/orchestrator/src/goals.rs` — DAG, explicit+inferred goals, deadline warnings, stale detection, D-Bus `org.delphi.Goals`, 20+ tests)
 - **3A.3** — Ambient environmental awareness (`die/orchestrator/src/environment.rs` — /sys/ + /proc/ sensors, activity detection, adaptive responses, D-Bus `org.delphi.Environment`, 15+ tests)
 - **3A.4** — Predictive crisis prevention (SMART data, crash frequency, deadline risk, security monitoring, D-Bus `org.delphi.Health`, 15+ tests)
@@ -94,6 +96,6 @@ Currently implemented: AES-256-GCM vault, Argon2id key derivation, SHA-256 audit
 - **Blocker:** None active.
 - **Phase 1+2 split caveat:** `git log` shows a single combined commit `90a25f8` for both phases. Granular 16-commit split was infeasible because Phase 2 code is interwoven with Phase 1 files (`services/src/learning.rs` inside the services crate, `shell-bridge/src/handler.rs` has 150+ lines of learning handlers mixed with Phase 1 handlers, `die/orchestrator/src/error.rs` enum has both `BrowserError` and `LearningError` variants). Tagging both v0.2.0-phase1 and v0.3.0-phase2 at the same SHA would have been misleading, so only `v0.3.0-phase2` was created. A later `git rebase -i` with file-level patches can reconstruct the boundary if desired.
 - **Remote:** None configured — user to create private GitHub repo and push for off-disk backup.
-- **WIP:** `die/orchestrator/Cargo.toml` has an added `dirs = { workspace = true }` line pending Task 3A.1 implementation.
+- **WIP:** none. `dirs` workspace dep landed with 3A.1.
 - **Dev environment:** Windows host (source of truth), WSL2 Ubuntu-24.04 at `/home/raven/delphi` mirror for cargo operations (Smithay/llama-cpp-2 need Linux system libs). Shell (pnpm) works on either. `rsync -a --delete --exclude='target/' --exclude='node_modules/' --exclude='.claude/' --exclude='.claude-flow/' --exclude='.mcp.json' /mnt/c/Users/kvlnr/OneDrive/Desktop/Delphi/ /home/raven/delphi/` syncs Windows → WSL.
-- **Anti-hallucination protocol:** CLAUDE.md Section 13 in effect. All test counts, commit counts, and codebase claims must come from executed commands in the current session. Section 13 + Iron Law #12 landed in commit-pending state as of 2026-04-19.
+- **Anti-hallucination protocol:** CLAUDE.md Section 13 in effect. All test counts, commit counts, and codebase claims must come from executed commands in the current session. Section 13 + Iron Law #12 landed at commit `dae8bf2`. The 3A.1 session-report numbers (1,009 Rust tests, 73 TS tests, 49 new tests, 2,037 insertions) were all produced by commands executed this session (`cargo test --workspace`, `pnpm test --run`, `grep -cE`, `git diff --stat`).

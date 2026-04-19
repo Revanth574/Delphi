@@ -11,6 +11,7 @@
 //! - [`mode`] — Window UI mode management
 //! - [`timeline`] — Action timeline with 24-hour undo
 //! - [`learning`] — Learning engine suggestions
+//! - [`conversation`] — Persistent conversation memory with FTS search
 //!
 //! # Architecture
 //!
@@ -20,9 +21,10 @@
 //!                                           die-inference / semantic-fs / die-orchestrator
 //! ```
 //!
-//! All 5 interfaces are registered on the session bus under
+//! All 6 interfaces are registered on the session bus under
 //! `org.delphi.Services`.
 
+pub mod conversation;
 pub mod file_search;
 pub mod inference;
 pub mod learning;

@@ -97,6 +97,9 @@ dirs = "6"
 # Date and time (UTC handling, Duration math, RFC3339 parsing)
 chrono = { version = "0.4", features = ["serde"] }
 
+# Temp dirs for tests
+tempfile = "3"
+
 # Benchmarks
 criterion = "0.5"
 

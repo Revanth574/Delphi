@@ -13,6 +13,7 @@
 //! - [`learning`] — Learning engine suggestions
 //! - [`conversation`] — Persistent conversation memory with FTS search
 //! - [`goals`] — Goal graph with deadline intelligence and timeline estimation
+//! - [`environment`] — Ambient environmental awareness with fidelity-tagged sensor readings
 //!
 //! # Architecture
 //!
@@ -22,10 +23,11 @@
 //!                                           die-inference / semantic-fs / die-orchestrator
 //! ```
 //!
-//! All 7 interfaces are registered on the session bus under
+//! All 8 interfaces are registered on the session bus under
 //! `org.delphi.Services`.
 
 pub mod conversation;
+pub mod environment;
 pub mod file_search;
 pub mod goals;
 pub mod inference;

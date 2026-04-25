@@ -59,6 +59,12 @@ pub enum OrchestratorError {
     /// Learning engine error (propagated from die-learning).
     #[error("learning error: {0}")]
     Learning(#[from] LearningError),
+
+    /// Ambient environment sensing failed (sysfs/procfs path missing,
+    /// malformed sensor output, subprocess error, etc.). Never crashes
+    /// the orchestrator — consumers degrade gracefully.
+    #[error("environment error: {0}")]
+    Environment(String),
 }
 
 #[cfg(test)]

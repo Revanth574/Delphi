@@ -30,6 +30,7 @@
 pub mod apps;
 pub mod brain;
 pub mod conversation;
+pub mod environment;
 pub mod error;
 pub mod goals;
 pub mod planner;

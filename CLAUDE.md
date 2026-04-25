@@ -399,6 +399,33 @@ Adding a dependency that creates a cycle is a **compilation error** (Cargo enfor
 - Queryable: "what do I know about non-IID convergence?" returns relevant nodes with source citations
 - NOT a replacement for file search — this is conceptual/semantic, file search is path/content
 
+### Fidelity declarations (REQUIRED for every integration)
+
+Every module that reads from or writes to an external source must include a fidelity declaration in its module-level documentation. Format:
+
+```rust
+//! # Fidelity levels supported
+//!
+//! This module probes interfaces in the following order:
+//!
+//! 1. **[name]** (preferred) — [what it provides, why it's highest fidelity here]
+//!    - Required: [what needs to be installed or configured]
+//!    - Failure modes: [when this level is unavailable]
+//!
+//! 2. **[name]** (fallback) — [what it provides]
+//!    - Required: [prerequisites]
+//!    - Tradeoffs: [what's lost vs level 1]
+//!
+//! 3. **[name]** (last resort) — [what it provides]
+//!    - Required: [prerequisites]
+//!    - Tradeoffs: [what's lost vs previous levels]
+//!
+//! Every public function in this module returns a `Fidelity` value alongside its result,
+//! indicating which level answered the query.
+```
+
+All modules that were built before this rule existed must have fidelity declarations added the next time they are substantially modified. Modules built going forward must include the declaration from the first commit.
+
 ---
 
 ## Section 5: File Structure and Naming Conventions
@@ -886,6 +913,41 @@ Currently implemented: AES-256-GCM vault (Layer 2 partial), Argon2id key derivat
 11. **Never skip, never assume, always verify.** Before starting any session, verify state (read PROGRESS.md, check git log, run the test suite). Before claiming a task complete, run its tests — not later, now. Before moving to the next task, update PROGRESS.md with the current status. Before declaring a phase done, execute the phase-end verification protocol in its entirety — all 8 steps, in order, no substitutions. Never say "I'll run tests later" or "that change is obviously fine" or "PROGRESS.md still looks right". Verification takes seconds; false assumptions take days to untangle. The cost asymmetry is absolute: verify.
 
 12. **Verify, don't fabricate.** When you don't know, say so and check. When you think you know, verify anyway. When you've verified, cite the source (file line, command output, documentation URL). Plausible-sounding answers generated from memory are the primary failure mode of AI-assisted development. Rigorous verification is the cure. For a project of Delphi's scope and importance, this rule has no exceptions.
+
+13. **Highest fidelity wins, lowest fidelity is last resort.** For every task that involves reading from or writing to an external source — a file, application, service, device, game, or website — Delphi probes for the highest-fidelity interface available and uses that. Lower-fidelity methods are fallbacks, not defaults.
+
+    **The fidelity hierarchy (from highest to lowest):**
+
+    1. **Direct data source access** — reading the actual file, database, or memory that holds the truth. Example: reading a SQLite file as SQL rather than via an app's UI.
+    2. **Native API** — the source's own programmatic interface. Example: GitHub REST API over scraping github.com, IMAP over scraping Gmail's web UI.
+    3. **Official plugin or extension interface** — interfaces the source exposes for third-party integration. Example: VS Code extension API, Obsidian plugin API, Skyrim Script Extender.
+    4. **Structured system integration** — D-Bus interfaces on Linux, MPRIS for media players, COM on Windows, AppleScript on macOS.
+    5. **Accessibility tree** — AT-SPI on Linux, UI Automation on Windows. Structured but less direct than native APIs.
+    6. **Structured web data** — JSON-LD, OpenGraph, Schema.org microdata, RSS, sitemaps. Present in the HTML but parseable as structured data.
+    7. **DOM parsing** — reading the actual HTML structure, not screenshots.
+    8. **Subprocess output parsing** — running a CLI tool and parsing its stdout. Common fallback but less stable than direct APIs because output format can change between tool versions.
+    9. **Screen capture + computer vision** — the universal fallback. Works for anything visible but is slowest, least stable across UI updates, and requires heavier compute.
+    10. **Keyboard and mouse input simulation** — the universal writer when no higher-fidelity writer is available.
+
+    **Rules that follow from this hierarchy:**
+
+    - Every integration MUST declare which fidelity levels it supports and what each level provides.
+    - Every integration MUST probe downward from the highest level and use the first one that works.
+    - Code must NEVER use a lower-fidelity method when a higher-fidelity method is known to be available on the target system. If the higher-fidelity method fails at runtime, fall back and log the fallback with the reason.
+    - Every response returned to the user MUST include fidelity provenance. "Your calendar shows 3 meetings tomorrow (Google Calendar API)" is correct. "Your calendar shows 3 meetings tomorrow" without provenance is incomplete because the user can't judge the answer's reliability.
+    - When two fidelity levels are equally direct, prefer the one that is more stable across version changes (APIs are usually more stable than DOM structure).
+
+    **Why this matters:**
+
+    Lower-fidelity methods look attractive in the short term because they work "universally" — vision can see any screen, keyboard simulation can type into any field. But they are brittle against UI changes, slow due to vision model costs, and imprecise because inference can be wrong. Every task built on low-fidelity methods becomes a maintenance burden.
+
+    Higher-fidelity methods take more work per integration (you have to find and use the right API) but they are reliable, fast, and precise. Delphi's value proposition depends on being *reliable* at complex workflows. Brittle low-fidelity automation is what every current "AI agent" does. Delphi is supposed to be better than that.
+
+    **Concrete example of correct vs incorrect application:**
+
+    **Incorrect:** "To read the user's emails, Delphi opens Gmail in a browser, takes a screenshot, and uses vision to extract the email list."
+
+    **Correct:** "To read the user's emails, Delphi checks available interfaces in this order: (1) if the user has configured IMAP credentials in Fortress, use IMAP directly; (2) if they have Gmail API credentials configured, use the Gmail API; (3) if they have only a browser session, use Chromium DevTools Protocol to read the DOM of the Gmail tab; (4) if none of the above, tell the user which interface they can set up for better results and fall back to DOM scraping as a last resort. Log which interface was used so the user can see it."
 
 ---
 

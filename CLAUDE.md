@@ -539,17 +539,56 @@ Every new file must have:
 
 ## Section 6: Git Workflow
 
-### Branch Naming
+### Branch workflow (MANDATORY from this point forward)
 
-```
-phase-{N}/{feature-name}
-```
+Every task must be worked on a feature branch, never directly on main.
+
+Branch naming: `phase-{N}/{task-name}`
 
 Examples:
-- `phase-0/compositor-skeleton`
-- `phase-0/cargo-workspace`
-- `phase-1/inference-router`
-- `phase-2/learning-engine`
+- `phase-3a/task-3a4-crisis-prevention`
+- `phase-3a/task-3a5-knowledge-synthesis`
+- `phase-3b/specialist-mesh`
+
+**Start of every task:**
+
+```bash
+git checkout main
+git pull  # ensure main is current
+git checkout -b phase-{N}/{task-name}
+```
+
+**End of every task (after self-audit passes):**
+
+```bash
+# On the feature branch, all tests green, all commits clean
+
+# For tasks touching fortress/, services/ auth code, die/orchestrator/
+# ZKQP or permissions, or ssi/ capability execution — run security review:
+$prompt = "Focus on privilege escalation, auth bypass, and data leakage. Check that all cloud queries pass through ZKQP, no credentials are exposed outside the vault, and no Autonomous-tier code can trigger Biometric-tier actions."
+$prompt | codex review --base main -
+
+# Then merge to main:
+git checkout main
+git merge --no-ff phase-{N}/{task-name} -m "merge(phase-{N}): {task-name}"
+git tag v{X}.{Y}.{Z}-phase{N}
+git branch -d phase-{N}/{task-name}
+```
+
+**Which tasks require the Codex security review before merge:**
+
+- Any task touching `fortress/` (all layers)
+- Any task touching `services/` files that handle credentials or permissions
+- Any task touching `die/orchestrator/` ZKQP, permission tiers, or vault access
+- Any task touching `ssi/` capability execution
+- Every phase boundary merge (always, no exceptions)
+
+**Tasks that do NOT require security review (can merge directly):**
+
+- Pure documentation changes
+- Test-only changes with no production code
+- `PROGRESS.md` updates
+- Shell UI changes with no backend auth involvement
 
 ### Commit Messages
 

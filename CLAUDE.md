@@ -539,17 +539,56 @@ Every new file must have:
 
 ## Section 6: Git Workflow
 
-### Branch Naming
+### Branch workflow (MANDATORY from this point forward)
 
-```
-phase-{N}/{feature-name}
-```
+Every task must be worked on a feature branch, never directly on main.
+
+Branch naming: `phase-{N}/{task-name}`
 
 Examples:
-- `phase-0/compositor-skeleton`
-- `phase-0/cargo-workspace`
-- `phase-1/inference-router`
-- `phase-2/learning-engine`
+- `phase-3a/task-3a4-crisis-prevention`
+- `phase-3a/task-3a5-knowledge-synthesis`
+- `phase-3b/specialist-mesh`
+
+**Start of every task:**
+
+```bash
+git checkout main
+git pull  # ensure main is current
+git checkout -b phase-{N}/{task-name}
+```
+
+**End of every task (after self-audit passes):**
+
+```bash
+# On the feature branch, all tests green, all commits clean
+
+# For tasks touching fortress/, services/ auth code, die/orchestrator/
+# ZKQP or permissions, or ssi/ capability execution — run security review:
+$prompt = "Focus on privilege escalation, auth bypass, and data leakage. Check that all cloud queries pass through ZKQP, no credentials are exposed outside the vault, and no Autonomous-tier code can trigger Biometric-tier actions."
+$prompt | codex review --base main -
+
+# Then merge to main:
+git checkout main
+git merge --no-ff phase-{N}/{task-name} -m "merge(phase-{N}): {task-name}"
+git tag v{X}.{Y}.{Z}-phase{N}
+git branch -d phase-{N}/{task-name}
+```
+
+**Which tasks require the Codex security review before merge:**
+
+- Any task touching `fortress/` (all layers)
+- Any task touching `services/` files that handle credentials or permissions
+- Any task touching `die/orchestrator/` ZKQP, permission tiers, or vault access
+- Any task touching `ssi/` capability execution
+- Every phase boundary merge (always, no exceptions)
+
+**Tasks that do NOT require security review (can merge directly):**
+
+- Pure documentation changes
+- Test-only changes with no production code
+- `PROGRESS.md` updates
+- Shell UI changes with no backend auth involvement
 
 ### Commit Messages
 
@@ -750,6 +789,70 @@ A phase is not "complete" until all of these steps pass in order. Do not skip an
 8. **Git commit + tag:** commit with Conventional Commits, then `git tag v{x}.{y}.{z}-phase{n}` matching the phase. Record the tag in PROGRESS.md's completed phases list.
 
 If any step fails, the phase is not done. Fix the failure (per Section 8 Error Resolution Protocol — root cause, not workaround), then re-run the protocol from step 1.
+
+### Codex security review protocol (MANDATORY at end of every task)
+
+At the end of every task, before reporting completion, Claude Code must:
+
+**Step 1: Determine if a security review is required.**
+
+A Codex security review IS required if the task touched any of:
+
+- `fortress/` (any file, any change)
+- `services/` files that handle credentials, permissions, or auth
+- `die/orchestrator/` files touching ZKQP, permission tiers, vault access, or cloud routing
+- `ssi/` files that execute capabilities on the user's behalf
+- Any file that introduces a new external network call
+- Any phase boundary merge (always, no exceptions)
+
+A Codex security review is NOT required if the task only touched:
+
+- Pure documentation (`PROGRESS.md`, `CLAUDE.md`, README, doc comments)
+- Test files with no production code changes
+- Shell UI components with no backend auth involvement
+- Build configuration (Cargo.toml dependency additions that are not auth-related)
+
+**Step 2: Report the determination explicitly.**
+
+In the session summary, include one of:
+
+> "Codex security review: NOT REQUIRED for this task (touched only [list of files/areas])"
+
+OR
+
+> "Codex security review: REQUIRED — running now"
+
+Never skip this determination. Even when the answer is "not required," state it explicitly so the audit trail is complete.
+
+**Step 3: If required, instruct the user to run the review.**
+
+Claude Code cannot run Codex directly (it's a separate tool on the user's machine). When a security review is required, include this exact block in the session summary:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ SECURITY REVIEW REQUIRED — run before merging:     │
+│                                                     │
+│ codex review --uncommitted                          │
+│                                                     │
+│ Focus areas for this task: [specific things to      │
+│ check based on what was built — e.g., "verify       │
+│ ZKQP is called before every cloud inference call"]  │
+└─────────────────────────────────────────────────────┘
+```
+
+**Step 4: Merge only after review.**
+
+The merge to main happens AFTER the user confirms the Codex review is clean. Claude Code must not merge to main and must not report the task as fully complete until the user pastes the Codex review output (or confirms it found nothing).
+
+If the review finds issues: Claude Code fixes them on the feature branch, re-runs self-audit, then the user re-runs the Codex review.
+
+If the review is clean: Claude Code performs the merge:
+
+```bash
+git checkout main
+git merge --no-ff phase-{N}/{task-name} -m "merge(phase-{N}): {task-name}"
+git branch -d phase-{N}/{task-name}
+```
 
 ---
 

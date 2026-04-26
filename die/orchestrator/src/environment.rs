@@ -123,11 +123,13 @@ pub const THERMAL_THROTTLING_THRESHOLD_C: f32 = 85.0;
 /// - [`Fidelity::Unavailable`] — sensor returned a safe default because
 ///   no level was reachable (missing files, missing binary, wrong
 ///   platform).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Fidelity {
     Direct,
     NativeApi,
     Subprocess,
+    /// Default — no provenance available yet.
+    #[default]
     Unavailable,
 }
 

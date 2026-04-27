@@ -44,6 +44,20 @@ zbus = "5"
 # Search
 tantivy = "0.25"
 
+# Document parsing (for knowledge synthesis ingestion pipeline — capability #17)
+# pulldown-cmark: pure-Rust Markdown parser, gives heading/paragraph/code-block
+# structure (Fidelity::Direct for markdown text).
+# scraper: pure-Rust HTML parser built on html5ever; sufficient for level-3 DOM
+# extraction in the fidelity hierarchy. JSON-LD/OpenGraph augmentation runs on
+# top of scraper's parsed tree.
+# DECISION: pdf-extract / docx-rs / lancedb / candle deliberately NOT added in
+# this task — declared as future fidelity-upgrade levels in knowledge.rs module
+# docs. PDF/DOCX ingestion returns Fidelity::Unavailable; vector storage uses
+# SQLite BLOB columns with cosine similarity computed in Rust (sufficient for
+# < 100K nodes; LanceDB becomes worthwhile at scale).
+pulldown-cmark = "0.13"
+scraper = "0.24"
+
 # File system watching + traversal
 notify = "8"
 walkdir = "2"

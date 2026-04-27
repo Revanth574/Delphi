@@ -1,0 +1,2611 @@
+// SPDX-License-Identifier: MIT
+
+//! Knowledge synthesis engine — capability #17.
+//!
+//! Builds a personal knowledge graph from documents the user reads, notes
+//! they write, conversations with Delphi (in a future task), and web
+//! research output. Queryable: "what do I know about X?" returns relevant
+//! nodes with **source citations** — every claim traceable to its origin.
+//!
+//! # Architectural principle: associative memory without confabulation
+//!
+//! Human associative memory is the inspiration: ideas connected by meaning,
+//! not location. But the human brain *also* confabulates — it reconstructs
+//! plausible details to fill gaps, biases recall toward emotional content,
+//! and forgets selectively.
+//!
+//! This graph deliberately keeps the associative-retrieval property
+//! (semantic search over node content) while excluding confabulation by
+//! construction:
+//!
+//! - **Every node has at least one [`Source`].** A node without a source is
+//!   not permitted at the API level; the constructors reject empty source
+//!   lists. That alone makes it impossible to "remember" something without
+//!   provenance.
+//! - **Sources carry a [`Fidelity`] tag.** Consumers know whether a claim
+//!   came from a `Direct`-fidelity SQLite read of the user's own notes, a
+//!   `Subprocess`-fidelity HTML scrape, or an `Unavailable`-fidelity
+//!   placeholder.
+//! - **Sources also carry a content hash.** Re-ingesting the same content
+//!   doesn't create duplicate nodes; ingesting changed content produces a
+//!   *new* source row so the user can see which version of the file each
+//!   claim came from.
+//! - **Edges carry their own source.** A relationship "X relates to Y" is
+//!   itself a claim that must trace back to wherever it was asserted —
+//!   typically the same document where X and Y appeared together.
+//!
+//! # Fidelity levels supported (per Iron Law #13)
+//!
+//! ## Markdown / plain text ingestion
+//!
+//! 1. **`pulldown-cmark` AST** (preferred, current) — `Fidelity::Direct`.
+//!    Pure-Rust CommonMark parser; gives heading hierarchy, paragraphs,
+//!    code blocks, and link text. Used by [`parse_markdown_to_concepts`].
+//! 2. **Plain-text line splitting** (declared, fallback) — `Fidelity::Direct`
+//!    for the bytes themselves but lossy on structure. Used as fallback
+//!    when pulldown-cmark fails or for `.txt` files.
+//!
+//! ## HTML / web content ingestion
+//!
+//! 1. **JSON-LD / OpenGraph extraction** (declared, future augmentation) —
+//!    when present, would yield `Fidelity::Direct` semantic data.
+//! 2. **Readability-mode extraction** (declared, future) — `Fidelity::Subprocess`
+//!    quality if running an external readability tool.
+//! 3. **`scraper` DOM parsing** (preferred, current) — `Fidelity::Direct`
+//!    for the bytes; pure-Rust html5ever-backed parser. Used by
+//!    [`parse_html_to_concepts`].
+//! 4. **Plain-text tag stripping** (declared, last resort) — `Fidelity::Direct`
+//!    on bytes but loses everything structural.
+//!
+//! ## PDF ingestion
+//!
+//! 1. **Tagged PDF structure** (declared, future) — `Fidelity::Direct` if
+//!    the PDF is tagged; requires lopdf or similar. Not implemented in
+//!    this task — too heavy a dep for our current needs.
+//! 2. **`pdf-extract` Rust crate** (declared, future) — `Fidelity::Subprocess`
+//!    in spirit (it shells out to a wrapped library); not added to the
+//!    workspace yet.
+//! 3. **`pdftotext` (poppler) subprocess** (declared, future).
+//! 4. **OCR via tesseract** (declared, future, opt-in).
+//!
+//! On the current dev system, PDF ingestion returns `Fidelity::Unavailable`
+//! and the format-detector advises that no extractor is present. Code is
+//! structured so the levels can be added without changing the public API.
+//!
+//! ## DOCX ingestion
+//!
+//! 1. **Direct ZIP+XML parsing** (declared, future) — `Fidelity::Direct`
+//!    once we add a parser. Same future-work treatment as PDF.
+//!
+//! ## Conversation history (self-ingestion, future task)
+//!
+//! 1. **Direct read from `crate::conversation::ConversationStore`**
+//!    (declared, wired in a future session) — `Fidelity::Direct`. We're
+//!    reading our own SQLite, no external interpretation involved.
+//!
+//! ## Embeddings
+//!
+//! 1. **Local model via candle / sentence-transformers** (declared, future) —
+//!    `Fidelity::Direct` privacy-wise (computation never leaves the device).
+//! 2. **Cloud embedding API behind ZKQP** (current, opt-in via feature
+//!    flag — disabled by default) — `Fidelity::Subprocess` because the
+//!    request flows through a sanitization step in
+//!    [`fortress::zkqp::QuerySanitizer`] before transmission. **MUST NOT**
+//!    be enabled without explicit user action; cloud transmission of user
+//!    document content is a privacy decision the user owns.
+//! 3. **Cached embedding from prior ingestion** (current) — `Fidelity::Direct`
+//!    if the cached source was Direct, otherwise propagated from the source.
+//! 4. **Mock deterministic embedding** (current, tests-only) —
+//!    `Fidelity::Subprocess` (deterministic but not semantically
+//!    meaningful). Used by [`MockEmbedder`] for unit tests.
+//!
+//! When no embedder is available, ingestion still proceeds; affected nodes
+//! simply lack vector entries and are excluded from semantic search results.
+//! This is the graceful-degradation path: text-graph queries (related-to,
+//! find-path, contradiction detection) continue to work without embeddings.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::{debug, info};
+
+use crate::OrchestratorError;
+use crate::environment::Fidelity;
+
+/// Default embedding dimension for the [`MockEmbedder`] and as the canonical
+/// dimension when no other constraint exists.
+pub const DEFAULT_EMBEDDING_DIMENSION: usize = 32;
+
+/// Schema for the knowledge SQLite database. Applied idempotently on every
+/// open via `IF NOT EXISTS`.
+const SCHEMA_DDL: &str = r#"
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    ingested_at_unix INTEGER NOT NULL,
+    fidelity TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    format TEXT NOT NULL,
+    UNIQUE(uri, content_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sources_uri ON sources(uri);
+CREATE INDEX IF NOT EXISTS idx_sources_format ON sources(format);
+CREATE INDEX IF NOT EXISTS idx_sources_ingested ON sources(ingested_at_unix);
+
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    last_accessed_unix INTEGER NOT NULL,
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
+CREATE INDEX IF NOT EXISTS idx_nodes_accessed ON nodes(last_accessed_unix);
+
+CREATE TABLE IF NOT EXISTS node_sources (
+    node_id INTEGER NOT NULL,
+    source_id INTEGER NOT NULL,
+    PRIMARY KEY(node_id, source_id),
+    FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_node INTEGER NOT NULL,
+    to_node INTEGER NOT NULL,
+    relation TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    source_id INTEGER NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    FOREIGN KEY(from_node) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(to_node) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE,
+    CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    CHECK(from_node != to_node)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_node);
+CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_node);
+CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    node_id INTEGER PRIMARY KEY,
+    dimension INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    fidelity TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+"#;
+
+// ────────────────────────────────────────────────────────────────────
+// Type aliases + enums
+// ────────────────────────────────────────────────────────────────────
+
+pub type NodeId = i64;
+pub type EdgeId = i64;
+pub type SourceId = i64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeType {
+    Concept,
+    Fact,
+    Person,
+    Project,
+    Opinion,
+}
+
+impl NodeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeType::Concept => "concept",
+            NodeType::Fact => "fact",
+            NodeType::Person => "person",
+            NodeType::Project => "project",
+            NodeType::Opinion => "opinion",
+        }
+    }
+}
+
+impl FromStr for NodeType {
+    type Err = OrchestratorError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "concept" => Ok(NodeType::Concept),
+            "fact" => Ok(NodeType::Fact),
+            "person" => Ok(NodeType::Person),
+            "project" => Ok(NodeType::Project),
+            "opinion" => Ok(NodeType::Opinion),
+            other => Err(OrchestratorError::Planning(format!(
+                "unknown node type: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeRelation {
+    RelatesTo,
+    Contradicts,
+    Supports,
+    PartOf,
+    DependsOn,
+    CreatedBy,
+    SimilarTo,
+}
+
+impl EdgeRelation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeRelation::RelatesTo => "relates_to",
+            EdgeRelation::Contradicts => "contradicts",
+            EdgeRelation::Supports => "supports",
+            EdgeRelation::PartOf => "part_of",
+            EdgeRelation::DependsOn => "depends_on",
+            EdgeRelation::CreatedBy => "created_by",
+            EdgeRelation::SimilarTo => "similar_to",
+        }
+    }
+
+    /// Edges of these relations must form a DAG. Cycle prevention runs
+    /// before insertion.
+    pub fn is_acyclic(&self) -> bool {
+        matches!(self, EdgeRelation::PartOf | EdgeRelation::DependsOn)
+    }
+}
+
+impl FromStr for EdgeRelation {
+    type Err = OrchestratorError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "relates_to" => Ok(EdgeRelation::RelatesTo),
+            "contradicts" => Ok(EdgeRelation::Contradicts),
+            "supports" => Ok(EdgeRelation::Supports),
+            "part_of" => Ok(EdgeRelation::PartOf),
+            "depends_on" => Ok(EdgeRelation::DependsOn),
+            "created_by" => Ok(EdgeRelation::CreatedBy),
+            "similar_to" => Ok(EdgeRelation::SimilarTo),
+            other => Err(OrchestratorError::Planning(format!(
+                "unknown edge relation: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SourceType {
+    LocalFile,
+    WebPage,
+    Conversation,
+    UserAssertion,
+}
+
+impl SourceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceType::LocalFile => "local_file",
+            SourceType::WebPage => "web_page",
+            SourceType::Conversation => "conversation",
+            SourceType::UserAssertion => "user_assertion",
+        }
+    }
+}
+
+impl FromStr for SourceType {
+    type Err = OrchestratorError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "local_file" => Ok(SourceType::LocalFile),
+            "web_page" => Ok(SourceType::WebPage),
+            "conversation" => Ok(SourceType::Conversation),
+            "user_assertion" => Ok(SourceType::UserAssertion),
+            other => Err(OrchestratorError::Planning(format!(
+                "unknown source type: {other}"
+            ))),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Domain structs
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Source {
+    pub id: SourceId,
+    pub source_type: SourceType,
+    pub uri: String,
+    pub ingested_at: DateTime<Utc>,
+    pub fidelity: Fidelity,
+    pub content_hash: String,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeNode {
+    pub id: NodeId,
+    pub content: String,
+    pub node_type: NodeType,
+    pub source_ids: Vec<SourceId>,
+    pub created_at: DateTime<Utc>,
+    pub last_accessed: DateTime<Utc>,
+    pub access_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeEdge {
+    pub id: EdgeId,
+    pub from_id: NodeId,
+    pub to_id: NodeId,
+    pub relation: EdgeRelation,
+    pub confidence: f32,
+    pub source_id: SourceId,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeWithSources {
+    pub node: KnowledgeNode,
+    pub sources: Vec<Source>,
+    pub similarity_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedNode {
+    pub node: KnowledgeNode,
+    pub via_relation: EdgeRelation,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestionResult {
+    pub source_id: SourceId,
+    pub nodes_created: u32,
+    pub edges_created: u32,
+    pub fidelity_used: Fidelity,
+    pub format_detected: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawConcept {
+    pub text: String,
+    pub node_type: NodeType,
+    pub depth: u32,
+    pub parent_text: Option<String>,
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Embedder trait + implementations
+// ────────────────────────────────────────────────────────────────────
+
+/// Trait for any embedding backend. Implementors return a vector AND the
+/// fidelity at which it was produced — `Direct` for a local model,
+/// `Subprocess` for a sanitized cloud call, `Unavailable` when no model
+/// is reachable.
+pub trait Embedder: Send + Sync {
+    fn embed(&self, text: &str) -> Result<(Vec<f32>, Fidelity), OrchestratorError>;
+    fn dimension(&self) -> usize;
+}
+
+/// Deterministic hash-based embedder. Not semantically meaningful — same
+/// text produces the same vector, similar text produces unrelated vectors.
+/// Used only by tests where we want reproducible behavior.
+pub struct MockEmbedder {
+    dimension: usize,
+}
+
+impl MockEmbedder {
+    pub fn new() -> Self {
+        Self {
+            dimension: DEFAULT_EMBEDDING_DIMENSION,
+        }
+    }
+
+    pub fn with_dimension(dimension: usize) -> Self {
+        Self {
+            dimension: dimension.max(1),
+        }
+    }
+}
+
+impl Default for MockEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Embedder for MockEmbedder {
+    fn embed(&self, text: &str) -> Result<(Vec<f32>, Fidelity), OrchestratorError> {
+        // SHA-256 of the input, expanded into a vector of f32s in [-1, 1].
+        // Same input → same output (deterministic). Sufficient for testing
+        // storage + similarity round-trips, not for real semantic search.
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        let mut seed = hasher.finalize().to_vec();
+        // Stretch to required length via repeat-hashing.
+        while seed.len() < self.dimension * 4 {
+            let mut h = Sha256::new();
+            h.update(&seed);
+            seed.extend_from_slice(&h.finalize());
+        }
+        let mut vector = Vec::with_capacity(self.dimension);
+        for chunk in seed.chunks_exact(4).take(self.dimension) {
+            let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            // Map u32 → f32 in [-1, 1].
+            let v = (bits as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            vector.push(v);
+        }
+        Ok((vector, Fidelity::Subprocess))
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+}
+
+/// Local model-based embedder. Stub implementation: returns
+/// `Fidelity::Unavailable` when no model file is configured. Meant to be
+/// replaced with a real candle-based embedder in a future task.
+pub struct LocalEmbedder {
+    model_path: Option<PathBuf>,
+    dimension: usize,
+}
+
+impl LocalEmbedder {
+    pub fn unavailable() -> Self {
+        Self {
+            model_path: None,
+            dimension: DEFAULT_EMBEDDING_DIMENSION,
+        }
+    }
+
+    pub fn with_model(model_path: PathBuf, dimension: usize) -> Self {
+        Self {
+            model_path: Some(model_path),
+            dimension: dimension.max(1),
+        }
+    }
+
+    pub fn has_model(&self) -> bool {
+        self.model_path.as_ref().is_some_and(|p| p.exists())
+    }
+}
+
+impl Default for LocalEmbedder {
+    fn default() -> Self {
+        Self::unavailable()
+    }
+}
+
+impl Embedder for LocalEmbedder {
+    fn embed(&self, _text: &str) -> Result<(Vec<f32>, Fidelity), OrchestratorError> {
+        // Real local-model inference is a future task. Until then, return
+        // an empty vector with Unavailable fidelity so callers can degrade.
+        if self.has_model() {
+            // Future: call into candle here.
+            return Err(OrchestratorError::Planning(
+                "local embedder model loaded but inference not yet implemented".to_string(),
+            ));
+        }
+        Ok((Vec::new(), Fidelity::Unavailable))
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+}
+
+/// Cloud embedder gated behind an explicit feature flag. Sends content to
+/// an external API only after passing through [`fortress::zkqp::QuerySanitizer`]
+/// for PII redaction.
+///
+/// **Default state: disabled.** Construction with `enabled = false` returns
+/// `Fidelity::Unavailable` from every call. Enabling requires explicit
+/// user opt-in (a setting the shell exposes; not auto-flipped by code).
+pub struct CloudEmbedder {
+    enabled: bool,
+    sanitizer: Arc<fortress::zkqp::QuerySanitizer>,
+    dimension: usize,
+}
+
+impl CloudEmbedder {
+    /// Construct the disabled stub. This is the safe default; enabling
+    /// requires explicit user opt-in via [`enable`](Self::enable).
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            sanitizer: Arc::new(fortress::zkqp::QuerySanitizer::new()),
+            dimension: DEFAULT_EMBEDDING_DIMENSION,
+        }
+    }
+
+    /// Construct an enabled cloud embedder with a fresh sanitizer.
+    /// Real cloud transmission is still a future task — for now this just
+    /// proves the ZKQP integration path is wired correctly.
+    pub fn enabled(dimension: usize) -> Self {
+        Self {
+            enabled: true,
+            sanitizer: Arc::new(fortress::zkqp::QuerySanitizer::new()),
+            dimension: dimension.max(1),
+        }
+    }
+
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Number of times sanitization has been invoked — used by tests to
+    /// verify that cloud transmission goes through ZKQP.
+    pub fn sanitizer(&self) -> &fortress::zkqp::QuerySanitizer {
+        &self.sanitizer
+    }
+}
+
+impl Embedder for CloudEmbedder {
+    fn embed(&self, text: &str) -> Result<(Vec<f32>, Fidelity), OrchestratorError> {
+        if !self.enabled {
+            // Strict default: never call out without explicit user opt-in.
+            return Ok((Vec::new(), Fidelity::Unavailable));
+        }
+        // CRITICAL: sanitize BEFORE any imagined transmission. This is the
+        // ZKQP gate that CLAUDE.md §10 mandates. The `safe_to_sanitize`
+        // flag is the scorer's verdict on whether the privacy score is low
+        // enough for autonomous transmission; if it's false, the caller
+        // (or human) must explicitly confirm before transmitting.
+        let sanitized = self.sanitizer.sanitize(text);
+        if sanitized.requires_confirmation {
+            return Err(OrchestratorError::Planning(format!(
+                "cloud embedding refused: privacy score {} requires user confirmation",
+                sanitized.score.total
+            )));
+        }
+        // Real network call happens here in a future task. For now return
+        // an empty vector tagged Subprocess to indicate the pathway exists.
+        debug!(
+            sanitized_len = sanitized.sanitized_text.len(),
+            pii_count = sanitized.pii_count(),
+            score = sanitized.score.total,
+            "cloud embedder ZKQP gate passed (no real transmission yet)"
+        );
+        // Explicit drop: SanitizationResult contains the in-memory PII map
+        // which CLAUDE.md §10 requires us to release as soon as we no
+        // longer need it.
+        drop(sanitized);
+        Ok((vec![0.0_f32; self.dimension], Fidelity::Subprocess))
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+}
+
+/// In-memory cache wrapper. Looks up by content; falls through to the
+/// inner embedder on miss.
+pub struct CachingEmbedder {
+    inner: Box<dyn Embedder>,
+    cache: Mutex<HashMap<String, (Vec<f32>, Fidelity)>>,
+}
+
+impl CachingEmbedder {
+    pub fn wrap(inner: Box<dyn Embedder>) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn cache_size(&self) -> usize {
+        self.cache.lock().map(|c| c.len()).unwrap_or(0)
+    }
+}
+
+impl Embedder for CachingEmbedder {
+    fn embed(&self, text: &str) -> Result<(Vec<f32>, Fidelity), OrchestratorError> {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(hit) = cache.get(text)
+        {
+            return Ok(hit.clone());
+        }
+        let result = self.inner.embed(text)?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(text.to_string(), result.clone());
+        }
+        Ok(result)
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Pure parsers
+// ────────────────────────────────────────────────────────────────────
+
+/// Parse markdown into a flat list of [`RawConcept`]s. Headings become
+/// [`NodeType::Concept`] entries; paragraphs and list items become
+/// [`NodeType::Fact`] entries. Code blocks are excluded from the concept
+/// stream by default — they're useful as references but rarely express
+/// the kind of semantic claim we want to anchor in the graph.
+pub fn parse_markdown_to_concepts(content: &str) -> Vec<RawConcept> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    let mut out = Vec::new();
+    let mut current_text = String::new();
+    let mut in_code_block = false;
+    let mut current_kind: Option<(NodeType, u32)> = None; // (type, depth)
+    let mut last_heading_text: Option<String> = None;
+    let mut last_parent_for_paragraph: Option<String> = None;
+
+    let parser = Parser::new(content);
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush_concept(
+                    &mut out,
+                    &mut current_text,
+                    &mut current_kind,
+                    &mut last_parent_for_paragraph,
+                );
+                let depth = heading_depth(level);
+                current_kind = Some((NodeType::Concept, depth));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                let text = current_text.trim().to_string();
+                if !text.is_empty() {
+                    last_heading_text = Some(text.clone());
+                    last_parent_for_paragraph = Some(text.clone());
+                }
+                flush_concept(
+                    &mut out,
+                    &mut current_text,
+                    &mut current_kind,
+                    &mut last_parent_for_paragraph,
+                );
+            }
+            Event::Start(Tag::Paragraph) | Event::Start(Tag::Item) => {
+                flush_concept(
+                    &mut out,
+                    &mut current_text,
+                    &mut current_kind,
+                    &mut last_parent_for_paragraph,
+                );
+                let depth = last_heading_text.as_ref().map(|_| 1).unwrap_or(0) + 1;
+                current_kind = Some((NodeType::Fact, depth));
+                last_parent_for_paragraph = last_heading_text.clone();
+            }
+            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Item) => {
+                flush_concept(
+                    &mut out,
+                    &mut current_text,
+                    &mut current_kind,
+                    &mut last_parent_for_paragraph,
+                );
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
+                current_text.clear();
+            }
+            Event::Text(t) => {
+                if !in_code_block {
+                    current_text.push_str(&t);
+                }
+            }
+            Event::Code(c) => {
+                if !in_code_block {
+                    current_text.push_str(&c);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if !in_code_block {
+                    current_text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_concept(
+        &mut out,
+        &mut current_text,
+        &mut current_kind,
+        &mut last_parent_for_paragraph,
+    );
+    out
+}
+
+fn flush_concept(
+    out: &mut Vec<RawConcept>,
+    buf: &mut String,
+    kind: &mut Option<(NodeType, u32)>,
+    parent: &mut Option<String>,
+) {
+    if let Some((node_type, depth)) = kind.take() {
+        let text = buf.trim().to_string();
+        if !text.is_empty() {
+            out.push(RawConcept {
+                text,
+                node_type,
+                depth,
+                parent_text: parent.clone(),
+            });
+        }
+    }
+    buf.clear();
+}
+
+fn heading_depth(level: pulldown_cmark::HeadingLevel) -> u32 {
+    use pulldown_cmark::HeadingLevel;
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+/// Parse HTML into a flat list of [`RawConcept`]s using `scraper`'s DOM.
+/// `<h1>`..`<h6>` become Concepts; `<p>` and `<li>` become Facts; `<title>`
+/// becomes a top-level Concept.
+pub fn parse_html_to_concepts(content: &str) -> Vec<RawConcept> {
+    use scraper::{Html, Selector};
+
+    let mut out = Vec::new();
+    let document = Html::parse_document(content);
+
+    if let Ok(sel) = Selector::parse("title")
+        && let Some(el) = document.select(&sel).next()
+    {
+        let text = collect_text(el).trim().to_string();
+        if !text.is_empty() {
+            out.push(RawConcept {
+                text,
+                node_type: NodeType::Concept,
+                depth: 0,
+                parent_text: None,
+            });
+        }
+    }
+
+    let heading_levels = [
+        ("h1", 1u32),
+        ("h2", 2),
+        ("h3", 3),
+        ("h4", 4),
+        ("h5", 5),
+        ("h6", 6),
+    ];
+    for (tag, depth) in heading_levels {
+        let Ok(sel) = Selector::parse(tag) else {
+            continue;
+        };
+        for el in document.select(&sel) {
+            let text = collect_text(el).trim().to_string();
+            if !text.is_empty() {
+                out.push(RawConcept {
+                    text,
+                    node_type: NodeType::Concept,
+                    depth,
+                    parent_text: None,
+                });
+            }
+        }
+    }
+    if let Ok(sel) = Selector::parse("p, li") {
+        for el in document.select(&sel) {
+            let text = collect_text(el).trim().to_string();
+            if !text.is_empty() {
+                out.push(RawConcept {
+                    text,
+                    node_type: NodeType::Fact,
+                    depth: 2,
+                    parent_text: None,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn collect_text(element: scraper::ElementRef<'_>) -> String {
+    element.text().collect::<Vec<_>>().join(" ")
+}
+
+/// Detect format by extension; falls back to magic-byte sniffing for a few
+/// common types when the extension is missing or ambiguous.
+pub fn detect_format(path: &Path, content_head: &[u8]) -> &'static str {
+    let by_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if let Some(ext) = by_ext.as_deref() {
+        match ext {
+            "md" | "markdown" => return "markdown",
+            "html" | "htm" => return "html",
+            "txt" => return "text",
+            "pdf" => return "pdf",
+            "docx" => return "docx",
+            "json" => return "json",
+            _ => {}
+        }
+    }
+    // Magic bytes fallback.
+    if content_head.starts_with(b"%PDF-") {
+        return "pdf";
+    }
+    if content_head.starts_with(b"PK\x03\x04") {
+        // Could be docx (ZIP-based). Without inspecting inner structure we
+        // can't be sure; default to docx for *.docx extension already
+        // handled above. Otherwise treat as zip→unknown.
+        return "zip";
+    }
+    if content_head.starts_with(b"<!DOCTYPE html") || content_head.starts_with(b"<html") {
+        return "html";
+    }
+    "text"
+}
+
+/// SHA-256 over content bytes, returned as a lowercase hex string. Used as
+/// the dedup key for sources.
+pub fn content_hash(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BLOB encoding for embeddings
+// ────────────────────────────────────────────────────────────────────
+
+fn vector_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+fn blob_to_vector(blob: &[u8], dimension: usize) -> Result<Vec<f32>, OrchestratorError> {
+    if blob.len() != dimension * 4 {
+        return Err(OrchestratorError::Planning(format!(
+            "embedding blob length {} doesn't match dimension {}",
+            blob.len(),
+            dimension * 4
+        )));
+    }
+    let mut out = Vec::with_capacity(dimension);
+    for chunk in blob.chunks_exact(4) {
+        out.push(f32::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3],
+        ]));
+    }
+    Ok(out)
+}
+
+/// Cosine similarity between two equal-length f32 vectors. Returns 0.0 when
+/// either vector has zero magnitude (avoids NaN); returns `None` when the
+/// dimensions differ.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom == 0.0 {
+        Some(0.0)
+    } else {
+        Some(dot / denom)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// KnowledgeStore
+// ────────────────────────────────────────────────────────────────────
+
+/// Top-level store. Owns the SQLite connection and the embedder behind a
+/// `Box<dyn Embedder>`. Mutex around the connection is a `std::sync::Mutex`
+/// (not `tokio::sync`) per CLAUDE.md §3 D-Bus rule 6 — `rusqlite::Connection`
+/// is `!Send` across await points.
+pub struct KnowledgeStore {
+    conn: Arc<Mutex<Connection>>,
+    embedder: Box<dyn Embedder>,
+}
+
+impl KnowledgeStore {
+    /// Open or create a knowledge graph at `db_path`. WAL mode enabled.
+    pub fn open(
+        db_path: &Path,
+        embedder: Box<dyn Embedder>,
+    ) -> Result<Self, OrchestratorError> {
+        let conn = Connection::open(db_path).map_err(map_sqlite_err)?;
+        Self::init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            embedder,
+        })
+    }
+
+    pub fn in_memory(embedder: Box<dyn Embedder>) -> Result<Self, OrchestratorError> {
+        let conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
+        Self::init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            embedder,
+        })
+    }
+
+    fn init_schema(conn: &Connection) -> Result<(), OrchestratorError> {
+        conn.execute_batch("PRAGMA journal_mode = WAL;")
+            .map_err(map_sqlite_err)?;
+        conn.execute_batch(SCHEMA_DDL).map_err(map_sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn embedder_dimension(&self) -> usize {
+        self.embedder.dimension()
+    }
+
+    // ── Source CRUD ────────────────────────────────────────────────────
+
+    /// Insert a source row, or return the existing id when (uri, content_hash)
+    /// already matches — idempotency by construction.
+    pub fn create_or_get_source(
+        &self,
+        source_type: SourceType,
+        uri: &str,
+        fidelity: Fidelity,
+        content_hash: &str,
+        format: &str,
+    ) -> Result<SourceId, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM sources WHERE uri = ?1 AND content_hash = ?2",
+                params![uri, content_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_err)?
+        {
+            return Ok(id);
+        }
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO sources (source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                source_type.as_str(),
+                uri,
+                now,
+                fidelity.as_str(),
+                content_hash,
+                format,
+            ],
+        )
+        .map_err(map_sqlite_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_source(&self, id: SourceId) -> Result<Source, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let row = conn
+            .query_row(
+                "SELECT id, source_type, uri, ingested_at_unix, fidelity, content_hash, format
+                 FROM sources WHERE id = ?1",
+                params![id],
+                row_to_source,
+            )
+            .map_err(map_sqlite_err)?;
+        Ok(row)
+    }
+
+    // ── Node CRUD ─────────────────────────────────────────────────────
+
+    /// Create a node and link it to at least one source. **Empty
+    /// `source_ids` is rejected** — that's the confabulation defense.
+    /// If embedding generation fails, the node is still created (graceful
+    /// degradation; semantic search will skip it).
+    pub fn create_node(
+        &self,
+        content: &str,
+        node_type: NodeType,
+        source_ids: &[SourceId],
+    ) -> Result<NodeId, OrchestratorError> {
+        if source_ids.is_empty() {
+            return Err(OrchestratorError::Planning(
+                "cannot create knowledge node without at least one source".to_string(),
+            ));
+        }
+        let now = Utc::now().timestamp();
+        let mut conn = self.conn.lock().map_err(map_lock_err)?;
+        let tx = conn.transaction().map_err(map_sqlite_err)?;
+        tx.execute(
+            "INSERT INTO nodes (content, node_type, created_at_unix, last_accessed_unix, access_count)
+             VALUES (?1, ?2, ?3, ?3, 0)",
+            params![content, node_type.as_str(), now],
+        )
+        .map_err(map_sqlite_err)?;
+        let node_id = tx.last_insert_rowid();
+        for src in source_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+                params![node_id, src],
+            )
+            .map_err(map_sqlite_err)?;
+        }
+        tx.commit().map_err(map_sqlite_err)?;
+        drop(conn);
+
+        // Best-effort embedding. Failures are logged and ignored; node
+        // already exists, only its semantic-search visibility is affected.
+        match self.embedder.embed(content) {
+            Ok((vec, fid)) if !vec.is_empty() => {
+                if let Err(e) = self.store_embedding(node_id, &vec, fid) {
+                    debug!(node_id, "embedding store failed: {e}");
+                }
+            }
+            Ok(_) => {
+                debug!(node_id, "embedder unavailable; node has no vector");
+            }
+            Err(e) => {
+                debug!(node_id, "embed failed: {e}");
+            }
+        }
+        Ok(node_id)
+    }
+
+    fn store_embedding(
+        &self,
+        node_id: NodeId,
+        vector: &[f32],
+        fidelity: Fidelity,
+    ) -> Result<(), OrchestratorError> {
+        let now = Utc::now().timestamp();
+        let blob = vector_to_blob(vector);
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (node_id, dimension, vector, fidelity, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![node_id, vector.len() as i64, blob, fidelity.as_str(), now],
+        )
+        .map_err(map_sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn get_node(&self, id: NodeId) -> Result<KnowledgeNode, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut node = conn
+            .query_row(
+                "SELECT id, content, node_type, created_at_unix, last_accessed_unix, access_count
+                 FROM nodes WHERE id = ?1",
+                params![id],
+                row_to_node,
+            )
+            .map_err(map_sqlite_err)?;
+        let mut stmt = conn
+            .prepare("SELECT source_id FROM node_sources WHERE node_id = ?1")
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![id], |r| r.get::<_, i64>(0))
+            .map_err(map_sqlite_err)?;
+        for row in rows {
+            node.source_ids.push(row.map_err(map_sqlite_err)?);
+        }
+        Ok(node)
+    }
+
+    pub fn touch_node(&self, id: NodeId) -> Result<(), OrchestratorError> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        conn.execute(
+            "UPDATE nodes SET last_accessed_unix = ?1, access_count = access_count + 1 WHERE id = ?2",
+            params![now, id],
+        )
+        .map_err(map_sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn search_by_type(
+        &self,
+        node_type: NodeType,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeNode>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, node_type, created_at_unix, last_accessed_unix, access_count
+                 FROM nodes WHERE node_type = ?1
+                 ORDER BY created_at_unix DESC, id DESC
+                 LIMIT ?2",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![node_type.as_str(), limit as i64], row_to_node)
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    // ── Edges + cycle prevention ─────────────────────────────────────
+
+    pub fn create_edge(
+        &self,
+        from_id: NodeId,
+        to_id: NodeId,
+        relation: EdgeRelation,
+        confidence: f32,
+        source_id: SourceId,
+    ) -> Result<EdgeId, OrchestratorError> {
+        if from_id == to_id {
+            return Err(OrchestratorError::Planning(
+                "self-edge rejected".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(OrchestratorError::Planning(format!(
+                "edge confidence {confidence} out of [0.0, 1.0]"
+            )));
+        }
+        if relation.is_acyclic() && self.would_create_cycle(from_id, to_id, relation)? {
+            return Err(OrchestratorError::Planning(format!(
+                "{} edge {} -> {} would create a cycle",
+                relation.as_str(),
+                from_id,
+                to_id
+            )));
+        }
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        conn.execute(
+            "INSERT INTO edges (from_node, to_node, relation, confidence, source_id, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                from_id,
+                to_id,
+                relation.as_str(),
+                confidence as f64,
+                source_id,
+                now,
+            ],
+        )
+        .map_err(map_sqlite_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn would_create_cycle(
+        &self,
+        from_id: NodeId,
+        to_id: NodeId,
+        relation: EdgeRelation,
+    ) -> Result<bool, OrchestratorError> {
+        // BFS forward from to_id along the same relation; if we reach
+        // from_id, the new edge would close a cycle.
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        queue.push_back(to_id);
+        let mut stmt = conn
+            .prepare("SELECT to_node FROM edges WHERE from_node = ?1 AND relation = ?2")
+            .map_err(map_sqlite_err)?;
+        while let Some(current) = queue.pop_front() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if current == from_id {
+                return Ok(true);
+            }
+            let rows = stmt
+                .query_map(params![current, relation.as_str()], |r| r.get::<_, i64>(0))
+                .map_err(map_sqlite_err)?;
+            for r in rows {
+                queue.push_back(r.map_err(map_sqlite_err)?);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn get_edge(&self, id: EdgeId) -> Result<KnowledgeEdge, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        conn.query_row(
+            "SELECT id, from_node, to_node, relation, confidence, source_id, created_at_unix
+             FROM edges WHERE id = ?1",
+            params![id],
+            row_to_edge,
+        )
+        .map_err(map_sqlite_err)
+    }
+
+    pub fn list_edges_from(&self, node_id: NodeId) -> Result<Vec<KnowledgeEdge>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, from_node, to_node, relation, confidence, source_id, created_at_unix
+                 FROM edges WHERE from_node = ?1
+                 ORDER BY created_at_unix DESC, id DESC",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![node_id], row_to_edge)
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    // ── Querying ──────────────────────────────────────────────────────
+
+    /// Compute query embedding, then rank all stored embeddings by cosine
+    /// similarity. O(N) in node count — sufficient for the < 100K-node
+    /// regime; LanceDB-style HNSW index becomes valuable beyond that.
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<NodeWithSources>, OrchestratorError> {
+        let (q_vec, _q_fidelity) = self.embedder.embed(query)?;
+        if q_vec.is_empty() {
+            // No embedder available; degrade to fallback below.
+            return self.fallback_keyword_search(query, max_results);
+        }
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.id, n.content, n.node_type, n.created_at_unix, n.last_accessed_unix, n.access_count,
+                        e.dimension, e.vector
+                 FROM nodes n
+                 INNER JOIN embeddings e ON e.node_id = n.id",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let node = row_to_node(row)?;
+                let dim: i64 = row.get(6)?;
+                let blob: Vec<u8> = row.get(7)?;
+                Ok((node, dim as usize, blob))
+            })
+            .map_err(map_sqlite_err)?;
+
+        let mut scored: Vec<(KnowledgeNode, f32)> = Vec::new();
+        for r in rows {
+            let (node, dim, blob) = r.map_err(map_sqlite_err)?;
+            let v = match blob_to_vector(&blob, dim) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let sim = match cosine_similarity(&q_vec, &v) {
+                Some(s) => s,
+                None => continue,
+            };
+            scored.push((node, sim));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(max_results);
+
+        // Hydrate sources for each hit.
+        let mut out = Vec::new();
+        for (mut node, sim) in scored {
+            let sources = self.list_sources_for_locked(&conn, node.id)?;
+            node.source_ids = sources.iter().map(|s| s.id).collect();
+            out.push(NodeWithSources {
+                node,
+                sources,
+                similarity_score: Some(sim),
+            });
+        }
+        Ok(out)
+    }
+
+    fn fallback_keyword_search(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<NodeWithSources>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, node_type, created_at_unix, last_accessed_unix, access_count
+                 FROM nodes WHERE LOWER(content) LIKE ?1
+                 ORDER BY created_at_unix DESC, id DESC
+                 LIMIT ?2",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![pattern, max_results as i64], row_to_node)
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let mut node = r.map_err(map_sqlite_err)?;
+            let sources = self.list_sources_for_locked(&conn, node.id)?;
+            node.source_ids = sources.iter().map(|s| s.id).collect();
+            out.push(NodeWithSources {
+                node,
+                sources,
+                similarity_score: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Walk outward from `start` along *any* relation up to `max_depth`.
+    pub fn related_to(
+        &self,
+        start: NodeId,
+        max_depth: u32,
+    ) -> Result<Vec<RelatedNode>, OrchestratorError> {
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        visited.insert(start);
+        let mut frontier: Vec<(NodeId, u32)> = vec![(start, 0)];
+        let mut out = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT to_node, relation FROM edges WHERE from_node = ?1",
+            )
+            .map_err(map_sqlite_err)?;
+        while let Some((current, depth)) = frontier.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+            let rows = stmt
+                .query_map(params![current], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_sqlite_err)?;
+            for r in rows {
+                let (to_id, rel_str) = r.map_err(map_sqlite_err)?;
+                if !visited.insert(to_id) {
+                    continue;
+                }
+                let relation = EdgeRelation::from_str(&rel_str)?;
+                let mut node = conn
+                    .query_row(
+                        "SELECT id, content, node_type, created_at_unix, last_accessed_unix, access_count
+                         FROM nodes WHERE id = ?1",
+                        params![to_id],
+                        row_to_node,
+                    )
+                    .map_err(map_sqlite_err)?;
+                node.source_ids = self
+                    .list_sources_for_locked(&conn, to_id)?
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect();
+                out.push(RelatedNode {
+                    node,
+                    via_relation: relation,
+                    depth: depth + 1,
+                });
+                frontier.push((to_id, depth + 1));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Shortest edge path from `from` to `to` in any direction. Returns
+    /// the sequence of edge ids, or `None` when unreachable.
+    pub fn find_path(
+        &self,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<Option<Vec<EdgeId>>, OrchestratorError> {
+        if from == to {
+            return Ok(Some(Vec::new()));
+        }
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut parent: HashMap<NodeId, (NodeId, EdgeId)> = HashMap::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        queue.push_back(from);
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        visited.insert(from);
+        let mut stmt = conn
+            .prepare("SELECT id, to_node FROM edges WHERE from_node = ?1")
+            .map_err(map_sqlite_err)?;
+        while let Some(current) = queue.pop_front() {
+            if current == to {
+                let mut path = Vec::new();
+                let mut cur = current;
+                while let Some(&(prev, edge_id)) = parent.get(&cur) {
+                    path.push(edge_id);
+                    cur = prev;
+                    if cur == from {
+                        break;
+                    }
+                }
+                path.reverse();
+                return Ok(Some(path));
+            }
+            let rows = stmt
+                .query_map(params![current], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(map_sqlite_err)?;
+            for r in rows {
+                let (edge_id, neighbor) = r.map_err(map_sqlite_err)?;
+                if visited.insert(neighbor) {
+                    parent.insert(neighbor, (current, edge_id));
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// All nodes that are connected to `node_id` via a `Contradicts` edge in
+    /// either direction.
+    pub fn contradictions_for(&self, node_id: NodeId) -> Result<Vec<NodeId>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT to_node FROM edges WHERE from_node = ?1 AND relation = 'contradicts'
+                 UNION
+                 SELECT from_node FROM edges WHERE to_node = ?1 AND relation = 'contradicts'",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![node_id], |r| r.get::<_, i64>(0))
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    pub fn detect_contradictions(&self) -> Result<Vec<(NodeId, NodeId)>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_node, to_node FROM edges WHERE relation = 'contradicts'
+                 ORDER BY id ASC",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_sources_for(&self, node_id: NodeId) -> Result<Vec<Source>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        self.list_sources_for_locked(&conn, node_id)
+    }
+
+    fn list_sources_for_locked(
+        &self,
+        conn: &Connection,
+        node_id: NodeId,
+    ) -> Result<Vec<Source>, OrchestratorError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.source_type, s.uri, s.ingested_at_unix, s.fidelity, s.content_hash, s.format
+                 FROM sources s
+                 INNER JOIN node_sources ns ON ns.source_id = s.id
+                 WHERE ns.node_id = ?1",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![node_id], row_to_source)
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_nodes_from_source(
+        &self,
+        source_id: SourceId,
+    ) -> Result<Vec<KnowledgeNode>, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.id, n.content, n.node_type, n.created_at_unix, n.last_accessed_unix, n.access_count
+                 FROM nodes n
+                 INNER JOIN node_sources ns ON ns.node_id = n.id
+                 WHERE ns.source_id = ?1
+                 ORDER BY n.id ASC",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map(params![source_id], row_to_node)
+            .map_err(map_sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Remove a source. Cascades: edges that cite the source are deleted
+    /// (FK), node_sources rows are deleted (FK), and any nodes that became
+    /// orphaned (no remaining sources) are explicitly deleted. Returns the
+    /// count of orphaned nodes that were removed.
+    pub fn forget_source(&self, source_id: SourceId) -> Result<u32, OrchestratorError> {
+        let mut conn = self.conn.lock().map_err(map_lock_err)?;
+        let tx = conn.transaction().map_err(map_sqlite_err)?;
+        // Find nodes that are about to become source-less.
+        let mut orphans: Vec<NodeId> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT node_id FROM node_sources
+                     WHERE source_id = ?1
+                     AND node_id NOT IN (
+                         SELECT node_id FROM node_sources WHERE source_id != ?1
+                     )",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![source_id], |r| r.get::<_, i64>(0))
+                .map_err(map_sqlite_err)?;
+            for r in rows {
+                orphans.push(r.map_err(map_sqlite_err)?);
+            }
+        }
+        // Delete the source. CASCADE removes node_sources rows and any
+        // edges whose source_id pointed at this source.
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![source_id])
+            .map_err(map_sqlite_err)?;
+        // Explicitly delete the orphaned nodes (CASCADE then handles their
+        // edges and embeddings).
+        for n in &orphans {
+            tx.execute("DELETE FROM nodes WHERE id = ?1", params![n])
+                .map_err(map_sqlite_err)?;
+        }
+        tx.commit().map_err(map_sqlite_err)?;
+        Ok(orphans.len() as u32)
+    }
+
+    pub fn count_nodes(&self) -> Result<u32, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .map_err(map_sqlite_err)?;
+        Ok(n as u32)
+    }
+
+    pub fn count_sources(&self) -> Result<u32, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
+            .map_err(map_sqlite_err)?;
+        Ok(n as u32)
+    }
+
+    pub fn count_edges(&self) -> Result<u32, OrchestratorError> {
+        let conn = self.conn.lock().map_err(map_lock_err)?;
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .map_err(map_sqlite_err)?;
+        Ok(n as u32)
+    }
+
+    // ── Ingestion pipeline ───────────────────────────────────────────
+
+    /// Ingest raw text under a stated format. Caller chooses the format
+    /// — typically resolved by [`detect_format`]. Idempotent: re-ingesting
+    /// the same `(source_uri, content)` pair returns the existing source's
+    /// nodes without re-creating them.
+    pub fn ingest_text(
+        &self,
+        text: &str,
+        source_uri: &str,
+        source_type: SourceType,
+        format: &str,
+    ) -> Result<IngestionResult, OrchestratorError> {
+        let hash = content_hash(text.as_bytes());
+        let pre_count = self.count_sources()?;
+        let source_id = self.create_or_get_source(
+            source_type,
+            source_uri,
+            Fidelity::Direct,
+            &hash,
+            format,
+        )?;
+        let post_count = self.count_sources()?;
+        // If the source already existed (idempotent re-ingest), don't
+        // re-create nodes — return the existing structure as a no-op.
+        if pre_count == post_count {
+            return Ok(IngestionResult {
+                source_id,
+                nodes_created: 0,
+                edges_created: 0,
+                fidelity_used: Fidelity::Direct,
+                format_detected: format.to_string(),
+            });
+        }
+        let (concepts, fidelity_used) = self.parse_concepts(text, format);
+        let mut nodes_created = 0_u32;
+        let mut text_to_id: HashMap<String, NodeId> = HashMap::new();
+        for c in &concepts {
+            let id = self.create_node(&c.text, c.node_type, &[source_id])?;
+            text_to_id.insert(c.text.clone(), id);
+            nodes_created += 1;
+        }
+        // Build PartOf edges: each concept whose parent_text matches a
+        // previously-created node becomes part_of that node. Skip if the
+        // edge would create a cycle (impossible by construction here, but
+        // create_edge enforces it anyway).
+        let mut edges_created = 0_u32;
+        for c in &concepts {
+            let Some(parent) = c.parent_text.as_ref() else {
+                continue;
+            };
+            let Some(&parent_id) = text_to_id.get(parent) else {
+                continue;
+            };
+            let Some(&child_id) = text_to_id.get(&c.text) else {
+                continue;
+            };
+            if parent_id == child_id {
+                continue;
+            }
+            match self.create_edge(child_id, parent_id, EdgeRelation::PartOf, 0.9, source_id) {
+                Ok(_) => edges_created += 1,
+                Err(e) => debug!("part_of edge skipped: {e}"),
+            }
+        }
+        info!(
+            source_id,
+            nodes_created, edges_created, "knowledge ingestion complete"
+        );
+        Ok(IngestionResult {
+            source_id,
+            nodes_created,
+            edges_created,
+            fidelity_used,
+            format_detected: format.to_string(),
+        })
+    }
+
+    fn parse_concepts(&self, text: &str, format: &str) -> (Vec<RawConcept>, Fidelity) {
+        match format {
+            "markdown" | "text" => (parse_markdown_to_concepts(text), Fidelity::Direct),
+            "html" => (parse_html_to_concepts(text), Fidelity::Direct),
+            "pdf" | "docx" => (Vec::new(), Fidelity::Unavailable),
+            _ => (Vec::new(), Fidelity::Unavailable),
+        }
+    }
+
+    /// Read a file from disk, detect the format, ingest. Returns
+    /// `Fidelity::Unavailable` for formats we can't currently extract.
+    pub fn ingest_file(&self, path: &Path) -> Result<IngestionResult, OrchestratorError> {
+        let bytes = std::fs::read(path).map_err(|e| {
+            OrchestratorError::Planning(format!(
+                "could not read {} for ingestion: {e}",
+                path.display()
+            ))
+        })?;
+        let head = &bytes[..bytes.len().min(64)];
+        let format = detect_format(path, head);
+        let uri = path.to_string_lossy().to_string();
+        // Only ingest UTF-8 text formats here — binary formats are declared
+        // as Unavailable until their parsers are added.
+        match format {
+            "markdown" | "text" | "html" => {
+                let text = std::str::from_utf8(&bytes).map_err(|e| {
+                    OrchestratorError::Planning(format!("non-UTF-8 input: {e}"))
+                })?;
+                self.ingest_text(text, &uri, SourceType::LocalFile, format)
+            }
+            other => {
+                // Record the source even though we can't extract concepts —
+                // the user can see we tried. Fidelity::Unavailable.
+                let hash = content_hash(&bytes);
+                let source_id = self.create_or_get_source(
+                    SourceType::LocalFile,
+                    &uri,
+                    Fidelity::Unavailable,
+                    &hash,
+                    other,
+                )?;
+                Ok(IngestionResult {
+                    source_id,
+                    nodes_created: 0,
+                    edges_created: 0,
+                    fidelity_used: Fidelity::Unavailable,
+                    format_detected: other.to_string(),
+                })
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Row helpers + error mappers
+// ────────────────────────────────────────────────────────────────────
+
+fn row_to_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
+    let id: i64 = row.get(0)?;
+    let st: String = row.get(1)?;
+    let uri: String = row.get(2)?;
+    let ts: i64 = row.get(3)?;
+    let fid: String = row.get(4)?;
+    let hash: String = row.get(5)?;
+    let format: String = row.get(6)?;
+    Ok(Source {
+        id,
+        source_type: SourceType::from_str(&st)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(SimpleErr(e.to_string()))))?,
+        uri,
+        ingested_at: DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or_else(Utc::now),
+        fidelity: parse_fidelity(&fid),
+        content_hash: hash,
+        format,
+    })
+}
+
+fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeNode> {
+    let id: i64 = row.get(0)?;
+    let content: String = row.get(1)?;
+    let nt: String = row.get(2)?;
+    let created: i64 = row.get(3)?;
+    let accessed: i64 = row.get(4)?;
+    let count: i64 = row.get(5)?;
+    Ok(KnowledgeNode {
+        id,
+        content,
+        node_type: NodeType::from_str(&nt)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(SimpleErr(e.to_string()))))?,
+        source_ids: Vec::new(),
+        created_at: DateTime::<Utc>::from_timestamp(created, 0).unwrap_or_else(Utc::now),
+        last_accessed: DateTime::<Utc>::from_timestamp(accessed, 0).unwrap_or_else(Utc::now),
+        access_count: count.max(0) as u32,
+    })
+}
+
+fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeEdge> {
+    let id: i64 = row.get(0)?;
+    let from_id: i64 = row.get(1)?;
+    let to_id: i64 = row.get(2)?;
+    let rel: String = row.get(3)?;
+    let conf: f64 = row.get(4)?;
+    let src: i64 = row.get(5)?;
+    let created: i64 = row.get(6)?;
+    Ok(KnowledgeEdge {
+        id,
+        from_id,
+        to_id,
+        relation: EdgeRelation::from_str(&rel)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(SimpleErr(e.to_string()))))?,
+        confidence: conf as f32,
+        source_id: src,
+        created_at: DateTime::<Utc>::from_timestamp(created, 0).unwrap_or_else(Utc::now),
+    })
+}
+
+fn parse_fidelity(s: &str) -> Fidelity {
+    match s {
+        "direct" => Fidelity::Direct,
+        "native_api" => Fidelity::NativeApi,
+        "subprocess" => Fidelity::Subprocess,
+        _ => Fidelity::Unavailable,
+    }
+}
+
+fn map_sqlite_err(e: rusqlite::Error) -> OrchestratorError {
+    OrchestratorError::Planning(format!("knowledge sqlite: {e}"))
+}
+
+fn map_lock_err<T>(_: std::sync::PoisonError<T>) -> OrchestratorError {
+    OrchestratorError::Planning("knowledge store lock poisoned".to_string())
+}
+
+#[derive(Debug)]
+struct SimpleErr(String);
+impl std::fmt::Display for SimpleErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for SimpleErr {}
+
+// ────────────────────────────────────────────────────────────────────
+// Tests
+// ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn store() -> KnowledgeStore {
+        KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap()
+    }
+
+    // ── Enum stability ────────────────────────────────────────────────
+
+    #[test]
+    fn node_type_strings_round_trip() {
+        for t in [
+            NodeType::Concept,
+            NodeType::Fact,
+            NodeType::Person,
+            NodeType::Project,
+            NodeType::Opinion,
+        ] {
+            assert_eq!(NodeType::from_str(t.as_str()).unwrap(), t);
+        }
+        assert!(NodeType::from_str("garbage").is_err());
+    }
+
+    #[test]
+    fn edge_relation_strings_round_trip() {
+        for r in [
+            EdgeRelation::RelatesTo,
+            EdgeRelation::Contradicts,
+            EdgeRelation::Supports,
+            EdgeRelation::PartOf,
+            EdgeRelation::DependsOn,
+            EdgeRelation::CreatedBy,
+            EdgeRelation::SimilarTo,
+        ] {
+            assert_eq!(EdgeRelation::from_str(r.as_str()).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn edge_relation_acyclic_set() {
+        assert!(EdgeRelation::PartOf.is_acyclic());
+        assert!(EdgeRelation::DependsOn.is_acyclic());
+        assert!(!EdgeRelation::RelatesTo.is_acyclic());
+        assert!(!EdgeRelation::Contradicts.is_acyclic());
+    }
+
+    #[test]
+    fn source_type_strings_round_trip() {
+        for s in [
+            SourceType::LocalFile,
+            SourceType::WebPage,
+            SourceType::Conversation,
+            SourceType::UserAssertion,
+        ] {
+            assert_eq!(SourceType::from_str(s.as_str()).unwrap(), s);
+        }
+    }
+
+    // ── content_hash + detect_format ──────────────────────────────────
+
+    #[test]
+    fn content_hash_is_deterministic() {
+        let a = content_hash(b"hello");
+        let b = content_hash(b"hello");
+        let c = content_hash(b"world");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 64); // 32 bytes hex
+    }
+
+    #[test]
+    fn detect_format_by_extension() {
+        assert_eq!(detect_format(Path::new("a.md"), &[]), "markdown");
+        assert_eq!(detect_format(Path::new("a.html"), &[]), "html");
+        assert_eq!(detect_format(Path::new("a.txt"), &[]), "text");
+        assert_eq!(detect_format(Path::new("a.pdf"), &[]), "pdf");
+        assert_eq!(detect_format(Path::new("a.docx"), &[]), "docx");
+    }
+
+    #[test]
+    fn detect_format_by_magic_bytes() {
+        assert_eq!(detect_format(Path::new("noext"), b"%PDF-1.4"), "pdf");
+        assert_eq!(
+            detect_format(Path::new("noext"), b"<!DOCTYPE html>"),
+            "html"
+        );
+        assert_eq!(detect_format(Path::new("noext"), b"plain text"), "text");
+    }
+
+    // ── Markdown parser ───────────────────────────────────────────────
+
+    #[test]
+    fn markdown_parser_extracts_heading_and_paragraph() {
+        let md = "# Title\n\nThis is a paragraph about the topic.\n";
+        let concepts = parse_markdown_to_concepts(md);
+        assert!(concepts.iter().any(|c| c.text == "Title" && c.node_type == NodeType::Concept));
+        assert!(
+            concepts
+                .iter()
+                .any(|c| c.text.starts_with("This is") && c.node_type == NodeType::Fact)
+        );
+    }
+
+    #[test]
+    fn markdown_parser_handles_nested_headings() {
+        let md = "# Top\n\n## Sub\n\nContent.\n";
+        let concepts = parse_markdown_to_concepts(md);
+        let depths: Vec<u32> = concepts
+            .iter()
+            .filter(|c| c.node_type == NodeType::Concept)
+            .map(|c| c.depth)
+            .collect();
+        assert!(depths.contains(&1));
+        assert!(depths.contains(&2));
+    }
+
+    #[test]
+    fn markdown_parser_excludes_code_blocks() {
+        let md = "# H\n\n```rust\nfn foo() {}\n```\n\nProse.\n";
+        let concepts = parse_markdown_to_concepts(md);
+        assert!(!concepts.iter().any(|c| c.text.contains("fn foo()")));
+        assert!(concepts.iter().any(|c| c.text == "Prose."));
+    }
+
+    #[test]
+    fn markdown_parser_handles_no_headings() {
+        let md = "Just one paragraph with no headings whatsoever.\n";
+        let concepts = parse_markdown_to_concepts(md);
+        assert!(!concepts.is_empty());
+        assert!(concepts.iter().all(|c| c.node_type == NodeType::Fact));
+    }
+
+    #[test]
+    fn markdown_parser_assigns_parent_text() {
+        let md = "# Topic\n\nA fact about the topic.\n";
+        let concepts = parse_markdown_to_concepts(md);
+        let fact = concepts
+            .iter()
+            .find(|c| c.node_type == NodeType::Fact)
+            .unwrap();
+        assert_eq!(fact.parent_text.as_deref(), Some("Topic"));
+    }
+
+    // ── HTML parser ───────────────────────────────────────────────────
+
+    #[test]
+    fn html_parser_extracts_title_and_paragraphs() {
+        let html = "<html><head><title>Doc Title</title></head><body><h1>Hello</h1><p>World.</p></body></html>";
+        let concepts = parse_html_to_concepts(html);
+        assert!(concepts.iter().any(|c| c.text == "Doc Title"));
+        assert!(concepts.iter().any(|c| c.text == "Hello"));
+        assert!(concepts.iter().any(|c| c.text == "World."));
+    }
+
+    #[test]
+    fn html_parser_handles_malformed_input() {
+        // Should not panic.
+        let html = "<html><body><p>unclosed";
+        let _ = parse_html_to_concepts(html);
+    }
+
+    #[test]
+    fn html_parser_extracts_list_items() {
+        let html = "<ul><li>First</li><li>Second</li></ul>";
+        let concepts = parse_html_to_concepts(html);
+        assert!(concepts.iter().any(|c| c.text == "First"));
+        assert!(concepts.iter().any(|c| c.text == "Second"));
+    }
+
+    // ── Vector encoding + similarity ──────────────────────────────────
+
+    #[test]
+    fn vector_to_blob_round_trip() {
+        let v = vec![1.0_f32, -0.5, 0.0, 7.25];
+        let blob = vector_to_blob(&v);
+        assert_eq!(blob.len(), 16);
+        let decoded = blob_to_vector(&blob, 4).unwrap();
+        for (a, b) in v.iter().zip(decoded.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn blob_to_vector_rejects_wrong_size() {
+        let blob = vec![0_u8; 8];
+        assert!(blob_to_vector(&blob, 4).is_err());
+    }
+
+    #[test]
+    fn cosine_similarity_identical_vectors_equals_one() {
+        let v = vec![1.0, 2.0, 3.0];
+        let s = cosine_similarity(&v, &v).unwrap();
+        assert!((s - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_vectors_equals_zero() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let s = cosine_similarity(&a, &b).unwrap();
+        assert!(s.abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vector_returns_zero_not_nan() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), Some(0.0));
+    }
+
+    #[test]
+    fn cosine_similarity_dimension_mismatch_returns_none() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0, 2.0, 3.0];
+        assert!(cosine_similarity(&a, &b).is_none());
+    }
+
+    // ── MockEmbedder ──────────────────────────────────────────────────
+
+    #[test]
+    fn mock_embedder_is_deterministic() {
+        let e = MockEmbedder::new();
+        let (a, _) = e.embed("hello").unwrap();
+        let (b, _) = e.embed("hello").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mock_embedder_different_inputs_different_vectors() {
+        let e = MockEmbedder::new();
+        let (a, _) = e.embed("foo").unwrap();
+        let (b, _) = e.embed("bar").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mock_embedder_dimension_matches() {
+        let e = MockEmbedder::with_dimension(16);
+        let (v, _) = e.embed("hi").unwrap();
+        assert_eq!(v.len(), 16);
+        assert_eq!(e.dimension(), 16);
+    }
+
+    // ── LocalEmbedder (stub) ──────────────────────────────────────────
+
+    #[test]
+    fn local_embedder_unavailable_by_default() {
+        let e = LocalEmbedder::unavailable();
+        let (v, fid) = e.embed("anything").unwrap();
+        assert!(v.is_empty());
+        assert_eq!(fid, Fidelity::Unavailable);
+    }
+
+    // ── CloudEmbedder + ZKQP gate ─────────────────────────────────────
+
+    #[test]
+    fn cloud_embedder_disabled_by_default() {
+        let e = CloudEmbedder::disabled();
+        assert!(!e.is_enabled());
+        let (v, fid) = e.embed("user data").unwrap();
+        assert!(v.is_empty());
+        assert_eq!(fid, Fidelity::Unavailable);
+    }
+
+    #[test]
+    fn cloud_embedder_enable_disable_round_trip() {
+        let mut e = CloudEmbedder::disabled();
+        assert!(!e.is_enabled());
+        e.enable();
+        assert!(e.is_enabled());
+        e.disable();
+        assert!(!e.is_enabled());
+    }
+
+    #[test]
+    fn cloud_embedder_when_enabled_sanitizes_via_zkqp() {
+        // Enabling alone shouldn't break — sanitizer runs internally.
+        // The fidelity returned is Subprocess (path is wired) but the vector
+        // is a stub zero vector until real cloud transmission lands.
+        let e = CloudEmbedder::enabled(8);
+        let (v, fid) = e.embed("benign content").unwrap();
+        assert_eq!(v.len(), 8);
+        assert_eq!(fid, Fidelity::Subprocess);
+    }
+
+    // ── CachingEmbedder ───────────────────────────────────────────────
+
+    #[test]
+    fn caching_embedder_reuses_cached_results() {
+        let inner = Box::new(MockEmbedder::new());
+        let cached = CachingEmbedder::wrap(inner);
+        let _ = cached.embed("x").unwrap();
+        let _ = cached.embed("x").unwrap();
+        let _ = cached.embed("y").unwrap();
+        assert_eq!(cached.cache_size(), 2);
+    }
+
+    // ── KnowledgeStore: source provenance enforcement ─────────────────
+
+    #[test]
+    fn create_node_rejects_empty_sources() {
+        let s = store();
+        let err = s.create_node("orphan", NodeType::Concept, &[]).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("source"));
+    }
+
+    #[test]
+    fn create_node_with_source_succeeds() {
+        let s = store();
+        let src = s
+            .create_or_get_source(
+                SourceType::UserAssertion,
+                "user://tester",
+                Fidelity::Direct,
+                "abc",
+                "text",
+            )
+            .unwrap();
+        let id = s
+            .create_node("a fact", NodeType::Fact, &[src])
+            .unwrap();
+        assert!(id > 0);
+        let node = s.get_node(id).unwrap();
+        assert_eq!(node.content, "a fact");
+        assert_eq!(node.source_ids, vec![src]);
+    }
+
+    // ── Source idempotency ───────────────────────────────────────────
+
+    #[test]
+    fn create_or_get_source_returns_existing_for_same_uri_hash() {
+        let s = store();
+        let a = s
+            .create_or_get_source(SourceType::LocalFile, "/p", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        let b = s
+            .create_or_get_source(SourceType::LocalFile, "/p", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(s.count_sources().unwrap(), 1);
+    }
+
+    #[test]
+    fn create_or_get_source_distinguishes_by_hash() {
+        let s = store();
+        let a = s
+            .create_or_get_source(SourceType::LocalFile, "/p", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        let b = s
+            .create_or_get_source(SourceType::LocalFile, "/p", Fidelity::Direct, "h2", "md")
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(s.count_sources().unwrap(), 2);
+    }
+
+    // ── Edge constraints ──────────────────────────────────────────────
+
+    #[test]
+    fn create_edge_rejects_self_edge() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let n = s.create_node("x", NodeType::Concept, &[src]).unwrap();
+        assert!(s
+            .create_edge(n, n, EdgeRelation::RelatesTo, 1.0, src)
+            .is_err());
+    }
+
+    #[test]
+    fn create_edge_rejects_out_of_range_confidence() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        assert!(s
+            .create_edge(a, b, EdgeRelation::RelatesTo, 1.5, src)
+            .is_err());
+        assert!(s
+            .create_edge(a, b, EdgeRelation::RelatesTo, -0.1, src)
+            .is_err());
+    }
+
+    #[test]
+    fn create_edge_part_of_cycle_prevented() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        let c = s.create_node("c", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::PartOf, 0.9, src).unwrap();
+        s.create_edge(b, c, EdgeRelation::PartOf, 0.9, src).unwrap();
+        // a -> b -> c is fine. Now c -> a would form a cycle.
+        let err = s
+            .create_edge(c, a, EdgeRelation::PartOf, 0.9, src)
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("cycle"));
+    }
+
+    #[test]
+    fn create_edge_relates_to_cycle_allowed() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::RelatesTo, 0.5, src).unwrap();
+        // Reverse direction should succeed for non-acyclic relations.
+        s.create_edge(b, a, EdgeRelation::RelatesTo, 0.5, src).unwrap();
+    }
+
+    // ── Semantic search ───────────────────────────────────────────────
+
+    #[test]
+    fn search_semantic_returns_top_k() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let _a = s.create_node("apple banana", NodeType::Fact, &[src]).unwrap();
+        let _b = s.create_node("apple banana", NodeType::Fact, &[src]).unwrap();
+        let _c = s.create_node("totally unrelated content", NodeType::Fact, &[src]).unwrap();
+        let results = s.search_semantic("apple banana", 2).unwrap();
+        assert_eq!(results.len(), 2);
+        // Top-2 should both include "apple banana" since they have identical
+        // mock embeddings.
+        for r in &results {
+            assert!(r.similarity_score.is_some());
+            assert!(r.node.content.contains("apple"));
+        }
+    }
+
+    #[test]
+    fn search_semantic_carries_sources() {
+        let s = store();
+        let src = s
+            .create_or_get_source(
+                SourceType::LocalFile,
+                "/file.md",
+                Fidelity::Direct,
+                "hash1",
+                "markdown",
+            )
+            .unwrap();
+        let _ = s.create_node("a fact", NodeType::Fact, &[src]).unwrap();
+        let r = s.search_semantic("a fact", 1).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].sources.len(), 1);
+        assert_eq!(r[0].sources[0].uri, "/file.md");
+        assert_eq!(r[0].sources[0].fidelity, Fidelity::Direct);
+    }
+
+    // ── related_to + find_path ───────────────────────────────────────
+
+    #[test]
+    fn related_to_walks_outward() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        let c = s.create_node("c", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        s.create_edge(b, c, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        let related = s.related_to(a, 2).unwrap();
+        assert_eq!(related.len(), 2);
+        let ids: Vec<NodeId> = related.iter().map(|r| r.node.id).collect();
+        assert!(ids.contains(&b));
+        assert!(ids.contains(&c));
+    }
+
+    #[test]
+    fn related_to_respects_max_depth() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        let c = s.create_node("c", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        s.create_edge(b, c, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        let related = s.related_to(a, 1).unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].node.id, b);
+    }
+
+    #[test]
+    fn find_path_returns_shortest() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        let c = s.create_node("c", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        s.create_edge(b, c, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        let path = s.find_path(a, c).unwrap().unwrap();
+        assert_eq!(path.len(), 2);
+    }
+
+    #[test]
+    fn find_path_returns_none_when_unreachable() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        // No edges → unreachable
+        assert!(s.find_path(a, b).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_path_same_node_returns_empty() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let path = s.find_path(a, a).unwrap().unwrap();
+        assert!(path.is_empty());
+    }
+
+    // ── Contradictions ───────────────────────────────────────────────
+
+    #[test]
+    fn contradictions_for_returns_directly_connected() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Fact, &[src]).unwrap();
+        let b = s.create_node("not a", NodeType::Fact, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::Contradicts, 0.9, src).unwrap();
+        let conflicts = s.contradictions_for(a).unwrap();
+        assert_eq!(conflicts, vec![b]);
+        // And reverse-direction works:
+        let conflicts_b = s.contradictions_for(b).unwrap();
+        assert_eq!(conflicts_b, vec![a]);
+    }
+
+    #[test]
+    fn detect_contradictions_lists_all_pairs() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Fact, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Fact, &[src]).unwrap();
+        let c = s.create_node("c", NodeType::Fact, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::Contradicts, 0.9, src).unwrap();
+        s.create_edge(a, c, EdgeRelation::Contradicts, 0.9, src).unwrap();
+        let pairs = s.detect_contradictions().unwrap();
+        assert_eq!(pairs.len(), 2);
+    }
+
+    // ── forget_source cascade ────────────────────────────────────────
+
+    #[test]
+    fn forget_source_orphans_nodes_correctly() {
+        let s = store();
+        let s1 = s
+            .create_or_get_source(SourceType::LocalFile, "/a.md", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        let s2 = s
+            .create_or_get_source(SourceType::LocalFile, "/b.md", Fidelity::Direct, "h2", "md")
+            .unwrap();
+        // Node only referenced by s1 → orphaned when s1 forgotten.
+        let only_s1 = s.create_node("only s1", NodeType::Fact, &[s1]).unwrap();
+        // Node referenced by both s1 and s2 → survives.
+        let both = s.create_node("both", NodeType::Fact, &[s1, s2]).unwrap();
+        let orphans = s.forget_source(s1).unwrap();
+        assert_eq!(orphans, 1);
+        // Only-s1 node is gone.
+        assert!(s.get_node(only_s1).is_err());
+        // Both-source node survives but loses s1.
+        let survivor = s.get_node(both).unwrap();
+        assert_eq!(survivor.source_ids, vec![s2]);
+    }
+
+    #[test]
+    fn forget_source_returns_zero_for_nonexistent() {
+        let s = store();
+        assert_eq!(s.forget_source(9999).unwrap(), 0);
+    }
+
+    // ── Ingestion pipeline ────────────────────────────────────────────
+
+    #[test]
+    fn ingest_text_markdown_creates_nodes_and_edges() {
+        let s = store();
+        let md = "# Topic\n\nA paragraph.\n\nAnother paragraph.\n";
+        let result = s.ingest_text(md, "user://note1", SourceType::UserAssertion, "markdown").unwrap();
+        assert!(result.nodes_created >= 3);
+        assert!(result.edges_created >= 1); // at least one part_of edge
+        assert_eq!(result.fidelity_used, Fidelity::Direct);
+        assert_eq!(result.format_detected, "markdown");
+    }
+
+    #[test]
+    fn ingest_text_html_creates_nodes() {
+        let s = store();
+        let html = "<html><head><title>T</title></head><body><h1>H</h1><p>Body.</p></body></html>";
+        let result = s.ingest_text(html, "https://x", SourceType::WebPage, "html").unwrap();
+        assert!(result.nodes_created >= 2);
+        assert_eq!(result.fidelity_used, Fidelity::Direct);
+    }
+
+    #[test]
+    fn ingest_text_idempotent_for_same_content() {
+        let s = store();
+        let md = "# T\n\nP.\n";
+        let r1 = s.ingest_text(md, "u", SourceType::UserAssertion, "markdown").unwrap();
+        let r2 = s.ingest_text(md, "u", SourceType::UserAssertion, "markdown").unwrap();
+        assert_eq!(r1.source_id, r2.source_id);
+        assert_eq!(r2.nodes_created, 0);
+        assert_eq!(r2.edges_created, 0);
+    }
+
+    #[test]
+    fn ingest_text_changed_content_creates_new_source() {
+        let s = store();
+        let r1 = s
+            .ingest_text("# A", "u", SourceType::UserAssertion, "markdown")
+            .unwrap();
+        let r2 = s
+            .ingest_text("# B", "u", SourceType::UserAssertion, "markdown")
+            .unwrap();
+        assert_ne!(r1.source_id, r2.source_id);
+    }
+
+    #[test]
+    fn ingest_text_unsupported_format_yields_unavailable() {
+        let s = store();
+        let result = s
+            .ingest_text("dummy", "/a.pdf", SourceType::LocalFile, "pdf")
+            .unwrap();
+        assert_eq!(result.fidelity_used, Fidelity::Unavailable);
+        assert_eq!(result.nodes_created, 0);
+    }
+
+    #[test]
+    fn ingest_file_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("note.md");
+        std::fs::write(&path, "# Hello\n\nWorld.\n").unwrap();
+        let s = store();
+        let result = s.ingest_file(&path).unwrap();
+        assert!(result.nodes_created >= 2);
+        assert_eq!(result.format_detected, "markdown");
+        assert_eq!(result.fidelity_used, Fidelity::Direct);
+    }
+
+    #[test]
+    fn ingest_file_pdf_records_unavailable_source() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("doc.pdf");
+        std::fs::write(&path, b"%PDF-1.4\nfake").unwrap();
+        let s = store();
+        let result = s.ingest_file(&path).unwrap();
+        assert_eq!(result.fidelity_used, Fidelity::Unavailable);
+        assert_eq!(result.nodes_created, 0);
+        // Source should still be recorded (provenance for "we tried").
+        assert!(result.source_id > 0);
+        let src = s.get_source(result.source_id).unwrap();
+        assert_eq!(src.fidelity, Fidelity::Unavailable);
+    }
+
+    // ── Storage round-trips ──────────────────────────────────────────
+
+    #[test]
+    fn store_open_persists_nodes_across_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let path: PathBuf = tmp.path().join("k.db");
+        let src_id;
+        let node_id;
+        {
+            let s = KnowledgeStore::open(&path, Box::new(MockEmbedder::new())).unwrap();
+            src_id = s
+                .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+                .unwrap();
+            node_id = s.create_node("persist me", NodeType::Fact, &[src_id]).unwrap();
+        }
+        let s2 = KnowledgeStore::open(&path, Box::new(MockEmbedder::new())).unwrap();
+        let n = s2.get_node(node_id).unwrap();
+        assert_eq!(n.content, "persist me");
+        assert_eq!(n.source_ids, vec![src_id]);
+    }
+
+    #[test]
+    fn touch_node_increments_access_count() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let n = s.create_node("x", NodeType::Concept, &[src]).unwrap();
+        assert_eq!(s.get_node(n).unwrap().access_count, 0);
+        s.touch_node(n).unwrap();
+        s.touch_node(n).unwrap();
+        assert_eq!(s.get_node(n).unwrap().access_count, 2);
+    }
+
+    #[test]
+    fn search_by_type_filters_results() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        s.create_node("c1", NodeType::Concept, &[src]).unwrap();
+        s.create_node("c2", NodeType::Concept, &[src]).unwrap();
+        s.create_node("f1", NodeType::Fact, &[src]).unwrap();
+        let concepts = s.search_by_type(NodeType::Concept, 10).unwrap();
+        assert_eq!(concepts.len(), 2);
+        let facts = s.search_by_type(NodeType::Fact, 10).unwrap();
+        assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn list_nodes_from_source_returns_only_matching() {
+        let s = store();
+        let s1 = s
+            .create_or_get_source(SourceType::LocalFile, "/a", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        let s2 = s
+            .create_or_get_source(SourceType::LocalFile, "/b", Fidelity::Direct, "h2", "md")
+            .unwrap();
+        s.create_node("from s1", NodeType::Fact, &[s1]).unwrap();
+        s.create_node("from s2", NodeType::Fact, &[s2]).unwrap();
+        let from_s1 = s.list_nodes_from_source(s1).unwrap();
+        assert_eq!(from_s1.len(), 1);
+        assert_eq!(from_s1[0].content, "from s1");
+    }
+
+    #[test]
+    fn count_helpers_match_inserts() {
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::RelatesTo, 0.5, src).unwrap();
+        assert_eq!(s.count_sources().unwrap(), 1);
+        assert_eq!(s.count_nodes().unwrap(), 2);
+        assert_eq!(s.count_edges().unwrap(), 1);
+    }
+}

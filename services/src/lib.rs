@@ -15,6 +15,7 @@
 //! - [`goals`] — Goal graph with deadline intelligence and timeline estimation
 //! - [`environment`] — Ambient environmental awareness with fidelity-tagged sensor readings
 //! - [`health`] — Predictive crisis prevention with baseline-based anomaly detection
+//! - [`knowledge`] — Knowledge synthesis engine with source-provenance graph + semantic search
 //!
 //! # Architecture
 //!
@@ -24,7 +25,7 @@
 //!                                           die-inference / semantic-fs / die-orchestrator
 //! ```
 //!
-//! All 9 interfaces are registered on the session bus under
+//! All 10 interfaces are registered on the session bus under
 //! `org.delphi.Services`.
 
 pub mod conversation;
@@ -33,6 +34,7 @@ pub mod file_search;
 pub mod goals;
 pub mod health;
 pub mod inference;
+pub mod knowledge;
 pub mod learning;
 pub mod mode;
 pub mod timeline;

@@ -18,6 +18,11 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 zbus = { workspace = true }
 chrono = { workspace = true }
+# Knowledge ingestion allowlist resolves the user's home dir as the
+# default ingestion root (Codex review FIX 1, Task 3A.5).
+dirs = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# Allowlist tests use TempDir to construct isolated allowed roots.
+tempfile = { workspace = true }

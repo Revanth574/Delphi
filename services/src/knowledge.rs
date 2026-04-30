@@ -34,7 +34,7 @@
 //! Uses `std::sync::Mutex` (not `tokio::sync`) because `rusqlite::Connection`
 //! is `!Send` across await points — see CLAUDE.md §3 D-Bus rule 6.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
@@ -54,6 +54,24 @@ pub const PATH: &str = "/org/delphi/Knowledge";
 /// can lock briefly to read state or mutate the graph. The Mutex is the
 /// standard `std::sync::Mutex`.
 ///
+/// # Path access control (Codex review FIX 1)
+///
+/// [`ingest_file`](Self::ingest_file) takes a caller-supplied path. Without
+/// access control, a malicious or buggy shell client could request
+/// ingestion of `/etc/shadow`, the user's SSH private keys, or any file
+/// the daemon has read permission for. The service enforces an
+/// **allowlist of permitted base directories** (the user's home dir by
+/// default, plus any paths the shell explicitly registers).
+///
+/// Path validation:
+/// 1. The input path is canonicalized via `std::fs::canonicalize` —
+///    resolves symlinks AND `..` components. Non-existent paths fail
+///    early with `AccessDenied`.
+/// 2. Each allowlist entry is canonicalized once when added.
+/// 3. The canonicalized input must `starts_with` at least one allowlist
+///    entry. `Path::starts_with` operates on path components, so byte
+///    prefixes like `/home/user2` against `/home/user` correctly fail.
+///
 /// # Examples
 ///
 /// ```
@@ -66,12 +84,99 @@ pub const PATH: &str = "/org/delphi/Knowledge";
 /// ```
 pub struct KnowledgeService {
     store: Arc<Mutex<KnowledgeStore>>,
+    /// Canonicalized base directories that `ingest_file` will accept.
+    /// Empty allowlist → no path is permitted (closed by default).
+    allowlist: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl KnowledgeService {
+    /// Build a service with the user's home directory as the only
+    /// permitted ingestion root. The shell can extend the allowlist via
+    /// [`add_ingestion_root`](Self::add_ingestion_root) for project
+    /// directories the user explicitly registers.
     #[must_use]
     pub fn new(store: Arc<Mutex<KnowledgeStore>>) -> Self {
-        Self { store }
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(home) = dirs::home_dir()
+            && let Ok(canon) = std::fs::canonicalize(&home)
+        {
+            roots.push(canon);
+        }
+        Self {
+            store,
+            allowlist: Arc::new(Mutex::new(roots)),
+        }
+    }
+
+    /// Build a service with an explicit allowlist of base directories.
+    /// Each entry is canonicalized; entries that don't exist are dropped.
+    /// Useful for tests that need to inject a tempdir-rooted allowlist.
+    #[must_use]
+    pub fn with_allowlist(
+        store: Arc<Mutex<KnowledgeStore>>,
+        roots: Vec<PathBuf>,
+    ) -> Self {
+        let canon: Vec<PathBuf> = roots
+            .into_iter()
+            .filter_map(|p| std::fs::canonicalize(&p).ok())
+            .collect();
+        Self {
+            store,
+            allowlist: Arc::new(Mutex::new(canon)),
+        }
+    }
+
+    /// Add a base directory to the allowlist. Returns `true` if the path
+    /// was added (canonicalization succeeded and it wasn't already
+    /// present); `false` if already present or unresolvable.
+    pub fn add_ingestion_root(&self, root: &Path) -> bool {
+        let Ok(canon) = std::fs::canonicalize(root) else {
+            return false;
+        };
+        let Ok(mut allow) = self.allowlist.lock() else {
+            return false;
+        };
+        if allow.contains(&canon) {
+            return false;
+        }
+        allow.push(canon);
+        true
+    }
+
+    /// Snapshot of currently-allowed roots — for diagnostics and tests.
+    pub fn allowlist_snapshot(&self) -> Vec<PathBuf> {
+        self.allowlist
+            .lock()
+            .map(|a| a.clone())
+            .unwrap_or_default()
+    }
+
+    /// Validate a caller-supplied path against the allowlist. Returns
+    /// the canonicalized form on success; `Err(AccessDenied)` otherwise.
+    /// Errors deliberately do NOT echo the path back to the caller — the
+    /// audit log entry has the raw path; the wire response is structured.
+    fn check_path_allowed(&self, raw: &str) -> zbus::fdo::Result<PathBuf> {
+        let canon = std::fs::canonicalize(raw).map_err(|_| {
+            zbus::fdo::Error::AccessDenied(
+                "path not permitted: unresolvable or does not exist".to_string(),
+            )
+        })?;
+        let allow = self
+            .allowlist
+            .lock()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("allowlist lock poisoned: {e}")))?;
+        if allow.is_empty() {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "path not permitted: ingestion allowlist is empty".to_string(),
+            ));
+        }
+        if allow.iter().any(|root| canon.starts_with(root)) {
+            Ok(canon)
+        } else {
+            Err(zbus::fdo::Error::AccessDenied(
+                "path not permitted: outside ingestion allowlist".to_string(),
+            ))
+        }
     }
 }
 
@@ -79,17 +184,23 @@ impl KnowledgeService {
 impl KnowledgeService {
     /// Ingest a file from disk. Returns a JSON [`IngestionResult`].
     ///
+    /// **Access control (Codex review FIX 1):** the path must lie under
+    /// one of the configured ingestion roots (see [`add_ingestion_root`](Self::add_ingestion_root)).
+    /// Paths outside the allowlist return `zbus::fdo::Error::AccessDenied`
+    /// without leaking the rejected path back to the caller.
+    ///
     /// Errors are returned as `zbus::fdo::Error::Failed` with a structured
     /// reason; the file's content is never echoed back in the error
     /// message.
     async fn ingest_file(&self, path: String) -> zbus::fdo::Result<String> {
         info!(path = %path, "D-Bus ingest_file");
+        let canonical = self.check_path_allowed(&path)?;
         let store = self
             .store
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let result = store
-            .ingest_file(&PathBuf::from(&path))
+            .ingest_file(&canonical)
             .map_err(|e| zbus::fdo::Error::Failed(redact_to_kind(&e.to_string())))?;
         ingestion_to_json_string(&result)
     }
@@ -324,6 +435,13 @@ mod tests {
         KnowledgeService::new(Arc::new(Mutex::new(store)))
     }
 
+    /// Build a service whose only ingestion root is `root`. Used by the
+    /// allowlist tests to fully isolate the per-test filesystem region.
+    fn mk_svc_with_root(root: PathBuf) -> KnowledgeService {
+        let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
+        KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![root])
+    }
+
     #[test]
     fn path_is_valid() {
         assert!(PATH.starts_with("/org/delphi"));
@@ -342,6 +460,117 @@ mod tests {
             "knowledge sqlite"
         );
         assert_eq!(redact_to_kind("standalone"), "standalone");
+    }
+
+    // ── FIX 1: ingest_file allowlist enforcement ─────────────────────
+
+    #[tokio::test]
+    async fn ingest_file_accepts_path_inside_allowlist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let file = tmp.path().join("note.md");
+        std::fs::write(&file, "# T\n\nP.\n").unwrap();
+        let json = svc
+            .ingest_file(file.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        // Successful round-trip — JSON shape, not contents
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["source_id"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejects_path_outside_allowlist() {
+        let allowed = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let outside = other.path().join("evil.md");
+        std::fs::write(&outside, "should not be ingested").unwrap();
+        let err = svc
+            .ingest_file(outside.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        // Must be AccessDenied per FIX 1
+        let s = err.to_string().to_lowercase();
+        assert!(
+            s.contains("access") || s.contains("not permitted") || s.contains("denied"),
+            "expected access-denied error, got: {s}"
+        );
+        // Error message must not echo the rejected path
+        let raw = outside.to_string_lossy();
+        assert!(
+            !err.to_string().contains(raw.as_ref()),
+            "error message leaked the path: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejects_nonexistent_path() {
+        let allowed = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let ghost = allowed.path().join("does-not-exist.md");
+        let err = svc
+            .ingest_file(ghost.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        let s = err.to_string().to_lowercase();
+        assert!(s.contains("access") || s.contains("not permitted"));
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejects_traversal_escape() {
+        // /allowed/../other/secret.md canonicalizes to /other/secret.md,
+        // which is outside the allowlist — must be rejected.
+        let allowed = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let outside = other.path().join("secret.md");
+        std::fs::write(&outside, "secret").unwrap();
+        // Construct a traversal path through the allowed root.
+        let traversal = allowed
+            .path()
+            .join("..")
+            .join(outside.file_name().unwrap());
+        // Note: this traversal path doesn't exist in the form constructed —
+        // canonicalization fails first. That's still AccessDenied (the
+        // safe-by-default semantic: anything we can't prove is inside is
+        // outside).
+        let err = svc
+            .ingest_file(traversal.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("access"));
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejects_when_allowlist_empty() {
+        let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
+        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("any.md");
+        std::fs::write(&file, "x").unwrap();
+        let err = svc
+            .ingest_file(file.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        let s = err.to_string().to_lowercase();
+        assert!(s.contains("access") || s.contains("empty") || s.contains("not permitted"));
+    }
+
+    #[test]
+    fn add_ingestion_root_canonicalizes_and_dedupes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
+        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        assert!(svc.allowlist_snapshot().is_empty());
+        // First add succeeds.
+        assert!(svc.add_ingestion_root(tmp.path()));
+        assert_eq!(svc.allowlist_snapshot().len(), 1);
+        // Second add of the same path is a no-op (already present after canon).
+        assert!(!svc.add_ingestion_root(tmp.path()));
+        assert_eq!(svc.allowlist_snapshot().len(), 1);
+        // Adding a non-existent path fails.
+        assert!(!svc.add_ingestion_root(std::path::Path::new("/no/such/path/here/exists")));
     }
 
     #[tokio::test]

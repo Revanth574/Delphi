@@ -1423,8 +1423,15 @@ impl KnowledgeStore {
         Ok(out)
     }
 
-    /// Shortest edge path from `from` to `to` in any direction. Returns
-    /// the sequence of edge ids, or `None` when unreachable.
+    /// Shortest edge path from `from` to `to`, treating the graph as
+    /// **undirected** for traversal. Returns the sequence of edge ids
+    /// connecting the two nodes, or `None` when unreachable.
+    ///
+    /// **Codex review FIX 3:** the BFS walks both outgoing AND incoming
+    /// edges at each node — an edge `A → B` is reachable in either
+    /// direction. Edge ids alone identify edges (callers can look up
+    /// direction via [`get_edge`](Self::get_edge) if needed), so the
+    /// returned `Vec<EdgeId>` semantics are unchanged.
     pub fn find_path(
         &self,
         from: NodeId,
@@ -1439,8 +1446,14 @@ impl KnowledgeStore {
         queue.push_back(from);
         let mut visited: HashSet<NodeId> = HashSet::new();
         visited.insert(from);
+        // UNION ALL to walk in both directions: at each node, collect
+        // every edge incident to it regardless of direction.
         let mut stmt = conn
-            .prepare("SELECT id, to_node FROM edges WHERE from_node = ?1")
+            .prepare(
+                "SELECT id, to_node AS neighbor FROM edges WHERE from_node = ?1
+                 UNION ALL
+                 SELECT id, from_node AS neighbor FROM edges WHERE to_node = ?1",
+            )
             .map_err(map_sqlite_err)?;
         while let Some(current) = queue.pop_front() {
             if current == to {
@@ -1633,6 +1646,14 @@ impl KnowledgeStore {
     /// — typically resolved by [`detect_format`]. Idempotent: re-ingesting
     /// the same `(source_uri, content)` pair returns the existing source's
     /// nodes without re-creating them.
+    ///
+    /// **Fidelity provenance (Codex review FIX 2):** the source row's
+    /// fidelity reflects whether we actually extracted concepts, not the
+    /// caller's optimistic assumption. We ask `parse_concepts` first;
+    /// for unsupported formats (pdf/docx/unknown) we tag the new source
+    /// row `Fidelity::Unavailable`. On idempotent re-ingest we re-read
+    /// the stored source's fidelity and format rather than echoing the
+    /// caller's input.
     pub fn ingest_text(
         &self,
         text: &str,
@@ -1641,27 +1662,32 @@ impl KnowledgeStore {
         format: &str,
     ) -> Result<IngestionResult, OrchestratorError> {
         let hash = content_hash(text.as_bytes());
+        // Determine fidelity FIRST. The parser knows whether it can
+        // actually extract concepts for this format; we honor its verdict.
+        let (concepts, fidelity_used) = self.parse_concepts(text, format);
         let pre_count = self.count_sources()?;
         let source_id = self.create_or_get_source(
             source_type,
             source_uri,
-            Fidelity::Direct,
+            fidelity_used,
             &hash,
             format,
         )?;
         let post_count = self.count_sources()?;
         // If the source already existed (idempotent re-ingest), don't
         // re-create nodes — return the existing structure as a no-op.
+        // Re-fetch the stored source so the response reflects the source
+        // row's recorded provenance, not the current caller's input.
         if pre_count == post_count {
+            let stored = self.get_source(source_id)?;
             return Ok(IngestionResult {
                 source_id,
                 nodes_created: 0,
                 edges_created: 0,
-                fidelity_used: Fidelity::Direct,
-                format_detected: format.to_string(),
+                fidelity_used: stored.fidelity,
+                format_detected: stored.format,
             });
         }
-        let (concepts, fidelity_used) = self.parse_concepts(text, format);
         let mut nodes_created = 0_u32;
         let mut text_to_id: HashMap<String, NodeId> = HashMap::new();
         for c in &concepts {
@@ -2375,6 +2401,47 @@ mod tests {
     }
 
     #[test]
+    fn find_path_traverses_edge_in_reverse_direction() {
+        // Codex review FIX 3: with only edge A→B, find_path(B, A) must
+        // return a path of length 1 (the edge id of A→B). The graph is
+        // treated as undirected for traversal even though edges store
+        // direction.
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        let edge = s
+            .create_edge(a, b, EdgeRelation::RelatesTo, 1.0, src)
+            .unwrap();
+        let path = s.find_path(b, a).unwrap().unwrap();
+        assert_eq!(path.len(), 1, "B→A should reach A via the A→B edge");
+        assert_eq!(
+            path[0], edge,
+            "returned edge id must identify the actual stored edge"
+        );
+    }
+
+    #[test]
+    fn find_path_uses_shortest_across_mixed_directions() {
+        // Three nodes, two edges, mixed directions: A→B and C→B.
+        // Path A↔B↔C exists with length 2; both legs traversed in
+        // reverse for the second one.
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("a", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("b", NodeType::Concept, &[src]).unwrap();
+        let c = s.create_node("c", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        s.create_edge(c, b, EdgeRelation::RelatesTo, 1.0, src).unwrap();
+        let path = s.find_path(a, c).unwrap().unwrap();
+        assert_eq!(path.len(), 2);
+    }
+
+    #[test]
     fn find_path_same_node_returns_empty() {
         let s = store();
         let src = s
@@ -2501,6 +2568,46 @@ mod tests {
             .unwrap();
         assert_eq!(result.fidelity_used, Fidelity::Unavailable);
         assert_eq!(result.nodes_created, 0);
+    }
+
+    #[test]
+    fn ingest_text_unsupported_format_records_unavailable_in_source_row() {
+        // Codex review FIX 2: the source row's fidelity must reflect what
+        // the parser could actually extract — not Direct optimism.
+        let s = store();
+        let result = s
+            .ingest_text("dummy", "/a.pdf", SourceType::LocalFile, "pdf")
+            .unwrap();
+        let stored = s.get_source(result.source_id).unwrap();
+        assert_eq!(
+            stored.fidelity,
+            Fidelity::Unavailable,
+            "source row must inherit parser's Unavailable verdict"
+        );
+        assert_eq!(stored.format, "pdf");
+    }
+
+    #[test]
+    fn ingest_text_idempotent_returns_stored_fidelity_not_caller_input() {
+        // Codex review FIX 2: re-ingesting an already-stored Unavailable
+        // source must report Unavailable on the second call — not the
+        // caller's current input.
+        let s = store();
+        let r1 = s
+            .ingest_text("dummy", "/a.pdf", SourceType::LocalFile, "pdf")
+            .unwrap();
+        assert_eq!(r1.fidelity_used, Fidelity::Unavailable);
+        let r2 = s
+            .ingest_text("dummy", "/a.pdf", SourceType::LocalFile, "pdf")
+            .unwrap();
+        assert_eq!(r2.source_id, r1.source_id, "idempotent reuse expected");
+        assert_eq!(r2.nodes_created, 0);
+        assert_eq!(
+            r2.fidelity_used,
+            Fidelity::Unavailable,
+            "idempotent path must echo stored fidelity, not Direct"
+        );
+        assert_eq!(r2.format_detected, "pdf");
     }
 
     #[test]

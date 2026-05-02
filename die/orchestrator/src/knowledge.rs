@@ -1155,6 +1155,13 @@ impl KnowledgeStore {
         Ok(())
     }
 
+    /// List nodes filtered by type, newest first.
+    ///
+    /// **Codex review FIX 6 (P2):** every returned `KnowledgeNode` has
+    /// its `source_ids` hydrated from the `node_sources` join table —
+    /// the module-level invariant ("every node has at least one
+    /// `Source`, the confabulation defense") would otherwise be
+    /// broken by this listing path.
     pub fn search_by_type(
         &self,
         node_type: NodeType,
@@ -1174,7 +1181,13 @@ impl KnowledgeStore {
             .map_err(map_sqlite_err)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(map_sqlite_err)?);
+            let mut node = row.map_err(map_sqlite_err)?;
+            node.source_ids = self
+                .list_sources_for_locked(&conn, node.id)?
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            out.push(node);
         }
         Ok(out)
     }
@@ -1569,6 +1582,13 @@ impl KnowledgeStore {
         Ok(out)
     }
 
+    /// List every node linked to `source_id`.
+    ///
+    /// **Codex review FIX 6 (P2):** each returned node has its
+    /// `source_ids` fully hydrated — including sources OTHER than the
+    /// queried `source_id`. A node may participate in multiple sources;
+    /// callers must see the complete provenance set, not just the
+    /// matching one.
     pub fn list_nodes_from_source(
         &self,
         source_id: SourceId,
@@ -1588,7 +1608,13 @@ impl KnowledgeStore {
             .map_err(map_sqlite_err)?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(map_sqlite_err)?);
+            let mut node = r.map_err(map_sqlite_err)?;
+            node.source_ids = self
+                .list_sources_for_locked(&conn, node.id)?
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            out.push(node);
         }
         Ok(out)
     }
@@ -2790,6 +2816,9 @@ mod tests {
 
     #[test]
     fn list_nodes_from_source_returns_only_matching() {
+        // Codex review FIX 6 P2: tightened to also assert source_ids is
+        // populated (the previous version asserted content but not
+        // provenance, leaving a hole the invariant fix closes).
         let s = store();
         let s1 = s
             .create_or_get_source(SourceType::LocalFile, "/a", Fidelity::Direct, "h1", "md")
@@ -2802,6 +2831,103 @@ mod tests {
         let from_s1 = s.list_nodes_from_source(s1).unwrap();
         assert_eq!(from_s1.len(), 1);
         assert_eq!(from_s1[0].content, "from s1");
+        assert!(
+            !from_s1[0].source_ids.is_empty(),
+            "provenance invariant: source_ids must not be empty"
+        );
+        assert!(from_s1[0].source_ids.contains(&s1));
+    }
+
+    // ── FIX 6 (P2): hydrate source_ids on listing methods ─────────────
+
+    #[test]
+    fn search_by_type_hydrates_source_ids() {
+        // Codex review FIX 6 P2: row_to_node leaves source_ids empty;
+        // search_by_type must hydrate before returning.
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        s.create_node("c1", NodeType::Concept, &[src]).unwrap();
+        let nodes = s.search_by_type(NodeType::Concept, 10).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].source_ids,
+            vec![src],
+            "search_by_type must hydrate source_ids — provenance invariant"
+        );
+    }
+
+    #[test]
+    fn search_by_type_hydrates_multiple_sources() {
+        // A node linked to two sources must surface both ids when
+        // returned by search_by_type.
+        let s = store();
+        let src_a = s
+            .create_or_get_source(SourceType::LocalFile, "/a", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        let src_b = s
+            .create_or_get_source(SourceType::LocalFile, "/b", Fidelity::Direct, "h2", "md")
+            .unwrap();
+        s.create_node("dual", NodeType::Concept, &[src_a, src_b])
+            .unwrap();
+        let nodes = s.search_by_type(NodeType::Concept, 10).unwrap();
+        assert_eq!(nodes.len(), 1);
+        let mut ids = nodes[0].source_ids.clone();
+        ids.sort();
+        let mut expected = vec![src_a, src_b];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn list_nodes_from_source_hydrates_source_ids() {
+        // A node linked to two sources, queried via list_nodes_from_source
+        // for ONE of them, must still return BOTH source ids — the
+        // returned KnowledgeNode is the full provenance picture, not
+        // filtered to the queried source.
+        let s = store();
+        let src_a = s
+            .create_or_get_source(SourceType::LocalFile, "/a", Fidelity::Direct, "h1", "md")
+            .unwrap();
+        let src_b = s
+            .create_or_get_source(SourceType::LocalFile, "/b", Fidelity::Direct, "h2", "md")
+            .unwrap();
+        s.create_node("dual", NodeType::Fact, &[src_a, src_b]).unwrap();
+        let nodes = s.list_nodes_from_source(src_a).unwrap();
+        assert_eq!(nodes.len(), 1);
+        let mut ids = nodes[0].source_ids.clone();
+        ids.sort();
+        let mut expected = vec![src_a, src_b];
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "list_nodes_from_source must return full provenance, not just queried source"
+        );
+    }
+
+    #[test]
+    fn search_by_type_hydration_works_when_node_only_has_one_source() {
+        // Smoke test: minimum-source case (every node has at least one
+        // source by construction; this verifies the hydrator handles
+        // the 1-source path correctly with no extra/missing entries).
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        for i in 0..3 {
+            s.create_node(&format!("n{i}"), NodeType::Fact, &[src])
+                .unwrap();
+        }
+        let nodes = s.search_by_type(NodeType::Fact, 10).unwrap();
+        assert_eq!(nodes.len(), 3);
+        for n in &nodes {
+            assert_eq!(
+                n.source_ids,
+                vec![src],
+                "every node must carry exactly the one source it was created with"
+            );
+        }
     }
 
     #[test]

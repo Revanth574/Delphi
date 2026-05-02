@@ -48,29 +48,120 @@ use die_orchestrator::knowledge::{
 /// D-Bus object path for the Knowledge interface.
 pub const PATH: &str = "/org/delphi/Knowledge";
 
+/// Directory names that must never be ingested, regardless of allowlist.
+/// Compared component-wise (case-insensitive ASCII) against the
+/// canonicalized path. A path containing any of these as a component is
+/// rejected even if the user explicitly added a parent dir to the
+/// allowlist.
+///
+/// Codex review (FIX 4 round) flagged the original allowlist as
+/// insufficient: even an opt-in allowlist that includes the user's home
+/// can pull keys/credentials/tokens. This denylist provides a safety
+/// net the allowlist cannot override.
+const SENSITIVE_DIR_NAMES: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".gpg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".azure",
+];
+
+/// File-name stems that always indicate sensitive material. Compared
+/// case-insensitively against the canonicalized path's `file_name`.
+const SENSITIVE_FILE_NAMES: &[&str] = &[
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    "credentials",
+    "authorized_keys",
+    "known_hosts",
+];
+
+/// File extensions that always indicate sensitive material. Compared
+/// case-insensitively (so `.PEM` is rejected the same as `.pem`).
+const SENSITIVE_EXTENSIONS: &[&str] = &[
+    "pem", "key", "p12", "pfx", "kdbx", "keystore", "jks",
+];
+
+/// Pure function: returns `true` if the canonicalized path matches the
+/// sensitive-content denylist and must be rejected.
+///
+/// Checks (in order, return `true` on first hit):
+/// 1. Each path component against [`SENSITIVE_DIR_NAMES`]
+/// 2. The file-name stem against [`SENSITIVE_FILE_NAMES`]
+/// 3. The file name's `.env*` prefix (catches `.env`, `.env.production`, etc.)
+/// 4. The file extension against [`SENSITIVE_EXTENSIONS`]
+///
+/// The function takes only `&Path` and performs no I/O — it's a pure
+/// classifier suitable for unit testing without temp dirs or fixtures.
+pub(crate) fn is_sensitive_path(path: &Path) -> bool {
+    // Component-wise dir-name check.
+    for comp in path.components() {
+        if let std::path::Component::Normal(os) = comp
+            && let Some(name) = os.to_str()
+            && SENSITIVE_DIR_NAMES
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+    }
+    // File name + extension checks.
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = file_name.to_ascii_lowercase();
+    if SENSITIVE_FILE_NAMES.iter().any(|n| lower == *n) {
+        return true;
+    }
+    if lower.starts_with(".env") {
+        return true;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+        if SENSITIVE_EXTENSIONS.iter().any(|e| ext_lower == *e) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Knowledge D-Bus service.
 ///
 /// Wraps a [`KnowledgeStore`] in `Arc<Mutex<...>>` so async D-Bus methods
 /// can lock briefly to read state or mutate the graph. The Mutex is the
 /// standard `std::sync::Mutex`.
 ///
-/// # Path access control (Codex review FIX 1)
+/// # Path access control — closed-by-default (Codex review FIX 4, P1)
 ///
-/// [`ingest_file`](Self::ingest_file) takes a caller-supplied path. Without
-/// access control, a malicious or buggy shell client could request
-/// ingestion of `/etc/shadow`, the user's SSH private keys, or any file
-/// the daemon has read permission for. The service enforces an
-/// **allowlist of permitted base directories** (the user's home dir by
-/// default, plus any paths the shell explicitly registers).
+/// [`ingest_file`](Self::ingest_file) takes a caller-supplied path. The
+/// initial 3A.5 design auto-registered the user's home directory as an
+/// ingestion root — Codex flagged that any D-Bus caller could then
+/// request ingestion of `~/.ssh/id_rsa`, `~/.aws/credentials`,
+/// dotfile-stored API tokens, or browser cookie databases, and pull
+/// parsed content back through `search`.
 ///
-/// Path validation:
-/// 1. The input path is canonicalized via `std::fs::canonicalize` —
-///    resolves symlinks AND `..` components. Non-existent paths fail
-///    early with `AccessDenied`.
-/// 2. Each allowlist entry is canonicalized once when added.
-/// 3. The canonicalized input must `starts_with` at least one allowlist
-///    entry. `Path::starts_with` operates on path components, so byte
-///    prefixes like `/home/user2` against `/home/user` correctly fail.
+/// **The default allowlist is now empty.** The shell explicitly
+/// registers each ingestion root via
+/// [`add_ingestion_root`](Self::add_ingestion_root) only after the user
+/// picks a directory in a folder-picker dialog. Without that explicit
+/// opt-in, every `ingest_file` call returns `AccessDenied`.
+///
+/// Path validation runs in this order, returning `AccessDenied` on the
+/// first failure (without echoing the rejected path back to the wire):
+///
+/// 1. Canonicalize the input via `std::fs::canonicalize` (resolves
+///    symlinks AND `..` components; non-existent paths fail early).
+/// 2. Verify the canonical path lies under at least one allowlist entry
+///    (component-wise prefix match — `/home/user2` does NOT match
+///    `/home/user`).
+/// 3. Verify the canonical path does not match the sensitive-content
+///    denylist ([`is_sensitive_path`]). The denylist runs **after** the
+///    allowlist so a denylisted file inside an allowed directory still
+///    rejects — even an explicit allowlist cannot override the denylist.
 ///
 /// # Examples
 ///
@@ -81,36 +172,39 @@ pub const PATH: &str = "/org/delphi/Knowledge";
 ///
 /// let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
 /// let svc = KnowledgeService::new(Arc::new(Mutex::new(store)));
+/// // svc.allowlist_snapshot() is empty — shell must add roots before ingestion.
 /// ```
 pub struct KnowledgeService {
     store: Arc<Mutex<KnowledgeStore>>,
     /// Canonicalized base directories that `ingest_file` will accept.
-    /// Empty allowlist → no path is permitted (closed by default).
+    /// Empty allowlist → no path is permitted (closed by default,
+    /// Codex review FIX 4 P1).
     allowlist: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl KnowledgeService {
-    /// Build a service with the user's home directory as the only
-    /// permitted ingestion root. The shell can extend the allowlist via
-    /// [`add_ingestion_root`](Self::add_ingestion_root) for project
-    /// directories the user explicitly registers.
+    /// Build a service with an **empty** ingestion allowlist. This is
+    /// the closed-by-default posture per Codex review FIX 4 (P1):
+    /// every `ingest_file` call returns `AccessDenied` until the shell
+    /// registers explicit roots via
+    /// [`add_ingestion_root`](Self::add_ingestion_root).
+    ///
+    /// The intended flow is: the user clicks a folder-picker in the
+    /// shell, the shell sends the picked path over D-Bus to a future
+    /// `AddIngestionRoot` method (or the daemon registers it directly
+    /// at construction), and only THEN can the path be ingested.
     #[must_use]
     pub fn new(store: Arc<Mutex<KnowledgeStore>>) -> Self {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Some(home) = dirs::home_dir()
-            && let Ok(canon) = std::fs::canonicalize(&home)
-        {
-            roots.push(canon);
-        }
         Self {
             store,
-            allowlist: Arc::new(Mutex::new(roots)),
+            allowlist: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Build a service with an explicit allowlist of base directories.
     /// Each entry is canonicalized; entries that don't exist are dropped.
-    /// Useful for tests that need to inject a tempdir-rooted allowlist.
+    /// Useful for tests that need to inject a tempdir-rooted allowlist
+    /// and for daemon code that pre-registers roots from saved settings.
     #[must_use]
     pub fn with_allowlist(
         store: Arc<Mutex<KnowledgeStore>>,
@@ -170,13 +264,21 @@ impl KnowledgeService {
                 "path not permitted: ingestion allowlist is empty".to_string(),
             ));
         }
-        if allow.iter().any(|root| canon.starts_with(root)) {
-            Ok(canon)
-        } else {
-            Err(zbus::fdo::Error::AccessDenied(
+        if !allow.iter().any(|root| canon.starts_with(root)) {
+            return Err(zbus::fdo::Error::AccessDenied(
                 "path not permitted: outside ingestion allowlist".to_string(),
-            ))
+            ));
         }
+        // Codex review FIX 4 P1: denylist runs AFTER allowlist on purpose.
+        // We never want to leak even the existence of a denylisted file
+        // via a different rejection reason; all rejection paths return
+        // AccessDenied with the path NOT echoed back.
+        if is_sensitive_path(&canon) {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "path not permitted: matches sensitive-content denylist".to_string(),
+            ));
+        }
+        Ok(canon)
     }
 }
 
@@ -571,6 +673,143 @@ mod tests {
         assert_eq!(svc.allowlist_snapshot().len(), 1);
         // Adding a non-existent path fails.
         assert!(!svc.add_ingestion_root(std::path::Path::new("/no/such/path/here/exists")));
+    }
+
+    // ── FIX 4 (P1): closed-by-default allowlist + sensitive-path denylist ─
+
+    #[test]
+    fn default_new_has_empty_allowlist() {
+        // Codex review FIX 4 P1: KnowledgeService::new must NOT auto-add
+        // home dir. The shell registers explicit roots after the user
+        // picks them in a folder dialog.
+        let svc = mk_svc();
+        assert!(
+            svc.allowlist_snapshot().is_empty(),
+            "default new() must produce empty allowlist (closed by default)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejected_when_allowlist_default_empty() {
+        // Even an ordinary markdown file inside the user's home is
+        // rejected unless the user explicitly registers that location.
+        let svc = mk_svc();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("note.md");
+        std::fs::write(&file, "# T\n\nP.\n").unwrap();
+        let err = svc
+            .ingest_file(file.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        let s = err.to_string().to_lowercase();
+        assert!(
+            s.contains("access") || s.contains("not permitted"),
+            "default new() must close all paths until allowlist registered, got: {s}"
+        );
+    }
+
+    // -- Pure is_sensitive_path tests (no async, no I/O) --
+
+    #[test]
+    fn sensitive_path_rejects_ssh_private_key() {
+        assert!(is_sensitive_path(Path::new("/home/u/.ssh/id_rsa")));
+    }
+
+    #[test]
+    fn sensitive_path_rejects_ed25519() {
+        assert!(is_sensitive_path(Path::new("/home/u/.ssh/id_ed25519")));
+    }
+
+    #[test]
+    fn sensitive_path_rejects_pem_extension() {
+        assert!(is_sensitive_path(Path::new("/tmp/cert.pem")));
+    }
+
+    #[test]
+    fn sensitive_path_rejects_env_file() {
+        assert!(is_sensitive_path(Path::new("/proj/.env.production")));
+    }
+
+    #[test]
+    fn sensitive_path_rejects_credentials_filename() {
+        // /home/u/.aws/credentials — caught by either the .aws dir name
+        // OR the "credentials" file-stem rule. Either is fine.
+        assert!(is_sensitive_path(Path::new("/home/u/.aws/credentials")));
+    }
+
+    #[test]
+    fn sensitive_path_rejects_kdbx() {
+        assert!(is_sensitive_path(Path::new("/home/u/passwords.kdbx")));
+    }
+
+    #[test]
+    fn sensitive_path_rejects_gnupg_dir_midpath() {
+        // .gnupg as an intermediate path component triggers the dir rule
+        // even though the leaf file looks innocuous.
+        assert!(is_sensitive_path(Path::new("/home/u/.gnupg/random.txt")));
+    }
+
+    #[test]
+    fn sensitive_path_accepts_ordinary_markdown() {
+        assert!(!is_sensitive_path(Path::new("/home/u/notes/foo.md")));
+    }
+
+    #[test]
+    fn sensitive_path_accepts_dotfile_that_is_not_sensitive() {
+        // .bashrc is a dotfile but neither a sensitive-named file nor
+        // does it match the .env* prefix nor a sensitive extension.
+        assert!(!is_sensitive_path(Path::new("/home/u/.bashrc")));
+    }
+
+    #[test]
+    fn sensitive_path_extension_check_is_case_insensitive() {
+        assert!(is_sensitive_path(Path::new("/tmp/cert.PEM")));
+        assert!(is_sensitive_path(Path::new("/tmp/cert.Pem")));
+    }
+
+    // -- Integration tests: denylist defeats allowlist --
+
+    #[tokio::test]
+    async fn ingest_file_rejects_sensitive_path_inside_allowlist() {
+        // Even when the user explicitly registers tmp/ as an ingestion
+        // root, dropping an id_rsa file inside it must still reject —
+        // the denylist runs after the allowlist and cannot be overridden.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let key_file = tmp.path().join("id_rsa");
+        std::fs::write(&key_file, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        let err = svc
+            .ingest_file(key_file.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        let s = err.to_string().to_lowercase();
+        assert!(s.contains("access") || s.contains("denylist") || s.contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejects_pem_inside_allowlist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let pem = tmp.path().join("cert.pem");
+        std::fs::write(&pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let err = svc
+            .ingest_file(pem.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("access"));
+    }
+
+    #[tokio::test]
+    async fn ingest_file_rejects_env_inside_allowlist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let env = tmp.path().join(".env");
+        std::fs::write(&env, "API_KEY=secret\n").unwrap();
+        let err = svc
+            .ingest_file(env.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("access"));
     }
 
     #[tokio::test]

@@ -124,6 +124,17 @@ pub const DEFAULT_EMBEDDING_DIMENSION: usize = 32;
 
 /// Schema for the knowledge SQLite database. Applied idempotently on every
 /// open via `IF NOT EXISTS`.
+///
+/// **Codex review FIX 5 (P2):** the source uniqueness key is
+/// `(uri, content_hash, format)` — NOT `(uri, content_hash)`. The earlier
+/// 2-column key let a caller's first ingestion of a `(uri, content)` pair
+/// under a wrong format (e.g. `pdf` → `Fidelity::Unavailable`, no nodes)
+/// silently shadow a corrected later re-ingest under the right format
+/// (e.g. `markdown` → `Fidelity::Direct`, with parsed nodes). The third
+/// column ensures the corrected re-ingest creates a new source row with
+/// its own fidelity, leaving the bad row to be `forget_source`'d
+/// independently. Same `(uri, content, format)` triple is still
+/// idempotent — the intended semantic for repeat ingestion.
 const SCHEMA_DDL: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -135,7 +146,7 @@ CREATE TABLE IF NOT EXISTS sources (
     fidelity TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     format TEXT NOT NULL,
-    UNIQUE(uri, content_hash)
+    UNIQUE(uri, content_hash, format)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sources_uri ON sources(uri);
@@ -980,8 +991,14 @@ impl KnowledgeStore {
 
     // ── Source CRUD ────────────────────────────────────────────────────
 
-    /// Insert a source row, or return the existing id when (uri, content_hash)
-    /// already matches — idempotency by construction.
+    /// Insert a source row, or return the existing id when
+    /// `(uri, content_hash, format)` already matches — idempotency by
+    /// construction.
+    ///
+    /// **Codex review FIX 5 (P2):** the lookup matches on the full
+    /// 3-tuple, not just `(uri, content_hash)`. Re-ingesting the same
+    /// `(uri, bytes)` pair under a *different* format yields a separate
+    /// source row instead of silently shadowing the prior row.
     pub fn create_or_get_source(
         &self,
         source_type: SourceType,
@@ -993,8 +1010,8 @@ impl KnowledgeStore {
         let conn = self.conn.lock().map_err(map_lock_err)?;
         if let Some(id) = conn
             .query_row(
-                "SELECT id FROM sources WHERE uri = ?1 AND content_hash = ?2",
-                params![uri, content_hash],
+                "SELECT id FROM sources WHERE uri = ?1 AND content_hash = ?2 AND format = ?3",
+                params![uri, content_hash, format],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -2233,6 +2250,91 @@ mod tests {
             .unwrap();
         assert_ne!(a, b);
         assert_eq!(s.count_sources().unwrap(), 2);
+    }
+
+    // ── FIX 5 (P2): format participates in source uniqueness key ─────
+
+    #[test]
+    fn create_or_get_source_distinguishes_by_format() {
+        // Codex review FIX 5 P2: same (uri, content_hash) under different
+        // formats must produce distinct source rows so a corrected
+        // re-ingest doesn't silently shadow the bad row.
+        let s = store();
+        let a = s
+            .create_or_get_source(SourceType::LocalFile, "/p", Fidelity::Direct, "h1", "markdown")
+            .unwrap();
+        let b = s
+            .create_or_get_source(SourceType::LocalFile, "/p", Fidelity::Direct, "h1", "html")
+            .unwrap();
+        assert_ne!(a, b, "different formats must produce distinct source rows");
+        assert_eq!(s.count_sources().unwrap(), 2);
+    }
+
+    #[test]
+    fn ingest_text_same_bytes_different_format_creates_separate_sources() {
+        // The motivating Codex scenario: caller first ingests bytes as
+        // pdf (Unavailable, no nodes), then re-ingests the same bytes as
+        // markdown (Direct, with parsed nodes). Both source rows must
+        // exist with their own fidelity.
+        let s = store();
+        let bytes = "# Title\n\nA paragraph.\n";
+        let pdf_result = s
+            .ingest_text(bytes, "/note", SourceType::LocalFile, "pdf")
+            .unwrap();
+        let md_result = s
+            .ingest_text(bytes, "/note", SourceType::LocalFile, "markdown")
+            .unwrap();
+        assert_ne!(
+            pdf_result.source_id, md_result.source_id,
+            "different format on same (uri, content) → distinct sources"
+        );
+        assert_eq!(s.count_sources().unwrap(), 2);
+        // First (pdf) row is Unavailable
+        let pdf_src = s.get_source(pdf_result.source_id).unwrap();
+        assert_eq!(pdf_src.fidelity, Fidelity::Unavailable);
+        // Second (markdown) row is Direct
+        let md_src = s.get_source(md_result.source_id).unwrap();
+        assert_eq!(md_src.fidelity, Fidelity::Direct);
+    }
+
+    #[test]
+    fn ingest_text_corrected_format_extracts_nodes() {
+        // Same setup; the markdown re-ingest must produce ≥ 2 nodes
+        // (parser worked) while the pdf row remains node-less.
+        let s = store();
+        let bytes = "# Title\n\nA paragraph.\n";
+        let pdf_result = s
+            .ingest_text(bytes, "/note", SourceType::LocalFile, "pdf")
+            .unwrap();
+        let md_result = s
+            .ingest_text(bytes, "/note", SourceType::LocalFile, "markdown")
+            .unwrap();
+        assert_eq!(pdf_result.nodes_created, 0, "pdf path extracts no nodes");
+        assert!(
+            md_result.nodes_created >= 2,
+            "markdown path extracts heading + paragraph"
+        );
+        let pdf_nodes = s.list_nodes_from_source(pdf_result.source_id).unwrap();
+        assert!(pdf_nodes.is_empty(), "pdf source still has 0 linked nodes");
+        let md_nodes = s.list_nodes_from_source(md_result.source_id).unwrap();
+        assert!(md_nodes.len() >= 2, "markdown source has parsed nodes");
+    }
+
+    #[test]
+    fn ingest_text_same_bytes_same_format_still_idempotent() {
+        // Guard: identical (uri, bytes, format) triple must still
+        // dedupe to a single source row with nodes_created: 0 on
+        // the second call.
+        let s = store();
+        let r1 = s
+            .ingest_text("# T\n\nP.\n", "/x", SourceType::LocalFile, "markdown")
+            .unwrap();
+        let r2 = s
+            .ingest_text("# T\n\nP.\n", "/x", SourceType::LocalFile, "markdown")
+            .unwrap();
+        assert_eq!(r1.source_id, r2.source_id);
+        assert_eq!(r2.nodes_created, 0);
+        assert_eq!(s.count_sources().unwrap(), 1);
     }
 
     // ── Edge constraints ──────────────────────────────────────────────

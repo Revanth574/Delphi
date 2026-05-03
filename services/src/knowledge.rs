@@ -247,39 +247,102 @@ impl KnowledgeService {
 
     /// Validate a caller-supplied path against the allowlist. Returns
     /// the canonicalized form on success; `Err(AccessDenied)` otherwise.
-    /// Errors deliberately do NOT echo the path back to the caller — the
-    /// audit log entry has the raw path; the wire response is structured.
+    ///
+    /// **Codex re-review FIX 7 (P1-high):** every rejection path returns
+    /// the SAME public message — [`REJECTION_MESSAGE`]. Round-1 returned
+    /// four distinguishable messages under one `AccessDenied` discriminant,
+    /// which let a D-Bus caller probe the filesystem for resolvable vs.
+    /// missing paths. Detailed reasons now go to the local tracing log
+    /// only (operator diagnostics) via [`reject`]. The wire response is
+    /// uniform regardless of why the path was rejected.
+    ///
+    /// **Order matters:** the empty-allowlist check runs **before**
+    /// canonicalization. When ingestion is closed by default, we never
+    /// touch the filesystem at all — eliminating the probe oracle for
+    /// the default-deployed state. Only after the allowlist is
+    /// non-empty do we resolve the caller's path.
     fn check_path_allowed(&self, raw: &str) -> zbus::fdo::Result<PathBuf> {
-        let canon = std::fs::canonicalize(raw).map_err(|_| {
-            zbus::fdo::Error::AccessDenied(
-                "path not permitted: unresolvable or does not exist".to_string(),
-            )
-        })?;
-        let allow = self
-            .allowlist
-            .lock()
-            .map_err(|e| zbus::fdo::Error::Failed(format!("allowlist lock poisoned: {e}")))?;
-        if allow.is_empty() {
-            return Err(zbus::fdo::Error::AccessDenied(
-                "path not permitted: ingestion allowlist is empty".to_string(),
-            ));
+        // Snapshot the allowlist under the mutex, then drop the guard
+        // before any filesystem syscall. This keeps the lock window
+        // tight and lets the canonicalize() call run unsynchronized.
+        let snapshot: Vec<PathBuf> = {
+            let allow = self
+                .allowlist
+                .lock()
+                .map_err(|e| zbus::fdo::Error::Failed(format!("allowlist lock poisoned: {e}")))?;
+            // FIX 7 part A: short-circuit on empty allowlist BEFORE any
+            // filesystem syscall. Closed-by-default → no probe oracle.
+            if allow.is_empty() {
+                return Err(reject(RejectionReason::AllowlistEmpty, raw));
+            }
+            allow.clone()
+        };
+
+        // Allowlist is non-empty; canonicalization is justified.
+        let canon = std::fs::canonicalize(raw)
+            .map_err(|_| reject(RejectionReason::Unresolvable, raw))?;
+
+        if !snapshot.iter().any(|root| canon.starts_with(root)) {
+            return Err(reject(RejectionReason::OutsideAllowlist, raw));
         }
-        if !allow.iter().any(|root| canon.starts_with(root)) {
-            return Err(zbus::fdo::Error::AccessDenied(
-                "path not permitted: outside ingestion allowlist".to_string(),
-            ));
-        }
-        // Codex review FIX 4 P1: denylist runs AFTER allowlist on purpose.
-        // We never want to leak even the existence of a denylisted file
-        // via a different rejection reason; all rejection paths return
-        // AccessDenied with the path NOT echoed back.
+
+        // Denylist runs AFTER allowlist on purpose: we never want to
+        // signal "this file exists but is denylisted" with a different
+        // rejection reason than "this file isn't in your allowlist."
         if is_sensitive_path(&canon) {
-            return Err(zbus::fdo::Error::AccessDenied(
-                "path not permitted: matches sensitive-content denylist".to_string(),
-            ));
+            return Err(reject(RejectionReason::SensitivePath, raw));
         }
+
         Ok(canon)
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// FIX 7 (P1-high): uniform public rejection + local-only audit log
+// ────────────────────────────────────────────────────────────────────
+
+/// Single public rejection message. The detailed reason is logged
+/// locally via `tracing` for operator diagnostics, never returned to
+/// the D-Bus caller — that would re-introduce the filesystem-existence
+/// oracle Codex flagged in re-review finding F7.
+pub(crate) const REJECTION_MESSAGE: &str = "path not permitted";
+
+/// Reasons we reject a path. Used only for local tracing; never crosses
+/// the D-Bus boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RejectionReason {
+    /// Allowlist is empty — ingestion closed by default.
+    AllowlistEmpty,
+    /// `canonicalize()` failed — path doesn't exist or can't be resolved.
+    Unresolvable,
+    /// Canonical path doesn't start with any allowlist root.
+    OutsideAllowlist,
+    /// Path matches the sensitive-content denylist.
+    SensitivePath,
+}
+
+impl RejectionReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RejectionReason::AllowlistEmpty => "allowlist empty",
+            RejectionReason::Unresolvable => "unresolvable or does not exist",
+            RejectionReason::OutsideAllowlist => "outside allowlist",
+            RejectionReason::SensitivePath => "matches sensitive-content denylist",
+        }
+    }
+}
+
+/// Construct an `AccessDenied` error with the uniform public message,
+/// emitting the detailed reason + raw caller path to the local tracing
+/// log. The wire response carries no information about why the path
+/// was rejected.
+pub(crate) fn reject(reason: RejectionReason, raw: &str) -> zbus::fdo::Error {
+    tracing::warn!(
+        reason = reason.as_str(),
+        raw_path = %raw,
+        "knowledge ingestion path rejected"
+    );
+    zbus::fdo::Error::AccessDenied(REJECTION_MESSAGE.to_string())
 }
 
 #[zbus::interface(name = "org.delphi.Knowledge")]
@@ -581,6 +644,23 @@ mod tests {
         assert!(v["source_id"].as_i64().unwrap() > 0);
     }
 
+    /// FIX 7 helper: every allowlist/denylist rejection must be the
+    /// `AccessDenied` variant carrying exactly the uniform public
+    /// message. Tests use this in place of substring matching on the
+    /// Display string so they're immune to zbus formatting changes
+    /// AND can't accidentally allow a leaked-detail message to pass.
+    fn assert_uniform_rejection(err: &zbus::fdo::Error) {
+        match err {
+            zbus::fdo::Error::AccessDenied(msg) => {
+                assert_eq!(
+                    msg, REJECTION_MESSAGE,
+                    "rejection message must be uniform; got {msg:?}"
+                );
+            }
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn ingest_file_rejects_path_outside_allowlist() {
         let allowed = tempfile::TempDir::new().unwrap();
@@ -592,17 +672,16 @@ mod tests {
             .ingest_file(outside.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        // Must be AccessDenied per FIX 1
-        let s = err.to_string().to_lowercase();
-        assert!(
-            s.contains("access") || s.contains("not permitted") || s.contains("denied"),
-            "expected access-denied error, got: {s}"
-        );
-        // Error message must not echo the rejected path
+        // Codex re-review FIX 7 P1: discriminant + uniform message.
+        // Tests previously did substring matching on the Display, which
+        // would have happily accepted four distinct leaked messages.
+        assert_uniform_rejection(&err);
+        // Defense-in-depth: the rejected path must not be echoed in
+        // any part of the error string (Display, message, or both).
         let raw = outside.to_string_lossy();
         assert!(
             !err.to_string().contains(raw.as_ref()),
-            "error message leaked the path: {err}"
+            "error string leaked the path: {err}"
         );
     }
 
@@ -615,8 +694,7 @@ mod tests {
             .ingest_file(ghost.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        let s = err.to_string().to_lowercase();
-        assert!(s.contains("access") || s.contains("not permitted"));
+        assert_uniform_rejection(&err);
     }
 
     #[tokio::test]
@@ -641,7 +719,7 @@ mod tests {
             .ingest_file(traversal.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("access"));
+        assert_uniform_rejection(&err);
     }
 
     #[tokio::test]
@@ -655,8 +733,7 @@ mod tests {
             .ingest_file(file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        let s = err.to_string().to_lowercase();
-        assert!(s.contains("access") || s.contains("empty") || s.contains("not permitted"));
+        assert_uniform_rejection(&err);
     }
 
     #[test]
@@ -701,11 +778,7 @@ mod tests {
             .ingest_file(file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        let s = err.to_string().to_lowercase();
-        assert!(
-            s.contains("access") || s.contains("not permitted"),
-            "default new() must close all paths until allowlist registered, got: {s}"
-        );
+        assert_uniform_rejection(&err);
     }
 
     // -- Pure is_sensitive_path tests (no async, no I/O) --
@@ -782,8 +855,9 @@ mod tests {
             .ingest_file(key_file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        let s = err.to_string().to_lowercase();
-        assert!(s.contains("access") || s.contains("denylist") || s.contains("sensitive"));
+        // FIX 7 P1: must be the uniform "AccessDenied + REJECTION_MESSAGE",
+        // never a leak like "matches sensitive-content denylist".
+        assert_uniform_rejection(&err);
     }
 
     #[tokio::test]
@@ -796,7 +870,7 @@ mod tests {
             .ingest_file(pem.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("access"));
+        assert_uniform_rejection(&err);
     }
 
     #[tokio::test]
@@ -809,7 +883,171 @@ mod tests {
             .ingest_file(env.to_string_lossy().into_owned())
             .await
             .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("access"));
+        assert_uniform_rejection(&err);
+    }
+
+    // ── FIX 7 (P1-high): uniform public rejection + no FS probe oracle ──
+
+    #[tokio::test]
+    async fn rejection_message_is_uniform_across_all_failure_modes() {
+        // Drive ingest_file through all FOUR rejection paths and assert
+        // every one returns the IDENTICAL public message. Round-1 returned
+        // four distinct messages under one variant — Codex F7 oracle.
+        let allowed = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+
+        // Path 1: allowlist-empty (closed-by-default)
+        let store1 = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
+        let svc_empty =
+            KnowledgeService::with_allowlist(Arc::new(Mutex::new(store1)), vec![]);
+        let any_path = allowed.path().join("any.md");
+        std::fs::write(&any_path, "x").unwrap();
+        let err_empty = svc_empty
+            .ingest_file(any_path.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+
+        // Path 2: unresolvable (path doesn't exist)
+        let svc_with = mk_svc_with_root(allowed.path().to_path_buf());
+        let ghost = allowed.path().join("nonexistent.md");
+        let err_ghost = svc_with
+            .ingest_file(ghost.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+
+        // Path 3: outside allowlist
+        let outside = other.path().join("evil.md");
+        std::fs::write(&outside, "x").unwrap();
+        let err_outside = svc_with
+            .ingest_file(outside.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+
+        // Path 4: sensitive (denylisted) inside allowlist
+        let key = allowed.path().join("id_rsa");
+        std::fs::write(&key, "-----BEGIN-----\n").unwrap();
+        let err_sensitive = svc_with
+            .ingest_file(key.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+
+        // All four messages must be byte-for-byte equal.
+        let extract = |e: &zbus::fdo::Error| match e {
+            zbus::fdo::Error::AccessDenied(m) => m.clone(),
+            other => panic!("expected AccessDenied, got {other:?}"),
+        };
+        let m1 = extract(&err_empty);
+        let m2 = extract(&err_ghost);
+        let m3 = extract(&err_outside);
+        let m4 = extract(&err_sensitive);
+        assert_eq!(m1, m2, "empty-allowlist vs unresolvable leaked a difference");
+        assert_eq!(m2, m3, "unresolvable vs outside-allowlist leaked a difference");
+        assert_eq!(m3, m4, "outside vs sensitive leaked a difference");
+        assert_eq!(m1, REJECTION_MESSAGE, "all paths must use REJECTION_MESSAGE");
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_does_not_leak_filesystem_state() {
+        // FIX 7 part A: when the allowlist is empty, ingestion is closed.
+        // We do NOT touch the filesystem to canonicalize the input. So a
+        // resolvable path and an unresolvable path produce IDENTICAL
+        // rejections — caller cannot probe whether a path exists.
+        let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
+        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+
+        // A path that DOES exist.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        std::fs::write(&real, "x").unwrap();
+        let err_real = svc
+            .ingest_file(real.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+
+        // A path that does NOT exist (deliberately silly).
+        let err_ghost = svc
+            .ingest_file(
+                "/this/path/cannot/possibly/exist/should-be-rejected.md".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        // Both must produce the same uniform rejection.
+        assert_uniform_rejection(&err_real);
+        assert_uniform_rejection(&err_ghost);
+        // And they must be string-equal — no oracle.
+        assert_eq!(err_real.to_string(), err_ghost.to_string());
+    }
+
+    #[test]
+    fn tracing_log_records_specific_reason_but_wire_does_not() {
+        // Asymmetry verification: the operator's tracing log gets the
+        // detailed reason; the D-Bus caller gets only the uniform message.
+        //
+        // Tested directly against `reject()` — the SOLE constructor of
+        // path-validation `AccessDenied` errors. Testing the full async
+        // ingest_file path here would mean fighting tokio + thread-local
+        // tracing scoping under parallel `cargo test` execution; calling
+        // `reject()` directly is equivalent because `check_path_allowed`
+        // routes every rejection through it.
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct CaptureWriter(StdArc<StdMutex<Vec<u8>>>);
+        impl Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf: StdArc<StdMutex<Vec<u8>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let buf_for_writer = buf.clone();
+        let make_writer = move || CaptureWriter(buf_for_writer.clone());
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+
+        let err = tracing::subscriber::with_default(subscriber, || {
+            reject(
+                RejectionReason::SensitivePath,
+                "/secret/path/that/should/not/leak",
+            )
+        });
+
+        // Local tracing log MUST contain the specific reason AND the path.
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("matches sensitive-content denylist"),
+            "expected detailed reason in local log; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("/secret/path/that/should/not/leak"),
+            "expected raw path in local log; got: {captured:?}"
+        );
+
+        // Wire error MUST NOT contain the reason or the path — only the
+        // uniform public message.
+        let wire = match &err {
+            zbus::fdo::Error::AccessDenied(m) => m.clone(),
+            other => panic!("expected AccessDenied, got {other:?}"),
+        };
+        assert_eq!(wire, REJECTION_MESSAGE);
+        assert!(
+            !wire.contains("denylist") && !wire.contains("sensitive"),
+            "wire response leaked specific reason: {wire}"
+        );
+        assert!(
+            !wire.contains("/secret"),
+            "wire response leaked the path: {wire}"
+        );
     }
 
     #[tokio::test]

@@ -202,6 +202,33 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 "#;
 
+/// **Codex re-review FIX 9 (P2-medium):** version-tracked schema epoch.
+///
+/// The `schema_version` table records every applied schema epoch as a
+/// row whose primary key is the integer version. The highest version is
+/// the current state. New databases land at [`CURRENT_SCHEMA_VERSION`]
+/// in a single fresh install; existing databases from earlier epochs
+/// step up via migration functions (e.g. [`migrate_epoch_1_to_2`]).
+///
+/// A future epoch ≥ 3 will add another `migrate_epoch_2_to_3` and
+/// extend the match arm in [`KnowledgeStore::init_schema`]. Don't
+/// generalize prematurely — a one-shot per-epoch function is easier to
+/// reason about than a migration framework.
+const SCHEMA_VERSION_TABLE_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY
+);
+"#;
+
+/// Current schema epoch. Bumped whenever the schema changes in a way
+/// existing databases must catch up to.
+///
+/// - Epoch 1: round-1 layout (commits bd554bf / 2b3ca3e), with
+///   `UNIQUE(uri, content_hash)` on `sources`.
+/// - Epoch 2: post-FIX-5 layout (commit c3147b9), with
+///   `UNIQUE(uri, content_hash, format)` on `sources`.
+const CURRENT_SCHEMA_VERSION: i64 = 2;
+
 // ────────────────────────────────────────────────────────────────────
 // Type aliases + enums
 // ────────────────────────────────────────────────────────────────────
@@ -978,10 +1005,86 @@ impl KnowledgeStore {
         })
     }
 
+    /// Initialize the schema for a fresh database, or migrate an
+    /// existing one to the current schema version.
+    ///
+    /// **Codex re-review FIX 9 (P2-medium):** the round-1 implementation
+    /// applied the schema unconditionally via `CREATE TABLE IF NOT EXISTS`,
+    /// which is a no-op when the table already exists. A database created
+    /// by an earlier branch tip kept the OLD `UNIQUE(uri, content_hash)`
+    /// constraint, so the FIX 5 pdf→markdown recovery path silently broke
+    /// for those stores. This method now branches on a schema version
+    /// table:
+    ///
+    /// - **Fresh DB** (version table empty): apply [`SCHEMA_DDL`] in full,
+    ///   record [`CURRENT_SCHEMA_VERSION`].
+    /// - **Epoch 1** (round-1 layout, old `(uri, content_hash)` unique key):
+    ///   run [`migrate_epoch_1_to_2`] which rebuilds `sources` with the
+    ///   new 3-column unique key inside a transaction, preserving `id`
+    ///   values so `node_sources` foreign keys stay valid.
+    /// - **Epoch 2** (current): no-op.
+    /// - **Unknown future epoch**: refuse to open with a clear error
+    ///   (forward-compat guard).
     fn init_schema(conn: &Connection) -> Result<(), OrchestratorError> {
         conn.execute_batch("PRAGMA journal_mode = WAL;")
             .map_err(map_sqlite_err)?;
-        conn.execute_batch(SCHEMA_DDL).map_err(map_sqlite_err)?;
+        conn.execute_batch(SCHEMA_VERSION_TABLE_DDL)
+            .map_err(map_sqlite_err)?;
+
+        // Recorded version: the authoritative source if present.
+        let recorded: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(version) FROM schema_version",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_err)?
+            .flatten();
+
+        // Inferred version: necessary for legacy epoch-1 databases that
+        // predate this version-tracking change. Their schema_version
+        // table is empty (because we just created it) but the existing
+        // `sources` table still has the old 2-column unique key. We
+        // must detect and migrate THAT case, not treat it as fresh.
+        let inferred = infer_schema_version(conn)?;
+
+        let version = recorded.unwrap_or(inferred);
+
+        match version {
+            0 => {
+                // Truly fresh: no sources table, no recorded version.
+                conn.execute_batch(SCHEMA_DDL).map_err(map_sqlite_err)?;
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    params![CURRENT_SCHEMA_VERSION],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            1 => {
+                // Epoch-1 detected by inference (no recorded version)
+                // OR by an explicit recorded version=1 (theoretical;
+                // round-1 didn't write any version row).
+                migrate_epoch_1_to_2(conn)?;
+            }
+            v if v == CURRENT_SCHEMA_VERSION => {
+                // Already current. If the version row was missing
+                // (schema is correct but unrecorded), backfill it so
+                // the next open reads from the recorded path.
+                if recorded.is_none() {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                        params![CURRENT_SCHEMA_VERSION],
+                    )
+                    .map_err(map_sqlite_err)?;
+                }
+            }
+            v => {
+                return Err(OrchestratorError::Planning(format!(
+                    "knowledge schema version {v} is newer than this binary supports (max {CURRENT_SCHEMA_VERSION}); refusing to open"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1899,6 +2002,7 @@ pub fn safe_open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     {
         let f = std::fs::File::open(path)?;
+        // Reject reparse points (symlinks, junctions, mount points).
         let meta = f.metadata()?;
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
@@ -1910,6 +2014,7 @@ pub fn safe_open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        // Other platforms: degrade safely with open + metadata check.
         let f = std::fs::File::open(path)?;
         if f.metadata()?.file_type().is_symlink() {
             return Err(std::io::Error::new(
@@ -1919,6 +2024,112 @@ pub fn safe_open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         }
         Ok(f)
     }
+}
+
+/// **Codex re-review FIX 9 (P2-medium):** infer the schema epoch from
+/// the actual `sources` table SQL when no `schema_version` row is
+/// recorded.
+///
+/// Round-1 databases (commits `bd554bf` / `2b3ca3e`) predate the
+/// `schema_version` table, so on first reopen by a binary that knows
+/// about epochs, the `MAX(version)` query returns NULL but the schema
+/// itself is at epoch 1. We must detect that and migrate, NOT treat it
+/// as a fresh install (which would no-op the schema and leave the bug
+/// unfixed — exactly the scenario Codex named).
+///
+/// Returns:
+/// - `0`: no `sources` table exists (truly fresh database).
+/// - `1`: `sources` has `UNIQUE(uri, content_hash)` (round-1 layout).
+/// - `2`: `sources` has `UNIQUE(uri, content_hash, format)` (current).
+/// - `Err`: unrecognized schema (refuse to open rather than corrupt).
+fn infer_schema_version(conn: &Connection) -> Result<i64, OrchestratorError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sources'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let create_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sources'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    if create_sql.contains("UNIQUE(uri, content_hash, format)") {
+        Ok(2)
+    } else if create_sql.contains("UNIQUE(uri, content_hash)") {
+        Ok(1)
+    } else {
+        Err(OrchestratorError::Planning(format!(
+            "unrecognized sources schema; refusing to open (first 120 chars: {})",
+            create_sql.chars().take(120).collect::<String>()
+        )))
+    }
+}
+
+/// **Codex re-review FIX 9 (P2-medium):** rebuild the `sources` table
+/// with the new `UNIQUE(uri, content_hash, format)` key while preserving
+/// every existing row's `id`. The `node_sources` and `edges` foreign
+/// keys reference `sources.id`, so the IDs must survive verbatim.
+///
+/// Atomicity: the entire migration runs inside a single SQLite
+/// transaction (`BEGIN IMMEDIATE; ... COMMIT;`). If any step fails the
+/// outer caller will see a `rusqlite::Error`, the transaction rolls
+/// back, and the database stays at epoch 1 — recoverable. On success,
+/// the version table gets a new `2` row in a separate statement
+/// outside the transaction (idempotent — `PRIMARY KEY` would catch a
+/// double-run).
+fn migrate_epoch_1_to_2(conn: &Connection) -> Result<(), OrchestratorError> {
+    conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+
+        -- Stash existing rows under a temporary name.
+        ALTER TABLE sources RENAME TO sources_old;
+
+        -- Create the new sources table with the 3-column unique key.
+        CREATE TABLE sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            uri TEXT NOT NULL,
+            ingested_at_unix INTEGER NOT NULL,
+            fidelity TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            format TEXT NOT NULL,
+            UNIQUE(uri, content_hash, format)
+        );
+
+        -- Copy rows verbatim. The unique key WIDENS, so no row is rejected;
+        -- two distinct epoch-1 rows that happened to share (uri, hash) but
+        -- differ in format are now both legal.
+        INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+            SELECT id, source_type, uri, ingested_at_unix, fidelity, content_hash, format
+            FROM sources_old;
+
+        -- Recreate indexes (the rename dropped them on the old table).
+        CREATE INDEX IF NOT EXISTS idx_sources_uri ON sources(uri);
+        CREATE INDEX IF NOT EXISTS idx_sources_format ON sources(format);
+        CREATE INDEX IF NOT EXISTS idx_sources_ingested ON sources(ingested_at_unix);
+
+        DROP TABLE sources_old;
+
+        COMMIT;
+        "#,
+    )
+    .map_err(map_sqlite_err)?;
+
+    conn.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        params![CURRENT_SCHEMA_VERSION],
+    )
+    .map_err(map_sqlite_err)?;
+
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2885,9 +3096,10 @@ mod tests {
         let link = tmp.path().join("link.md");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let err = safe_open_no_follow(&link).expect_err("symlink must be rejected");
-        // Linux maps O_NOFOLLOW + symlink at the final component to ELOOP.
-        // Match on raw_os_error to avoid the unstable
-        // ErrorKind::FilesystemLoop (issue rust-lang#86442).
+        // Linux maps O_NOFOLLOW + symlink at the final component to
+        // ELOOP (libc errno 40). Match on raw_os_error to avoid the
+        // unstable `ErrorKind::FilesystemLoop` (issue rust-lang#86442).
+        // The numeric ELOOP value is stable libc ABI.
         assert_eq!(
             err.raw_os_error(),
             Some(libc::ELOOP),
@@ -2898,10 +3110,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn safe_open_no_follow_rejects_symlink_to_outside_target() {
-        // Symlink target lives OUTSIDE the tempdir entirely.
-        // The boundary must reject regardless of where the target sits —
-        // we anchor identity to "no symlinks at the final component",
-        // not to "target is inside scope".
+        // Symlink target lives OUTSIDE the tempdir entirely (different
+        // filesystem region). The boundary must reject regardless of
+        // where the target sits — we anchor identity to "no symlinks
+        // at the final component", not to "target is inside scope".
         let tmp = TempDir::new().unwrap();
         let other = TempDir::new().unwrap();
         let outside = other.path().join("outside.md");
@@ -3130,5 +3342,275 @@ mod tests {
         assert_eq!(s.count_sources().unwrap(), 1);
         assert_eq!(s.count_nodes().unwrap(), 2);
         assert_eq!(s.count_edges().unwrap(), 1);
+    }
+
+    // ── FIX 9 (P2-medium): explicit schema migration with version table ──
+    //
+    // Tests construct an "epoch 1" database in-memory by applying the
+    // round-1 DDL by hand, populate some sources rows, then call
+    // `KnowledgeStore::open_with_existing_connection` (a thin shim around
+    // `init_schema`). Assertions verify:
+    //   * row preservation (id values survive the migration)
+    //   * schema_version is recorded as 2 after migration
+    //   * the new UNIQUE(uri, content_hash, format) constraint is in
+    //     effect (reflected in sqlite_master)
+    //   * end-to-end: the FIX 5 pdf→markdown recovery now works on a
+    //     migrated store
+    //   * idempotency: running init twice doesn't duplicate version rows
+
+    /// The exact round-1 DDL, frozen as a const for the migration tests.
+    /// Must match commit `c3147b9`'s post-FIX-5 schema MINUS the version
+    /// table — so `UNIQUE(uri, content_hash)` rather than the new
+    /// 3-column key.
+    const OLD_SCHEMA_DDL_FOR_TESTS: &str = r#"
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    ingested_at_unix INTEGER NOT NULL,
+    fidelity TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    format TEXT NOT NULL,
+    UNIQUE(uri, content_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sources_uri ON sources(uri);
+CREATE INDEX IF NOT EXISTS idx_sources_format ON sources(format);
+CREATE INDEX IF NOT EXISTS idx_sources_ingested ON sources(ingested_at_unix);
+
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    last_accessed_unix INTEGER NOT NULL,
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
+CREATE INDEX IF NOT EXISTS idx_nodes_accessed ON nodes(last_accessed_unix);
+
+CREATE TABLE IF NOT EXISTS node_sources (
+    node_id INTEGER NOT NULL,
+    source_id INTEGER NOT NULL,
+    PRIMARY KEY(node_id, source_id),
+    FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_node INTEGER NOT NULL,
+    to_node INTEGER NOT NULL,
+    relation TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    source_id INTEGER NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    FOREIGN KEY(from_node) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(to_node) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE,
+    CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    CHECK(from_node != to_node)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_node);
+CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_node);
+CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    node_id INTEGER PRIMARY KEY,
+    dimension INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    fidelity TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+"#;
+
+    /// Build an "epoch 1" in-memory database with the round-1 schema
+    /// and a couple of seeded `sources` rows. Returns a `Connection`
+    /// that has NOT yet been through `init_schema` from the new code.
+    fn make_epoch_1_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_SCHEMA_DDL_FOR_TESTS).unwrap();
+        // Seed two sources rows with deliberate ids so we can verify
+        // they survive the migration verbatim.
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "local_file", "/note.md", 100_i64, "direct", "hash-a", "markdown"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![2_i64, "local_file", "/doc.pdf", 200_i64, "unavailable", "hash-b", "pdf"],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Read the recorded schema version directly from the table.
+    /// Returns `None` if the table doesn't exist OR exists but is empty.
+    /// This tolerates the pre-migration test condition where the
+    /// `schema_version` table hasn't been created yet.
+    fn read_recorded_version(conn: &Connection) -> Option<i64> {
+        // First check whether the table exists; bail to None if not.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            return None;
+        }
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .optional()
+        .unwrap()
+        .flatten()
+    }
+
+    /// Read the `sources` CREATE statement from sqlite_master so tests
+    /// can verify the unique key changed.
+    fn read_sources_sql(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sources'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_from_epoch_1_to_2_preserves_rows() {
+        let conn = make_epoch_1_db();
+        // Pre-migration: epoch 1, recorded_version=None, 2 rows present.
+        assert!(read_sources_sql(&conn).contains("UNIQUE(uri, content_hash)"));
+        assert!(!read_sources_sql(&conn).contains("UNIQUE(uri, content_hash, format)"));
+        assert_eq!(read_recorded_version(&conn), None);
+
+        // Run init_schema (the migration entry point).
+        KnowledgeStore::init_schema(&conn).unwrap();
+
+        // Post-migration assertions:
+        // (a) version is now 2
+        assert_eq!(read_recorded_version(&conn), Some(2));
+        // (b) sources schema is now the 3-column key
+        assert!(
+            read_sources_sql(&conn).contains("UNIQUE(uri, content_hash, format)"),
+            "sources table must be at epoch 2 after migration"
+        );
+        // (c) row IDs survived verbatim
+        let row1: (String, String, String) = conn
+            .query_row(
+                "SELECT uri, content_hash, format FROM sources WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row1, ("/note.md".into(), "hash-a".into(), "markdown".into()));
+        let row2_uri: String = conn
+            .query_row("SELECT uri FROM sources WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row2_uri, "/doc.pdf");
+        // (d) row count unchanged
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn migration_from_epoch_1_unblocks_corrected_format_reingest() {
+        // The motivating Codex F9 scenario: a database created at epoch 1
+        // had the same (uri, content_hash) under one format. After
+        // migration to epoch 2, ingesting the same bytes under a
+        // DIFFERENT format must succeed — the FIX 5 recovery path now
+        // works for migrated stores.
+        let conn = make_epoch_1_db();
+        KnowledgeStore::init_schema(&conn).unwrap();
+        // Now the table accepts a third row distinguished only by format.
+        let result = conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![3_i64, "local_file", "/note.md", 300_i64, "direct", "hash-a", "html"],
+        );
+        assert!(
+            result.is_ok(),
+            "epoch-2 schema must accept (uri, hash, format) triple distinct only by format; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_database_starts_at_current_schema_version() {
+        // Empty in-memory DB → init_schema → version 2 recorded, all
+        // tables created, no migration attempted.
+        let conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&conn).unwrap();
+        assert_eq!(read_recorded_version(&conn), Some(CURRENT_SCHEMA_VERSION));
+        assert!(read_sources_sql(&conn).contains("UNIQUE(uri, content_hash, format)"));
+        // Indexes are present
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_sources%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(idx_count >= 3, "expected the three sources indexes");
+    }
+
+    #[test]
+    fn schema_version_newer_than_supported_refuses_to_open() {
+        // Forward-compat guard: a database written by a future binary
+        // (recording a higher version) must not be opened blindly. The
+        // current binary refuses with a clear error rather than risking
+        // data corruption against an unknown schema.
+        let conn = Connection::open_in_memory().unwrap();
+        // Apply the current schema (so init_schema doesn't trip on
+        // missing tables) then write a sentinel future version.
+        conn.execute_batch(SCHEMA_VERSION_TABLE_DDL).unwrap();
+        conn.execute_batch(SCHEMA_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![99_i64],
+        )
+        .unwrap();
+        // Now init_schema must refuse.
+        let err = KnowledgeStore::init_schema(&conn).expect_err("must refuse newer schema");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer"),
+            "expected forward-compat error, got: {msg}"
+        );
+        assert!(msg.contains("99"), "expected the version number in the error");
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        // Running init_schema twice on a fresh database must not
+        // duplicate version rows or mutate the schema.
+        let conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&conn).unwrap();
+        let first_version_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(first_version_count, 1);
+
+        KnowledgeStore::init_schema(&conn).unwrap();
+        let second_version_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            second_version_count, 1,
+            "second init must not append a duplicate version row"
+        );
+        assert_eq!(read_recorded_version(&conn), Some(CURRENT_SCHEMA_VERSION));
     }
 }

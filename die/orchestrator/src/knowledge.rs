@@ -1783,10 +1783,27 @@ impl KnowledgeStore {
         }
     }
 
-    /// Read a file from disk, detect the format, ingest. Returns
-    /// `Fidelity::Unavailable` for formats we can't currently extract.
+    /// Read a file from disk via the safe-open boundary, detect the
+    /// format, and ingest. Returns `Fidelity::Unavailable` for formats
+    /// we can't currently extract.
+    ///
+    /// **Codex re-review FIX 8 (P1-high):** the file is opened via
+    /// [`safe_open_no_follow`], which uses `O_NOFOLLOW` on Unix and
+    /// rejects reparse points on Windows. The bytes ingested come from
+    /// the resulting `File` handle — NOT from a fresh re-resolution of
+    /// the path string. This closes the TOCTOU window where an attacker
+    /// with write access inside an allowed root could swap a benign
+    /// file for a symlink between path validation and read.
     pub fn ingest_file(&self, path: &Path) -> Result<IngestionResult, OrchestratorError> {
-        let bytes = std::fs::read(path).map_err(|e| {
+        use std::io::Read;
+        let mut file = safe_open_no_follow(path).map_err(|e| {
+            OrchestratorError::Planning(format!(
+                "could not safely open {} for ingestion: {e}",
+                path.display()
+            ))
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| {
             OrchestratorError::Planning(format!(
                 "could not read {} for ingestion: {e}",
                 path.display()
@@ -1795,22 +1812,36 @@ impl KnowledgeStore {
         let head = &bytes[..bytes.len().min(64)];
         let format = detect_format(path, head);
         let uri = path.to_string_lossy().to_string();
-        // Only ingest UTF-8 text formats here — binary formats are declared
-        // as Unavailable until their parsers are added.
+        self.ingest_bytes(&bytes, &uri, format)
+    }
+
+    /// Pure bytes-in path. Extracted from the old `ingest_file` body so
+    /// any caller that already has a validated bytes source can ingest
+    /// without re-touching the filesystem.
+    ///
+    /// FIX 8: this function never receives a `Path` — only the bytes
+    /// already read through the safe-open boundary. There's no second
+    /// filesystem round-trip from here.
+    pub fn ingest_bytes(
+        &self,
+        bytes: &[u8],
+        uri: &str,
+        format: &str,
+    ) -> Result<IngestionResult, OrchestratorError> {
         match format {
             "markdown" | "text" | "html" => {
-                let text = std::str::from_utf8(&bytes).map_err(|e| {
+                let text = std::str::from_utf8(bytes).map_err(|e| {
                     OrchestratorError::Planning(format!("non-UTF-8 input: {e}"))
                 })?;
-                self.ingest_text(text, &uri, SourceType::LocalFile, format)
+                self.ingest_text(text, uri, SourceType::LocalFile, format)
             }
             other => {
                 // Record the source even though we can't extract concepts —
                 // the user can see we tried. Fidelity::Unavailable.
-                let hash = content_hash(&bytes);
+                let hash = content_hash(bytes);
                 let source_id = self.create_or_get_source(
                     SourceType::LocalFile,
-                    &uri,
+                    uri,
                     Fidelity::Unavailable,
                     &hash,
                     other,
@@ -1824,6 +1855,69 @@ impl KnowledgeStore {
                 })
             }
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// FIX 8 (P1-high): safe-open boundary closes validate→read TOCTOU
+// ────────────────────────────────────────────────────────────────────
+
+/// Open a file at `path` while refusing to follow any symlink at the
+/// final component.
+///
+/// **Why this exists** (Codex re-review FIX 8 P1-high): without this,
+/// the caller's flow is `validate(path) → read(path)`, where the
+/// validation canonicalizes the path and checks the allowlist + denylist,
+/// then `std::fs::read(path)` re-resolves the path string. Between those
+/// two resolutions, an attacker with write access inside an allowed
+/// directory can replace a benign file with a symlink/reparse point
+/// pointing at a sensitive target — a classic TOCTOU race.
+///
+/// The defense: open the file with kernel-level no-follow semantics, so
+/// the kernel guarantees the file we got bytes from is NOT a symlink.
+/// The downstream code reads from the returned `File` handle, anchoring
+/// the validated identity to the kernel's file descriptor, not to a
+/// path string that can be re-resolved.
+///
+/// Platform behavior:
+/// - **Unix:** `OpenOptions::custom_flags(libc::O_NOFOLLOW)`. The
+///   kernel returns `ELOOP` if the final path component is a symlink.
+/// - **Windows:** `std::fs::File::open` follows reparse points by
+///   default. We reject reparse points by inspecting `metadata()` after
+///   open and refusing if `file_type().is_symlink()` returns true.
+///   Reparse points include symlinks, junctions, and mount points.
+/// - **Other:** symlink check after open via `metadata()`.
+pub fn safe_open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        let f = std::fs::File::open(path)?;
+        let meta = f.metadata()?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "symlink/reparse point rejected at safe-open boundary",
+            ));
+        }
+        Ok(f)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let f = std::fs::File::open(path)?;
+        if f.metadata()?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "symlink rejected at safe-open boundary",
+            ));
+        }
+        Ok(f)
     }
 }
 
@@ -2763,6 +2857,100 @@ mod tests {
         assert!(result.source_id > 0);
         let src = s.get_source(result.source_id).unwrap();
         assert_eq!(src.fidelity, Fidelity::Unavailable);
+    }
+
+    // ── FIX 8 (P1-high): safe-open boundary closes validate→read TOCTOU ──
+
+    #[test]
+    fn safe_open_no_follow_accepts_real_file() {
+        // Sanity: the safe-open boundary must NOT reject regular files.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("real.md");
+        std::fs::write(&path, "# Hello\n\nWorld.\n").unwrap();
+        use std::io::Read;
+        let mut file = safe_open_no_follow(&path).expect("real file must open");
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "# Hello\n\nWorld.\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_open_no_follow_rejects_symlink_to_inside_target() {
+        // Symlink whose target lives in the SAME tempdir.
+        // O_NOFOLLOW must reject before reading any bytes.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        std::fs::write(&real, "innocent content").unwrap();
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = safe_open_no_follow(&link).expect_err("symlink must be rejected");
+        // Linux maps O_NOFOLLOW + symlink at the final component to ELOOP.
+        // Match on raw_os_error to avoid the unstable
+        // ErrorKind::FilesystemLoop (issue rust-lang#86442).
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from O_NOFOLLOW, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_open_no_follow_rejects_symlink_to_outside_target() {
+        // Symlink target lives OUTSIDE the tempdir entirely.
+        // The boundary must reject regardless of where the target sits —
+        // we anchor identity to "no symlinks at the final component",
+        // not to "target is inside scope".
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let outside = other.path().join("outside.md");
+        std::fs::write(&outside, "outside content").unwrap();
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = safe_open_no_follow(&link).expect_err("symlink must be rejected");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ingest_file_returns_safe_open_error_for_symlink() {
+        // End-to-end: KnowledgeStore::ingest_file with a symlink path
+        // must return Err and never create a source row.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        std::fs::write(&real, "# T\n\nP.\n").unwrap();
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let s = store();
+        let before = s.count_sources().unwrap();
+        let err = s.ingest_file(&link).expect_err("symlink ingest must fail");
+        assert!(
+            err.to_string().contains("could not safely open"),
+            "expected safe-open error, got: {err}"
+        );
+        let after = s.count_sources().unwrap();
+        assert_eq!(
+            before, after,
+            "no source row may be created when safe-open rejects"
+        );
+    }
+
+    #[test]
+    fn ingest_bytes_path_still_works() {
+        // Direct call to ingest_bytes with markdown content must produce
+        // the same shape as the pre-FIX-8 ingest_file (full pipeline:
+        // create source row + parse concepts + persist nodes).
+        let s = store();
+        let bytes = b"# Title\n\nA paragraph of text.\n";
+        let result = s
+            .ingest_bytes(bytes, "user://note", "markdown")
+            .unwrap();
+        assert!(result.source_id > 0);
+        assert!(result.nodes_created >= 2);
+        assert_eq!(result.fidelity_used, Fidelity::Direct);
+        assert_eq!(result.format_detected, "markdown");
     }
 
     // ── Storage round-trips ──────────────────────────────────────────

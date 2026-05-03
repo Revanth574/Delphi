@@ -1050,6 +1050,52 @@ mod tests {
         );
     }
 
+    // ── FIX 8 (P1-high): symlink TOCTOU rejected at the safe-open boundary ──
+    //
+    // The TOCTOU defense lives at the **orchestrator** layer:
+    // `safe_open_no_follow` opens with `O_NOFOLLOW` so the kernel
+    // refuses to follow a symlink at the final path component, even
+    // if an attacker has swapped a previously-validated file for a
+    // symlink between validation and read. The orchestrator's tests
+    // (`safe_open_no_follow_rejects_*`, `ingest_file_returns_safe_open_error_for_symlink`)
+    // exercise that defense directly.
+    //
+    // At the services layer, a symlink whose target is inside the
+    // allowlist canonicalizes cleanly to the real target — that's the
+    // happy path. The integration test below documents that cooperation:
+    // canonicalize resolves the symlink, the allowlist permits the
+    // resolved target, and safe_open opens the real file. The actual
+    // TOCTOU race (concurrent file swap) is impractical to test at the
+    // services layer without thread interleaving; the orchestrator's
+    // direct symlink-rejection tests are the right place for that.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ingest_file_via_symlink_canonicalizes_to_real_target() {
+        // Documents the FIX 1 + FIX 8 cooperation: passing a symlink
+        // whose target is inside the allowlist works — canonicalize
+        // resolves to the real target, allowlist permits the real target,
+        // safe_open_no_follow opens the real target (not a symlink).
+        // The TOCTOU defense (orchestrator-level) only matters if an
+        // attacker races against this resolved path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        std::fs::write(&real, "# Real\n\nContent.\n").unwrap();
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let json = svc
+            .ingest_file(link.to_string_lossy().into_owned())
+            .await
+            .expect("symlink → real-target inside allowlist must succeed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["source_id"].as_i64().unwrap() > 0);
+        // The fidelity must be Direct because the markdown parser ran
+        // on real bytes from the resolved file.
+        assert_eq!(v["fidelity_used"], "direct");
+    }
+
     #[tokio::test]
     async fn ingest_text_returns_json_with_counts() {
         let svc = mk_svc();

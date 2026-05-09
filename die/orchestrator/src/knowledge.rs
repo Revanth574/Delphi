@@ -995,8 +995,8 @@ impl KnowledgeStore {
         db_path: &Path,
         embedder: Box<dyn Embedder>,
     ) -> Result<Self, OrchestratorError> {
-        let conn = Connection::open(db_path).map_err(map_sqlite_err)?;
-        Self::init_schema(&conn)?;
+        let mut conn = Connection::open(db_path).map_err(map_sqlite_err)?;
+        Self::init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             embedder,
@@ -1004,8 +1004,8 @@ impl KnowledgeStore {
     }
 
     pub fn in_memory(embedder: Box<dyn Embedder>) -> Result<Self, OrchestratorError> {
-        let conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
-        Self::init_schema(&conn)?;
+        let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
+        Self::init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             embedder,
@@ -1044,7 +1044,7 @@ impl KnowledgeStore {
     /// runs on every `Connection::open` and `open_in_memory` boundary.
     /// If the SQLite build cannot honor the pragma we refuse to open
     /// rather than silently proceed without provenance integrity.
-    fn init_schema(conn: &Connection) -> Result<(), OrchestratorError> {
+    fn init_schema(conn: &mut Connection) -> Result<(), OrchestratorError> {
         // FIX 12 part A: enable FK enforcement on this specific connection.
         // The pragma is per-connection in SQLite — putting it in SCHEMA_DDL
         // only set it on the connection that first created the schema.
@@ -2357,28 +2357,123 @@ fn infer_schema_version(conn: &Connection) -> Result<i64, OrchestratorError> {
     }
 }
 
-/// **Codex re-review FIX 9 (P2-medium):** rebuild the `sources` table
-/// with the new `UNIQUE(uri, content_hash, format)` key while preserving
-/// every existing row's `id`. The `node_sources` and `edges` foreign
-/// keys reference `sources.id`, so the IDs must survive verbatim.
+/// **Codex re-review FIX 13 (P1-high):** rebuild the `sources` table
+/// with the new `UNIQUE(uri, content_hash, format)` key while
+/// **preserving foreign-key integrity** for `node_sources` and `edges`,
+/// the `sqlite_sequence` AUTOINCREMENT counter, and the indexes.
 ///
-/// Atomicity: the entire migration runs inside a single SQLite
-/// transaction (`BEGIN IMMEDIATE; ... COMMIT;`). If any step fails the
-/// outer caller will see a `rusqlite::Error`, the transaction rolls
-/// back, and the database stays at epoch 1 — recoverable. On success,
-/// the version table gets a new `2` row in a separate statement
-/// outside the transaction (idempotent — `PRIMARY KEY` would catch a
-/// double-run).
-fn migrate_epoch_1_to_2(conn: &Connection) -> Result<(), OrchestratorError> {
-    conn.execute_batch(
+/// # Why this is harder than it looks
+///
+/// Round-2's migration used the natural-looking sequence
+/// `RENAME sources → sources_old; CREATE sources (new); INSERT; DROP sources_old`.
+/// That sequence is BROKEN under modern SQLite (≥ 3.25 with default
+/// `legacy_alter_table = OFF`):
+///
+/// 1. The first `ALTER TABLE sources RENAME TO sources_old` causes
+///    SQLite to **rewrite child FK metadata** on `node_sources` and
+///    `edges` so their `REFERENCES sources` becomes `REFERENCES sources_old`.
+/// 2. The fresh `CREATE TABLE sources` then has no children pointing
+///    at it.
+/// 3. `DROP TABLE sources_old` then orphans the children's FK
+///    references — they point at a table that no longer exists. With
+///    FK enforcement OFF (which round-2 didn't set, so it depended on
+///    the connection-default), the DROP succeeds silently and
+///    referential integrity is permanently corrupted.
+///
+/// The round-2 tests didn't catch this because they only seeded rows
+/// in `sources` itself; without `node_sources` or `edges` rows, no
+/// dangling FK reference was ever observable.
+///
+/// # The fix: order matters
+///
+/// The correct sequence keeps the parent table named `sources`
+/// throughout, so child FK metadata never gets rewritten:
+///
+/// 1. **`PRAGMA foreign_keys = OFF`** *before* `BEGIN`. SQLite
+///    silently ignores this PRAGMA when a transaction is active, so
+///    setting it inside `BEGIN ... COMMIT` is a no-op. The disable
+///    must happen on the connection BEFORE the transaction starts.
+///    It's required because the `DROP TABLE sources` step would
+///    otherwise fail (or trigger cascade) on the active FK refs from
+///    children.
+/// 2. **`BEGIN IMMEDIATE`** — atomic boundary for the rebuild.
+/// 3. **`CREATE TABLE sources_new`** with the 3-column unique key.
+///    Children still reference `sources` (untouched).
+/// 4. **`INSERT INTO sources_new SELECT * FROM sources`** with
+///    explicit column list and IDs. The ID preservation is what
+///    keeps children's FK target values valid after step 6.
+/// 5. **Preserve `sqlite_sequence`** by reading the original counter
+///    for `sources` and stashing it for re-application after step 6.
+///    SQLite's AUTOINCREMENT counter lives in the `sqlite_sequence`
+///    internal table; without explicit handling, it would reset on
+///    DROP and the next inserted source would re-use a freed id.
+/// 6. **`DROP TABLE sources`** — at this point children's FK metadata
+///    still says `REFERENCES sources`, but no `sources` table exists.
+///    The references are temporarily dangling; FK-OFF prevents this
+///    from being rejected.
+/// 7. **`ALTER TABLE sources_new RENAME TO sources`** — the children's
+///    FK target name (`sources`) is now bound to the new table.
+///    Children's FK metadata is NOT rewritten because we're renaming
+///    `sources_new`, which has no inbound FK references.
+/// 8. **Re-apply** the stashed `sqlite_sequence` row.
+/// 9. **Recreate** the three sources indexes.
+/// 10. **`COMMIT`**.
+/// 11. **`PRAGMA foreign_keys = ON`** — restore enforcement.
+/// 12. **`PRAGMA foreign_key_check`** — verify no orphan rows. If any
+///     exist, refuse to mark the migration complete.
+/// 13. Insert the version-2 row in `schema_version` (unchanged from
+///     round-2; idempotent via `INSERT OR IGNORE`).
+///
+/// # Atomicity
+///
+/// If any statement inside `BEGIN ... COMMIT` fails, SQLite rolls back
+/// the transaction and the database stays at epoch 1. The PRAGMA
+/// changes outside the transaction are per-connection: re-enabling FK
+/// after a rollback is harmless because the original schema is
+/// untouched. If the post-commit `foreign_key_check` reports orphan
+/// rows (which would indicate the migration logic is wrong), we return
+/// `Err` without writing the version-2 row, leaving the database in
+/// epoch-2 schema with a missing version row — a recoverable state
+/// the next call to `init_schema` will diagnose explicitly.
+///
+/// # Why `&mut Connection`?
+///
+/// `rusqlite::Connection::transaction()` requires an exclusive
+/// mutable borrow because the returned `Transaction` holds a borrow
+/// against the connection for its lifetime. The change in signature
+/// from `&Connection` to `&mut Connection` propagates one level up
+/// to `init_schema`, which already owns the connection at that point
+/// (it's called from `KnowledgeStore::open` immediately after
+/// `Connection::open`). No public API change.
+fn migrate_epoch_1_to_2(conn: &mut Connection) -> Result<(), OrchestratorError> {
+    // Step 1: disable FK enforcement BEFORE the transaction.
+    // SQLite's PRAGMA foreign_keys is silently ignored inside a
+    // transaction (per its docs); it MUST be set on the connection
+    // first.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .map_err(map_sqlite_err)?;
+
+    // Steps 2–9: atomic rebuild inside a single transaction.
+    let tx = conn.transaction().map_err(map_sqlite_err)?;
+
+    // Step 5 (early): read the original sqlite_sequence counter for
+    // sources, so we can re-apply it after the DROP+RENAME. If
+    // sqlite_sequence has no row for "sources" (table was empty),
+    // we leave it alone — there's nothing to preserve.
+    let original_seq: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'sources'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_err)?;
+
+    // Step 3: create the new table under a temporary name. Children's
+    // FK metadata still references "sources" — untouched.
+    tx.execute_batch(
         r#"
-        BEGIN IMMEDIATE;
-
-        -- Stash existing rows under a temporary name.
-        ALTER TABLE sources RENAME TO sources_old;
-
-        -- Create the new sources table with the 3-column unique key.
-        CREATE TABLE sources (
+        CREATE TABLE sources_new (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_type TEXT NOT NULL,
             uri TEXT NOT NULL,
@@ -2388,28 +2483,94 @@ fn migrate_epoch_1_to_2(conn: &Connection) -> Result<(), OrchestratorError> {
             format TEXT NOT NULL,
             UNIQUE(uri, content_hash, format)
         );
-
-        -- Copy rows verbatim. The unique key WIDENS, so no row is rejected;
-        -- two distinct epoch-1 rows that happened to share (uri, hash) but
-        -- differ in format are now both legal.
-        INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
-            SELECT id, source_type, uri, ingested_at_unix, fidelity, content_hash, format
-            FROM sources_old;
-
-        -- Recreate indexes (the rename dropped them on the old table).
-        CREATE INDEX IF NOT EXISTS idx_sources_uri ON sources(uri);
-        CREATE INDEX IF NOT EXISTS idx_sources_format ON sources(format);
-        CREATE INDEX IF NOT EXISTS idx_sources_ingested ON sources(ingested_at_unix);
-
-        DROP TABLE sources_old;
-
-        COMMIT;
         "#,
     )
     .map_err(map_sqlite_err)?;
 
+    // Step 4: copy rows verbatim. Explicit column list + explicit IDs
+    // keep `node_sources.source_id` and `edges.source_id` valid after
+    // step 6's DROP. The unique key WIDENS, so no epoch-1 row is
+    // rejected — two rows that shared (uri, hash) but differed in
+    // format are both legal in epoch-2.
+    tx.execute_batch(
+        r#"
+        INSERT INTO sources_new (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+            SELECT id, source_type, uri, ingested_at_unix, fidelity, content_hash, format
+            FROM sources;
+        "#,
+    )
+    .map_err(map_sqlite_err)?;
+
+    // Step 6: drop the old sources table. Children's FK metadata
+    // still says `REFERENCES sources` — the references are now
+    // temporarily dangling. FK-OFF makes this safe.
+    tx.execute_batch("DROP TABLE sources;")
+        .map_err(map_sqlite_err)?;
+
+    // Step 7: rename sources_new → sources. The children's FK target
+    // name (`sources`) is now bound to the new table. Because we're
+    // renaming `sources_new` (which has no inbound FK refs),
+    // SQLite's auto-rename of child FK metadata is a no-op here.
+    tx.execute_batch("ALTER TABLE sources_new RENAME TO sources;")
+        .map_err(map_sqlite_err)?;
+
+    // Step 8: re-apply the stashed sqlite_sequence counter so
+    // AUTOINCREMENT picks up where epoch-1 left off, not at MAX(id)+1.
+    // INSERT OR REPLACE handles both cases:
+    // - an sqlite_sequence row for "sources" was created by step 4's
+    //   INSERT (we want our stashed value, which may be ≥ that)
+    // - no sqlite_sequence row exists yet (we want to create one)
+    if let Some(seq) = original_seq {
+        tx.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('sources', ?1)",
+            params![seq],
+        )
+        .map_err(map_sqlite_err)?;
+    }
+
+    // Step 9: recreate the three indexes that lived on epoch-1's
+    // sources. These were dropped along with the old table in step 6.
+    tx.execute_batch(
+        r#"
+        CREATE INDEX idx_sources_uri ON sources(uri);
+        CREATE INDEX idx_sources_format ON sources(format);
+        CREATE INDEX idx_sources_ingested ON sources(ingested_at_unix);
+        "#,
+    )
+    .map_err(map_sqlite_err)?;
+
+    // Step 10: commit. If any prior statement failed, this is
+    // unreachable (the `?` returned early) and the transaction's
+    // Drop impl rolled back automatically.
+    tx.commit().map_err(map_sqlite_err)?;
+
+    // Step 11: re-enable FK enforcement on the connection.
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(map_sqlite_err)?;
+
+    // Step 12: verify referential integrity after the rebuild.
+    // PRAGMA foreign_key_check returns one row per orphaned child,
+    // so we want zero rows. If any exist, the migration is in a
+    // broken state and we refuse to record the version-2 row — the
+    // store will reopen as epoch-2 schema without a recorded version,
+    // and infer_schema_version() will diagnose the mismatch.
+    let mut stmt = conn
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(map_sqlite_err)?;
+    let mut rows = stmt.query([]).map_err(map_sqlite_err)?;
+    if rows.next().map_err(map_sqlite_err)?.is_some() {
+        return Err(OrchestratorError::Planning(
+            "post-migration foreign_key_check reported orphan rows — \
+             rejecting epoch_1_to_2 migration"
+                .to_string(),
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+
+    // Step 13: record the version. INSERT OR IGNORE for idempotency.
     conn.execute(
-        "INSERT INTO schema_version (version) VALUES (?1)",
+        "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
         params![CURRENT_SCHEMA_VERSION],
     )
     .map_err(map_sqlite_err)?;
@@ -3833,6 +3994,97 @@ CREATE TABLE IF NOT EXISTS embeddings (
         conn
     }
 
+    /// Build an "epoch 1" in-memory database with the round-1 schema
+    /// AND a fully-populated graph: sources, nodes, node_sources
+    /// mappings, and edges. The migration tests for FIX 13 need this
+    /// fixture because round-2's tests only seeded `sources`, which
+    /// hid the FK-reference dangling bug Codex F13 named — without
+    /// child rows, no FK violation was observable.
+    ///
+    /// Layout (all rows have explicit IDs so post-migration assertions
+    /// can address them by ID):
+    /// - sources: id 1 (markdown), id 5 (pdf) — non-contiguous IDs
+    ///   exercise the AUTOINCREMENT-counter preservation case.
+    /// - nodes: id 1 (concept "alpha"), id 2 (fact "beta")
+    /// - node_sources: (1,1), (1,5), (2,5)
+    /// - edges: id 10 (1→2 "relates_to" via source 1)
+    fn make_epoch_1_db_with_full_graph() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        // Round-1 used PRAGMA foreign_keys = ON inside SCHEMA_DDL,
+        // which made the test connection inherit FK enforcement when
+        // it executed OLD_SCHEMA_DDL_FOR_TESTS. After FIX 12 that
+        // pragma was hoisted out of the DDL, so tests must set it
+        // explicitly here to mirror the historical epoch-1 reality.
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(OLD_SCHEMA_DDL_FOR_TESTS).unwrap();
+
+        // Sources with deliberate IDs (1, 5) — non-contiguous to
+        // exercise the AUTOINCREMENT preservation invariant.
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "local_file", "/note.md", 100_i64, "direct", "hash-a", "markdown"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![5_i64, "local_file", "/doc.pdf", 200_i64, "unavailable", "hash-b", "pdf"],
+        )
+        .unwrap();
+        // Force the AUTOINCREMENT counter to 5 (matches the second
+        // insert above; SQLite would already track this, but we
+        // assert it explicitly so the test is robust to insert order).
+        conn.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('sources', 5)",
+            [],
+        )
+        .unwrap();
+
+        // Nodes
+        conn.execute(
+            "INSERT INTO nodes (id, content, node_type, created_at_unix, last_accessed_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1_i64, "alpha", "concept", 100_i64, 100_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, content, node_type, created_at_unix, last_accessed_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![2_i64, "beta", "fact", 200_i64, 200_i64],
+        )
+        .unwrap();
+
+        // node_sources mappings — these are the FK references that
+        // the round-2 broken migration would orphan.
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 1_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 5_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![2_i64, 5_i64],
+        )
+        .unwrap();
+
+        // Edge with FK to sources — the second flavor of FK reference
+        // that the migration must preserve.
+        conn.execute(
+            "INSERT INTO edges (id, from_node, to_node, relation, confidence, source_id, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![10_i64, 1_i64, 2_i64, "relates_to", 0.9_f64, 1_i64, 100_i64],
+        )
+        .unwrap();
+
+        conn
+    }
+
     /// Read the recorded schema version directly from the table.
     /// Returns `None` if the table doesn't exist OR exists but is empty.
     /// This tolerates the pre-migration test condition where the
@@ -3870,14 +4122,14 @@ CREATE TABLE IF NOT EXISTS embeddings (
 
     #[test]
     fn migration_from_epoch_1_to_2_preserves_rows() {
-        let conn = make_epoch_1_db();
+        let mut conn = make_epoch_1_db();
         // Pre-migration: epoch 1, recorded_version=None, 2 rows present.
         assert!(read_sources_sql(&conn).contains("UNIQUE(uri, content_hash)"));
         assert!(!read_sources_sql(&conn).contains("UNIQUE(uri, content_hash, format)"));
         assert_eq!(read_recorded_version(&conn), None);
 
         // Run init_schema (the migration entry point).
-        KnowledgeStore::init_schema(&conn).unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
 
         // Post-migration assertions:
         // (a) version is now 2
@@ -3914,8 +4166,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // migration to epoch 2, ingesting the same bytes under a
         // DIFFERENT format must succeed — the FIX 5 recovery path now
         // works for migrated stores.
-        let conn = make_epoch_1_db();
-        KnowledgeStore::init_schema(&conn).unwrap();
+        let mut conn = make_epoch_1_db();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
         // Now the table accepts a third row distinguished only by format.
         let result = conn.execute(
             "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
@@ -3932,8 +4184,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
     fn fresh_database_starts_at_current_schema_version() {
         // Empty in-memory DB → init_schema → version 2 recorded, all
         // tables created, no migration attempted.
-        let conn = Connection::open_in_memory().unwrap();
-        KnowledgeStore::init_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
         assert_eq!(read_recorded_version(&conn), Some(CURRENT_SCHEMA_VERSION));
         assert!(read_sources_sql(&conn).contains("UNIQUE(uri, content_hash, format)"));
         // Indexes are present
@@ -3953,7 +4205,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // (recording a higher version) must not be opened blindly. The
         // current binary refuses with a clear error rather than risking
         // data corruption against an unknown schema.
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         // Apply the current schema (so init_schema doesn't trip on
         // missing tables) then write a sentinel future version.
         conn.execute_batch(SCHEMA_VERSION_TABLE_DDL).unwrap();
@@ -3964,7 +4216,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
         )
         .unwrap();
         // Now init_schema must refuse.
-        let err = KnowledgeStore::init_schema(&conn).expect_err("must refuse newer schema");
+        let err = KnowledgeStore::init_schema(&mut conn).expect_err("must refuse newer schema");
         let msg = err.to_string();
         assert!(
             msg.contains("newer"),
@@ -3977,14 +4229,14 @@ CREATE TABLE IF NOT EXISTS embeddings (
     fn migration_is_idempotent() {
         // Running init_schema twice on a fresh database must not
         // duplicate version rows or mutate the schema.
-        let conn = Connection::open_in_memory().unwrap();
-        KnowledgeStore::init_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
         let first_version_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(first_version_count, 1);
 
-        KnowledgeStore::init_schema(&conn).unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
         let second_version_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
@@ -4009,8 +4261,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // baseline: prior to FIX 12, the pragma was buried in SCHEMA_DDL
         // and only fired when a fresh-database CREATE path ran; this test
         // confirms init_schema itself is now responsible for the pragma.
-        let conn = Connection::open_in_memory().unwrap();
-        KnowledgeStore::init_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
         assert_eq!(
             read_fk_pragma(&conn),
             1,
@@ -4032,8 +4284,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
         let path = tmp.path().to_path_buf();
         // First open: create the schema.
         {
-            let conn = Connection::open(&path).unwrap();
-            KnowledgeStore::init_schema(&conn).unwrap();
+            let mut conn = Connection::open(&path).unwrap();
+            KnowledgeStore::init_schema(&mut conn).unwrap();
             assert_eq!(read_fk_pragma(&conn), 1, "first open must enforce FKs");
         }
         // Second open: schema already exists, version row is recorded.
@@ -4044,7 +4296,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // alone as a probe). After init_schema runs, the pragma MUST be
         // ON, proving init_schema actively enforces the invariant rather
         // than relying on whatever the connection happened to start with.
-        let conn2 = Connection::open(&path).unwrap();
+        let mut conn2 = Connection::open(&path).unwrap();
         conn2
             .execute_batch("PRAGMA foreign_keys = OFF;")
             .expect("must be able to set pragma");
@@ -4053,7 +4305,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
             0,
             "explicit OFF must take effect on this connection"
         );
-        KnowledgeStore::init_schema(&conn2).unwrap();
+        KnowledgeStore::init_schema(&mut conn2).unwrap();
         assert_eq!(
             read_fk_pragma(&conn2),
             1,
@@ -4067,8 +4319,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // just the pragma's REPORTED value. Without FK enforcement, a
         // DELETE on `sources` would orphan `node_sources` rows. With
         // enforcement, ON DELETE CASCADE removes them.
-        let conn = Connection::open_in_memory().unwrap();
-        KnowledgeStore::init_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
 
         // Seed: one source, one node, one node_sources mapping row.
         conn.execute(
@@ -4114,8 +4366,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // node_sources row pointing at a NONEXISTENT source must fail
         // immediately. Without enforcement, the row would silently insert
         // and the graph would carry phantom provenance.
-        let conn = Connection::open_in_memory().unwrap();
-        KnowledgeStore::init_schema(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
 
         // Insert a node so the node_id side is valid.
         conn.execute(
@@ -4142,5 +4394,322 @@ CREATE TABLE IF NOT EXISTS embeddings (
             err_msg.contains("FOREIGN KEY") || err_msg.to_lowercase().contains("constraint"),
             "expected a FOREIGN KEY constraint error, got: {err_msg}"
         );
+    }
+
+    // ── FIX 13 (P1-high): SQLite-correct migration with FK preservation ──
+    //
+    // Round-2's migration sequence (RENAME → CREATE → INSERT → DROP)
+    // silently broke `node_sources` and `edges` FK references because
+    // SQLite's modern ALTER RENAME rewrites child FK metadata to point
+    // at the renamed parent, and then the DROP of the renamed parent
+    // orphans those references. The bug was invisible in round-2's
+    // tests because they only seeded `sources` rows. These tests use
+    // the new `make_epoch_1_db_with_full_graph` fixture, which seeds
+    // all four related tables, then assert that every FK relation
+    // resolves correctly after migration.
+
+    /// Helper: count rows in a table.
+    fn row_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Helper: count `PRAGMA foreign_key_check` rows. Returns 0 when
+    /// referential integrity is intact, > 0 otherwise.
+    fn fk_check_violation_count(conn: &Connection) -> usize {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check").unwrap();
+        stmt.query_map([], |_| Ok(()))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .count()
+    }
+
+    #[test]
+    fn migration_preserves_node_sources_fk_after_rebuild() {
+        // The F13 motivating case: round-2 left node_sources with
+        // dangling FK references after the DROP+RENAME shuffle. With
+        // FIX 13's CREATE → INSERT → DROP → RENAME sequence, every
+        // node_sources row's source_id must still resolve to an
+        // existing sources.id after migration.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        let mappings_before = row_count(&conn, "node_sources");
+        assert_eq!(
+            mappings_before, 3,
+            "fixture should seed 3 node_sources rows"
+        );
+
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+
+        let mappings_after = row_count(&conn, "node_sources");
+        assert_eq!(
+            mappings_after, 3,
+            "every node_sources row must survive the migration; \
+             round-2's RENAME-first sequence would have left them dangling"
+        );
+
+        // Every node_sources row must point to an existing sources row.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_sources ns
+                 LEFT JOIN sources s ON s.id = ns.source_id
+                 WHERE s.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "no node_sources row may reference a deleted source after migration"
+        );
+    }
+
+    #[test]
+    fn migration_preserves_edges_source_fk_after_rebuild() {
+        // Same F13 case, the second FK relation: edges.source_id.
+        // Round-2's broken migration also dangled edge → source
+        // references. The fixture seeds one edge with source_id=1;
+        // after migration that reference must still resolve.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        let edge_count_before = row_count(&conn, "edges");
+        assert_eq!(edge_count_before, 1, "fixture seeds 1 edge");
+
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+
+        let edge_count_after = row_count(&conn, "edges");
+        assert_eq!(edge_count_after, 1, "edge row must survive migration");
+
+        let edge_source_id: i64 = conn
+            .query_row("SELECT source_id FROM edges WHERE id = 10", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edge_source_id, 1, "edge's source_id must survive verbatim");
+
+        // The source must exist for the edge's FK to resolve.
+        let source_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sources WHERE id = ?1",
+                params![edge_source_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_exists, 1, "edge's source must still exist");
+    }
+
+    #[test]
+    fn migration_passes_foreign_key_check_after_completion() {
+        // Independent referential-integrity verification: after
+        // migration, `PRAGMA foreign_key_check` must report ZERO
+        // violations across the entire database. Round-2's broken
+        // migration would surface multiple violations here (one per
+        // dangling node_sources row + one per dangling edge).
+        let mut conn = make_epoch_1_db_with_full_graph();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+        let violations = fk_check_violation_count(&conn);
+        assert_eq!(
+            violations, 0,
+            "PRAGMA foreign_key_check must report zero violations after migration; \
+             a non-zero count means dangling FK references survived"
+        );
+    }
+
+    #[test]
+    fn migration_preserves_autoincrement_counter() {
+        // F13 also names the AUTOINCREMENT counter as a preservation
+        // requirement. The fixture's sources rows have IDs 1 and 5
+        // (non-contiguous, with sqlite_sequence forced to 5).
+        // After migration, inserting a new source must yield ID 6
+        // — NOT 2 (which is what would happen if the counter reset).
+        let mut conn = make_epoch_1_db_with_full_graph();
+        // Pre-migration sanity: counter is 5.
+        let counter_before: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'sources'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(counter_before, 5, "fixture sets sqlite_sequence to 5");
+
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+
+        // Post-migration: counter must still be 5.
+        let counter_after: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'sources'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            counter_after, 5,
+            "AUTOINCREMENT counter must survive the migration (was 5, became {counter_after})"
+        );
+
+        // Behavioral check: inserting a new source without specifying
+        // ID must yield 6, proving the counter is in effect.
+        conn.execute(
+            "INSERT INTO sources (source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES ('local_file', '/new.md', 300, 'direct', 'hash-c', 'markdown')",
+            [],
+        )
+        .unwrap();
+        let new_id: i64 = conn.last_insert_rowid();
+        assert_eq!(
+            new_id, 6,
+            "next AUTOINCREMENT insert must yield 6 (counter+1), got {new_id}; \
+             a value of 2 would mean the counter reset on DROP"
+        );
+    }
+
+    #[test]
+    fn migration_recreates_three_indexes() {
+        // Round-2's migration recreated the three sources indexes.
+        // FIX 13 retains that, but with a different sequence that
+        // could regress the index recreation if the developer
+        // forgot. This test independently verifies all three exist
+        // after migration.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='index' AND tbl_name='sources' \
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|n| n.ok())
+            .collect();
+        // SQLite auto-creates an internal `sqlite_autoindex_sources_*`
+        // index for the UNIQUE constraint, so we filter to the named
+        // ones we explicitly created in SCHEMA_DDL / migration.
+        let named: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("idx_sources_"))
+            .collect();
+        assert_eq!(
+            named.len(),
+            3,
+            "expected exactly 3 named idx_sources_* indexes, got {named:?}"
+        );
+        assert!(named.iter().any(|n| n.as_str() == "idx_sources_uri"));
+        assert!(named.iter().any(|n| n.as_str() == "idx_sources_format"));
+        assert!(named.iter().any(|n| n.as_str() == "idx_sources_ingested"));
+    }
+
+    #[test]
+    fn migration_preserves_node_data_unmodified() {
+        // The migration touches only `sources`. Verify that nothing
+        // in `nodes` was disturbed — content, type, timestamps,
+        // access_count must all match the pre-migration values.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        let alpha_before: (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT content, node_type, created_at_unix, last_accessed_unix \
+                 FROM nodes WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+
+        let alpha_after: (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT content, node_type, created_at_unix, last_accessed_unix \
+                 FROM nodes WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            alpha_before, alpha_after,
+            "nodes row 1 must survive migration unchanged"
+        );
+    }
+
+    #[test]
+    fn migration_keeps_cascade_delete_working_post_migration() {
+        // After migration, deleting a source must cascade to
+        // node_sources and edges. This proves FK enforcement is
+        // active AND points at the right tables — round-2's broken
+        // migration would have left node_sources pointing at a
+        // dropped table, so this DELETE would silently no-op the
+        // cascade.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+
+        // Delete source 5 — this should cascade to:
+        //   - node_sources rows (1,5) and (2,5)
+        //   - no edges (the only edge has source_id=1, not 5)
+        let deleted = conn
+            .execute("DELETE FROM sources WHERE id = ?1", params![5_i64])
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let mappings_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_sources WHERE source_id = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mappings_after, 0,
+            "ON DELETE CASCADE must remove dependent node_sources rows after migration; \
+             non-zero count would indicate FK enforcement is OFF or pointed at the wrong table"
+        );
+
+        // The OTHER node_sources row (1,1) should still be present.
+        let surviving: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_sources WHERE source_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving, 1, "unrelated node_sources row must survive");
+    }
+
+    #[test]
+    fn migration_records_version_2_after_full_graph_rebuild() {
+        // Independent verification that the schema_version row gets
+        // written ONLY after a successful migration (not before, not
+        // half-done). Tests FIX 13's step 13.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        assert_eq!(read_recorded_version(&conn), None, "epoch-1 has no version row");
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+        assert_eq!(
+            read_recorded_version(&conn),
+            Some(CURRENT_SCHEMA_VERSION),
+            "post-migration version must be recorded"
+        );
+    }
+
+    #[test]
+    fn migration_widens_unique_key_to_three_columns() {
+        // The FIX 5 motivating recovery path. With epoch-1's old
+        // 2-column key, a second source row with the same (uri, hash)
+        // under a different format would be rejected. With the
+        // 3-column key after migration, it's accepted.
+        let mut conn = make_epoch_1_db_with_full_graph();
+        KnowledgeStore::init_schema(&mut conn).unwrap();
+
+        // Insert a source with the SAME uri and hash as id=1, but
+        // a DIFFERENT format. Old key would reject; new key accepts.
+        let result = conn.execute(
+            "INSERT INTO sources (source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params!["local_file", "/note.md", 999_i64, "direct", "hash-a", "html"],
+        );
+        assert!(
+            result.is_ok(),
+            "post-migration schema must accept (uri, hash, format) triple distinct only by format; \
+             got {result:?}"
+        );
+        // Sanity: the new row got auto-assigned ID 6 (counter
+        // started at 5 + 1).
+        let new_id: i64 = conn.last_insert_rowid();
+        assert_eq!(new_id, 6, "AUTOINCREMENT must continue from preserved counter");
     }
 }

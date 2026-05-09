@@ -135,9 +135,16 @@ pub const DEFAULT_EMBEDDING_DIMENSION: usize = 32;
 /// its own fidelity, leaving the bad row to be `forget_source`'d
 /// independently. Same `(uri, content, format)` triple is still
 /// idempotent — the intended semantic for repeat ingestion.
+///
+/// **Codex re-review FIX 12 (P1-high):** the `PRAGMA foreign_keys = ON`
+/// statement is **NOT** part of this schema DDL. SQLite foreign-key
+/// enforcement is a per-connection setting (and defaults to OFF), not a
+/// per-database setting. Putting the pragma here only enabled FKs on the
+/// connection that first ran the schema; every reopen and every new
+/// background-worker connection silently inherited the default-OFF
+/// state. The pragma now lives in [`KnowledgeStore::init_schema`] which
+/// runs on every `Connection::open` boundary.
 const SCHEMA_DDL: &str = r#"
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_type TEXT NOT NULL,
@@ -1025,9 +1032,46 @@ impl KnowledgeStore {
     /// - **Epoch 2** (current): no-op.
     /// - **Unknown future epoch**: refuse to open with a clear error
     ///   (forward-compat guard).
+    ///
+    /// **Codex re-review FIX 12 (P1-high):** SQLite foreign-key enforcement
+    /// is a **per-connection** setting (defaults to OFF). Round-2 set the
+    /// pragma inside `SCHEMA_DDL`, which only fires once per connection on
+    /// fresh-database setup; every reopen and every short-lived background
+    /// connection inherited the default OFF state, so `node_sources` and
+    /// `edges` cascade-delete behavior was silently disabled in production
+    /// while passing tests in single-connection unit fixtures. The pragma
+    /// is now set + verified at the **opening** of `init_schema`, which
+    /// runs on every `Connection::open` and `open_in_memory` boundary.
+    /// If the SQLite build cannot honor the pragma we refuse to open
+    /// rather than silently proceed without provenance integrity.
     fn init_schema(conn: &Connection) -> Result<(), OrchestratorError> {
+        // FIX 12 part A: enable FK enforcement on this specific connection.
+        // The pragma is per-connection in SQLite — putting it in SCHEMA_DDL
+        // only set it on the connection that first created the schema.
         conn.execute_batch("PRAGMA journal_mode = WAL;")
             .map_err(map_sqlite_err)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(map_sqlite_err)?;
+
+        // FIX 12 part B: verify the pragma actually took effect. A SQLite
+        // build compiled with `SQLITE_OMIT_FOREIGN_KEY` silently ignores
+        // the pragma; opening such a database without enforcement would
+        // let `node_sources` / `edges` rows orphan their parents. The
+        // knowledge graph's "every node has at least one source" invariant
+        // depends on FK cascade behavior — refuse to open if enforcement
+        // is unavailable.
+        let fk_enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .map_err(map_sqlite_err)?;
+        if fk_enabled != 1 {
+            return Err(OrchestratorError::Planning(
+                "SQLite foreign-key enforcement could not be enabled on this \
+                 connection — this build of SQLite cannot guarantee provenance \
+                 integrity; refusing to open the knowledge store"
+                    .to_string(),
+            ));
+        }
+
         conn.execute_batch(SCHEMA_VERSION_TABLE_DDL)
             .map_err(map_sqlite_err)?;
 
@@ -3362,9 +3406,12 @@ mod tests {
     /// Must match commit `c3147b9`'s post-FIX-5 schema MINUS the version
     /// table — so `UNIQUE(uri, content_hash)` rather than the new
     /// 3-column key.
+    ///
+    /// **FIX 12 invariant**: the pragma is intentionally OUT of this DDL.
+    /// Tests that need FK enforcement must set it themselves on the test
+    /// connection, mirroring what [`KnowledgeStore::init_schema`] does
+    /// for production callers.
     const OLD_SCHEMA_DDL_FOR_TESTS: &str = r#"
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_type TEXT NOT NULL,
@@ -3612,5 +3659,154 @@ CREATE TABLE IF NOT EXISTS embeddings (
             "second init must not append a duplicate version row"
         );
         assert_eq!(read_recorded_version(&conn), Some(CURRENT_SCHEMA_VERSION));
+    }
+
+    // ── FIX 12 (P1-high): per-connection foreign-key enforcement ──────
+
+    /// Helper: read `PRAGMA foreign_keys` from a connection.
+    fn read_fk_pragma(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn fk_enforcement_active_after_init_schema() {
+        // After init_schema, the very connection used to set up the schema
+        // must have FK enforcement ON. This is the trivial-but-required
+        // baseline: prior to FIX 12, the pragma was buried in SCHEMA_DDL
+        // and only fired when a fresh-database CREATE path ran; this test
+        // confirms init_schema itself is now responsible for the pragma.
+        let conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&conn).unwrap();
+        assert_eq!(
+            read_fk_pragma(&conn),
+            1,
+            "FK enforcement must be ON after init_schema"
+        );
+    }
+
+    #[test]
+    fn fk_enforcement_active_after_close_and_reopen() {
+        // FIX 12 motivating case: round-2 set the pragma in SCHEMA_DDL.
+        // SQLite's CREATE TABLE IF NOT EXISTS is a no-op on the second
+        // open, so the pragma never re-ran on the new connection — the
+        // database file silently lost FK enforcement on every reopen
+        // (the failure mode that wasn't visible in single-connection
+        // tests). This test uses NamedTempFile to materialize a real
+        // database file, drops the first connection, opens a fresh one,
+        // and checks the pragma on THE NEW connection.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // First open: create the schema.
+        {
+            let conn = Connection::open(&path).unwrap();
+            KnowledgeStore::init_schema(&conn).unwrap();
+            assert_eq!(read_fk_pragma(&conn), 1, "first open must enforce FKs");
+        }
+        // Second open: schema already exists, version row is recorded.
+        // We explicitly turn FK enforcement OFF on this fresh connection
+        // BEFORE running init_schema — this simulates a SQLite build where
+        // FK defaults OFF (the historical SQLite default; some builds
+        // override the default ON, which is why we can't use the default
+        // alone as a probe). After init_schema runs, the pragma MUST be
+        // ON, proving init_schema actively enforces the invariant rather
+        // than relying on whatever the connection happened to start with.
+        let conn2 = Connection::open(&path).unwrap();
+        conn2
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("must be able to set pragma");
+        assert_eq!(
+            read_fk_pragma(&conn2),
+            0,
+            "explicit OFF must take effect on this connection"
+        );
+        KnowledgeStore::init_schema(&conn2).unwrap();
+        assert_eq!(
+            read_fk_pragma(&conn2),
+            1,
+            "FK enforcement must be re-applied on every connection by init_schema"
+        );
+    }
+
+    #[test]
+    fn fk_cascade_actually_deletes_dependent_rows() {
+        // Behavioral test: confirm the pragma's effect is observable, not
+        // just the pragma's REPORTED value. Without FK enforcement, a
+        // DELETE on `sources` would orphan `node_sources` rows. With
+        // enforcement, ON DELETE CASCADE removes them.
+        let conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&conn).unwrap();
+
+        // Seed: one source, one node, one node_sources mapping row.
+        conn.execute(
+            "INSERT INTO sources (source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES ('local_file', 'u', 0, 'direct', 'h', 'markdown')",
+            [],
+        )
+        .unwrap();
+        let source_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO nodes (content, node_type, created_at_unix, last_accessed_unix)
+             VALUES ('n', 'fact', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let node_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![node_id, source_id],
+        )
+        .unwrap();
+        let mapping_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mapping_count_before, 1, "seeded one mapping row");
+
+        // Delete the source. Cascade must remove the mapping.
+        conn.execute("DELETE FROM sources WHERE id = ?1", params![source_id])
+            .unwrap();
+        let mapping_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mapping_count_after, 0,
+            "ON DELETE CASCADE must remove dependent node_sources rows; \
+             if this fails, FK enforcement is OFF on this connection"
+        );
+    }
+
+    #[test]
+    fn fk_violation_is_rejected_at_insert_time() {
+        // Inverse behavioral test: with FK enforcement ON, inserting a
+        // node_sources row pointing at a NONEXISTENT source must fail
+        // immediately. Without enforcement, the row would silently insert
+        // and the graph would carry phantom provenance.
+        let conn = Connection::open_in_memory().unwrap();
+        KnowledgeStore::init_schema(&conn).unwrap();
+
+        // Insert a node so the node_id side is valid.
+        conn.execute(
+            "INSERT INTO nodes (content, node_type, created_at_unix, last_accessed_unix)
+             VALUES ('n', 'fact', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let node_id: i64 = conn.last_insert_rowid();
+
+        // source_id = 999 doesn't exist. With FK enforcement, this insert
+        // must fail.
+        let result = conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![node_id, 999_i64],
+        );
+        assert!(
+            result.is_err(),
+            "FK enforcement must reject node_sources row pointing at nonexistent source; \
+             got Ok which means enforcement is OFF"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("FOREIGN KEY") || err_msg.to_lowercase().contains("constraint"),
+            "expected a FOREIGN KEY constraint error, got: {err_msg}"
+        );
     }
 }

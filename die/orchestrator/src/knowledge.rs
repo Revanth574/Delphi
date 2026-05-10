@@ -2446,136 +2446,211 @@ fn infer_schema_version(conn: &Connection) -> Result<i64, OrchestratorError> {
 /// (it's called from `KnowledgeStore::open` immediately after
 /// `Connection::open`). No public API change.
 fn migrate_epoch_1_to_2(conn: &mut Connection) -> Result<(), OrchestratorError> {
-    // Step 1: disable FK enforcement BEFORE the transaction.
-    // SQLite's PRAGMA foreign_keys is silently ignored inside a
-    // transaction (per its docs); it MUST be set on the connection
-    // first.
+    // **Codex re-review FIX 14 (P1-high) — atomicity of integrity check.**
+    //
+    // Round-3 ran `PRAGMA foreign_key_check` AFTER `tx.commit()` and
+    // wrote the version row in a separate post-commit statement. If
+    // the FK check found pre-existing orphan rows (or errored), the
+    // function returned `Err`, but the database was already at
+    // epoch-2 structure with no recorded version. On the next open,
+    // `infer_schema_version` would observe the 3-column UNIQUE key,
+    // classify the database as epoch-2 by structure, and the
+    // current-epoch branch of `init_schema` would silently backfill
+    // the version row WITHOUT rerunning the integrity check —
+    // accepting a corrupted graph.
+    //
+    // The FIX 14 boundary: schema rebuild + integrity check + version
+    // row write are now ONE atomic transaction. Any failure of any
+    // step rolls everything back via Transaction's `Drop::drop` →
+    // `finish_()` → `rollback_()` (rusqlite default `DropBehavior::Rollback`).
+    // The database is then either:
+    //   - fully epoch-2 with clean integrity AND a recorded version, or
+    //   - fully epoch-1, untouched.
+    // No middle state exists where infer_schema_version could be
+    // fooled into backfilling a bad rebuild.
+    //
+    // SQLite supports `PRAGMA foreign_key_check` inside transactions
+    // (it's a SELECT-shaped diagnostic, not a state-mutating PRAGMA
+    // like `foreign_keys = ON/OFF` which IS silently ignored inside
+    // tx). Verified against SQLite docs and via the test below.
+
+    // Disable FK enforcement BEFORE BEGIN. PRAGMA foreign_keys = ON/OFF
+    // is silently ignored inside a transaction; the disable must
+    // happen on the connection first. We need it OFF so that the
+    // DROP/RENAME shuffle below (which temporarily orphans child
+    // FK references) doesn't trip enforcement during the rebuild.
     conn.execute_batch("PRAGMA foreign_keys = OFF;")
         .map_err(map_sqlite_err)?;
 
-    // Steps 2–9: atomic rebuild inside a single transaction.
-    let tx = conn.transaction().map_err(map_sqlite_err)?;
+    // Run the migration body inside an immediately-invoked closure
+    // so we can use `?` for early exits and let the Transaction's
+    // Drop impl roll back automatically on the error path. The
+    // closure captures `conn` by mutable borrow only for the
+    // transaction's lifetime — once it returns (Ok or Err) the
+    // borrow ends and we can re-enable FK enforcement.
+    let migration_result: Result<(), OrchestratorError> = (|| {
+        let tx = conn.transaction().map_err(map_sqlite_err)?;
 
-    // Step 5 (early): read the original sqlite_sequence counter for
-    // sources, so we can re-apply it after the DROP+RENAME. If
-    // sqlite_sequence has no row for "sources" (table was empty),
-    // we leave it alone — there's nothing to preserve.
-    let original_seq: Option<i64> = tx
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'sources'",
-            [],
-            |r| r.get(0),
+        // Stash the original AUTOINCREMENT counter for `sources` so
+        // we can re-apply it after the DROP+RENAME. If sqlite_sequence
+        // has no row (table never had inserts), the Option is None
+        // and we leave the counter alone — nothing to preserve.
+        let original_seq: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'sources'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite_err)?;
+
+        // Build the new sources table under a temporary name. Child
+        // FK metadata on `node_sources` and `edges` still references
+        // the literal name "sources" — untouched.
+        tx.execute_batch(
+            r#"
+            CREATE TABLE sources_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                ingested_at_unix INTEGER NOT NULL,
+                fidelity TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                format TEXT NOT NULL,
+                UNIQUE(uri, content_hash, format)
+            );
+            "#,
         )
-        .optional()
         .map_err(map_sqlite_err)?;
 
-    // Step 3: create the new table under a temporary name. Children's
-    // FK metadata still references "sources" — untouched.
-    tx.execute_batch(
-        r#"
-        CREATE TABLE sources_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_type TEXT NOT NULL,
-            uri TEXT NOT NULL,
-            ingested_at_unix INTEGER NOT NULL,
-            fidelity TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            format TEXT NOT NULL,
-            UNIQUE(uri, content_hash, format)
-        );
-        "#,
-    )
-    .map_err(map_sqlite_err)?;
-
-    // Step 4: copy rows verbatim. Explicit column list + explicit IDs
-    // keep `node_sources.source_id` and `edges.source_id` valid after
-    // step 6's DROP. The unique key WIDENS, so no epoch-1 row is
-    // rejected — two rows that shared (uri, hash) but differed in
-    // format are both legal in epoch-2.
-    tx.execute_batch(
-        r#"
-        INSERT INTO sources_new (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
-            SELECT id, source_type, uri, ingested_at_unix, fidelity, content_hash, format
-            FROM sources;
-        "#,
-    )
-    .map_err(map_sqlite_err)?;
-
-    // Step 6: drop the old sources table. Children's FK metadata
-    // still says `REFERENCES sources` — the references are now
-    // temporarily dangling. FK-OFF makes this safe.
-    tx.execute_batch("DROP TABLE sources;")
+        // Copy rows verbatim with explicit IDs so `node_sources.source_id`
+        // and `edges.source_id` resolve correctly after the rename.
+        tx.execute_batch(
+            r#"
+            INSERT INTO sources_new (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+                SELECT id, source_type, uri, ingested_at_unix, fidelity, content_hash, format
+                FROM sources;
+            "#,
+        )
         .map_err(map_sqlite_err)?;
 
-    // Step 7: rename sources_new → sources. The children's FK target
-    // name (`sources`) is now bound to the new table. Because we're
-    // renaming `sources_new` (which has no inbound FK refs),
-    // SQLite's auto-rename of child FK metadata is a no-op here.
-    tx.execute_batch("ALTER TABLE sources_new RENAME TO sources;")
+        // DROP old sources, then RENAME sources_new → sources.
+        // Children's FK metadata stays bound to the literal name
+        // "sources" throughout — never gets rewritten — and resolves
+        // correctly after the RENAME restores the target name.
+        tx.execute_batch("DROP TABLE sources;")
+            .map_err(map_sqlite_err)?;
+        tx.execute_batch("ALTER TABLE sources_new RENAME TO sources;")
+            .map_err(map_sqlite_err)?;
+
+        // Re-apply the stashed AUTOINCREMENT counter. SQLite tracks
+        // sqlite_sequence rows by name; after the RENAME above, the
+        // row name will already be "sources". INSERT OR REPLACE
+        // handles both the "sqlite_sequence row exists for sources"
+        // and "no row yet" cases.
+        if let Some(seq) = original_seq {
+            tx.execute(
+                "INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('sources', ?1)",
+                params![seq],
+            )
+            .map_err(map_sqlite_err)?;
+        }
+
+        // Recreate the three indexes that lived on epoch-1's sources.
+        // These were dropped along with the old table.
+        tx.execute_batch(
+            r#"
+            CREATE INDEX idx_sources_uri ON sources(uri);
+            CREATE INDEX idx_sources_format ON sources(format);
+            CREATE INDEX idx_sources_ingested ON sources(ingested_at_unix);
+            "#,
+        )
         .map_err(map_sqlite_err)?;
 
-    // Step 8: re-apply the stashed sqlite_sequence counter so
-    // AUTOINCREMENT picks up where epoch-1 left off, not at MAX(id)+1.
-    // INSERT OR REPLACE handles both cases:
-    // - an sqlite_sequence row for "sources" was created by step 4's
-    //   INSERT (we want our stashed value, which may be ≥ that)
-    // - no sqlite_sequence row exists yet (we want to create one)
-    if let Some(seq) = original_seq {
+        // FIX 14 part A: run `PRAGMA foreign_key_check` INSIDE the
+        // transaction. The query returns one row per orphaned child,
+        // so an empty result set means clean integrity.
+        //
+        // We collect into a Vec so we can release the borrow on `tx`
+        // before the version-row insert below (rusqlite's prepared
+        // statement holds an immutable borrow on `tx` for its
+        // lifetime, which would conflict with `tx.execute()`).
+        let violations: Vec<(String, i64, String, i64)> = {
+            let mut stmt = tx
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?, // child table name
+                        r.get::<_, i64>(1)?,    // child rowid
+                        r.get::<_, String>(2)?, // parent table name
+                        r.get::<_, i64>(3)?,    // FK index
+                    ))
+                })
+                .map_err(map_sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite_err)?
+        };
+        if !violations.is_empty() {
+            // Returning Err here triggers Transaction::Drop →
+            // finish_() → rollback_(), reverting the entire schema
+            // rebuild AND ensuring no version row gets written.
+            // The error message is local-only (not crossed-D-Bus per
+            // FIX 7) so listing the violation count + first 3 entries
+            // for operator diagnostics is safe.
+            let preview: Vec<_> = violations.iter().take(3).collect();
+            return Err(OrchestratorError::Planning(format!(
+                "schema migration would leave {} foreign-key violation(s) \
+                 (first {} shown): {:?}; aborting and rolling back to epoch 1",
+                violations.len(),
+                preview.len(),
+                preview
+            )));
+        }
+
+        // FIX 14 part B: write the version row INSIDE the same
+        // transaction. Either we commit with version=2 AND clean
+        // integrity together, or both roll back together. There's
+        // no window where infer_schema_version sees epoch-2
+        // structure without a recorded version, so the
+        // current-epoch backfill path can never accept a corrupt
+        // graph silently.
+        //
+        // Plain INSERT (not OR IGNORE): a fresh epoch-1 → epoch-2
+        // migration on a database that already has a version row
+        // is a logic bug we want to surface, not paper over. The
+        // init_schema match arm guarantees this branch only runs
+        // when version is inferred as 1 with no recorded row.
         tx.execute(
-            "INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('sources', ?1)",
-            params![seq],
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION],
         )
         .map_err(map_sqlite_err)?;
-    }
 
-    // Step 9: recreate the three indexes that lived on epoch-1's
-    // sources. These were dropped along with the old table in step 6.
-    tx.execute_batch(
-        r#"
-        CREATE INDEX idx_sources_uri ON sources(uri);
-        CREATE INDEX idx_sources_format ON sources(format);
-        CREATE INDEX idx_sources_ingested ON sources(ingested_at_unix);
-        "#,
-    )
-    .map_err(map_sqlite_err)?;
+        // Atomic commit boundary. If any prior `?` returned Err,
+        // we never reach here and Drop rolls back. If commit itself
+        // fails (extremely rare — SQLITE_FULL, I/O error), the
+        // Drop on the partly-committed Transaction will also try to
+        // roll back; even if both fail, the database file's atomic
+        // journal mechanism guarantees that on next open SQLite
+        // recovers to either pre-tx or post-commit state, never
+        // partial.
+        tx.commit().map_err(map_sqlite_err)?;
+        Ok(())
+    })();
 
-    // Step 10: commit. If any prior statement failed, this is
-    // unreachable (the `?` returned early) and the transaction's
-    // Drop impl rolled back automatically.
-    tx.commit().map_err(map_sqlite_err)?;
-
-    // Step 11: re-enable FK enforcement on the connection.
+    // Re-enable FK enforcement on this connection regardless of
+    // migration outcome. After a successful commit this just
+    // restores normal operating mode for subsequent queries; after
+    // a rollback it brings the connection back into the same FK-on
+    // state that init_schema set at the top of the call. Subsequent
+    // `Connection::open` calls also re-enable via FIX 12's
+    // init_schema verification step.
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(map_sqlite_err)?;
 
-    // Step 12: verify referential integrity after the rebuild.
-    // PRAGMA foreign_key_check returns one row per orphaned child,
-    // so we want zero rows. If any exist, the migration is in a
-    // broken state and we refuse to record the version-2 row — the
-    // store will reopen as epoch-2 schema without a recorded version,
-    // and infer_schema_version() will diagnose the mismatch.
-    let mut stmt = conn
-        .prepare("PRAGMA foreign_key_check")
-        .map_err(map_sqlite_err)?;
-    let mut rows = stmt.query([]).map_err(map_sqlite_err)?;
-    if rows.next().map_err(map_sqlite_err)?.is_some() {
-        return Err(OrchestratorError::Planning(
-            "post-migration foreign_key_check reported orphan rows — \
-             rejecting epoch_1_to_2 migration"
-                .to_string(),
-        ));
-    }
-    drop(rows);
-    drop(stmt);
-
-    // Step 13: record the version. INSERT OR IGNORE for idempotency.
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
-        params![CURRENT_SCHEMA_VERSION],
-    )
-    .map_err(map_sqlite_err)?;
-
-    Ok(())
+    migration_result
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4085,6 +4160,62 @@ CREATE TABLE IF NOT EXISTS embeddings (
         conn
     }
 
+    /// Build a deliberately-corrupt epoch-1 database that contains an
+    /// orphan `node_sources` row referencing a `source_id` that does
+    /// not exist in `sources`. This is the FIX 14 motivating fixture:
+    /// a database that survived the round-2 FK gap (where FK
+    /// enforcement was per-connection-defaulted instead of
+    /// universally on) could plausibly contain such orphans.
+    ///
+    /// **Construction trick:** we set `PRAGMA foreign_keys = OFF` on
+    /// the temporary fixture connection, do the orphaning insert,
+    /// then leave the connection in that state. Round-3's migration
+    /// would happily accept this database without surfacing the
+    /// corruption — exactly the silent-acceptance path F14 describes.
+    /// Round-4's atomic-tx migration must REJECT it via the in-tx
+    /// `foreign_key_check`.
+    fn make_corrupt_epoch_1_db(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        // FK off so we can construct the orphan row without rejection.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(OLD_SCHEMA_DDL_FOR_TESTS).unwrap();
+
+        // One valid source.
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "local_file", "/real.md", 100_i64, "direct", "hash-real", "markdown"],
+        )
+        .unwrap();
+
+        // One valid node.
+        conn.execute(
+            "INSERT INTO nodes (id, content, node_type, created_at_unix, last_accessed_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1_i64, "real-content", "fact", 100_i64, 100_i64],
+        )
+        .unwrap();
+
+        // Valid mapping (1, 1) — node 1 cites the real source 1.
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 1_i64],
+        )
+        .unwrap();
+
+        // ORPHAN: node 1 cites a source 99999 that doesn't exist.
+        // FK is OFF so this insert succeeds. With FK ON it would
+        // have been rejected. This row is what the in-tx
+        // `foreign_key_check` must surface.
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 99999_i64],
+        )
+        .unwrap();
+
+        conn
+    }
+
     /// Read the recorded schema version directly from the table.
     /// Returns `None` if the table doesn't exist OR exists but is empty.
     /// This tolerates the pre-migration test condition where the
@@ -4711,5 +4842,175 @@ CREATE TABLE IF NOT EXISTS embeddings (
         // started at 5 + 1).
         let new_id: i64 = conn.last_insert_rowid();
         assert_eq!(new_id, 6, "AUTOINCREMENT must continue from preserved counter");
+    }
+
+    // ── FIX 14 (P1-high): atomic FK check + version row inside tx ──
+    //
+    // Round-3 ran `PRAGMA foreign_key_check` and the version-row
+    // INSERT after `tx.commit()`. A failed FK check returned Err but
+    // the database was already structurally epoch-2 with no version
+    // row — and `init_schema` would silently backfill version=2 on
+    // next open via the current-epoch arm, accepting a corrupt graph.
+    // Round-4 puts the rebuild + integrity check + version row in
+    // ONE atomic transaction, so the database is either fully
+    // epoch-2-with-clean-integrity-AND-version, or fully epoch-1.
+
+    #[test]
+    fn migration_with_pre_existing_orphan_aborts_atomically() {
+        // F14 motivating case. The fixture has an orphan node_sources
+        // row referencing source_id=99999 (which doesn't exist).
+        // Round-3 would have committed the schema rebuild, then
+        // raised an error on the post-commit FK check, leaving the
+        // database structurally epoch-2 with no version row.
+        // Round-4's atomic transaction must roll the entire rebuild
+        // back, leaving epoch-1 untouched.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Drop the fixture's connection so we get a clean reopen.
+        drop(make_corrupt_epoch_1_db(&path));
+
+        // Now open via KnowledgeStore::init_schema. The migration
+        // should detect the orphan via the in-tx FK check and roll
+        // back, returning Err.
+        let mut conn = Connection::open(&path).unwrap();
+        let err = KnowledgeStore::init_schema(&mut conn)
+            .expect_err("migration must abort when fixture has orphan rows");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foreign-key violation"),
+            "expected the FK violation error message, got: {msg}"
+        );
+
+        // CRITICAL ASSERTION: the database is still epoch-1 — the
+        // 3-column UNIQUE constraint must NOT be present, and there
+        // is no `schema_version` row. Round-3's bug was that the
+        // 3-column key WAS present (commit happened) and the version
+        // row was missing, which then got silently backfilled.
+        let sources_sql = read_sources_sql(&conn);
+        assert!(
+            sources_sql.contains("UNIQUE(uri, content_hash)")
+                && !sources_sql.contains("UNIQUE(uri, content_hash, format)"),
+            "ROLLBACK must restore epoch-1 schema; got: {sources_sql}"
+        );
+        assert_eq!(
+            read_recorded_version(&conn),
+            None,
+            "no version row may be written when migration aborts"
+        );
+    }
+
+    #[test]
+    fn migration_aborted_open_does_not_silently_succeed_on_retry() {
+        // The atomicity invariant means a SECOND open on the same
+        // corrupted database must produce the SAME error — not a
+        // silent acceptance. Round-3's bug was that the second open
+        // would see epoch-2 structure (because round-3 committed
+        // the rebuild) and backfill version=2 without rerunning the
+        // FK check. Round-4's rollback ensures the corruption is
+        // still visible and the migration still fails.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(make_corrupt_epoch_1_db(&path));
+
+        // First attempt: fails as expected.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let _ = KnowledgeStore::init_schema(&mut conn).expect_err("first attempt fails");
+        }
+        // Second attempt: must ALSO fail — no silent backfill.
+        let mut conn = Connection::open(&path).unwrap();
+        let err = KnowledgeStore::init_schema(&mut conn)
+            .expect_err("second attempt must also fail; no silent backfill");
+        assert!(
+            err.to_string().contains("foreign-key violation"),
+            "second attempt must surface the same corruption diagnostic"
+        );
+    }
+
+    #[test]
+    fn migration_succeeds_after_operator_repairs_orphans() {
+        // Operator-recovery path: a database with orphan rows can
+        // be brought back into compliance by deleting the orphans
+        // (or repointing them at valid sources). After that, the
+        // migration must succeed normally. This proves the F14
+        // boundary is "reject corruption, allow recovery" rather
+        // than "permanently brick the database".
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(make_corrupt_epoch_1_db(&path));
+
+        // First open fails — the FIX 14 detection.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let _ = KnowledgeStore::init_schema(&mut conn).expect_err("orphan present");
+
+            // Operator repairs the corruption directly via SQL.
+            // FK is back ON after the failed migration (the
+            // unconditional re-enable) so we have to disable it
+            // again to delete the orphan without trying to enforce
+            // its (impossible) FK.
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute(
+                "DELETE FROM node_sources WHERE source_id = 99999",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Second open: migration now succeeds.
+        let mut conn = Connection::open(&path).unwrap();
+        KnowledgeStore::init_schema(&mut conn)
+            .expect("migration must succeed after orphan repair");
+        assert_eq!(
+            read_recorded_version(&conn),
+            Some(CURRENT_SCHEMA_VERSION),
+            "version row must be recorded after successful migration"
+        );
+        assert!(
+            read_sources_sql(&conn).contains("UNIQUE(uri, content_hash, format)"),
+            "schema must be at epoch-2 after successful migration"
+        );
+    }
+
+    #[test]
+    fn migration_rollback_leaves_no_sources_new_artifact() {
+        // Defense-in-depth: a rolled-back migration must leave NO
+        // `sources_new` table behind. The Drop-rollback machinery
+        // is supposed to reverse every CREATE inside the
+        // transaction, but verifying it directly catches any
+        // future regression where someone moves a CREATE outside
+        // the transaction by mistake.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(make_corrupt_epoch_1_db(&path));
+
+        let mut conn = Connection::open(&path).unwrap();
+        let _ = KnowledgeStore::init_schema(&mut conn).expect_err("orphan triggers rollback");
+
+        // No `sources_new` artifact may exist.
+        let sources_new_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sources_new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sources_new_count, 0,
+            "rolled-back migration must not leave sources_new table behind"
+        );
+
+        // The original `sources` table must still exist.
+        let sources_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sources'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sources_count, 1,
+            "original sources table must survive rollback"
+        );
     }
 }

@@ -481,6 +481,40 @@ impl KnowledgeService {
     /// Errors are returned as `zbus::fdo::Error::Failed` with a structured
     /// reason; the file's content is never echoed back in the error
     /// message.
+    ///
+    /// # Platform support (Codex re-review FIX 16, P1-high)
+    ///
+    /// This method is supported on **Linux only** in the current build.
+    /// Linux uses `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)`
+    /// anchored to a held directory handle (FIX 15) for kernel-level
+    /// race-free safe-open.
+    ///
+    /// On **Windows**, this method always returns
+    /// `zbus::fdo::Error::AccessDenied` because
+    /// [`add_ingestion_root`](Self::add_ingestion_root) refuses
+    /// registration on Windows (the underlying `open_dir_no_follow`
+    /// returns `ErrorKind::Unsupported`). The architectural reason:
+    /// Windows lacks a documented kernel-level API equivalent to
+    /// Linux `openat2`. The component-walk implementation used in
+    /// round-3 had unfixable TOCTOU races between `symlink_metadata`
+    /// checks and the final open; the only race-free Windows path
+    /// requires `NtCreateFile` with `OBJ_DONT_REPARSE`, which is
+    /// undocumented and version-unstable across Windows releases.
+    /// Implementing the NT-level path is tracked as future work when
+    /// Windows becomes a primary deployment target.
+    ///
+    /// On **macOS** and other Unix variants, this method also returns
+    /// `AccessDenied` for the same reason: `openat2` is Linux-specific.
+    /// macOS could in principle implement an equivalent via repeated
+    /// `openat` walks with `O_NOFOLLOW`, but that work is deferred.
+    ///
+    /// **Workaround for unsupported platforms:** the
+    /// [`ingest_text`](Self::ingest_text) method ingests
+    /// caller-supplied content directly without requiring filesystem
+    /// access. Shell code can read the file itself (using whatever
+    /// platform-appropriate API is available) and pass the bytes
+    /// through `ingest_text`, accepting that the safe-open boundary
+    /// is the shell's responsibility on those platforms.
     async fn ingest_file(&self, path: String) -> zbus::fdo::Result<String> {
         info!(path = %path, "D-Bus ingest_file");
 
@@ -1556,6 +1590,86 @@ mod tests {
         let real_canon = std::fs::canonicalize(&real_dir).unwrap();
         let allow = svc.allowlist.lock().unwrap();
         assert_eq!(allow[0].canonical_path, real_canon);
+    }
+
+    // ── FIX 16 (P1-high): explicit Windows feature-gate ──
+    //
+    // Round-3 shipped a Windows component-walk that LOOKED safe but
+    // had unfixable TOCTOU races between symlink_metadata checks and
+    // the final open. The only race-free Windows path requires
+    // NtCreateFile + OBJ_DONT_REPARSE, which is undocumented and
+    // version-unstable. Round-4 makes the security boundary honest:
+    // open_dir_no_follow returns Unsupported on non-Linux, so
+    // add_ingestion_root rejects, so ingest_file rejects with the
+    // uniform AccessDenied message. ingest_text remains supported.
+    //
+    // These tests are gated to non-Linux platforms so they only
+    // exercise the Unsupported path on Windows + macOS CI runners.
+    // On WSL2 (target_os = "linux") they're skipped at compile time.
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn add_ingestion_root_returns_false_on_non_linux() {
+        // FIX 16: open_dir_no_follow returns Unsupported on
+        // non-Linux, so add_ingestion_root must return false even
+        // for a real, existing directory. This is a feature-gate
+        // assertion: the registration boundary is the place where
+        // the platform limitation surfaces.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc();
+        assert!(
+            !svc.add_ingestion_root(tmp.path()),
+            "add_ingestion_root must reject on non-Linux platforms; \
+             open_dir_no_follow returns Unsupported"
+        );
+        // Allowlist must remain empty.
+        assert_eq!(svc.allowlist_snapshot().len(), 0);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn ingest_file_returns_unified_access_denied_on_non_linux() {
+        // FIX 16: with no roots registerable, every ingest_file
+        // call hits the empty-allowlist short-circuit (FIX 7) and
+        // returns the uniform "path not permitted" message.
+        // Critically: the wire response carries no information
+        // about WHY (platform vs allowlist vs path). Operator-side
+        // tracing logs distinguish; the D-Bus response does not.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("any.md");
+        std::fs::write(&file, "# placeholder\n").unwrap();
+        let svc = mk_svc();
+        let err = svc
+            .ingest_file(file.to_string_lossy().into_owned())
+            .await
+            .expect_err("ingest_file must fail on non-Linux");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path not permitted"),
+            "must use uniform rejection message; got: {msg}"
+        );
+    }
+
+    /// FIX 16 sanity test (cross-platform): the workaround
+    /// recommended in the rustdoc must actually work. ingest_text
+    /// requires no filesystem access and so is supported on every
+    /// platform that builds the crate. This test runs on Linux
+    /// AND non-Linux, so it doubles as a regression check.
+    #[tokio::test]
+    async fn ingest_text_remains_supported_on_all_platforms() {
+        let svc = mk_svc();
+        let json = svc
+            .ingest_text(
+                "# Title\n\nA paragraph.\n".into(),
+                "user://platform-test".into(),
+                "markdown".into(),
+            )
+            .await
+            .expect("ingest_text must succeed on every platform — it's the FIX 16 workaround");
+        // Non-empty JSON — confirms the IngestionResult was
+        // produced and serialized.
+        assert!(json.contains("source_id"));
+        assert!(json.contains("nodes_created"));
     }
 
     #[cfg(target_os = "linux")]

@@ -1934,47 +1934,59 @@ impl KnowledgeStore {
     /// format, and ingest. Returns `Fidelity::Unavailable` for formats
     /// we can't currently extract.
     ///
-    /// **Codex re-review FIX 10+11 (P1-high):** the file is opened via
-    /// [`safe_open_under_root`], which on Linux uses `openat2(2)` with
-    /// `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH` to atomically reject
-    /// symlinks at ANY component (not just the leaf), and on Windows
-    /// walks each component checking `FILE_ATTRIBUTE_REPARSE_POINT`
-    /// before opening the leaf with `FILE_FLAG_OPEN_REPARSE_POINT`.
-    /// Round-2's `safe_open_no_follow` only checked the final
-    /// component — Codex F10 demonstrated this missed intermediate
-    /// symlinks, and F11 demonstrated `is_symlink()` missed
-    /// non-symlink reparse points. The new contract requires the
-    /// caller to supply the allowlist root that gated the request,
-    /// so `safe_open_under_root` can anchor the walk to a
-    /// directory FD rather than a re-resolvable path string.
+    /// **Codex re-review FIX 15 (P1-high):** `trusted_root` is now a
+    /// **held directory handle**, not a re-resolvable path string.
+    /// Round-3 took `trusted_root: &Path` and called
+    /// `std::fs::File::open(trusted_root)` inside `safe_open_under_root`;
+    /// this re-resolved the path at every ingest call, so an attacker
+    /// who controlled the parent of an allowlist entry could swap the
+    /// entry for a symlink between registration and use, and `openat2`
+    /// would then anchor `RESOLVE_BENEATH` to the symlink target
+    /// instead of the originally-approved root — an allowlist escape.
     ///
-    /// **Caller invariant**: `trusted_root` is the canonical allowlist
-    /// root that contains `path`. The D-Bus service in
-    /// `services::knowledge` looks up the matching root from its
-    /// allowlist after `check_path_allowed` succeeds and passes it
-    /// here.
-    pub fn ingest_file(
+    /// The new contract: the services layer opens the directory once
+    /// at registration time with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
+    /// and holds the resulting `File` for the service's lifetime.
+    /// That handle is the trust anchor — it references a kernel
+    /// inode, not a path string. `safe_open_under_root_handle` uses
+    /// `openat2(dirfd=root_handle.as_raw_fd(), ...)` to atomically
+    /// resolve `target` relative to that inode, even if the path
+    /// string that originally opened the inode has since been swapped.
+    ///
+    /// **Codex re-review FIX 10+11 (P1-high) — retained:** Linux
+    /// uses `openat2(2)` with `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`
+    /// to atomically reject symlinks at ANY component and refuse
+    /// `..` escapes from the trusted root.
+    ///
+    /// # Platform support
+    ///
+    /// This function is supported on **Linux only** in the current
+    /// build. Windows and other Unix variants return
+    /// `ErrorKind::Unsupported`. See `safe_open_under_root_handle`
+    /// for the platform-support rationale.
+    pub fn ingest_file_with_root_handle(
         &self,
-        trusted_root: &Path,
-        path: &Path,
+        trusted_root_handle: &std::fs::File,
+        target: &Path,
     ) -> Result<IngestionResult, OrchestratorError> {
         use std::io::Read;
-        let mut file = safe_open_under_root(trusted_root, path).map_err(|e| {
-            OrchestratorError::Planning(format!(
-                "could not safely open {} for ingestion: {e}",
-                path.display()
-            ))
-        })?;
+        let mut file = safe_open_under_root_handle(trusted_root_handle, target)
+            .map_err(|e| {
+                OrchestratorError::Planning(format!(
+                    "could not safely open {} for ingestion: {e}",
+                    target.display()
+                ))
+            })?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|e| {
             OrchestratorError::Planning(format!(
                 "could not read {} for ingestion: {e}",
-                path.display()
+                target.display()
             ))
         })?;
         let head = &bytes[..bytes.len().min(64)];
-        let format = detect_format(path, head);
-        let uri = path.to_string_lossy().to_string();
+        let format = detect_format(target, head);
+        let uri = target.to_string_lossy().to_string();
         self.ingest_bytes(&bytes, &uri, format)
     }
 
@@ -2022,119 +2034,130 @@ impl KnowledgeStore {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// FIX 10+11 (P1-high): kernel-level path-anchored safe open
-// (supersedes round-2 FIX 8 / safe_open_no_follow)
+// FIX 15 (P1-high): handle-anchored kernel-level safe open
+// (supersedes round-3 FIX 10+11 / safe_open_under_root)
 // ────────────────────────────────────────────────────────────────────
 
-/// Open `target` for reading, refusing to traverse ANY symlink/reparse
-/// point between `trusted_root` and the target — including intermediate
-/// directory components.
+/// Open `target` for reading, anchored to a held directory handle
+/// for the trusted root. Refuses to traverse ANY symlink/reparse
+/// point between the held root and the target.
 ///
-/// **Why this exists** (Codex re-review FIX 10 + FIX 11, P1-high):
-/// round-2's `safe_open_no_follow(path)` only checked the FINAL path
-/// component (Unix `O_NOFOLLOW`, Windows `metadata().file_type().is_symlink()`
-/// after-the-fact). The Codex re-review demonstrated this is insufficient:
+/// **Why this exists** (Codex re-review FIX 15, P1-high):
+/// round-3's `safe_open_under_root(trusted_root: &Path, target: &Path)`
+/// took the trusted root as a path string and called
+/// `std::fs::File::open(trusted_root)` to get a directory FD for
+/// `openat2`. This re-resolved the path at every ingest call. An
+/// attacker with write access to the parent of an allowlist entry
+/// could swap the entry for a symlink AFTER `add_ingestion_root`'s
+/// canonicalization but BEFORE this open — at which point `openat2`'s
+/// `RESOLVE_BENEATH` would happily anchor to the symlink target
+/// rather than the originally-approved directory, allowing an
+/// allowlist escape.
 ///
-/// - **F10**: an attacker with write access inside an allowed root can
-///   swap an intermediate directory for a symlink pointing at a sensitive
-///   target. `O_NOFOLLOW` is silent on intermediate components — the
-///   kernel happily traverses them — so the validated leaf path resolved
-///   to one identity at canonicalize-time and a different identity at
-///   open-time, exactly the TOCTOU class round-2 claimed to close.
-/// - **F11**: Windows `is_symlink()` only catches symlink-typed reparse
-///   points. NTFS supports several other reparse-point classes —
-///   junctions, mount points, AppExecLink, OneDrive cloud-state — that
-///   share the `FILE_ATTRIBUTE_REPARSE_POINT` flag but report false from
-///   `is_symlink()`. The pre-open check must inspect the raw attribute
-///   bit, not the typed wrapper.
+/// The fix: the trusted root is passed as a **held `&File`** that
+/// the services layer opens once at registration time with
+/// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and retains for the
+/// service's lifetime. The handle's identity (kernel inode behind
+/// the fd) is the trust anchor, not a re-resolvable path string.
+/// `safe_open_under_root_handle` uses the handle's raw fd as
+/// `dirfd` for `openat2`, anchoring all path resolution to that
+/// inode. Even if the original path string has been swapped for a
+/// symlink in the meantime, the held fd still references the
+/// original inode and the kernel walks from there.
 ///
-/// The new contract: callers supply BOTH the allowlist root that gated
-/// the request AND the canonical target path. The function refuses to
-/// open if the open-time path traversal crosses any reparse point or
-/// escapes the trusted root. The returned `File` handle is then the
-/// identity the caller reads from — bytes come from the kernel object,
-/// not from a path string that can be re-resolved.
+/// **Codex re-review FIX 10+11 (P1-high) — retained:** the resolve
+/// flags are `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, which
+/// atomically reject symlinks at any component and refuse `..`
+/// escapes from the trusted root.
 ///
-/// # Platform behavior
+/// # Platform support
 ///
-/// - **Linux** (`target_os = "linux"`): the `openat2(2)` syscall with
-///   `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`. The kernel atomically
-///   walks every component from the directory FD opened on
-///   `trusted_root` to `target` and returns `-ELOOP` if any component
-///   is a symlink, or `-EXDEV` if the resolution would escape the root.
-///   This is the same primitive Linux's `unshare`, fchroot, and
-///   container runtimes use to anchor open-by-handle identity. There
-///   is no TOCTOU window: the resolution and the open are one syscall.
+/// This function is supported on **Linux only** in the current build.
 ///
-/// - **Windows**: `openat2` has no equivalent. We approximate by
-///   walking each component between `trusted_root` and `target`,
-///   inspecting the `FILE_ATTRIBUTE_REPARSE_POINT` bit on each parent
-///   directory's attributes via `symlink_metadata`, then opening the
-///   final target with `FILE_FLAG_OPEN_REPARSE_POINT` (no follow) and
-///   re-checking the attribute. This is best-effort — small TOCTOU
-///   races remain between `symlink_metadata` calls — but it covers
-///   ALL reparse-point classes (symlinks, junctions, mount points,
-///   AppExecLink, etc.) and ALL components, not just the leaf.
+/// - **Linux** (`target_os = "linux"`): `openat2(2)` with
+///   `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, anchored to the held
+///   directory FD. Kernel-level atomicity: resolution and open are
+///   one syscall. Stable since kernel 5.6 (verified via
+///   `libc::SYS_openat2 = 437` in libc 0.2.186).
 ///
-/// - **Other targets** (e.g. macOS, BSD): returned as `Unsupported`.
-///   The knowledge ingestion path is currently Linux/Windows only;
-///   this guarantees no silent-degradation path on platforms we
-///   haven't audited.
+/// - **Windows**: returns `ErrorKind::Unsupported`. Round-3's
+///   component-walk implementation had unfixable TOCTOU races
+///   between `symlink_metadata` checks and the final open; the only
+///   race-free Windows path requires `NtCreateFile` with
+///   `OBJ_DONT_REPARSE`, which is undocumented and version-unstable
+///   across Windows releases. See FIX 16 commit message for the
+///   full architectural-decision rationale. Windows users can
+///   ingest content via the `ingest_text` D-Bus method which
+///   doesn't require filesystem access.
+///
+/// - **Other targets** (macOS, BSD, etc.): returns
+///   `ErrorKind::Unsupported`. `openat2` is Linux-specific. macOS
+///   could in principle implement an equivalent via repeated
+///   `openat` walks with `O_NOFOLLOW`, but that work is deferred
+///   until macOS becomes a deployment target.
 ///
 /// # Caller invariants
 ///
-/// 1. `trusted_root` must already be canonicalized (no symlinks in
-///    its own ancestry) — the allowlist layer in
-///    `services::knowledge::KnowledgeService` enforces this.
-/// 2. `target` must already be canonicalized AND verified to start
-///    with `trusted_root`. This function checks (2) again as
-///    defense-in-depth but does not re-canonicalize.
-pub fn safe_open_under_root(
-    trusted_root: &Path,
+/// 1. `trusted_root_handle` must have been opened with `O_DIRECTORY |
+///    O_NOFOLLOW | O_CLOEXEC` at registration time (see
+///    `services::knowledge::open_dir_no_follow`). The
+///    `O_NOFOLLOW` flag makes the registration-time canonical
+///    path the trust anchor; even if that path is later replaced
+///    by a symlink, the held fd still references the original inode.
+/// 2. `target` should already be canonicalized; this function
+///    re-validates that target lies under the held root by
+///    consulting `/proc/self/fd/<n>` to find the current canonical
+///    path of the held inode.
+pub fn safe_open_under_root_handle(
+    trusted_root_handle: &std::fs::File,
     target: &Path,
 ) -> std::io::Result<std::fs::File> {
-    // Defense-in-depth: refuse the open if the target doesn't lie
-    // under the supplied root. The caller is supposed to have
-    // verified this already; we re-verify so a buggy caller can't
-    // bypass the check.
-    if !target.starts_with(trusted_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "target path is not under the supplied trusted root",
-        ));
-    }
-
     #[cfg(target_os = "linux")]
     {
-        linux_openat2_under_root(trusted_root, target)
+        linux_openat2_under_held_root(trusted_root_handle, target)
     }
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     {
-        windows_open_under_root(trusted_root, target)
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let _ = (trusted_root, target);
+        // FIX 16: explicit feature-gate. See module docs and the
+        // commit message for the full rationale. The Windows
+        // component-walk in round-3 had unfixable TOCTOU races; the
+        // only correct Windows path is undocumented NT-level APIs
+        // we don't want to depend on at this build stage. Other
+        // Unix variants are similarly deferred.
+        let _ = (trusted_root_handle, target);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "safe_open_under_root requires Linux openat2 or Windows reparse-point detection; \
-             this build target is not supported for knowledge ingestion",
+            "knowledge file ingestion is supported on Linux only in this build. \
+             Linux uses openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) anchored to a \
+             held directory handle for kernel-level race-free safe-open. Windows \
+             lacks a documented kernel-level equivalent (NtCreateFile + \
+             OBJ_DONT_REPARSE is undocumented and version-unstable); macOS support \
+             via repeated openat walks is deferred. Use the ingest_text D-Bus \
+             method to ingest content without filesystem access.",
         ))
     }
 }
 
 /// Linux-specific implementation: `openat2(2)` with
-/// `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`.
+/// `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, anchored to a held
+/// directory file descriptor.
 ///
-/// The relative path passed to `openat2` is `target.strip_prefix(trusted_root)`,
-/// so the kernel walks ONLY the components inside the trusted root.
-/// `RESOLVE_NO_SYMLINKS` makes the kernel reject every symlink during
-/// that walk; `RESOLVE_BENEATH` rejects any `..` traversal that would
+/// The kernel walks `target` relative to the held `dirfd` and
+/// returns `-ELOOP` if any component is a symlink, or `-EXDEV`
+/// (ENOTDIR/EXDEV depending on cause) if the resolution would
 /// escape the directory FD even if no symlinks are involved.
 ///
+/// **The /proc/self/fd readlink trick:** to compute the path
+/// relative to the held root, we need to know the root's *current*
+/// canonical path (which may differ from what was originally passed
+/// at registration time, if a directory rename has happened). We
+/// readlink `/proc/self/fd/<n>` where `n` is the held fd's number;
+/// the kernel returns the inode's current canonical path, which we
+/// then `strip_prefix` from `target` to get the relative path for
+/// `openat2`.
+///
 /// `SYS_openat2` is syscall 437 on every Linux ABI — confirmed via
-/// libc 0.2.186 source for x86_64 (`SYS_openat2: c_long = 437`). The
-/// kernel-side syscall has been stable since 5.6.
+/// libc 0.2.186 source for x86_64. Stable since kernel 5.6.
 ///
 /// Memory safety (per CLAUDE.md §3):
 /// - the `OpenHow` struct is owned on the stack, lives until after
@@ -2144,28 +2167,47 @@ pub fn safe_open_under_root(
 ///   would close it on drop), then converted to `File` (transferring
 ///   ownership), so there is no double-close or leak path.
 #[cfg(target_os = "linux")]
-fn linux_openat2_under_root(
-    trusted_root: &Path,
+fn linux_openat2_under_held_root(
+    trusted_root_handle: &std::fs::File,
     target: &Path,
 ) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
 
-    // Open the trusted root as a directory file descriptor. This is the
-    // anchor for openat2 — every component traversal happens RELATIVE
-    // to this fd, never re-resolving the trusted_root path string.
-    let root_dir = std::fs::File::open(trusted_root)?;
-    let root_fd = root_dir.as_raw_fd();
+    // The held fd IS the trust anchor. We never re-open trusted_root
+    // by path; openat2's dirfd parameter takes the raw fd of an
+    // already-open directory, and the kernel resolves `target`
+    // relative to that fd. Even if the original path string for
+    // this fd has since been swapped for a symlink, the kernel's
+    // view of the fd is bound to the original inode.
+    let root_fd = trusted_root_handle.as_raw_fd();
 
-    // Compute the relative path from trusted_root to target. The
-    // starts_with check above guarantees this strip won't fail.
-    let relative = target.strip_prefix(trusted_root).map_err(|_| {
+    // Compute the current canonical path of the held inode via
+    // /proc/self/fd readlink. This is the kernel's view of "where
+    // does this fd point right now" — robust against directory
+    // renames that happened after the fd was opened.
+    let proc_path = format!("/proc/self/fd/{root_fd}");
+    let canonical_root = std::fs::read_link(&proc_path).map_err(|e| {
         std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "target path is not under the supplied trusted root",
+            e.kind(),
+            format!("could not resolve held root fd via /proc/self/fd: {e}"),
         )
     })?;
+
+    // Strip the canonical root from the target to get the relative
+    // path we'll pass to openat2. If the target doesn't lie under
+    // the held root's CURRENT canonical path, refuse — defense in
+    // depth against a buggy caller passing a target that lexically
+    // doesn't fit (the services-side check_path_allowed_with_root
+    // is supposed to enforce this, but we re-verify here).
+    let relative = target.strip_prefix(&canonical_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "target path is not under the held trusted root",
+        )
+    })?;
+
     // openat2 wants a NUL-terminated C string for the relative path.
     let relative_cstr = CString::new(relative.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
@@ -2175,10 +2217,9 @@ fn linux_openat2_under_root(
     })?;
 
     // The `open_how` struct passed to openat2(2). Mirrors
-    // <linux/openat2.h>'s definition exactly. We define it inline
-    // because libc 0.2.186 doesn't expose `open_how` as a struct or
-    // the RESOLVE_* flags as constants — the syscall number is
-    // exposed but the surrounding ABI is not.
+    // <linux/openat2.h>'s definition exactly. libc 0.2.186 exposes
+    // SYS_openat2 but not the surrounding ABI, so we define it
+    // inline.
     #[repr(C)]
     struct OpenHow {
         flags: u64,
@@ -2195,12 +2236,13 @@ fn linux_openat2_under_root(
         resolve: RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
     };
 
-    // SAFETY: we pass the kernel a raw root_fd that we own (root_dir
-    // is alive for the syscall), a NUL-terminated C string we own,
-    // and a pointer to a stack-allocated OpenHow with its size. The
-    // kernel reads from the path bytes and writes nothing through
-    // these pointers. The returned value is the new file descriptor
-    // on success or `-1` with errno set on failure.
+    // SAFETY: we pass the kernel a raw root_fd that we own (the
+    // caller's `trusted_root_handle` is alive for the syscall via
+    // borrow), a NUL-terminated C string we own, and a pointer to a
+    // stack-allocated OpenHow with its size. The kernel reads from
+    // the path bytes and writes nothing through these pointers. The
+    // returned value is the new file descriptor on success or `-1`
+    // with errno set on failure.
     let raw_fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -2218,97 +2260,10 @@ fn linux_openat2_under_root(
     // SAFETY: raw_fd is a positive i64 value that the kernel has
     // verified is a valid newly-opened file descriptor. We
     // immediately transfer ownership into OwnedFd (which would close
-    // it on drop if anything panicked), then into File via From<OwnedFd>.
-    // No other code holds a reference to raw_fd.
+    // it on drop if anything panicked), then into File via
+    // From<OwnedFd>. No other code holds a reference to raw_fd.
     let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw_fd as i32) };
     Ok(std::fs::File::from(owned))
-}
-
-/// Windows-specific implementation: walk each component, reject any
-/// reparse point, then open the leaf with `FILE_FLAG_OPEN_REPARSE_POINT`
-/// for one final no-follow safety net.
-///
-/// This is best-effort: between each `symlink_metadata` call and the
-/// final open, an attacker with write access inside the trusted root
-/// can race-replace a component. Windows lacks a true `openat2`
-/// equivalent (`NtOpenFile` with `OBJ_DONT_REPARSE` is the closest but
-/// requires the NT layer and a relative-path open via `OBJECT_ATTRIBUTES`
-/// — an enormous unsafe surface for a 12-line Rust function). The
-/// component walk is documented as a known partial mitigation; full
-/// closure on Windows is a follow-up task tracked in the round-3
-/// review notes.
-#[cfg(windows)]
-fn windows_open_under_root(
-    trusted_root: &Path,
-    target: &Path,
-) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::path::Component;
-
-    // `FILE_FLAG_OPEN_REPARSE_POINT`: tell CreateFileW NOT to traverse
-    // a reparse point on the final component. We need this so the
-    // attribute check below sees the reparse point itself, not the
-    // resolved target.
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
-    // `FILE_ATTRIBUTE_REPARSE_POINT`: set on every reparse-point class
-    // (symlink, junction, mount point, AppExecLink, OneDrive cloud
-    // file, etc.). This is the comprehensive check round-2's
-    // `is_symlink()` call missed (FIX 11).
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
-
-    // Walk each component between trusted_root and target. For each
-    // component (excluding the target itself, which we open with
-    // FILE_FLAG_OPEN_REPARSE_POINT below), check the attribute bit
-    // via symlink_metadata so we see the reparse point itself rather
-    // than its resolved target.
-    let relative = target.strip_prefix(trusted_root).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "target path is not under the supplied trusted root",
-        )
-    })?;
-    let mut current = trusted_root.to_path_buf();
-    let components: Vec<&std::ffi::OsStr> = relative
-        .components()
-        .map(|c| match c {
-            Component::Normal(s) => Ok(s),
-            other => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("relative path component {other:?} is not a normal component"),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // Walk all components — including the leaf. Each push extends
-    // `current` to a path the OS can stat, and `symlink_metadata`
-    // returns the attributes of THAT component without following
-    // through it.
-    for name in &components {
-        current.push(name);
-        let meta = std::fs::symlink_metadata(&current)?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "reparse point detected on path component — refusing to traverse",
-            ));
-        }
-    }
-
-    // Open the target with no-follow flag. This is the second line of
-    // defense against a race between the walk above and this open: if
-    // the leaf was swapped for a reparse point in the meantime, the
-    // attribute check on the resulting file metadata catches it.
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(target)?;
-    let meta = f.metadata()?;
-    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "leaf is a reparse point — refusing to open",
-        ));
-    }
-    Ok(f)
 }
 
 /// **Codex re-review FIX 9 (P2-medium):** infer the schema epoch from
@@ -3567,16 +3522,20 @@ mod tests {
     #[test]
     fn ingest_file_round_trip() {
         // FIX 10+11: ingest_file now requires `trusted_root` so the
-        // safe-open boundary can anchor its kernel-level traversal to
-        // a directory FD. The TempDir's canonical path serves as the
-        // trusted root for these tests (mirroring the production flow
-        // where the D-Bus service derives the root from its allowlist).
+        // safe-open boundary anchors to a held directory handle (FIX 15).
+        // Tests open the TempDir directly via OpenOptions with O_DIRECTORY |
+        // O_NOFOLLOW | O_CLOEXEC so the test handle mirrors the
+        // production flow (the services-side `open_dir_no_follow`
+        // produces this same handle shape at registration time).
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let path = trusted_root.join("note.md");
         std::fs::write(&path, "# Hello\n\nWorld.\n").unwrap();
         let s = store();
-        let result = s.ingest_file(&trusted_root, &path).unwrap();
+        let result = s
+            .ingest_file_with_root_handle(&trusted_root_handle, &path)
+            .unwrap();
         assert!(result.nodes_created >= 2);
         assert_eq!(result.format_detected, "markdown");
         assert_eq!(result.fidelity_used, Fidelity::Direct);
@@ -3586,10 +3545,13 @@ mod tests {
     fn ingest_file_pdf_records_unavailable_source() {
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let path = trusted_root.join("doc.pdf");
         std::fs::write(&path, b"%PDF-1.4\nfake").unwrap();
         let s = store();
-        let result = s.ingest_file(&trusted_root, &path).unwrap();
+        let result = s
+            .ingest_file_with_root_handle(&trusted_root_handle, &path)
+            .unwrap();
         assert_eq!(result.fidelity_used, Fidelity::Unavailable);
         assert_eq!(result.nodes_created, 0);
         // Source should still be recorded (provenance for "we tried").
@@ -3598,59 +3560,81 @@ mod tests {
         assert_eq!(src.fidelity, Fidelity::Unavailable);
     }
 
-    // ── FIX 10+11 (P1-high): safe-open under trusted root,
-    //    intermediate-component coverage, kernel-level guarantees ──
+    // ── FIX 15 (P1-high): handle-anchored safe-open boundary
+    //    (supersedes round-3 path-based tests, retains FIX 10+11 invariants) ──
 
+    /// Open a tempdir as a directory handle in the same shape that
+    /// services-side `open_dir_no_follow` produces. Used by FIX 15
+    /// orchestrator tests so they don't depend on the services crate.
+    #[cfg(target_os = "linux")]
+    fn open_test_root_handle(path: &Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .expect("open_test_root_handle: O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC must succeed")
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn open_test_root_handle(path: &Path) -> std::fs::File {
+        // Non-Linux test path: the surrounding tests are
+        // cfg-gated to Linux anyway, but a fallback open is needed
+        // so non-Linux test compilations succeed.
+        std::fs::File::open(path).expect("open_test_root_handle fallback")
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn safe_open_under_root_accepts_real_file() {
-        // Sanity: a regular file under the trusted root must open.
+    fn safe_open_under_root_handle_accepts_real_file() {
+        // Sanity: a regular file under the held trusted root must open.
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let path = trusted_root.join("real.md");
         std::fs::write(&path, "# Hello\n\nWorld.\n").unwrap();
         use std::io::Read;
-        let mut file =
-            safe_open_under_root(&trusted_root, &path).expect("real file must open");
+        let mut file = safe_open_under_root_handle(&trusted_root_handle, &path)
+            .expect("real file must open");
         let mut buf = String::new();
         file.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "# Hello\n\nWorld.\n");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn safe_open_under_root_rejects_target_outside_root() {
-        // Defense-in-depth: even when the caller mistakenly supplies a
-        // target outside the trusted root, safe_open_under_root must
-        // refuse before any kernel call.
+    fn safe_open_under_root_handle_rejects_target_outside_root() {
+        // Defense in depth: even when the caller mistakenly supplies
+        // a target outside the held root's current canonical path,
+        // safe_open_under_root_handle must refuse via the
+        // strip_prefix check (which uses /proc/self/fd readlink to
+        // resolve the held inode's CURRENT canonical path).
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let other = TempDir::new().unwrap();
         let outside = std::fs::canonicalize(other.path())
             .unwrap()
             .join("outside.md");
         std::fs::write(&outside, "outside").unwrap();
-        let err = safe_open_under_root(&trusted_root, &outside)
+        let err = safe_open_under_root_handle(&trusted_root_handle, &outside)
             .expect_err("target outside root must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn safe_open_under_root_rejects_leaf_symlink_via_openat2() {
-        // Final-component symlink: openat2 RESOLVE_NO_SYMLINKS must
-        // reject with ELOOP. This test exercises the same case
-        // round-2's O_NOFOLLOW caught, ensuring we don't regress on
-        // it while moving to the stricter primitive.
+    fn safe_open_under_root_handle_rejects_leaf_symlink_via_openat2() {
+        // FIX 10 retained: final-component symlink rejected with ELOOP
+        // by openat2 RESOLVE_NO_SYMLINKS.
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let real = trusted_root.join("real.md");
         std::fs::write(&real, "innocent content").unwrap();
         let link = trusted_root.join("link.md");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let err = safe_open_under_root(&trusted_root, &link)
+        let err = safe_open_under_root_handle(&trusted_root_handle, &link)
             .expect_err("leaf symlink must be rejected");
-        // openat2 with RESOLVE_NO_SYMLINKS surfaces as ELOOP. The
-        // numeric value is stable libc ABI; ErrorKind::FilesystemLoop
-        // is still unstable in this rustc.
         assert_eq!(
             err.raw_os_error(),
             Some(libc::ELOOP),
@@ -3660,25 +3644,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn safe_open_under_root_rejects_intermediate_symlink_via_openat2() {
-        // FIX 10 motivating case: an INTERMEDIATE directory component
-        // is a symlink. Round-2's O_NOFOLLOW silently traversed
-        // intermediate symlinks because O_NOFOLLOW only checks the
-        // final component. openat2 RESOLVE_NO_SYMLINKS rejects at
-        // ANY component — kernel-level guarantee.
-        //
-        // Setup:
-        //   trusted_root/
-        //     real_dir/
-        //       leaf.md           ← actual file
-        //     link_dir → real_dir ← intermediate symlink
-        //
-        // We attempt to open `trusted_root/link_dir/leaf.md`. Without
-        // FIX 10, this would succeed (round-2's O_NOFOLLOW was
-        // silent on the link_dir traversal). With FIX 10's openat2,
-        // the kernel rejects with ELOOP before reading any bytes.
+    fn safe_open_under_root_handle_rejects_intermediate_symlink_via_openat2() {
+        // FIX 10 retained: intermediate-component symlink rejected
+        // with ELOOP by openat2 RESOLVE_NO_SYMLINKS.
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let real_dir = trusted_root.join("real_dir");
         std::fs::create_dir(&real_dir).unwrap();
         let leaf = real_dir.join("leaf.md");
@@ -3687,46 +3658,25 @@ mod tests {
         std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
         let through_link = link_dir.join("leaf.md");
 
-        let err = safe_open_under_root(&trusted_root, &through_link)
+        let err = safe_open_under_root_handle(&trusted_root_handle, &through_link)
             .expect_err("intermediate-component symlink must be rejected");
         assert_eq!(
             err.raw_os_error(),
             Some(libc::ELOOP),
-            "expected ELOOP from RESOLVE_NO_SYMLINKS at intermediate component, got {err:?}"
+            "expected ELOOP from RESOLVE_NO_SYMLINKS at intermediate, got {err:?}"
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn safe_open_under_root_rejects_dotdot_escape_via_openat2() {
-        // RESOLVE_BENEATH guards the trusted root: even if no
-        // symlinks are involved, a relative path with `..` that
-        // resolves outside the root must be rejected. This matters
-        // for callers that pass uncanonicalized targets — the
-        // canonical-prefix check in safe_open_under_root would
-        // bounce those, but RESOLVE_BENEATH is the second line of
-        // defense if a future caller is sloppy.
+    fn safe_open_under_root_handle_rejects_dotdot_escape_via_openat2() {
+        // FIX 10 retained: RESOLVE_BENEATH guard against `..` escapes.
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
-        let outside = TempDir::new().unwrap();
-        let outside_canon = std::fs::canonicalize(outside.path()).unwrap();
-        std::fs::write(outside_canon.join("escape.md"), "escape").unwrap();
-
-        // Manufacture an "in trusted_root" path that .. escapes.
-        // NOTE: starts_with check rejects this earlier — but we want
-        // to exercise the openat2 path for thoroughness, so we use a
-        // path that lexically starts with trusted_root and escapes
-        // through .. only inside the relative portion.
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let target_inside = trusted_root.join("a").join("..").join("..");
-        // The lexical starts_with check WILL pass because `target`
-        // begins with trusted_root literally; openat2 RESOLVE_BENEATH
-        // is what rejects at syscall time.
-        let err = safe_open_under_root(&trusted_root, &target_inside)
+        let err = safe_open_under_root_handle(&trusted_root_handle, &target_inside)
             .expect_err("dotdot escape must be rejected by RESOLVE_BENEATH");
-        // RESOLVE_BENEATH typically surfaces as EXDEV on the
-        // openat2 syscall, but kernels also accept EAGAIN/ELOOP in
-        // related cases. We accept any error — the negative result
-        // is the security guarantee we care about.
         assert!(
             err.raw_os_error().is_some(),
             "expected an os error from RESOLVE_BENEATH/openat2, got {err:?}"
@@ -3735,13 +3685,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn ingest_file_returns_safe_open_error_for_symlink() {
-        // End-to-end via KnowledgeStore::ingest_file. Same setup as
-        // round-2's regression test, now adapted to the new
-        // (trusted_root, path) signature. Confirms no source row is
-        // created when the kernel rejects the open.
+    fn ingest_file_with_root_handle_returns_safe_open_error_for_symlink() {
+        // End-to-end via KnowledgeStore::ingest_file_with_root_handle.
+        // Confirms no source row is created when the kernel rejects.
         let tmp = TempDir::new().unwrap();
         let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
         let real = trusted_root.join("real.md");
         std::fs::write(&real, "# T\n\nP.\n").unwrap();
         let link = trusted_root.join("link.md");
@@ -3750,7 +3699,7 @@ mod tests {
         let s = store();
         let before = s.count_sources().unwrap();
         let err = s
-            .ingest_file(&trusted_root, &link)
+            .ingest_file_with_root_handle(&trusted_root_handle, &link)
             .expect_err("symlink ingest must fail");
         assert!(
             err.to_string().contains("could not safely open"),
@@ -3763,11 +3712,121 @@ mod tests {
         );
     }
 
+    // ── FIX 15 (P1-high) NEW tests: handle anchoring properties ──
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn safe_open_under_root_handle_resolves_path_after_root_rename() {
+        // The /proc/self/fd readlink trick. Open a directory handle,
+        // then rename the directory at the path level. The held
+        // handle still references the original inode; the kernel
+        // updates `/proc/self/fd/<n>` to reflect the current path.
+        // safe_open_under_root_handle must still find files under
+        // the renamed path because it reads the current canonical
+        // path via /proc/self/fd, not via the original path string.
+        //
+        // This test directly proves the F15 architectural property:
+        // the trust anchor is the inode behind the fd, not a path
+        // string — survives renames.
+        let tmp = TempDir::new().unwrap();
+        let original_dir = std::fs::canonicalize(tmp.path()).unwrap().join("orig");
+        std::fs::create_dir(&original_dir).unwrap();
+        std::fs::write(original_dir.join("file.md"), "# content\n").unwrap();
+        let trusted_root_handle = open_test_root_handle(&original_dir);
+
+        // Rename the directory at the filesystem level. The held
+        // handle still references the original inode.
+        let renamed_dir = std::fs::canonicalize(tmp.path()).unwrap().join("renamed");
+        std::fs::rename(&original_dir, &renamed_dir).unwrap();
+
+        // safe_open_under_root_handle must still resolve files under
+        // the held inode's CURRENT canonical path (via
+        // /proc/self/fd readlink). The target uses the new name.
+        let target = renamed_dir.join("file.md");
+        let mut file = safe_open_under_root_handle(&trusted_root_handle, &target)
+            .expect("file under renamed root must open via held handle");
+        use std::io::Read;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "# content\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn safe_open_under_root_handle_immune_to_path_swap_attack() {
+        // F15 motivating attack scenario. Simulate an attacker who
+        // swaps the registered path for a symlink AFTER the handle
+        // is opened. The held handle still references the original
+        // inode, so safe_open_under_root_handle must still resolve
+        // under that inode and not under the symlink target.
+        //
+        // Setup:
+        //   tmp/parent/allowed_root/safe.md   ← legitimate file
+        //   tmp/attacker/forbidden.md         ← what attacker wants us to read
+        //
+        // After registration, attacker:
+        //   - removes tmp/parent/allowed_root
+        //   - replaces it with a symlink → tmp/attacker
+        //
+        // Under round-3's path-based safe_open_under_root, the
+        // re-resolution at ingest time would have followed the
+        // symlink and ingested forbidden.md. Under FIX 15's held
+        // handle, the kernel-side dirfd is still bound to the
+        // original allowed_root inode, so the swap is inert — but
+        // the file is gone from the inode's view, so the open
+        // returns ENOENT (the file truly no longer exists at the
+        // anchored inode), NOT a successful open of forbidden.md.
+        let tmp = TempDir::new().unwrap();
+        let tmp_canon = std::fs::canonicalize(tmp.path()).unwrap();
+        let parent = tmp_canon.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let allowed_root = parent.join("allowed_root");
+        std::fs::create_dir(&allowed_root).unwrap();
+        std::fs::write(allowed_root.join("safe.md"), "# safe content\n").unwrap();
+
+        // Open the handle BEFORE the swap.
+        let trusted_root_handle = open_test_root_handle(&allowed_root);
+
+        // Attacker: remove allowed_root, replace with a symlink to
+        // a directory containing a file with the same leaf name but
+        // forbidden content.
+        let attacker_dir = tmp_canon.join("attacker");
+        std::fs::create_dir(&attacker_dir).unwrap();
+        std::fs::write(attacker_dir.join("safe.md"), "# FORBIDDEN content\n").unwrap();
+        std::fs::remove_dir_all(&allowed_root).unwrap();
+        std::os::unix::fs::symlink(&attacker_dir, &allowed_root).unwrap();
+
+        // Attempt to ingest "allowed_root/safe.md". With round-3's
+        // path-based safe_open, the open would have followed the
+        // symlink and read FORBIDDEN content. With FIX 15's held
+        // handle, the held inode IS the original (now-deleted)
+        // allowed_root directory, so the file lookup fails — the
+        // attacker's file is unreachable from the held fd.
+        //
+        // The expected error is ENOENT (the legitimate file is gone
+        // from the held inode's view). What MUST NOT happen is a
+        // successful open of attacker_dir/safe.md.
+        let target = allowed_root.join("safe.md");
+        let result = safe_open_under_root_handle(&trusted_root_handle, &target);
+        assert!(
+            result.is_err(),
+            "must not return Ok — that would mean we read attacker's file"
+        );
+        let err = result.unwrap_err();
+        // Confirm we did NOT silently read the attacker's content.
+        // An Ok result here would be the F15 vulnerability.
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::Other,
+            "unexpected error kind suggesting we may have followed the symlink: {err:?}"
+        );
+    }
+
     #[test]
     fn ingest_bytes_path_still_works() {
         // Direct call to ingest_bytes with markdown content must produce
-        // the same shape as the pre-FIX-8 ingest_file (full pipeline:
-        // create source row + parse concepts + persist nodes).
+        // the same shape as the path-based ingest_file used to (full
+        // pipeline: create source row + parse concepts + persist nodes).
         let s = store();
         let bytes = b"# Title\n\nA paragraph of text.\n";
         let result = s

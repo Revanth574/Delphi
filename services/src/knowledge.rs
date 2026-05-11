@@ -766,8 +766,29 @@ mod tests {
         KnowledgeService::new(Arc::new(Mutex::new(store)))
     }
 
-    /// Build a service whose only ingestion root is `root`. Used by the
-    /// allowlist tests to fully isolate the per-test filesystem region.
+    /// Build a service whose only ingestion root is `root`. Used by
+    /// the allowlist tests to fully isolate the per-test filesystem
+    /// region.
+    ///
+    /// **Codex re-review FIX 16 + FIX 18 platform behavior:** on
+    /// **Linux**, the path is canonicalized and opened with
+    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`; the resulting
+    /// service has a populated allowlist of one root and
+    /// `ingest_file` calls under it succeed. On **non-Linux**
+    /// platforms, `open_dir_no_follow` returns
+    /// `ErrorKind::Unsupported` so `with_allowlist` silently drops
+    /// the entry; the resulting service has an EMPTY allowlist and
+    /// every `ingest_file` call returns the uniform
+    /// `AccessDenied("path not permitted")` from the
+    /// closed-by-default short-circuit.
+    ///
+    /// Tests that rely on success behavior under this helper must
+    /// be gated with `#[cfg(target_os = "linux")]`. Tests that
+    /// exercise non-Linux behavior must assert the uniform
+    /// `AccessDenied` shape; they MUST NOT call `.unwrap()` on the
+    /// `ingest_file` result, as that would panic for the wrong
+    /// reason (empty allowlist instead of the platform limitation
+    /// the test should be probing).
     fn mk_svc_with_root(root: PathBuf) -> KnowledgeService {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
         KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![root])
@@ -794,7 +815,19 @@ mod tests {
     }
 
     // ── FIX 1: ingest_file allowlist enforcement ─────────────────────
+    //
+    // **FIX 18 gating note:** every test below that calls
+    // `mk_svc_with_root` and asserts allowlist-dependent behavior is
+    // gated `#[cfg(target_os = "linux")]`. On non-Linux platforms
+    // `open_dir_no_follow` returns Unsupported, `with_allowlist`
+    // drops the entry, and the resulting empty allowlist would cause
+    // these tests to pass for the WRONG reason (short-circuit at
+    // AllowlistEmpty instead of the rejection path the test names).
+    // The non-Linux platform contract is covered by
+    // `ingest_file_returns_unified_access_denied_on_non_linux` and
+    // `add_ingestion_root_returns_false_on_non_linux` further below.
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_accepts_path_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -827,6 +860,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_rejects_path_outside_allowlist() {
         let allowed = tempfile::TempDir::new().unwrap();
@@ -851,6 +885,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_rejects_nonexistent_path() {
         let allowed = tempfile::TempDir::new().unwrap();
@@ -863,6 +898,7 @@ mod tests {
         assert_uniform_rejection(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_rejects_traversal_escape() {
         // /allowed/../other/secret.md canonicalizes to /other/secret.md,
@@ -902,6 +938,7 @@ mod tests {
         assert_uniform_rejection(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn add_ingestion_root_canonicalizes_and_dedupes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1008,6 +1045,7 @@ mod tests {
 
     // -- Integration tests: denylist defeats allowlist --
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_rejects_sensitive_path_inside_allowlist() {
         // Even when the user explicitly registers tmp/ as an ingestion
@@ -1026,6 +1064,7 @@ mod tests {
         assert_uniform_rejection(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_rejects_pem_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1039,6 +1078,7 @@ mod tests {
         assert_uniform_rejection(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_rejects_env_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1054,11 +1094,19 @@ mod tests {
 
     // ── FIX 7 (P1-high): uniform public rejection + no FS probe oracle ──
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn rejection_message_is_uniform_across_all_failure_modes() {
         // Drive ingest_file through all FOUR rejection paths and assert
         // every one returns the IDENTICAL public message. Round-1 returned
         // four distinct messages under one variant — Codex F7 oracle.
+        //
+        // **FIX 18 gating:** the semantic intent of this test
+        // (four DIFFERENT rejection paths producing the same wire
+        // message) requires Linux's populated allowlist via
+        // `mk_svc_with_root`. On non-Linux, the empty allowlist
+        // short-circuits all four to the same path, so the test
+        // would pass for the wrong reason.
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
 
@@ -1241,7 +1289,15 @@ mod tests {
     // interleaving; the orchestrator's direct symlink-rejection tests
     // are the right place for that.
 
-    #[cfg(unix)]
+    // **FIX 18 gating:** narrowed from `cfg(unix)` to
+    // `cfg(target_os = "linux")` because the test asserts INGEST
+    // SUCCESS, which depends on the populated allowlist that
+    // `open_dir_no_follow` (FIX 16) produces only on Linux. On
+    // non-Linux Unix (macOS, BSD), `mk_svc_with_root` produces an
+    // empty allowlist and the ingest would short-circuit at
+    // AllowlistEmpty instead of exercising the canonicalize→
+    // safe-open cooperation this test names.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ingest_file_via_symlink_canonicalizes_to_real_target() {
         // Documents the FIX 1 + FIX 10+11 cooperation: passing a symlink
@@ -1670,6 +1726,53 @@ mod tests {
         // produced and serialized.
         assert!(json.contains("source_id"));
         assert!(json.contains("nodes_created"));
+    }
+
+    // ── FIX 18 (P2-medium) META-TESTS: mk_svc_with_root contract ──
+    //
+    // These two tests prove that the test-helper contract documented
+    // in mk_svc_with_root's rustdoc matches reality on each platform.
+    // If a future refactor accidentally inverts the contract (e.g.,
+    // allowlist gets populated on non-Linux, or empty on Linux), one
+    // of these meta-tests fires immediately — before the platform-
+    // specific test gating starts producing confusing CI failures.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mk_svc_with_root_produces_populated_allowlist_on_linux() {
+        // On Linux, open_dir_no_follow succeeds for any real
+        // directory, so with_allowlist registers the entry.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let snapshot = svc.allowlist_snapshot();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "Linux mk_svc_with_root must register the supplied root"
+        );
+        // The stored canonical path matches what canonicalize
+        // returns for the tempdir.
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(snapshot[0], canon);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn mk_svc_with_root_produces_empty_allowlist_on_non_linux() {
+        // On non-Linux, open_dir_no_follow returns Unsupported, so
+        // with_allowlist silently drops the entry. The resulting
+        // service has an empty allowlist. This is the EXACT
+        // behavior that would cause an unsuspecting test to pass
+        // for the wrong reason (short-circuit at AllowlistEmpty),
+        // which is why every Linux-only test must be cfg-gated.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let snapshot = svc.allowlist_snapshot();
+        assert!(
+            snapshot.is_empty(),
+            "non-Linux mk_svc_with_root must produce an empty allowlist; \
+             got: {snapshot:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -1112,15 +1112,30 @@ impl KnowledgeStore {
                 migrate_epoch_1_to_2(conn)?;
             }
             v if v == CURRENT_SCHEMA_VERSION => {
-                // Already current. If the version row was missing
-                // (schema is correct but unrecorded), backfill it so
-                // the next open reads from the recorded path.
+                // Already current by structure. If the version row is
+                // missing (schema is correct but unrecorded), the
+                // database may have come from a previous incomplete
+                // migration that committed the schema rebuild but
+                // never wrote the version row — see Codex re-review
+                // FIX 17.
+                //
+                // **FIX 17 (P1-high):** before backfilling the version
+                // row we MUST verify referential integrity. `PRAGMA
+                // foreign_keys = ON` set above does NOT validate
+                // existing orphan rows — it only enforces FK
+                // constraints on NEW inserts/updates. A database left
+                // structurally epoch-2 with orphaned `node_sources` /
+                // `edges` rows (the round-3 broken-migration scenario)
+                // would otherwise be permanently marked "valid
+                // epoch-2" on the next open, silently accepting the
+                // corruption. The backfill helper runs
+                // `PRAGMA foreign_key_check` and the version row
+                // insert inside a single transaction so the database
+                // is either "version=2 with verified clean integrity"
+                // or "no version row at all" — never the corrupt-
+                // but-marked-clean middle state.
                 if recorded.is_none() {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
-                        params![CURRENT_SCHEMA_VERSION],
-                    )
-                    .map_err(map_sqlite_err)?;
+                    backfill_version_with_integrity_check(conn)?;
                 }
             }
             v => {
@@ -2400,6 +2415,112 @@ fn infer_schema_version(conn: &Connection) -> Result<i64, OrchestratorError> {
 /// to `init_schema`, which already owns the connection at that point
 /// (it's called from `KnowledgeStore::open` immediately after
 /// `Connection::open`). No public API change.
+/// **Codex re-review FIX 17 (P1-high):** atomically backfill the
+/// `schema_version` row for a database whose schema is already
+/// structurally at [`CURRENT_SCHEMA_VERSION`] but has no recorded
+/// version row.
+///
+/// # Why this exists
+///
+/// A database can reach this state in two ways:
+/// 1. **Round-3 broken migration.** Round-3 ran
+///    `PRAGMA foreign_key_check` and wrote the version row AFTER
+///    `tx.commit()`. If the post-commit FK check found violations,
+///    the function returned `Err` — but the schema rebuild had
+///    already committed. The database was left structurally epoch-2
+///    with no version row.
+/// 2. **Operator schema repair.** An operator may have rebuilt
+///    `sources` via direct SQL while restoring from backup and
+///    forgotten to insert the version row. Same shape.
+///
+/// Round-4's `init_schema` "current epoch" arm noticed this missing
+/// version row and inserted version=2 unconditionally. But `PRAGMA
+/// foreign_keys = ON` (FIX 12) does NOT validate existing orphan
+/// rows — it only enforces FK constraints on subsequent
+/// inserts/updates. So a database with orphan `node_sources` /
+/// `edges` from the round-3 path was permanently marked "valid
+/// epoch-2" on the very next open, accepting the corruption.
+///
+/// **F17 fix:** run `PRAGMA foreign_key_check` AND the version-row
+/// INSERT inside a single transaction. Rusqlite's
+/// `DropBehavior::Rollback` guarantees that any failure (including
+/// the FK check returning violations) reverts the entire operation
+/// atomically. The database is then either:
+/// - fully epoch-2 with verified clean integrity AND a recorded
+///   version row, or
+/// - exactly the input state — no version row, no other side
+///   effects.
+///
+/// Operator can then either repair the orphan rows via direct SQL
+/// or restore from backup before reopening.
+fn backfill_version_with_integrity_check(
+    conn: &mut Connection,
+) -> Result<(), OrchestratorError> {
+    // Single atomic boundary: FK check + version-row insert. Same
+    // pattern as FIX 14's migration transaction. If `?`-early-exit
+    // fires on either step, Transaction's Drop rolls back —
+    // verified in round-4 pre-flight (rusqlite default
+    // DropBehavior::Rollback).
+    let tx = conn.transaction().map_err(map_sqlite_err)?;
+
+    // PRAGMA foreign_key_check is a SELECT-shaped diagnostic (not
+    // a state-mutating pragma like `foreign_keys = ON/OFF`), so it
+    // IS valid inside transactions. Returns one row per orphan:
+    // (child_table, child_rowid, parent_table, fk_index).
+    let violations: Vec<(String, i64, String, i64)> = {
+        let mut stmt = tx
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(map_sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_err)?
+    };
+
+    if !violations.is_empty() {
+        // Drop on `tx` triggers automatic ROLLBACK — no version row
+        // is written; the database stays unversioned-but-
+        // structurally-current. Listing the first few violations
+        // in the error message helps the operator diagnose; this
+        // is a local error (not crossed-D-Bus per FIX 7) so
+        // referencing row identities is safe.
+        let preview: Vec<_> = violations.iter().take(3).collect();
+        return Err(OrchestratorError::Planning(format!(
+            "schema appears current (epoch {}) but has {} foreign-key violation(s) \
+             from a prior incomplete migration (first {} shown): {:?}; \
+             refusing to backfill schema_version. Repair orphan rows via direct SQL \
+             before reopening, or restore from backup.",
+            CURRENT_SCHEMA_VERSION,
+            violations.len(),
+            preview.len(),
+            preview
+        )));
+    }
+
+    // FK check clean — record the version row inside the same
+    // transaction. If a row already exists (e.g., from a concurrent
+    // init by another connection), the PRIMARY KEY conflict fails
+    // here and the rollback covers both steps. We use plain INSERT
+    // (not OR IGNORE): this branch only runs when recorded.is_none(),
+    // so any existing row is a logic bug we want to surface.
+    tx.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        params![CURRENT_SCHEMA_VERSION],
+    )
+    .map_err(map_sqlite_err)?;
+
+    tx.commit().map_err(map_sqlite_err)?;
+    Ok(())
+}
+
 fn migrate_epoch_1_to_2(conn: &mut Connection) -> Result<(), OrchestratorError> {
     // **Codex re-review FIX 14 (P1-high) — atomicity of integrity check.**
     //
@@ -4275,6 +4396,64 @@ CREATE TABLE IF NOT EXISTS embeddings (
         conn
     }
 
+    /// Build a database in the exact "round-3 broken migration"
+    /// shape that FIX 17 protects against: epoch-2 schema
+    /// (3-column UNIQUE), `schema_version` table present but
+    /// EMPTY (no version row), and an orphan `node_sources` row
+    /// referencing a non-existent source.
+    ///
+    /// This fixture reproduces what round-3's migration would have
+    /// left on disk after committing the schema rebuild but
+    /// raising an error on the post-commit FK check. Round-4's
+    /// migration path (FIX 14) closed that gap for the epoch-1 →
+    /// epoch-2 transition, but the round-4 backfill arm in
+    /// init_schema would still silently bless this database as
+    /// version=2 — that's the F17 vulnerability.
+    fn make_unversioned_corrupt_epoch_2_db(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        // FK OFF so we can construct the orphan row.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        // Apply epoch-2 schema in full but DO NOT insert the
+        // schema_version row. Note: SCHEMA_VERSION_TABLE_DDL is
+        // also applied so the table exists but is empty — exactly
+        // the "structure says current, recorded says nothing"
+        // state F17 names.
+        conn.execute_batch(SCHEMA_VERSION_TABLE_DDL).unwrap();
+        conn.execute_batch(SCHEMA_DDL).unwrap();
+        // (Deliberately NO INSERT INTO schema_version.)
+
+        // Seed one valid source + node + linkage.
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "local_file", "/real.md", 100_i64, "direct", "hash-real", "markdown"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, content, node_type, created_at_unix, last_accessed_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1_i64, "content", "fact", 100_i64, 100_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 1_i64],
+        )
+        .unwrap();
+
+        // ORPHAN ROW: node 1 cites a source 99999 that doesn't
+        // exist. FK OFF lets this insert succeed. With FK enforced
+        // and PRAGMA foreign_key_check, this is the violation the
+        // backfill helper must surface.
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 99999_i64],
+        )
+        .unwrap();
+
+        conn
+    }
+
     /// Read the recorded schema version directly from the table.
     /// Returns `None` if the table doesn't exist OR exists but is empty.
     /// This tolerates the pre-migration test condition where the
@@ -5070,6 +5249,176 @@ CREATE TABLE IF NOT EXISTS embeddings (
         assert_eq!(
             sources_count, 1,
             "original sources table must survive rollback"
+        );
+    }
+
+    // ── FIX 17 (P1-high): atomic backfill with FK check ──
+    //
+    // Round-4's FIX 14 made the migration path atomic. F17 surfaced
+    // the sibling vulnerability in the backfill path: a database
+    // whose schema is structurally current but has no version row
+    // (the round-3 broken-migration shape) was being silently
+    // marked valid epoch-2 on the next open, accepting any orphan
+    // rows that survived. F17 routes the backfill through
+    // backfill_version_with_integrity_check, which runs PRAGMA
+    // foreign_key_check + the version-row INSERT inside ONE
+    // transaction so the database is either "version=2 with
+    // verified integrity" or "no version row at all".
+
+    #[test]
+    fn unversioned_current_schema_with_orphans_refuses_backfill() {
+        // F17 motivating regression. The fixture is the exact
+        // round-3 broken-migration shape: epoch-2 structure, no
+        // version row, orphan node_sources. The backfill helper
+        // must detect via PRAGMA foreign_key_check and refuse.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(make_unversioned_corrupt_epoch_2_db(&path));
+
+        let mut conn = Connection::open(&path).unwrap();
+        let err = KnowledgeStore::init_schema(&mut conn)
+            .expect_err("init_schema must refuse to bless a corrupt-but-current db");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foreign-key violation") && msg.contains("refusing to backfill"),
+            "expected the FK-violation diagnostic; got: {msg}"
+        );
+
+        // CRITICAL: the schema_version table is still empty.
+        // Round-3 would have left the version row in place after
+        // the FK check failed (because the bare INSERT happened
+        // first). FIX 17's atomic transaction must roll back the
+        // version-row insert AS WELL.
+        assert_eq!(
+            read_recorded_version(&conn),
+            None,
+            "no version row may be written when backfill aborts"
+        );
+    }
+
+    #[test]
+    fn unversioned_current_schema_orphan_repaired_then_succeeds() {
+        // Operator-recovery path. After the first init_schema
+        // fails, the operator removes the orphan row, then a
+        // second init_schema succeeds and records the version row.
+        // This proves the F17 boundary is "reject corruption,
+        // allow recovery" — not "permanently brick the database".
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(make_unversioned_corrupt_epoch_2_db(&path));
+
+        // First attempt: fails.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let _ = KnowledgeStore::init_schema(&mut conn)
+                .expect_err("orphan present, must fail");
+
+            // Operator repairs via direct SQL. FIX 12 turned FK
+            // back ON after the failed init_schema, so we have to
+            // disable it again to delete the orphan without
+            // triggering enforcement on the (impossible) FK.
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute(
+                "DELETE FROM node_sources WHERE source_id = 99999",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Second attempt: now clean, must succeed and record v=2.
+        let mut conn = Connection::open(&path).unwrap();
+        KnowledgeStore::init_schema(&mut conn)
+            .expect("init_schema must succeed after orphan repair");
+        assert_eq!(
+            read_recorded_version(&conn),
+            Some(CURRENT_SCHEMA_VERSION),
+            "version row must be recorded after successful backfill"
+        );
+    }
+
+    #[test]
+    fn unversioned_current_schema_clean_succeeds_backfill() {
+        // Happy path for the same code branch: a database in the
+        // structurally-current-but-no-version-row state with NO
+        // orphan rows. backfill_version_with_integrity_check must
+        // run the FK check (which returns clean), then insert
+        // version=2. Subsequent operations work normally and a
+        // second init_schema is a no-op (version is already 2).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Build a clean unversioned-but-current fixture: apply the
+        // full schema, insert one valid source + node + mapping,
+        // but no version row and no orphans.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute_batch(SCHEMA_VERSION_TABLE_DDL).unwrap();
+            conn.execute_batch(SCHEMA_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![1_i64, "local_file", "/clean.md", 100_i64, "direct", "hash", "markdown"],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (id, content, node_type, created_at_unix, last_accessed_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![1_i64, "content", "fact", 100_i64, 100_i64],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+                params![1_i64, 1_i64],
+            ).unwrap();
+        }
+
+        // First init_schema: clean FK check, backfill happens.
+        let mut conn = Connection::open(&path).unwrap();
+        KnowledgeStore::init_schema(&mut conn)
+            .expect("init_schema must succeed on clean unversioned db");
+        assert_eq!(read_recorded_version(&conn), Some(CURRENT_SCHEMA_VERSION));
+
+        // Second init_schema: recorded.is_none() is now false, so
+        // the backfill branch isn't taken. No double-insert, no
+        // duplicate-PK error.
+        KnowledgeStore::init_schema(&mut conn)
+            .expect("second init_schema must be a no-op");
+        let version_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version_count, 1, "no duplicate version row on second open");
+    }
+
+    #[test]
+    fn aborted_backfill_does_not_silently_succeed_on_retry() {
+        // Atomicity property: a SECOND init_schema on the same
+        // corrupt-unversioned db must produce the SAME error — no
+        // silent acceptance on retry. This is the round-3 → round-5
+        // regression test: if the rollback weren't truly atomic
+        // (e.g., the version-row insert leaked outside the
+        // transaction), the second attempt would see a recorded
+        // version=2 and skip the backfill branch entirely, silently
+        // accepting the corrupt graph.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(make_unversioned_corrupt_epoch_2_db(&path));
+
+        // First attempt: fails as expected.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let _ = KnowledgeStore::init_schema(&mut conn).expect_err("first attempt fails");
+        }
+        // Second attempt: MUST also fail — the version row must
+        // still be missing.
+        let mut conn = Connection::open(&path).unwrap();
+        let err = KnowledgeStore::init_schema(&mut conn)
+            .expect_err("second attempt must also fail; no silent backfill");
+        assert!(
+            err.to_string().contains("foreign-key violation"),
+            "second attempt must surface the same corruption"
+        );
+        assert_eq!(
+            read_recorded_version(&conn),
+            None,
+            "no version row may have been written across the two failed attempts"
         );
     }
 }

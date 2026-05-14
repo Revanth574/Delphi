@@ -996,6 +996,20 @@ impl KnowledgeStore {
         embedder: Box<dyn Embedder>,
     ) -> Result<Self, OrchestratorError> {
         let mut conn = Connection::open(db_path).map_err(map_sqlite_err)?;
+        // **Codex re-review FIX 19 (P2-medium):** set a 5-second busy
+        // timeout BEFORE `init_schema` runs. `init_schema` may route
+        // into `backfill_version_with_integrity_check`, which opens a
+        // `BEGIN IMMEDIATE` transaction; two processes opening the
+        // same file concurrently serialize there, and the loser
+        // receives SQLITE_BUSY at BEGIN. The busy timeout makes that
+        // loser retry (sleep-and-wait) until the winner commits,
+        // instead of failing a legitimate opener against a valid
+        // database. No prior `busy_timeout` pattern existed anywhere
+        // in the workspace — this call site establishes it; 5s
+        // matches the conventional SQLite default-tier choice and is
+        // far longer than any backfill transaction.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(map_sqlite_err)?;
         Self::init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -1005,6 +1019,14 @@ impl KnowledgeStore {
 
     pub fn in_memory(embedder: Box<dyn Embedder>) -> Result<Self, OrchestratorError> {
         let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
+        // FIX 19: kept symmetric with `open` so both connection-init
+        // paths apply the same standard setup. An in-memory database
+        // is private to its single connection and can never see
+        // cross-connection lock contention, so the timeout never
+        // actually fires here — but a uniform init path is easier to
+        // reason about than a conditional one.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(map_sqlite_err)?;
         Self::init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -1134,6 +1156,21 @@ impl KnowledgeStore {
                 // is either "version=2 with verified clean integrity"
                 // or "no version row at all" — never the corrupt-
                 // but-marked-clean middle state.
+                // **Codex re-review FIX 19 (P2-medium):** this
+                // `recorded.is_none()` test is the OPTIMISTIC half of
+                // a double-checked-locking pair. It runs here WITHOUT
+                // a write lock — cheap, and on the overwhelmingly
+                // common path (already-versioned database) it
+                // correctly skips the backfill with zero locking
+                // cost. But it is NOT authoritative: between this
+                // read and the backfill helper's `BEGIN IMMEDIATE`, a
+                // concurrent opener of the same file may have
+                // completed the backfill. The AUTHORITATIVE half is
+                // inside `backfill_version_with_integrity_check`,
+                // which re-reads `schema_version` while holding the
+                // RESERVED write lock and no-ops if a peer already
+                // wrote the row. Never treat this outer check as
+                // proof that the row is absent.
                 if recorded.is_none() {
                     backfill_version_with_integrity_check(conn)?;
                 }
@@ -2453,15 +2490,96 @@ fn infer_schema_version(conn: &Connection) -> Result<i64, OrchestratorError> {
 ///
 /// Operator can then either repair the orphan rows via direct SQL
 /// or restore from backup before reopening.
+///
+/// **Codex re-review FIX 19 (P2-medium):** the transaction is opened
+/// `BEGIN IMMEDIATE` and the helper re-reads `schema_version` under
+/// that write lock before doing any work. This makes the helper safe
+/// under concurrent opens of the same database file — two openers
+/// serialize at BEGIN, and whichever loses the lock race re-reads the
+/// now-present version row and returns Ok rather than colliding on
+/// the INSERT. See the inline comments for the full rationale.
 fn backfill_version_with_integrity_check(
     conn: &mut Connection,
 ) -> Result<(), OrchestratorError> {
-    // Single atomic boundary: FK check + version-row insert. Same
-    // pattern as FIX 14's migration transaction. If `?`-early-exit
-    // fires on either step, Transaction's Drop rolls back —
-    // verified in round-4 pre-flight (rusqlite default
-    // DropBehavior::Rollback).
-    let tx = conn.transaction().map_err(map_sqlite_err)?;
+    // **Codex re-review FIX 19 (P2-medium) — concurrent-open race.**
+    //
+    // Round-5 opened this with the rusqlite DEFAULT (DEFERRED)
+    // transaction. A DEFERRED transaction takes its RESERVED write
+    // lock only on the first WRITE statement — not at BEGIN. Two
+    // openers of the same clean unversioned epoch-2 DB could
+    // therefore both pass the outer `recorded.is_none()` check in
+    // `init_schema`, both run `foreign_key_check` under independent
+    // SHARED locks (SHARED readers coexist), and then race on the
+    // version-row INSERT: one wins the RESERVED lock and commits,
+    // the other gets SQLITE_BUSY ("database is locked") or a UNIQUE
+    // violation — failing a legitimate opener against a database
+    // that was already structurally valid.
+    //
+    // FIX 19: open with `TransactionBehavior::Immediate` (BEGIN
+    // IMMEDIATE). This acquires the RESERVED write lock at BEGIN,
+    // BEFORE any read. Concurrent backfillers serialize at BEGIN —
+    // exactly one acquires RESERVED, the other receives SQLITE_BUSY
+    // at the BEGIN statement, which the connection's `busy_timeout`
+    // (set in `KnowledgeStore::open`) retries until the winner
+    // commits and releases the lock.
+    //
+    // Atomicity is unchanged from FIX 14 / FIX 17: any `?`-early-exit
+    // drops the Transaction, whose rusqlite default
+    // `DropBehavior::Rollback` reverts every step.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(map_sqlite_err)?;
+
+    // FIX 19 — double-checked locking, AUTHORITATIVE half. The outer
+    // `recorded.is_none()` check in `init_schema` ran WITHOUT a write
+    // lock, so a concurrent opener may have completed the backfill in
+    // the window between that check and our BEGIN IMMEDIATE. Re-read
+    // `schema_version` now that we hold RESERVED:
+    //   - `Some(CURRENT_SCHEMA_VERSION)`: a peer finished the backfill
+    //     first. We have written nothing; commit the (empty)
+    //     transaction to release the write lock promptly and return
+    //     Ok — the database is valid and versioned.
+    //   - `Some(other)`: unexpected schema drift under the write lock.
+    //     Roll back (Transaction Drop) and surface a mismatch error
+    //     rather than silently proceeding.
+    //   - `None`: still unversioned under the write lock — proceed
+    //     with the FK check + version insert below. The INSERT stays
+    //     a plain INSERT (not OR IGNORE) precisely because we just
+    //     confirmed `None` while holding the exclusive write intent:
+    //     no peer can insert the row before we commit.
+    let recorded_under_lock: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(version) FROM schema_version",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_err)?
+        .flatten();
+    match recorded_under_lock {
+        Some(v) if v == CURRENT_SCHEMA_VERSION => {
+            // A concurrent opener completed the backfill in the
+            // check → BEGIN window. Nothing to write; commit the
+            // empty transaction to release the write lock promptly.
+            tx.commit().map_err(map_sqlite_err)?;
+            return Ok(());
+        }
+        Some(v) => {
+            // Drop on `tx` rolls back. In practice unreachable —
+            // `init_schema` only routes here when the structure is
+            // already `CURRENT_SCHEMA_VERSION` and `recorded` was
+            // `None` — but surfacing it loudly guards against future
+            // schema-drift bugs instead of silently proceeding.
+            return Err(OrchestratorError::Planning(format!(
+                "schema_version unexpectedly holds version {v} under the write lock \
+                 (expected no row or {CURRENT_SCHEMA_VERSION}); refusing to backfill"
+            )));
+        }
+        None => {
+            // Still unversioned under the write lock — fall through
+            // to the FK check + version insert below.
+        }
+    }
 
     // PRAGMA foreign_key_check is a SELECT-shaped diagnostic (not
     // a state-mutating pragma like `foreign_keys = ON/OFF`), so it
@@ -4454,6 +4572,70 @@ CREATE TABLE IF NOT EXISTS embeddings (
         conn
     }
 
+    /// Build a **clean** database in the structurally-current-but-no-
+    /// version-row state: epoch-2 schema (3-column UNIQUE),
+    /// `schema_version` table present but EMPTY, one valid
+    /// source + node + mapping, and NO orphan rows.
+    ///
+    /// This is the input the F19 concurrent-backfill regression test
+    /// drives two threads against: `init_schema` sees
+    /// `recorded.is_none()` with structure already at
+    /// [`CURRENT_SCHEMA_VERSION`], so it routes into
+    /// [`backfill_version_with_integrity_check`] — and that helper
+    /// must survive being executed concurrently by two openers of
+    /// the same file.
+    ///
+    /// Mirrors [`make_unversioned_corrupt_epoch_2_db`] minus the
+    /// orphan row (naming follows the `make_*` fixture convention
+    /// established in rounds 4–5).
+    fn make_clean_unversioned_epoch_2_db(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        // Pre-set WAL mode so the on-disk file is already in WAL
+        // when the concurrent openers touch it. `journal_mode` is a
+        // persistent per-DATABASE property (unlike per-connection
+        // `foreign_keys`), so one set here sticks. Without this, the
+        // two openers in the concurrent regression test would ALSO
+        // contend on `init_schema`'s own `PRAGMA journal_mode = WAL`,
+        // and the test could fail on HEAD for the wrong reason
+        // (journal-mode contention) instead of the actual F19 race
+        // (the schema_version backfill INSERT).
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        // FK OFF only so the fixture build itself is unconstrained;
+        // the seeded graph below is fully valid, so a later
+        // `foreign_key_check` returns clean.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        // Apply the epoch-2 schema in full. The schema_version table
+        // exists but stays EMPTY — exactly the "structure says
+        // current, recorded says nothing" state init_schema's
+        // backfill arm handles.
+        conn.execute_batch(SCHEMA_VERSION_TABLE_DDL).unwrap();
+        conn.execute_batch(SCHEMA_DDL).unwrap();
+        // (Deliberately NO INSERT INTO schema_version.)
+
+        // Seed one valid source + node + linkage. No orphans, so the
+        // backfill helper's FK check passes and it proceeds to the
+        // version-row insert — the step F19's race corrupts.
+        conn.execute(
+            "INSERT INTO sources (id, source_type, uri, ingested_at_unix, fidelity, content_hash, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_i64, "local_file", "/clean.md", 100_i64, "direct", "hash-clean", "markdown"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, content, node_type, created_at_unix, last_accessed_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1_i64, "content", "fact", 100_i64, 100_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_sources (node_id, source_id) VALUES (?1, ?2)",
+            params![1_i64, 1_i64],
+        )
+        .unwrap();
+
+        conn
+    }
+
     /// Read the recorded schema version directly from the table.
     /// Returns `None` if the table doesn't exist OR exists but is empty.
     /// This tolerates the pre-migration test condition where the
@@ -5420,5 +5602,112 @@ CREATE TABLE IF NOT EXISTS embeddings (
             None,
             "no version row may have been written across the two failed attempts"
         );
+    }
+
+    #[test]
+    fn schema_version_backfill_survives_concurrent_open() {
+        // ── Codex re-review FIX 19 (P2-medium) regression ──
+        //
+        // Round-5's `backfill_version_with_integrity_check` opened the
+        // rusqlite DEFAULT (DEFERRED) transaction. A DEFERRED txn
+        // acquires a RESERVED write lock only on the first WRITE
+        // statement — not at BEGIN. Two openers of the same clean
+        // unversioned epoch-2 DB therefore both:
+        //   1. passed the outer `recorded.is_none()` check in init_schema,
+        //   2. opened their own DEFERRED transactions (no lock yet),
+        //   3. ran `PRAGMA foreign_key_check` under independent SHARED
+        //      locks (SHARED readers coexist), both observing clean,
+        //   4. raced on `INSERT INTO schema_version` — the winner took
+        //      RESERVED and committed version=2; the loser either hit
+        //      SQLITE_BUSY mid-write (HEAD set no `busy_timeout`, so
+        //      SQLITE_BUSY surfaced immediately with no retry) or, if
+        //      it arrived just after the winner committed, hit a
+        //      UNIQUE/PRIMARY KEY violation on the version row.
+        // Either way a *legitimate* opener failed against a database
+        // that was already structurally valid — a self-inflicted
+        // availability regression versus the prior `INSERT OR IGNORE`.
+        //
+        // The fix: the helper now opens with
+        // `TransactionBehavior::Immediate` (BEGIN IMMEDIATE — RESERVED
+        // acquired at BEGIN, before any read), so concurrent
+        // backfillers serialize at BEGIN; the loser gets SQLITE_BUSY
+        // there and the `busy_timeout` set in `KnowledgeStore::open`
+        // retries it. After acquiring the write lock the helper
+        // re-reads `schema_version` under that lock — double-checked
+        // locking — and if the winner already wrote version=2 it
+        // commits a no-op and returns Ok. Both openers succeed.
+        //
+        // Test methodology: a single un-synchronised pair of opens can
+        // serialise by luck (opener A finishes the whole open, writes
+        // version=2, and only THEN does opener B read `recorded`,
+        // seeing Some(2) and skipping the backfill branch entirely —
+        // no race). A `Barrier` releases both threads into
+        // `KnowledgeStore::open` simultaneously so they reach the
+        // `SELECT MAX(version)` → backfill → INSERT window together,
+        // and the loop runs it against many fresh DBs so the contended
+        // window is hit reliably. On 8e7775a (pre-fix) at least one
+        // iteration fails; with the fix every iteration passes.
+        const ITERATIONS: usize = 24;
+        for iter in 0..ITERATIONS {
+            let tmpdir = TempDir::new().unwrap();
+            let db_path = tmpdir.path().join("kg.db");
+            // Fresh clean unversioned epoch-2 DB each iteration. The
+            // fixture pre-sets WAL so the only thing the two openers
+            // can contend on is the backfill INSERT — i.e. F19, not
+            // journal-mode setup.
+            drop(make_clean_unversioned_epoch_2_db(&db_path));
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let p1 = db_path.clone();
+            let p2 = db_path.clone();
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+
+            // Each thread maps the result to `Result<(), String>` so
+            // the closure return type is unconditionally `Send`,
+            // independent of whether `KnowledgeStore` /
+            // `OrchestratorError` are `Send`. The opened store is
+            // dropped immediately — the assertion is purely "did the
+            // open (and therefore init_schema → backfill) succeed".
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                KnowledgeStore::open(&p1, Box::new(MockEmbedder::new()))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                KnowledgeStore::open(&p2, Box::new(MockEmbedder::new()))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
+
+            let r1 = t1.join().expect("opener thread 1 must not panic");
+            let r2 = t2.join().expect("opener thread 2 must not panic");
+            assert!(
+                r1.is_ok(),
+                "iteration {iter}: opener 1 failed against a structurally-valid db: {r1:?}"
+            );
+            assert!(
+                r2.is_ok(),
+                "iteration {iter}: opener 2 failed against a structurally-valid db: {r2:?}"
+            );
+
+            // After both openers, `schema_version` must hold EXACTLY
+            // one row, value 2 — no duplicate row, no missing row.
+            let conn = Connection::open(&db_path).unwrap();
+            let rows: Vec<i64> = conn
+                .prepare("SELECT version FROM schema_version")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![2],
+                "iteration {iter}: schema_version must hold exactly one row = [2]"
+            );
+        }
     }
 }

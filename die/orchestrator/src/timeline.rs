@@ -222,6 +222,22 @@ impl Timeline {
     pub fn undo_action(&self, action_id: &str) -> Result<String, OrchestratorError> {
         let now = current_timestamp();
 
+        // **Codex re-review FIX 25 (round 9):** the previous
+        // `.map_err(|_| Planning("action not found: ..."))` discarded
+        // every rusqlite error and unconditionally produced a "not
+        // found" message — masking `SQLITE_BUSY`/`SQLITE_LOCKED` as
+        // "missing row" when in fact the row is there but the DB is
+        // locked. A typed retry on `TransientLock` would look in the
+        // wrong place ("does the row exist somewhere else?") instead
+        // of doing the right thing (wait + retry this same query).
+        //
+        // Fix: `.optional()` converts only `QueryReturnedNoRows` →
+        // `Ok(None)`; every other rusqlite error propagates as
+        // `Err(e)`. Routing those through `map_sqlite_err` preserves
+        // `TransientLock` semantics for `DatabaseBusy`/`DatabaseLocked`
+        // while still producing a descriptive "action not found"
+        // error for the genuine missing-row case via `ok_or_else`.
+        use rusqlite::OptionalExtension;
         let record: ActionRecord = self
             .conn
             .query_row(
@@ -238,7 +254,9 @@ impl Timeline {
                     })
                 },
             )
-            .map_err(|_| {
+            .optional()
+            .map_err(|e| map_sqlite_err(e, "undo_action lookup"))?
+            .ok_or_else(|| {
                 OrchestratorError::Planning(format!("action not found: {action_id}"))
             })?;
 
@@ -578,5 +596,98 @@ mod tests {
         );
         let mapped = map_sqlite_err(err, "timeline test");
         assert!(matches!(mapped, OrchestratorError::Planning(_)));
+    }
+
+    // ── Codex re-review FIX 25 (round 9): query_row error preservation ──
+
+    #[test]
+    fn undo_action_missing_row_returns_planning_with_action_id() {
+        // **F25 regression — Part 1 of 2.** Pre-F25, `undo_action`'s
+        // bare `.map_err(|_| Planning("action not found: {id}"))` chain
+        // happened to produce the right error variant for genuine
+        // missing-row cases *but for the wrong reason*: it produced
+        // that error for EVERY rusqlite error, including
+        // `SQLITE_BUSY` / `SQLITE_LOCKED`. Post-F25 the missing-row
+        // path now goes through `.optional() + ok_or_else`, which
+        // preserves the descriptive message ONLY for the genuine
+        // `QueryReturnedNoRows` case. This test pins the message
+        // format so a future regression (e.g. someone dropping the
+        // `action_id` from the message during refactoring) trips
+        // the assertion. The companion `_routes_database_busy_*`
+        // test below covers the lock-error half.
+        let tl = Timeline::in_memory().unwrap();
+        let err = tl.undo_action("tl-nonexistent-id").unwrap_err();
+        match err {
+            OrchestratorError::Planning(msg) => {
+                assert!(
+                    msg.contains("action not found") && msg.contains("tl-nonexistent-id"),
+                    "missing-row error must be Planning containing 'action not found' \
+                     and the action_id, got: {msg}"
+                );
+            }
+            other => panic!(
+                "missing row must produce Planning, not {other:?} \
+                 (F25 regression: pre-fix bare map_err chain would also have produced \
+                 Planning here, but for the wrong reason — this test pins the variant + \
+                 message so the post-F25 ok_or_else path stays semantically equivalent \
+                 on the missing-row branch)"
+            ),
+        }
+    }
+
+    #[test]
+    fn undo_action_optional_chain_routes_database_busy_to_transient_lock() {
+        // **F25 regression — Part 2 of 2.** Pre-F25, `undo_action`'s
+        // bare `.map_err(|_| Planning("action not found: {id}"))`
+        // discarded the rusqlite error and reported "action not
+        // found" for *every* failure mode, including SQLITE_BUSY /
+        // SQLITE_LOCKED. A typed caller retrying on `TransientLock`
+        // would never see one — they'd see a `Planning` "not found"
+        // and look elsewhere for the row instead of waiting + retrying
+        // the same query.
+        //
+        // Post-F25, the chain is:
+        //
+        //     .query_row(...)        // rusqlite::Result<T>
+        //     .optional()            // rusqlite::Result<Option<T>>  (only NoRows → None)
+        //     .map_err(|e| map_sqlite_err(e, "undo_action lookup"))?
+        //     .ok_or_else(|| Planning("action not found: {id}"))?
+        //
+        // The undo_action call-site closure is inline and not testable
+        // in isolation, so this test exercises the chain semantically:
+        // a synthetic `SqliteFailure(SQLITE_BUSY)` threaded through
+        // `.optional()` must propagate as `Err` (NOT collapse to
+        // `Ok(None)` — that's the rusqlite contract F25 relies on),
+        // and the same error routed through `map_sqlite_err` with
+        // the call-site's context string must produce `TransientLock`.
+        // Together this proves the post-F25 chain is correct for
+        // both halves of its case analysis.
+        use rusqlite::OptionalExtension;
+
+        let synthetic_busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("test database is locked".to_string()),
+        );
+
+        // Step 1: `.optional()` must NOT swallow SqliteFailure(BUSY).
+        // If rusqlite ever changes this contract, this assertion trips
+        // immediately — the F25 fix would be silently invalidated.
+        let optional_result: Result<Option<()>, rusqlite::Error> =
+            Err::<(), _>(synthetic_busy).optional();
+        let propagated_err = optional_result.expect_err(
+            "OptionalExtension::optional must propagate SqliteFailure(BUSY) — \
+             F25's correctness depends on this rusqlite contract",
+        );
+
+        // Step 2: the propagated error, run through `map_sqlite_err`
+        // with the exact context string used at the `undo_action`
+        // call site, must produce `TransientLock`.
+        let mapped = map_sqlite_err(propagated_err, "undo_action lookup");
+        assert!(
+            matches!(mapped, OrchestratorError::TransientLock { .. }),
+            "SQLITE_BUSY threaded through the F25 undo_action chain must \
+             yield TransientLock so daemons can typed-retry, NOT Planning \
+             'action not found' (pre-F25 bug); got {mapped:?}"
+        );
     }
 }

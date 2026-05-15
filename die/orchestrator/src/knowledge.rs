@@ -5840,6 +5840,39 @@ CREATE TABLE IF NOT EXISTS embeddings (
         }
     }
 
+    // ── Codex re-review FIX 26 (round 9): in_memory constructor parity ──
+
+    #[test]
+    fn knowledge_in_memory_busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 26 (round 9):** round-8 added
+        // `init_sqlite_connection` to `KnowledgeStore::in_memory` (and
+        // even left a self-referential comment pointing at "the
+        // `busy_timeout_pinned_to_5_seconds` regression test") but the
+        // matching regression test was never actually written — the
+        // three siblings (Timeline, ConversationStore, GoalStore) all
+        // got theirs in FIX 23 round 8, leaving KnowledgeStore as the
+        // only store without constructor-parity coverage.
+        //
+        // The default `:memory:` database is private to a single
+        // connection per SQLite docs (*"Every :memory: database is
+        // distinct from every other"*), so cross-connection lock
+        // contention is impossible and the pragma is functionally a
+        // no-op at runtime. The test exists as a regression detector
+        // against future drift: someone copy-pasting an init path and
+        // forgetting `init_sqlite_connection` will trip this assertion
+        // immediately rather than degrading the SQLite policy silently
+        // across the workspace.
+        let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "KnowledgeStore::in_memory must pin busy_timeout to 5000ms (F26 constructor parity)"
+        );
+    }
+
     // ── Codex re-review FIX 21 (round 7) regression — typed error mapping ──
 
     #[test]

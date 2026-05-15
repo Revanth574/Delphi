@@ -398,6 +398,14 @@ impl ConversationStore {
     /// Returns `OrchestratorError::Planning` if the conversation is not
     /// found.
     pub fn get_conversation(&self, id: &str) -> Result<Conversation, OrchestratorError> {
+        // **Codex re-review FIX 25 (round 9):** see timeline.rs's
+        // `undo_action` for the full rationale. The previous bare
+        // `.map_err(|_|` swallowed `SQLITE_BUSY`/`SQLITE_LOCKED` as
+        // "conversation not found"; `.optional()` + `ok_or_else`
+        // distinguishes genuine misses from lock contention, and
+        // routes the lock errors through `map_sqlite_err` for
+        // typed `TransientLock` propagation.
+        use rusqlite::OptionalExtension;
         self.conn
             .query_row(
                 "SELECT id, started_at, title, summary FROM conversations WHERE id = ?1",
@@ -411,7 +419,9 @@ impl ConversationStore {
                     })
                 },
             )
-            .map_err(|_| OrchestratorError::Planning(format!("conversation not found: {id}")))
+            .optional()
+            .map_err(|e| map_sqlite_err(e, "get_conversation lookup"))?
+            .ok_or_else(|| OrchestratorError::Planning(format!("conversation not found: {id}")))
     }
 
     /// Fetch the most recent messages from a conversation (newest first).
@@ -1271,5 +1281,87 @@ mod tests {
         );
         let mapped = map_sqlite_err(err, "conversation test");
         assert!(matches!(mapped, OrchestratorError::Planning(_)));
+    }
+
+    // ── Codex re-review FIX 25 (round 9): query_row error preservation ──
+
+    #[test]
+    fn get_conversation_missing_id_returns_planning_with_id() {
+        // **F25 regression — Part 1 of 2.** See timeline.rs's
+        // `undo_action_missing_row_returns_planning_with_action_id`
+        // for the full rationale. Pre-F25, `get_conversation`'s
+        // bare `.map_err(|_| Planning("conversation not found: {id}"))`
+        // produced this error for EVERY rusqlite failure, including
+        // SQLITE_BUSY. Post-F25, `.optional() + ok_or_else` confines
+        // this message to the actual `QueryReturnedNoRows` case.
+        // This test pins the variant + message format; the companion
+        // `_routes_database_busy_*` test covers the lock-error half.
+        //
+        // Tightens the existing `get_conversation_not_found` test
+        // (line 911), which only asserts `.is_err()` without
+        // pinning the variant or message format — a regression that
+        // turned the error type into a `TransientLock` (or anything
+        // else) would not have tripped that loose assertion.
+        let store = ConversationStore::in_memory().unwrap();
+        let err = store.get_conversation("conv-nonexistent-id").unwrap_err();
+        match err {
+            OrchestratorError::Planning(msg) => {
+                assert!(
+                    msg.contains("conversation not found")
+                        && msg.contains("conv-nonexistent-id"),
+                    "missing-row error must be Planning containing 'conversation not found' \
+                     and the id, got: {msg}"
+                );
+            }
+            other => panic!(
+                "missing conversation must produce Planning, not {other:?} \
+                 (F25 regression: post-fix ok_or_else path must stay semantically \
+                 equivalent on the missing-row branch)"
+            ),
+        }
+    }
+
+    #[test]
+    fn get_conversation_optional_chain_routes_database_busy_to_transient_lock() {
+        // **F25 regression — Part 2 of 2.** See timeline.rs's
+        // `undo_action_optional_chain_routes_database_busy_to_transient_lock`
+        // for the full rationale and chain diagram. Pre-F25,
+        // `get_conversation` mapped every rusqlite::Error to
+        // `Planning("conversation not found: {id}")`; post-F25 the
+        // chain is:
+        //
+        //     .query_row(...)
+        //     .optional()                                  // only NoRows → None
+        //     .map_err(|e| map_sqlite_err(e, "get_conversation lookup"))?
+        //     .ok_or_else(|| Planning("conversation not found: {id}"))
+        //
+        // This test exercises the same chain semantically with a
+        // synthetic SqliteFailure(SQLITE_BUSY): the closure is
+        // inline-only so the chain itself is what's reproduced here.
+        // Asserts (a) `.optional()` propagates SQLITE_BUSY as Err
+        // (rusqlite contract F25 depends on), and (b) `map_sqlite_err`
+        // with the call-site's context string routes it to
+        // `TransientLock`.
+        use rusqlite::OptionalExtension;
+
+        let synthetic_busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("test database is locked".to_string()),
+        );
+
+        let optional_result: Result<Option<()>, rusqlite::Error> =
+            Err::<(), _>(synthetic_busy).optional();
+        let propagated_err = optional_result.expect_err(
+            "OptionalExtension::optional must propagate SqliteFailure(BUSY) — \
+             F25's correctness depends on this rusqlite contract",
+        );
+
+        let mapped = map_sqlite_err(propagated_err, "get_conversation lookup");
+        assert!(
+            matches!(mapped, OrchestratorError::TransientLock { .. }),
+            "SQLITE_BUSY threaded through the F25 get_conversation chain must \
+             yield TransientLock so daemons can typed-retry, NOT Planning \
+             'conversation not found' (pre-F25 bug); got {mapped:?}"
+        );
     }
 }

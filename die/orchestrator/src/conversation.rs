@@ -41,6 +41,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use crate::sqlite::{init_sqlite_connection, map_sqlite_err};
 use crate::OrchestratorError;
 
 /// Duration of the "verbatim tier" in seconds (24 hours).
@@ -257,6 +258,9 @@ impl ConversationStore {
     /// ```
     pub fn open(path: &Path) -> Result<Self, OrchestratorError> {
         if let Some(parent) = path.parent() {
+            // `std::fs::create_dir_all` returns `std::io::Error`, not
+            // a rusqlite error — keep the existing Planning mapping
+            // with the dynamic-context parent path.
             std::fs::create_dir_all(parent).map_err(|e| {
                 OrchestratorError::Planning(format!(
                     "failed to create conversation dir {}: {e}",
@@ -264,12 +268,13 @@ impl ConversationStore {
                 ))
             })?;
         }
-        let conn = Connection::open(path).map_err(|e| {
-            OrchestratorError::Planning(format!("failed to open conversation db: {e}"))
-        })?;
-        // Explicit 5s busy_timeout. Project policy per CLAUDE.md (added round 7).
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| OrchestratorError::Planning(format!("conversation busy_timeout: {e}")))?;
+        let conn = Connection::open(path)
+            .map_err(|e| map_sqlite_err(e, "failed to open conversation db"))?;
+        // **Codex re-review FIX 22 (round 8):** shared
+        // `init_sqlite_connection` pins `busy_timeout` per CLAUDE.md
+        // SQLite Connection Policy.
+        init_sqlite_connection(&conn)
+            .map_err(|e| map_sqlite_err(e, "conversation init_sqlite_connection"))?;
         let store = Self { conn };
         store.configure_pragmas()?;
         store.init_schema()?;
@@ -283,9 +288,15 @@ impl ConversationStore {
     ///
     /// Returns `OrchestratorError::Planning` if SQLite init fails.
     pub fn in_memory() -> Result<Self, OrchestratorError> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            OrchestratorError::Planning(format!("failed to create in-memory db: {e}"))
-        })?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| map_sqlite_err(e, "failed to create in-memory db"))?;
+        // **Codex re-review FIX 23 (round 8):** in-memory constructor
+        // parity. `:memory:` DBs cannot see cross-connection
+        // contention so `busy_timeout` is a no-op here, but pinning
+        // it through the shared helper keeps the init path uniform
+        // and catches future drift via the regression test.
+        init_sqlite_connection(&conn)
+            .map_err(|e| map_sqlite_err(e, "conversation in_memory init"))?;
         let store = Self { conn };
         // WAL mode cannot be enabled on in-memory databases; skip pragmas.
         store.init_schema()?;
@@ -321,9 +332,7 @@ impl ConversationStore {
                 "INSERT INTO conversations (id, started_at, title, summary) VALUES (?1, ?2, ?3, NULL)",
                 params![conv_id, now, title],
             )
-            .map_err(|e| {
-                OrchestratorError::Planning(format!("failed to create conversation: {e}"))
-            })?;
+            .map_err(|e| map_sqlite_err(e, "failed to create conversation"))?;
 
         debug!(conversation_id = %conv_id, title, "conversation started");
         Ok(conv_id)
@@ -369,14 +378,14 @@ impl ConversationStore {
                 "INSERT INTO messages (id, conversation_id, role, content, context_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![msg_id, conversation_id, role.as_str(), content, ctx_json, now],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("failed to insert message: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "failed to insert message"))?;
 
         self.conn
             .execute(
                 "INSERT INTO messages_fts (rowid, content) VALUES ((SELECT last_insert_rowid()), ?1)",
                 params![content],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("fts insert failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "fts insert failed"))?;
 
         debug!(message_id = %msg_id, conversation_id, role = role.as_str(), "message added");
         Ok(msg_id)
@@ -421,11 +430,11 @@ impl ConversationStore {
                 "SELECT id, conversation_id, role, content, context_json, timestamp \
                  FROM messages WHERE conversation_id = ?1 ORDER BY timestamp DESC, rowid DESC LIMIT ?2",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("query prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query prepare failed"))?;
 
         let rows = stmt
             .query_map(params![conversation_id, limit], row_to_message)
-            .map_err(|e| OrchestratorError::Planning(format!("query failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query failed"))?;
 
         collect_messages(rows)
     }
@@ -449,11 +458,11 @@ impl ConversationStore {
                  WHERE messages_fts MATCH ?1 \
                  ORDER BY m.timestamp DESC LIMIT ?2",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("search prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "search prepare failed"))?;
 
         let rows = stmt
             .query_map(params![query, limit], row_to_message)
-            .map_err(|e| OrchestratorError::Planning(format!("search failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "search failed"))?;
 
         collect_messages(rows)
     }
@@ -473,7 +482,7 @@ impl ConversationStore {
                 "SELECT id, started_at, title, summary FROM conversations \
                  ORDER BY started_at DESC, rowid DESC LIMIT ?1",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("list prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "list prepare failed"))?;
 
         let rows = stmt
             .query_map(params![limit], |row| {
@@ -484,13 +493,11 @@ impl ConversationStore {
                     summary: row.get(3)?,
                 })
             })
-            .map_err(|e| OrchestratorError::Planning(format!("list failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "list failed"))?;
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| {
-                OrchestratorError::Planning(format!("conversation row read failed: {e}"))
-            })?);
+            out.push(row.map_err(|e| map_sqlite_err(e, "conversation row read failed"))?);
         }
         Ok(out)
     }
@@ -524,7 +531,7 @@ impl ConversationStore {
                 "DELETE FROM messages WHERE timestamp < ?1",
                 params![cutoff],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("forget_older_than failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "forget_older_than failed"))?;
         self.rebuild_fts()?;
         self.gc_empty_conversations()?;
         info!(days, deleted, "forget_older_than executed");
@@ -547,7 +554,7 @@ impl ConversationStore {
                  (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1)",
                 params![topic],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("forget_topic failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "forget_topic failed"))?;
         self.rebuild_fts()?;
         self.gc_empty_conversations()?;
         info!(topic, deleted, "forget_topic executed");
@@ -606,7 +613,7 @@ impl ConversationStore {
         let c: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .map_err(|e| OrchestratorError::Planning(format!("count failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "count failed"))?;
         Ok(c as usize)
     }
 
@@ -619,7 +626,7 @@ impl ConversationStore {
         let c: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .map_err(|e| OrchestratorError::Planning(format!("conv count failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "conv count failed"))?;
         Ok(c as usize)
     }
 
@@ -630,10 +637,10 @@ impl ConversationStore {
         let _: String = self
             .conn
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .map_err(|e| OrchestratorError::Planning(format!("WAL enable failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "WAL enable failed"))?;
         self.conn
             .execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| OrchestratorError::Planning(format!("pragma set failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "pragma set failed"))?;
         Ok(())
     }
 
@@ -658,7 +665,7 @@ impl ConversationStore {
                 CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(timestamp);
                 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content);",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("schema init failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "schema init failed"))?;
         Ok(())
     }
 
@@ -670,7 +677,7 @@ impl ConversationStore {
                 params![id],
                 |row| row.get(0),
             )
-            .map_err(|e| OrchestratorError::Planning(format!("existence check failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "existence check failed"))?;
         if n == 0 {
             return Err(OrchestratorError::Planning(format!(
                 "conversation not found: {id}"
@@ -686,7 +693,7 @@ impl ConversationStore {
                 "DELETE FROM messages WHERE timestamp >= ?1",
                 params![since],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("forget_since failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "forget_since failed"))?;
         self.rebuild_fts()?;
         self.gc_empty_conversations()?;
         info!(since, deleted, "forget_since executed");
@@ -703,7 +710,7 @@ impl ConversationStore {
                  INSERT INTO messages_fts (rowid, content) \
                  SELECT rowid, content FROM messages;",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("fts rebuild failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "fts rebuild failed"))?;
         Ok(())
     }
 
@@ -714,7 +721,7 @@ impl ConversationStore {
                  (SELECT DISTINCT conversation_id FROM messages)",
                 [],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("gc failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "gc failed"))?;
         Ok(())
     }
 
@@ -730,10 +737,10 @@ impl ConversationStore {
                  FROM messages WHERE conversation_id = ?1 AND timestamp >= ?2 \
                  ORDER BY timestamp DESC, rowid DESC",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("msgs_since prepare: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "msgs_since prepare"))?;
         let rows = stmt
             .query_map(params![conversation_id, since], row_to_message)
-            .map_err(|e| OrchestratorError::Planning(format!("msgs_since query: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "msgs_since query"))?;
         collect_messages(rows)
     }
 
@@ -750,10 +757,10 @@ impl ConversationStore {
                  FROM messages WHERE conversation_id = ?1 AND timestamp >= ?2 AND timestamp < ?3 \
                  ORDER BY timestamp ASC",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("msgs_between prepare: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "msgs_between prepare"))?;
         let rows = stmt
             .query_map(params![conversation_id, start, end], row_to_message)
-            .map_err(|e| OrchestratorError::Planning(format!("msgs_between query: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "msgs_between query"))?;
         collect_messages(rows)
     }
 
@@ -769,7 +776,7 @@ impl ConversationStore {
                 params![conversation_id, before],
                 |row| row.get(0),
             )
-            .map_err(|e| OrchestratorError::Planning(format!("count_before failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "count_before failed"))?;
         Ok(c as usize)
     }
 }
@@ -802,7 +809,7 @@ where
     let mut out = Vec::new();
     for row in rows {
         out.push(
-            row.map_err(|e| OrchestratorError::Planning(format!("message row read failed: {e}")))?,
+            row.map_err(|e| map_sqlite_err(e, "message row read failed"))?,
         );
     }
     Ok(out)
@@ -1216,5 +1223,53 @@ mod tests {
             timeout, 5_000,
             "ConversationStore::open must pin busy_timeout to 5000ms per CLAUDE.md policy"
         );
+    }
+
+    #[test]
+    fn in_memory_busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 23 (round 8):** in-memory constructor
+        // parity. See timeline / goals siblings for the policy
+        // rationale.
+        let store = ConversationStore::in_memory().unwrap();
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "ConversationStore::in_memory must pin busy_timeout to 5000ms (F23 constructor parity)"
+        );
+    }
+
+    // ── Codex re-review FIX 22 (round 8): sibling typed routing ──
+
+    #[test]
+    fn conversation_routes_database_busy_to_transient_lock() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("test".to_string()),
+        );
+        let mapped = map_sqlite_err(err, "conversation test");
+        assert!(matches!(mapped, OrchestratorError::TransientLock { .. }));
+    }
+
+    #[test]
+    fn conversation_routes_database_locked_to_transient_lock() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let mapped = map_sqlite_err(err, "conversation test");
+        assert!(matches!(mapped, OrchestratorError::TransientLock { .. }));
+    }
+
+    #[test]
+    fn conversation_preserves_planning_for_non_lock_sqlite_failures() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE failed".to_string()),
+        );
+        let mapped = map_sqlite_err(err, "conversation test");
+        assert!(matches!(mapped, OrchestratorError::Planning(_)));
     }
 }

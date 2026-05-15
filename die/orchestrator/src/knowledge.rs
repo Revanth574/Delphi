@@ -236,19 +236,28 @@ CREATE TABLE IF NOT EXISTS schema_version (
 ///   `UNIQUE(uri, content_hash, format)` on `sources`.
 const CURRENT_SCHEMA_VERSION: i64 = 2;
 
-/// **Codex re-review FIX 20 (round 7):** maximum attempts the
-/// [`KnowledgeStore::open`] retry loop makes before surfacing
-/// [`OrchestratorError::TransientLock`] to the caller.
+/// **Codex re-review FIX 20 (round 7) + FIX 24 (round 8):** maximum
+/// attempts the [`KnowledgeStore::open`] retry loop makes before
+/// surfacing [`OrchestratorError::TransientLock`] to the caller.
 ///
 /// The retry only fires on `TransientLock` (per F21). Any other
-/// `OrchestratorError` short-circuits immediately. With the default
-/// 5s per-attempt `busy_timeout` plus the exponential backoff between
-/// attempts (100 + 200 + 400 + 800 + 1600 ms = 3.1s total inter-attempt
-/// sleep), the worst-case opener latency under sustained contention is
-/// roughly `5 × 5s + 3.1s ≈ 28s` before a typed `TransientLock` reaches
-/// the caller. Callers still get a typed error they can interpret,
-/// rather than a string-matched lockup.
-pub const MAX_OPEN_ATTEMPTS: usize = 5;
+/// `OrchestratorError` short-circuits immediately. The retry loop's
+/// guard is `attempt < MAX_OPEN_ATTEMPTS - 1`, so this constant
+/// counts attempts (initial + retries), and the number of
+/// inter-attempt sleeps is `MAX_OPEN_ATTEMPTS - 1`.
+///
+/// **F24 (round 8):** previously 5, which gave only 4 inter-attempt
+/// sleeps (100, 200, 400, 800 ms) and made the documented final
+/// 1600 ms sleep — plus [`MAX_BACKOFF_MS`] — unreachable. Bumped to
+/// 6 so the documented `100 → 200 → 400 → 800 → 1600 ms` sequence
+/// fully fires. With the default 5 s per-attempt `busy_timeout` plus
+/// the exponential backoff between attempts (100 + 200 + 400 + 800 +
+/// 1600 ms = 3.1 s total inter-attempt sleep), worst-case opener
+/// latency under sustained contention is `6 × 5 s + 3.1 s ≈ 33 s`
+/// before a typed `TransientLock` reaches the caller. Callers still
+/// get a typed error they can interpret rather than a string-matched
+/// lockup.
+pub const MAX_OPEN_ATTEMPTS: usize = 6;
 
 /// **Codex re-review FIX 20 (round 7):** initial backoff for the
 /// retry-with-backoff loop in [`KnowledgeStore::open`]. Doubled each
@@ -1048,14 +1057,17 @@ impl KnowledgeStore {
     }
 
     pub fn in_memory(embedder: Box<dyn Embedder>) -> Result<Self, OrchestratorError> {
-        // In-memory databases are private to a single connection;
-        // they cannot see cross-connection lock contention, so the
-        // retry loop is unnecessary. Kept symmetric with `open` only
-        // in setting `busy_timeout` (still pointless for `:memory:`
-        // but uniform with the production-policy default).
+        // **Codex re-review FIX 22 + FIX 23 (round 8):** in-memory
+        // databases are private to a single connection per SQLite docs
+        // (*"Every :memory: database is distinct from every other"*),
+        // so cross-connection lock contention is impossible and the
+        // retry loop is unnecessary. But the connection-init pragma
+        // still goes through `crate::sqlite::init_sqlite_connection`
+        // for constructor-parity (F23) — future drift where someone
+        // copies an init path and forgets the pragma is caught by the
+        // `busy_timeout_pinned_to_5_seconds` regression test.
         let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(map_sqlite_err)?;
+        crate::sqlite::init_sqlite_connection(&conn).map_err(map_sqlite_err)?;
         Self::init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -2963,12 +2975,11 @@ fn parse_fidelity(s: &str) -> Fidelity {
 /// propagates the error unchanged.
 fn try_open_and_backfill_once(db_path: &Path) -> Result<Connection, OrchestratorError> {
     let mut conn = Connection::open(db_path).map_err(map_sqlite_err)?;
-    // 5s busy_timeout, set explicitly per the CLAUDE.md SQLite
-    // connection policy. rusqlite 0.35.0's default happens to also be
-    // 5s but the rusqlite docs warn that default "may be subject to
-    // change," so we pin it.
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(map_sqlite_err)?;
+    // **Codex re-review FIX 22 (round 8):** route through the shared
+    // `crate::sqlite::init_sqlite_connection` helper rather than
+    // calling `conn.busy_timeout` directly. Single seam for the
+    // project-wide connection-init policy.
+    crate::sqlite::init_sqlite_connection(&conn).map_err(map_sqlite_err)?;
     KnowledgeStore::init_schema(&mut conn)?;
     Ok(conn)
 }
@@ -3023,34 +3034,22 @@ where
 
 /// Translate a `rusqlite::Error` into the orchestrator's error type.
 ///
-/// **Codex re-review FIX 21 (round 7):** `SqliteFailure` errors whose
-/// inner `ffi::Error.code` is `DatabaseBusy` (SQLITE_BUSY) or
-/// `DatabaseLocked` (SQLITE_LOCKED) are routed into
-/// [`OrchestratorError::TransientLock`] — both are transient and
-/// retryable, and downstream callers (including
-/// [`KnowledgeStore::open`]'s retry loop and any external daemon) can
-/// pattern-match for typed retry instead of string-matching error text.
+/// **Codex re-review FIX 22 (round 8):** this is now a thin wrapper
+/// around the shared [`crate::sqlite::map_sqlite_err`] helper — the
+/// canonical project-wide mapping per the CLAUDE.md SQLite Connection
+/// Policy. The wrapper preserves the historical "knowledge sqlite"
+/// context prefix on `Planning` errors so existing test message
+/// assertions stay stable; lock errors (which round through
+/// `TransientLock` regardless of context) are routed identically to
+/// the shared helper.
 ///
-/// All other rusqlite errors (logic failures, constraint violations,
-/// I/O errors, etc.) retain the existing
-/// [`OrchestratorError::Planning`] classification.
-///
-/// Extended codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`,
-/// `SQLITE_BUSY_TIMEOUT`, `SQLITE_LOCKED_SHAREDCACHE`,
-/// `SQLITE_LOCKED_VTAB`) are mapped by libsqlite3-sys to the same base
-/// `ErrorCode::DatabaseBusy`/`DatabaseLocked` via `Error::new`'s
-/// `& 0xff` mask, so matching on `ffi_err.code` alone catches both
-/// base and extended variants.
+/// All knowledge.rs call sites continue to call this as
+/// `map_sqlite_err(e)` (single-arg form); the context is implicit.
+/// Sibling stores in `timeline.rs`, `goals.rs`, `conversation.rs` call
+/// the shared helper directly with per-store / per-call-site context
+/// strings.
 fn map_sqlite_err(e: rusqlite::Error) -> OrchestratorError {
-    if let rusqlite::Error::SqliteFailure(ref ffi_err, _) = e
-        && matches!(
-            ffi_err.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        )
-    {
-        return OrchestratorError::TransientLock { source: e };
-    }
-    OrchestratorError::Planning(format!("knowledge sqlite: {e}"))
+    crate::sqlite::map_sqlite_err(e, "knowledge sqlite")
 }
 
 fn map_lock_err<T>(_: std::sync::PoisonError<T>) -> OrchestratorError {
@@ -6022,5 +6021,73 @@ CREATE TABLE IF NOT EXISTS embeddings (
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows, vec![2]);
+    }
+
+    // ── Codex re-review FIX 24 (round 8): retry budget off-by-one ──
+
+    #[test]
+    fn retry_with_backoff_invokes_op_exactly_max_open_attempts_under_transient_lock() {
+        // F24 regression. Round-7 set `MAX_OPEN_ATTEMPTS = 5`, which
+        // produced only 4 inter-attempt sleeps (100, 200, 400, 800),
+        // making the documented final 1600ms sleep and the
+        // `MAX_BACKOFF_MS = 2000` cap unreachable. Round-8 bumps the
+        // constant to 6 so the documented `100 → 200 → 400 → 800 →
+        // 1600 ms` sequence fully fires (5 sleeps across 6 attempts).
+        //
+        // This test directly drives `retry_with_backoff` with a
+        // closure that always returns `TransientLock` and counts
+        // invocations, asserting exactly `MAX_OPEN_ATTEMPTS` calls
+        // before the helper propagates the last `TransientLock` to
+        // the caller. Generic over `T = ()` so no real DB is needed.
+        //
+        // Wall-clock: the test sleeps the full backoff sequence
+        // (100+200+400+800+1600 = 3100 ms) before propagating. Not
+        // the fastest unit test, but it's the only way to verify the
+        // retry count and sleep sequence are honored end-to-end.
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), OrchestratorError> = retry_with_backoff(|| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Synthesize a TransientLock with a real SqliteFailure
+            // payload — the retry helper only inspects the variant
+            // discriminant, not the inner Error contents.
+            let synth = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("synthetic".to_string()),
+            );
+            Err(OrchestratorError::TransientLock { source: synth })
+        });
+
+        let attempts = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            attempts, MAX_OPEN_ATTEMPTS,
+            "retry_with_backoff must invoke op exactly MAX_OPEN_ATTEMPTS times under \
+             sustained TransientLock; got {attempts}"
+        );
+        assert!(
+            matches!(result, Err(OrchestratorError::TransientLock { .. })),
+            "retry_with_backoff must surface TransientLock after exhausting retries; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn retry_with_backoff_short_circuits_on_non_transient_error() {
+        // Defense-in-depth complement to the F24 attempt-count test.
+        // The retry loop must NEVER retry non-`TransientLock` errors;
+        // a `Planning` error should propagate immediately on the
+        // first attempt. Combined with the F24 test above this pins
+        // both ends of the retry contract.
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), OrchestratorError> = retry_with_backoff(|| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(OrchestratorError::Planning("not retryable".to_string()))
+        });
+
+        let attempts = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            attempts, 1,
+            "retry_with_backoff must short-circuit on non-TransientLock errors; \
+             got {attempts} attempts"
+        );
+        assert!(matches!(result, Err(OrchestratorError::Planning(_))));
     }
 }

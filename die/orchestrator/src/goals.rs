@@ -38,6 +38,7 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, info};
 
+use crate::sqlite::{init_sqlite_connection, map_sqlite_err};
 use crate::OrchestratorError;
 
 /// Numeric identifier for a goal. Auto-incremented by SQLite.
@@ -454,17 +455,18 @@ impl GoalStore {
     /// let _ = store;
     /// ```
     pub fn open(path: &Path) -> Result<Self, OrchestratorError> {
-        let conn = Connection::open(path).map_err(|e| {
-            OrchestratorError::Planning(format!("failed to open goal db: {e}"))
-        })?;
-        // Explicit 5s busy_timeout. Project policy per CLAUDE.md (added round 7).
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| OrchestratorError::Planning(format!("goal busy_timeout: {e}")))?;
+        let conn = Connection::open(path)
+            .map_err(|e| map_sqlite_err(e, "failed to open goal db"))?;
+        // **Codex re-review FIX 22 (round 8):** shared
+        // `init_sqlite_connection` pins `busy_timeout` per CLAUDE.md
+        // SQLite Connection Policy. Single seam across all stores.
+        init_sqlite_connection(&conn)
+            .map_err(|e| map_sqlite_err(e, "goal init_sqlite_connection"))?;
         // WAL for file-backed stores. Safe to run every open.
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| OrchestratorError::Planning(format!("WAL enable failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "WAL enable failed"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| OrchestratorError::Planning(format!("FK enable failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "FK enable failed"))?;
         let store = Self { conn };
         store.init_schema()?;
         info!("goal store opened at {}", path.display());
@@ -485,11 +487,17 @@ impl GoalStore {
     /// assert_eq!(store.count().unwrap(), 0);
     /// ```
     pub fn in_memory() -> Result<Self, OrchestratorError> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            OrchestratorError::Planning(format!("failed to create in-memory db: {e}"))
-        })?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| map_sqlite_err(e, "failed to create in-memory db"))?;
+        // **Codex re-review FIX 23 (round 8):** in-memory constructor
+        // parity — pin `busy_timeout` via the shared helper even
+        // though `:memory:` DBs cannot see cross-connection
+        // contention. Catches future init-path drift via the
+        // regression test.
+        init_sqlite_connection(&conn)
+            .map_err(|e| map_sqlite_err(e, "goal in_memory init"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| OrchestratorError::Planning(format!("FK enable failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "FK enable failed"))?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -551,7 +559,7 @@ impl GoalStore {
                     now,
                 ],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("insert goal failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "insert goal failed"))?;
         let id = self.conn.last_insert_rowid();
         debug!(goal_id = id, title, "goal created");
         Ok(id)
@@ -583,7 +591,7 @@ impl GoalStore {
                 params![id],
                 row_to_goal,
             )
-            .map_err(|e| OrchestratorError::Planning(format!("goal {id} not found: {e}")))?
+            .map_err(|e| map_sqlite_err(e, &format!("goal {id} not found")))?
     }
 
     /// Update any subset of a goal's fields.
@@ -664,7 +672,7 @@ impl GoalStore {
                     id,
                 ],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("update goal failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "update goal failed"))?;
         debug!(goal_id = id, "goal updated");
         Ok(())
     }
@@ -712,7 +720,7 @@ impl GoalStore {
                  WHERE id = ?3",
                 params![progress, now, id],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("progress update failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "progress update failed"))?;
         Ok(())
     }
 
@@ -734,7 +742,7 @@ impl GoalStore {
     pub fn delete_goal(&self, id: GoalId) -> Result<(), OrchestratorError> {
         self.conn
             .execute("DELETE FROM goals WHERE id = ?1", params![id])
-            .map_err(|e| OrchestratorError::Planning(format!("delete goal failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "delete goal failed"))?;
         Ok(())
     }
 
@@ -783,13 +791,13 @@ impl GoalStore {
                  FROM goals WHERE status = ?1
                  ORDER BY created_at_unix DESC, id DESC",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "prepare failed"))?;
         let rows = stmt
             .query_map(params![status.as_str()], row_to_goal)
-            .map_err(|e| OrchestratorError::Planning(format!("query failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query failed"))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| OrchestratorError::Planning(format!("row: {e}")))??);
+            out.push(r.map_err(|e| map_sqlite_err(e, "row"))??);
         }
         Ok(out)
     }
@@ -819,13 +827,13 @@ impl GoalStore {
                  FROM goals WHERE parent_goal_id = ?1
                  ORDER BY created_at_unix DESC, id DESC",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "prepare failed"))?;
         let rows = stmt
             .query_map(params![parent], row_to_goal)
-            .map_err(|e| OrchestratorError::Planning(format!("query failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query failed"))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| OrchestratorError::Planning(format!("row: {e}")))??);
+            out.push(r.map_err(|e| map_sqlite_err(e, "row"))??);
         }
         Ok(out)
     }
@@ -860,13 +868,13 @@ impl GoalStore {
                    AND COALESCE(last_activity_unix, created_at_unix) < ?1
                  ORDER BY COALESCE(last_activity_unix, created_at_unix) ASC, id ASC",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "prepare failed"))?;
         let rows = stmt
             .query_map(params![cutoff], row_to_goal)
-            .map_err(|e| OrchestratorError::Planning(format!("query failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query failed"))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| OrchestratorError::Planning(format!("row: {e}")))??);
+            out.push(r.map_err(|e| map_sqlite_err(e, "row"))??);
         }
         Ok(out)
     }
@@ -906,13 +914,13 @@ impl GoalStore {
                    AND deadline_unix <= ?2
                  ORDER BY deadline_unix ASC, id ASC",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "prepare failed"))?;
         let rows = stmt
             .query_map(params![now, horizon], row_to_goal)
-            .map_err(|e| OrchestratorError::Planning(format!("query failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query failed"))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| OrchestratorError::Planning(format!("row: {e}")))??);
+            out.push(r.map_err(|e| map_sqlite_err(e, "row"))??);
         }
         Ok(out)
     }
@@ -1050,7 +1058,7 @@ impl GoalStore {
                     |row| row.get::<_, Option<GoalId>>(0),
                 )
                 .optional()
-                .map_err(|e| OrchestratorError::Planning(format!("cycle-walk failed: {e}")))?
+                .map_err(|e| map_sqlite_err(e, "cycle-walk failed"))?
                 .flatten();
         }
         Ok(false)
@@ -1134,7 +1142,7 @@ impl GoalStore {
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM goals", [], |row| row.get(0))
-            .map_err(|e| OrchestratorError::Planning(format!("count failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "count failed"))?;
         Ok(count as usize)
     }
 
@@ -1147,7 +1155,7 @@ impl GoalStore {
                 row.get(0)
             })
             .optional()
-            .map_err(|e| OrchestratorError::Planning(format!("existence check failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "existence check failed"))?;
         Ok(found.is_some())
     }
 
@@ -1174,7 +1182,7 @@ impl GoalStore {
                 CREATE INDEX IF NOT EXISTS idx_goals_deadline ON goals(deadline_unix);
                 CREATE INDEX IF NOT EXISTS idx_goals_activity ON goals(last_activity_unix);",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("schema init failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "schema init failed"))?;
         Ok(())
     }
 }
@@ -1243,7 +1251,10 @@ fn row_to_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Goal, Orchest
 }
 
 fn sql_err(e: rusqlite::Error) -> OrchestratorError {
-    OrchestratorError::Planning(format!("row read failed: {e}"))
+    // **Codex re-review FIX 22 (round 8):** route through the shared
+    // helper so a rusqlite SQLITE_BUSY/SQLITE_LOCKED surfaced during
+    // row decoding still ends up as `TransientLock`, not `Planning`.
+    map_sqlite_err(e, "row read failed")
 }
 
 fn compute_deadline_risk(
@@ -1847,5 +1858,53 @@ mod tests {
             timeout, 5_000,
             "GoalStore::open must pin busy_timeout to 5000ms per CLAUDE.md policy"
         );
+    }
+
+    #[test]
+    fn in_memory_busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 23 (round 8):** in-memory constructor
+        // parity. See timeline / conversation siblings for the
+        // policy rationale.
+        let store = GoalStore::in_memory().unwrap();
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "GoalStore::in_memory must pin busy_timeout to 5000ms (F23 constructor parity)"
+        );
+    }
+
+    // ── Codex re-review FIX 22 (round 8): sibling typed routing ──
+
+    #[test]
+    fn goals_routes_database_busy_to_transient_lock() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("test".to_string()),
+        );
+        let mapped = map_sqlite_err(err, "goals test");
+        assert!(matches!(mapped, OrchestratorError::TransientLock { .. }));
+    }
+
+    #[test]
+    fn goals_routes_database_locked_to_transient_lock() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let mapped = map_sqlite_err(err, "goals test");
+        assert!(matches!(mapped, OrchestratorError::TransientLock { .. }));
+    }
+
+    #[test]
+    fn goals_preserves_planning_for_non_lock_sqlite_failures() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE failed".to_string()),
+        );
+        let mapped = map_sqlite_err(err, "goals test");
+        assert!(matches!(mapped, OrchestratorError::Planning(_)));
     }
 }

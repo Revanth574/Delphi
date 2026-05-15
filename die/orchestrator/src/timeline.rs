@@ -17,6 +17,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use tracing::{debug, info};
 
+use crate::sqlite::{init_sqlite_connection, map_sqlite_err};
 use crate::OrchestratorError;
 
 /// Duration of the undo window in seconds (24 hours).
@@ -87,10 +88,13 @@ impl Timeline {
     /// ```
     pub fn open(path: &Path) -> Result<Self, OrchestratorError> {
         let conn = Connection::open(path)
-            .map_err(|e| OrchestratorError::Planning(format!("failed to open timeline db: {e}")))?;
-        // Explicit 5s busy_timeout. Project policy per CLAUDE.md (added round 7).
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| OrchestratorError::Planning(format!("timeline busy_timeout: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "failed to open timeline db"))?;
+        // **Codex re-review FIX 22 (round 8):** route through the
+        // shared `init_sqlite_connection` helper (CLAUDE.md SQLite
+        // Connection Policy). Round-7 set `busy_timeout` directly
+        // here; round-8 unified it across stores.
+        init_sqlite_connection(&conn)
+            .map_err(|e| map_sqlite_err(e, "timeline init_sqlite_connection"))?;
         let tl = Self { conn };
         tl.init_schema()?;
         info!("timeline database opened at {}", path.display());
@@ -111,7 +115,16 @@ impl Timeline {
     /// ```
     pub fn in_memory() -> Result<Self, OrchestratorError> {
         let conn = Connection::open_in_memory()
-            .map_err(|e| OrchestratorError::Planning(format!("failed to create in-memory db: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "failed to create in-memory db"))?;
+        // **Codex re-review FIX 23 (round 8):** in-memory constructor
+        // parity. Default `:memory:` databases are private to a single
+        // connection per SQLite docs and cannot see cross-connection
+        // contention, so `busy_timeout` is functionally a no-op here.
+        // Pinning it anyway keeps the init path uniform with `open` —
+        // future drift where someone copies an init path and forgets
+        // the pragma gets caught by the regression test.
+        init_sqlite_connection(&conn)
+            .map_err(|e| map_sqlite_err(e, "timeline in_memory init"))?;
         let tl = Self { conn };
         tl.init_schema()?;
         Ok(tl)
@@ -148,7 +161,7 @@ impl Timeline {
                 "INSERT INTO actions (action_id, description, timestamp, reversible, undo_command, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![action_id, description, now, true, undo_command, expires_at],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("failed to record action: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "failed to record action"))?;
 
         debug!(action_id = %action_id, description, "action recorded");
         Ok(action_id)
@@ -180,7 +193,7 @@ impl Timeline {
                 "INSERT INTO actions (action_id, description, timestamp, reversible, undo_command, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![action_id, description, now, false, "", now],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("failed to record action: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "failed to record action"))?;
 
         debug!(action_id = %action_id, description, "irreversible action recorded");
         Ok(action_id)
@@ -248,7 +261,7 @@ impl Timeline {
                 "UPDATE actions SET reversible = 0, undo_command = '[UNDONE]' WHERE action_id = ?1",
                 params![action_id],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("failed to mark undone: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "failed to mark undone"))?;
 
         info!(action_id, "action undone");
         Ok(record.undo_command)
@@ -277,7 +290,7 @@ impl Timeline {
             .prepare(
                 "SELECT action_id, description, timestamp, reversible, undo_command, expires_at FROM actions ORDER BY timestamp DESC LIMIT ?1",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("query prepare failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query prepare failed"))?;
 
         let rows = stmt
             .query_map(params![count], |row| {
@@ -290,12 +303,12 @@ impl Timeline {
                     expires_at: row.get(5)?,
                 })
             })
-            .map_err(|e| OrchestratorError::Planning(format!("query failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "query failed"))?;
 
         let mut results = Vec::new();
         for row in rows {
             results.push(
-                row.map_err(|e| OrchestratorError::Planning(format!("row read failed: {e}")))?,
+                row.map_err(|e| map_sqlite_err(e, "row read failed"))?,
             );
         }
 
@@ -327,7 +340,7 @@ impl Timeline {
                 "DELETE FROM actions WHERE expires_at < ?1",
                 params![now],
             )
-            .map_err(|e| OrchestratorError::Planning(format!("cleanup failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "cleanup failed"))?;
 
         if deleted > 0 {
             debug!("cleaned up {deleted} expired actions");
@@ -353,7 +366,7 @@ impl Timeline {
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM actions", [], |row| row.get(0))
-            .map_err(|e| OrchestratorError::Planning(format!("count failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "count failed"))?;
         Ok(count as usize)
     }
 
@@ -372,7 +385,7 @@ impl Timeline {
                 CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON actions(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_actions_expires ON actions(expires_at);",
             )
-            .map_err(|e| OrchestratorError::Planning(format!("schema init failed: {e}")))?;
+            .map_err(|e| map_sqlite_err(e, "schema init failed"))?;
         Ok(())
     }
 }
@@ -507,5 +520,63 @@ mod tests {
             timeout, 5_000,
             "Timeline::open must pin busy_timeout to 5000ms per CLAUDE.md policy"
         );
+    }
+
+    #[test]
+    fn in_memory_busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 23 (round 8):** in-memory constructor
+        // parity. Default `:memory:` DBs cannot see cross-connection
+        // contention so `busy_timeout` is functionally a no-op here,
+        // but the policy mandates uniform init to catch future drift
+        // (someone copying an init path and forgetting the pragma).
+        let tl = Timeline::in_memory().unwrap();
+        let timeout: i64 = tl
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "Timeline::in_memory must pin busy_timeout to 5000ms (F23 constructor parity)"
+        );
+    }
+
+    // ── Codex re-review FIX 22 (round 8): sibling typed routing ──
+
+    #[test]
+    fn timeline_routes_database_busy_to_transient_lock() {
+        // Sibling consistency: SQLITE_BUSY surfaced from a Timeline
+        // rusqlite op must come out as TransientLock so daemons can
+        // typed-retry. Pre-F22 this routed to Planning via the
+        // direct `map_err(|e| OrchestratorError::Planning(...))`
+        // calls that pervaded timeline.rs.
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("test".to_string()),
+        );
+        let mapped = map_sqlite_err(err, "timeline test");
+        assert!(
+            matches!(mapped, OrchestratorError::TransientLock { .. }),
+            "SQLITE_BUSY routed via timeline's shared helper must be TransientLock"
+        );
+    }
+
+    #[test]
+    fn timeline_routes_database_locked_to_transient_lock() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let mapped = map_sqlite_err(err, "timeline test");
+        assert!(matches!(mapped, OrchestratorError::TransientLock { .. }));
+    }
+
+    #[test]
+    fn timeline_preserves_planning_for_non_lock_sqlite_failures() {
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE failed".to_string()),
+        );
+        let mapped = map_sqlite_err(err, "timeline test");
+        assert!(matches!(mapped, OrchestratorError::Planning(_)));
     }
 }

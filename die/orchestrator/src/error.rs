@@ -65,6 +65,38 @@ pub enum OrchestratorError {
     /// the orchestrator — consumers degrade gracefully.
     #[error("environment error: {0}")]
     Environment(String),
+
+    /// SQLite lock contention exhausted the connection's `busy_timeout`.
+    /// Surfaced when `map_sqlite_err` translates a
+    /// `rusqlite::Error::SqliteFailure` whose `code` is
+    /// `ErrorCode::DatabaseBusy` (SQLITE_BUSY — another connection or
+    /// process holds an incompatible lock) or `ErrorCode::DatabaseLocked`
+    /// (SQLITE_LOCKED — same connection, shared-cache conflict). Both
+    /// are transient and retryable.
+    ///
+    /// **Codex re-review FIX 21 (round 7):** before this variant the
+    /// post-F19 backfill path mapped `busy_timeout` exhaustion through
+    /// `map_sqlite_err` into `Planning("knowledge sqlite: database is
+    /// locked")`. The string survived but the structured rusqlite
+    /// `ErrorCode` was lost, so daemons could not distinguish transient
+    /// lock contention from genuine schema/logic failures except by
+    /// string matching. Routing the two retryable error codes into a
+    /// dedicated typed variant lets callers (`KnowledgeStore::open`
+    /// internally, and downstream daemons externally) pattern-match
+    /// for typed retry policy.
+    ///
+    /// The full `rusqlite::Error` is preserved as `source` so callers
+    /// that want to inspect extended codes (`SQLITE_BUSY_RECOVERY`,
+    /// `SQLITE_BUSY_SNAPSHOT`, `SQLITE_LOCKED_SHAREDCACHE`, etc.) can
+    /// reach the `ffi::Error` inside. The base `code` field already
+    /// masks extended codes to the same `DatabaseBusy`/`DatabaseLocked`
+    /// variant per libsqlite3-sys's `Error::new`, so matching on `code`
+    /// alone catches both base and extended cases.
+    #[error("transient sqlite lock contention: {source}")]
+    TransientLock {
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 #[cfg(test)]

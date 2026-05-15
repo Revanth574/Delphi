@@ -266,6 +266,20 @@ All D-Bus services must follow this pattern:
 5. Services must be independently startable (for testing) and collectively startable (via `delphi-daemon`)
 6. Use `std::sync::Mutex` (not `tokio::sync`) for `!Send` types (rusqlite, tantivy) in zbus interfaces
 
+### SQLite Connection Policy
+
+Codified in round 7 after Codex F19/F20/F21 surfaced that the project had been relying on rusqlite's default `busy_timeout` (currently 5000 ms but documented as "subject to change") and was unable to distinguish transient lock contention from genuine schema/logic failures at the type level. Every public store that opens a `rusqlite::Connection` MUST:
+
+1. **Set `busy_timeout` explicitly** to a documented value (5 s baseline, configurable per store if a store has documented contention requirements). Do not rely on the rusqlite default. Canonical implementation: `conn.busy_timeout(Duration::from_secs(5))` right after `Connection::open` and before any pragma-altering statement.
+
+2. **Map `rusqlite::Error::SqliteFailure` with `ErrorCode::DatabaseBusy` or `ErrorCode::DatabaseLocked`** into a typed transient-error variant (`OrchestratorError::TransientLock`) via the store's `map_sqlite_err` (or equivalent translation site). All other `rusqlite::Error` variants retain their existing classification. The base `ErrorCode` mask catches both base and extended busy/locked codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_LOCKED_SHAREDCACHE`, etc.) per libsqlite3-sys's `Error::new`.
+
+3. **If multi-process opener contention is a documented possibility**, wrap the open path in the standard retry-with-backoff loop. Canonical implementation: `die_orchestrator::knowledge::retry_with_backoff` (generic over the success type; reusable). Loop matches *only* on `OrchestratorError::TransientLock`; any other error short-circuits immediately. Defaults: `MAX_OPEN_ATTEMPTS = 5`, `INITIAL_BACKOFF_MS = 100`, doubled per attempt up to `MAX_BACKOFF_MS = 2000`, with jitter drawn from `SystemTime` nanoseconds (no `rand` dep).
+
+Connections opened by code under test or as `:memory:` may omit (3) — those connections never see cross-process contention — but should still satisfy (1) and (2) so the init path is uniform and a test fixture's behavior matches production's typed errors.
+
+The retry loop happens at the **store-open** level, not inside the integrity-check helpers. The integrity-check function stays single-attempt; the caller (e.g., `KnowledgeStore::open`) retries. This keeps `BEGIN IMMEDIATE` semantics atomic per attempt and makes the retry boundary an explicit, documented seam rather than implicit inside multi-statement transactions.
+
 ### WebSocket Bridge Pattern
 
 All shell-to-backend communication goes through the WebSocket bridge:

@@ -88,6 +88,9 @@ impl Timeline {
     pub fn open(path: &Path) -> Result<Self, OrchestratorError> {
         let conn = Connection::open(path)
             .map_err(|e| OrchestratorError::Planning(format!("failed to open timeline db: {e}")))?;
+        // Explicit 5s busy_timeout. Project policy per CLAUDE.md (added round 7).
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| OrchestratorError::Planning(format!("timeline busy_timeout: {e}")))?;
         let tl = Self { conn };
         tl.init_schema()?;
         info!("timeline database opened at {}", path.display());
@@ -482,5 +485,27 @@ mod tests {
             let recent = tl.list_recent(10).unwrap();
             assert_eq!(recent.len(), 2);
         }
+    }
+
+    #[test]
+    fn busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 20/F21 sibling consistency (round 7):**
+        // every public `Connection::open` site in the orchestrator must
+        // pin `busy_timeout` explicitly rather than rely on rusqlite's
+        // default (currently 5000ms but documented as "subject to
+        // change"). This test asserts `Timeline::open` does so. The
+        // value 5000 matches the CLAUDE.md SQLite-connection-policy
+        // baseline.
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("timeline.db");
+        let tl = Timeline::open(&db_path).unwrap();
+        let timeout: i64 = tl
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "Timeline::open must pin busy_timeout to 5000ms per CLAUDE.md policy"
+        );
     }
 }

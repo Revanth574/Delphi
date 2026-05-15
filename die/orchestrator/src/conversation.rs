@@ -267,6 +267,9 @@ impl ConversationStore {
         let conn = Connection::open(path).map_err(|e| {
             OrchestratorError::Planning(format!("failed to open conversation db: {e}"))
         })?;
+        // Explicit 5s busy_timeout. Project policy per CLAUDE.md (added round 7).
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| OrchestratorError::Planning(format!("conversation busy_timeout: {e}")))?;
         let store = Self { conn };
         store.configure_pragmas()?;
         store.init_schema()?;
@@ -1194,5 +1197,24 @@ mod tests {
         let m = utc_midnight(t);
         assert!(m <= t);
         assert_eq!(m % 86_400, 0);
+    }
+
+    #[test]
+    fn busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 20/F21 sibling consistency (round 7):**
+        // every public `Connection::open` site in the orchestrator must
+        // pin `busy_timeout` explicitly. Asserts `ConversationStore::open`
+        // does so. See CLAUDE.md SQLite-connection-policy.
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("conv.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "ConversationStore::open must pin busy_timeout to 5000ms per CLAUDE.md policy"
+        );
     }
 }

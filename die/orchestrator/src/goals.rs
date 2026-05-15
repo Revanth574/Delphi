@@ -457,6 +457,9 @@ impl GoalStore {
         let conn = Connection::open(path).map_err(|e| {
             OrchestratorError::Planning(format!("failed to open goal db: {e}"))
         })?;
+        // Explicit 5s busy_timeout. Project policy per CLAUDE.md (added round 7).
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| OrchestratorError::Planning(format!("goal busy_timeout: {e}")))?;
         // WAL for file-backed stores. Safe to run every open.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| OrchestratorError::Planning(format!("WAL enable failed: {e}")))?;
@@ -1825,5 +1828,24 @@ mod tests {
         assert_eq!(list[0].id, c);
         assert_eq!(list[1].id, b);
         assert_eq!(list[2].id, a);
+    }
+
+    #[test]
+    fn busy_timeout_pinned_to_5_seconds() {
+        // **Codex re-review FIX 20/F21 sibling consistency (round 7):**
+        // every public `Connection::open` site in the orchestrator must
+        // pin `busy_timeout` explicitly. Asserts `GoalStore::open` does
+        // so. See CLAUDE.md SQLite-connection-policy.
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("goals.db");
+        let store = GoalStore::open(&db_path).unwrap();
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "GoalStore::open must pin busy_timeout to 5000ms per CLAUDE.md policy"
+        );
     }
 }

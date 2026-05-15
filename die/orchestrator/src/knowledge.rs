@@ -236,6 +236,32 @@ CREATE TABLE IF NOT EXISTS schema_version (
 ///   `UNIQUE(uri, content_hash, format)` on `sources`.
 const CURRENT_SCHEMA_VERSION: i64 = 2;
 
+/// **Codex re-review FIX 20 (round 7):** maximum attempts the
+/// [`KnowledgeStore::open`] retry loop makes before surfacing
+/// [`OrchestratorError::TransientLock`] to the caller.
+///
+/// The retry only fires on `TransientLock` (per F21). Any other
+/// `OrchestratorError` short-circuits immediately. With the default
+/// 5s per-attempt `busy_timeout` plus the exponential backoff between
+/// attempts (100 + 200 + 400 + 800 + 1600 ms = 3.1s total inter-attempt
+/// sleep), the worst-case opener latency under sustained contention is
+/// roughly `5 × 5s + 3.1s ≈ 28s` before a typed `TransientLock` reaches
+/// the caller. Callers still get a typed error they can interpret,
+/// rather than a string-matched lockup.
+pub const MAX_OPEN_ATTEMPTS: usize = 5;
+
+/// **Codex re-review FIX 20 (round 7):** initial backoff for the
+/// retry-with-backoff loop in [`KnowledgeStore::open`]. Doubled each
+/// retry attempt (100 → 200 → 400 → 800 → 1600) and capped at
+/// [`MAX_BACKOFF_MS`] to keep total inter-attempt sleep bounded.
+pub const INITIAL_BACKOFF_MS: u64 = 100;
+
+/// **Codex re-review FIX 20 (round 7):** ceiling for the exponentially-
+/// growing backoff. Bound on inter-attempt sleep so a long-stuck
+/// database surfaces `TransientLock` in finite time rather than
+/// growing the per-retry sleep unboundedly.
+pub const MAX_BACKOFF_MS: u64 = 2_000;
+
 // ────────────────────────────────────────────────────────────────────
 // Type aliases + enums
 // ────────────────────────────────────────────────────────────────────
@@ -991,26 +1017,30 @@ pub struct KnowledgeStore {
 
 impl KnowledgeStore {
     /// Open or create a knowledge graph at `db_path`. WAL mode enabled.
+    ///
+    /// **Codex re-review FIX 20 (round 7):** the open+backfill sequence
+    /// is wrapped in [`retry_with_backoff`], a retry-with-exponential-
+    /// backoff loop that re-attempts only on
+    /// [`OrchestratorError::TransientLock`]. F19's `BEGIN IMMEDIATE` plus
+    /// `busy_timeout(5s)` serialize concurrent backfillers correctly
+    /// when the winner releases within 5s, but a slow
+    /// `PRAGMA foreign_key_check` (large unversioned graph) or any
+    /// writer holding the DB longer than 5s caused the loser's
+    /// `BEGIN IMMEDIATE` to surface `SQLITE_BUSY` at BEGIN — failing
+    /// a legitimate opener against a valid DB. The retry catches that
+    /// `TransientLock`, sleeps with exponential backoff (100, 200, 400,
+    /// 800, 1600 ms; jittered), and reattempts. Worst-case opener
+    /// latency under sustained contention is bounded by
+    /// [`MAX_OPEN_ATTEMPTS`].
+    ///
+    /// The embedder is consumed only after a connection is in hand
+    /// (i.e. after the retry loop completes successfully), so a failed
+    /// attempt doesn't leak it.
     pub fn open(
         db_path: &Path,
         embedder: Box<dyn Embedder>,
     ) -> Result<Self, OrchestratorError> {
-        let mut conn = Connection::open(db_path).map_err(map_sqlite_err)?;
-        // **Codex re-review FIX 19 (P2-medium):** set a 5-second busy
-        // timeout BEFORE `init_schema` runs. `init_schema` may route
-        // into `backfill_version_with_integrity_check`, which opens a
-        // `BEGIN IMMEDIATE` transaction; two processes opening the
-        // same file concurrently serialize there, and the loser
-        // receives SQLITE_BUSY at BEGIN. The busy timeout makes that
-        // loser retry (sleep-and-wait) until the winner commits,
-        // instead of failing a legitimate opener against a valid
-        // database. No prior `busy_timeout` pattern existed anywhere
-        // in the workspace — this call site establishes it; 5s
-        // matches the conventional SQLite default-tier choice and is
-        // far longer than any backfill transaction.
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(map_sqlite_err)?;
-        Self::init_schema(&mut conn)?;
+        let conn = retry_with_backoff(|| try_open_and_backfill_once(db_path))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             embedder,
@@ -1018,13 +1048,12 @@ impl KnowledgeStore {
     }
 
     pub fn in_memory(embedder: Box<dyn Embedder>) -> Result<Self, OrchestratorError> {
+        // In-memory databases are private to a single connection;
+        // they cannot see cross-connection lock contention, so the
+        // retry loop is unnecessary. Kept symmetric with `open` only
+        // in setting `busy_timeout` (still pointless for `:memory:`
+        // but uniform with the production-policy default).
         let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
-        // FIX 19: kept symmetric with `open` so both connection-init
-        // paths apply the same standard setup. An in-memory database
-        // is private to its single connection and can never see
-        // cross-connection lock contention, so the timeout never
-        // actually fires here — but a uniform init path is easier to
-        // reason about than a conditional one.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(map_sqlite_err)?;
         Self::init_schema(&mut conn)?;
@@ -2919,7 +2948,108 @@ fn parse_fidelity(s: &str) -> Fidelity {
     }
 }
 
+/// **Codex re-review FIX 20 (round 7):** the single-attempt open path
+/// extracted from [`KnowledgeStore::open`] for the retry loop.
+///
+/// Opens a connection at `db_path`, applies the project-standard
+/// `busy_timeout` policy (5s, explicit per CLAUDE.md SQLite policy
+/// rather than relying on rusqlite's default which is documented as
+/// "subject to change"), and runs `init_schema` — which may route into
+/// the backfill helper that opens `BEGIN IMMEDIATE` and can therefore
+/// surface [`OrchestratorError::TransientLock`] under contention.
+///
+/// On `TransientLock` the caller (`retry_with_backoff`) sleeps and
+/// reattempts; on any other error the caller short-circuits and
+/// propagates the error unchanged.
+fn try_open_and_backfill_once(db_path: &Path) -> Result<Connection, OrchestratorError> {
+    let mut conn = Connection::open(db_path).map_err(map_sqlite_err)?;
+    // 5s busy_timeout, set explicitly per the CLAUDE.md SQLite
+    // connection policy. rusqlite 0.35.0's default happens to also be
+    // 5s but the rusqlite docs warn that default "may be subject to
+    // change," so we pin it.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(map_sqlite_err)?;
+    KnowledgeStore::init_schema(&mut conn)?;
+    Ok(conn)
+}
+
+/// **Codex re-review FIX 20 (round 7):** retry-with-exponential-backoff
+/// loop. Re-attempts `op` only when it returns
+/// [`OrchestratorError::TransientLock`]; any other error short-circuits
+/// immediately. Sleeps `INITIAL_BACKOFF_MS`, doubles up to
+/// `MAX_BACKOFF_MS`, gives up after `MAX_OPEN_ATTEMPTS` attempts and
+/// surfaces the most recent `TransientLock` unchanged so callers can
+/// still pattern-match for typed retry.
+///
+/// **Jitter:** drawn from `SystemTime::now()`'s sub-second nanoseconds
+/// modulo `backoff_ms / 2`. This gives a per-call non-deterministic
+/// 0..50% jitter without pulling in the `rand` crate as a new
+/// orchestrator dep — the nanosecond precision naturally desyncs
+/// threads that fall into the retry path at the same instant. If the
+/// system clock is unavailable (shouldn't happen on Linux/Windows),
+/// jitter falls back to 0 and the exponential backoff alone provides
+/// desync over multiple attempts.
+///
+/// Generic over `T` so the same retry mechanism can be unit-tested
+/// with `T = ()` (driven by a mock closure) without opening an actual
+/// database connection.
+fn retry_with_backoff<T, F>(mut op: F) -> Result<T, OrchestratorError>
+where
+    F: FnMut() -> Result<T, OrchestratorError>,
+{
+    let mut attempt: usize = 0;
+    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(OrchestratorError::TransientLock { .. })
+                if attempt < MAX_OPEN_ATTEMPTS - 1 =>
+            {
+                let jitter_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::from(d.subsec_nanos()))
+                    .unwrap_or(0);
+                let jitter = jitter_nanos % (backoff_ms / 2).max(1);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    backoff_ms.saturating_add(jitter),
+                ));
+                attempt += 1;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Translate a `rusqlite::Error` into the orchestrator's error type.
+///
+/// **Codex re-review FIX 21 (round 7):** `SqliteFailure` errors whose
+/// inner `ffi::Error.code` is `DatabaseBusy` (SQLITE_BUSY) or
+/// `DatabaseLocked` (SQLITE_LOCKED) are routed into
+/// [`OrchestratorError::TransientLock`] — both are transient and
+/// retryable, and downstream callers (including
+/// [`KnowledgeStore::open`]'s retry loop and any external daemon) can
+/// pattern-match for typed retry instead of string-matching error text.
+///
+/// All other rusqlite errors (logic failures, constraint violations,
+/// I/O errors, etc.) retain the existing
+/// [`OrchestratorError::Planning`] classification.
+///
+/// Extended codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`,
+/// `SQLITE_BUSY_TIMEOUT`, `SQLITE_LOCKED_SHAREDCACHE`,
+/// `SQLITE_LOCKED_VTAB`) are mapped by libsqlite3-sys to the same base
+/// `ErrorCode::DatabaseBusy`/`DatabaseLocked` via `Error::new`'s
+/// `& 0xff` mask, so matching on `ffi_err.code` alone catches both
+/// base and extended variants.
 fn map_sqlite_err(e: rusqlite::Error) -> OrchestratorError {
+    if let rusqlite::Error::SqliteFailure(ref ffi_err, _) = e
+        && matches!(
+            ffi_err.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    {
+        return OrchestratorError::TransientLock { source: e };
+    }
     OrchestratorError::Planning(format!("knowledge sqlite: {e}"))
 }
 
@@ -5709,5 +5839,188 @@ CREATE TABLE IF NOT EXISTS embeddings (
                 "iteration {iter}: schema_version must hold exactly one row = [2]"
             );
         }
+    }
+
+    // ── Codex re-review FIX 21 (round 7) regression — typed error mapping ──
+
+    #[test]
+    fn map_sqlite_err_routes_database_busy_to_transient_lock() {
+        // SQLITE_BUSY (different connection/process holds incompatible
+        // lock) must surface as `TransientLock`, not `Planning`. Round-6
+        // left `busy_timeout` exhaustion as `Planning("...database is
+        // locked")`, requiring daemons to string-match for retry
+        // decisions. F21 routes it through a typed variant so callers
+        // can pattern-match.
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("test database is locked".to_string()),
+        );
+        let mapped = map_sqlite_err(err);
+        assert!(
+            matches!(mapped, OrchestratorError::TransientLock { .. }),
+            "SQLITE_BUSY must map to TransientLock; got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_sqlite_err_routes_database_locked_to_transient_lock() {
+        // SQLITE_LOCKED (same connection / shared cache conflict) is
+        // also transient and retryable, so it routes to the same typed
+        // variant as SQLITE_BUSY. Both lock-class error codes share the
+        // `DatabaseBusy | DatabaseLocked` pattern in `map_sqlite_err`.
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let mapped = map_sqlite_err(err);
+        assert!(
+            matches!(mapped, OrchestratorError::TransientLock { .. }),
+            "SQLITE_LOCKED must map to TransientLock; got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_sqlite_err_preserves_planning_for_non_lock_failures() {
+        // Non-busy/non-locked SqliteFailure (e.g. SQLITE_CONSTRAINT
+        // for FK / UNIQUE violations, SQLITE_CORRUPT, etc.) must keep
+        // the existing `Planning` classification. The F21 change is a
+        // narrow routing of the two retryable lock codes, NOT a
+        // wholesale reclassification of every SQLite error.
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE constraint failed".to_string()),
+        );
+        let mapped = map_sqlite_err(err);
+        assert!(
+            matches!(mapped, OrchestratorError::Planning(_)),
+            "SQLITE_CONSTRAINT must stay Planning; got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_sqlite_err_preserves_planning_for_non_sqlitefailure_variants() {
+        // `rusqlite::Error` has many non-`SqliteFailure` variants
+        // (QueryReturnedNoRows, InvalidColumnIndex, etc.). The F21
+        // routing only touches `SqliteFailure` with the lock codes;
+        // every other Error variant must continue to map to Planning.
+        let err = rusqlite::Error::QueryReturnedNoRows;
+        let mapped = map_sqlite_err(err);
+        assert!(
+            matches!(mapped, OrchestratorError::Planning(_)),
+            "QueryReturnedNoRows must stay Planning; got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn open_or_init_survives_n_thread_contention() {
+        // ── Codex re-review FIX 20 (P2-medium) regression ──
+        //
+        // F19's BEGIN IMMEDIATE + 5s `busy_timeout` serialize concurrent
+        // backfillers correctly *as long as the winning opener releases
+        // the write lock within the 5s busy window*. If the winner holds
+        // RESERVED through a long `PRAGMA foreign_key_check` (large
+        // unversioned graph) or any other writer holds the DB longer
+        // than 5s, the loser's `BEGIN IMMEDIATE` exhausts its busy
+        // timeout and surfaces SQLITE_BUSY at BEGIN — failing a
+        // legitimate opener against a valid DB. F19 closed the
+        // *insert race*; this finding pushes it out to a *bounded
+        // lock-wait race*.
+        //
+        // The fix: `KnowledgeStore::open` wraps the open+backfill
+        // sequence in a retry-with-backoff loop that matches only on
+        // `OrchestratorError::TransientLock` (new F21 typed variant)
+        // and sleeps with exponential backoff between attempts.
+        //
+        // ── Iron Law #9 test design ──
+        //
+        // The small seeded fixture's `foreign_key_check` finishes in
+        // microseconds, so an unaided N-thread `open` test does NOT
+        // exceed the 5s `busy_timeout` and PASSES even on 6f3f5c8 —
+        // verified empirically on this WSL2 box. A test that doesn't
+        // reproduce the bug is worse than no test.
+        //
+        // To deterministically force a >5s contention WITHOUT
+        // touching production code (no test-only sleep injected into
+        // `backfill_version_with_integrity_check`), this test takes
+        // the production lock from an independent connection in the
+        // test thread itself: opens a second `Connection` on the same
+        // file, issues `BEGIN IMMEDIATE`, sleeps past the 5s window,
+        // then commits. While the test holds RESERVED, every opener
+        // thread's `BEGIN IMMEDIATE` inside the backfill blocks via
+        // its own `busy_timeout`. On 6f3f5c8 the openers' 5s timeout
+        // expires before the lock-holder releases → SQLITE_BUSY →
+        // their opens fail (the F20 bug). On the post-fix code the
+        // retry-with-backoff loop reattempts after a short sleep,
+        // catches the lock release shortly after, and succeeds.
+        //
+        // Hold time = 5300ms — just past `busy_timeout` but short
+        // enough that the post-fix retry (initial 100ms backoff) catches
+        // the release within its second 5s window. Test wall-clock ≈ 5.4s.
+        const HOLD_MS: u64 = 5_300;
+        const N_THREADS: usize = 4;
+
+        let tmpdir = TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("kg.db");
+        drop(make_clean_unversioned_epoch_2_db(&db_path));
+
+        // Open the lock-holder connection in this test thread. Set a
+        // 0ms busy_timeout so the holder itself doesn't sit waiting
+        // (no one else holds RESERVED yet at this moment, so BEGIN
+        // IMMEDIATE acquires immediately).
+        let mut holder = Connection::open(&db_path).unwrap();
+        holder.busy_timeout(std::time::Duration::from_millis(0)).unwrap();
+        let holder_tx = holder
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("lock holder must acquire RESERVED on uncontended DB");
+
+        // Spawn opener threads, barrier-synced. Barrier size is
+        // N_THREADS + 1 (the workers + the test thread); the test
+        // thread releases the workers AFTER the holder transaction
+        // is open and the lock is reserved.
+        let barrier = Arc::new(std::sync::Barrier::new(N_THREADS + 1));
+        let handles: Vec<std::thread::JoinHandle<Result<(), String>>> = (0..N_THREADS)
+            .map(|i| {
+                let p = db_path.clone();
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    KnowledgeStore::open(&p, Box::new(MockEmbedder::new()))
+                        .map(|_| ())
+                        .map_err(|e| format!("thread {i}: {e}"))
+                })
+            })
+            .collect();
+
+        // Release the workers (lock still held by this thread), then
+        // hold past the 5s busy_timeout window.
+        barrier.wait();
+        std::thread::sleep(std::time::Duration::from_millis(HOLD_MS));
+
+        // Release the production lock so retrying workers can finally
+        // acquire RESERVED.
+        holder_tx.commit().expect("holder commit must succeed");
+        drop(holder);
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread must not panic"))
+            .collect();
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "opener failed against a valid DB (F20 regression): {r:?}"
+            );
+        }
+
+        // Exactly one schema_version row = [2] after all four opens.
+        let conn = Connection::open(&db_path).unwrap();
+        let rows: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![2]);
     }
 }

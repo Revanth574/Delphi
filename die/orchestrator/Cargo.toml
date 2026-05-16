@@ -22,6 +22,17 @@ zbus = { workspace = true }
 rusqlite = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+# Knowledge synthesis (Task 3A.5) — Markdown + HTML ingestion + content hashing.
+pulldown-cmark = { workspace = true }
+scraper = { workspace = true }
+sha2 = { workspace = true }
+
+# FIX 8 (Codex re-review P1-high): libc::O_NOFOLLOW closes the
+# validate→read TOCTOU window in `safe_open_no_follow` on Unix. The
+# crate is already in the workspace transitively via tokio + zbus, so
+# this is a declaration-of-intent change, not a build-cost change.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

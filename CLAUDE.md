@@ -266,6 +266,20 @@ All D-Bus services must follow this pattern:
 5. Services must be independently startable (for testing) and collectively startable (via `delphi-daemon`)
 6. Use `std::sync::Mutex` (not `tokio::sync`) for `!Send` types (rusqlite, tantivy) in zbus interfaces
 
+### SQLite Connection Policy
+
+Codified in round 7 after Codex F19/F20/F21 surfaced that the project had been relying on rusqlite's default `busy_timeout` (currently 5000 ms but documented as "subject to change") and was unable to distinguish transient lock contention from genuine schema/logic failures at the type level. Refined in round 8 (F22/F23/F24) to consolidate the helpers and close the in_memory parity + retry-budget off-by-one gaps. Every public store that opens a `rusqlite::Connection` MUST:
+
+1. **Set `busy_timeout` explicitly** to a documented value (5 s baseline, configurable per store if a store has documented contention requirements). Do not rely on the rusqlite default. Canonical implementation: call `die_orchestrator::sqlite::init_sqlite_connection(&conn)?` right after `Connection::open` (or `Connection::open_in_memory`) and before any pragma-altering statement. **This applies to `in_memory()` constructors too** — default `:memory:` databases are private to a single connection per SQLite docs ("Every :memory: database is distinct from every other") and cannot see cross-connection lock contention, but constructor parity is the regression-detection mechanism: future drift where someone copies an init path and forgets the pragma is caught by the `busy_timeout_pinned_to_5_seconds` tests every store ships.
+
+2. **Map `rusqlite::Error::SqliteFailure` with `ErrorCode::DatabaseBusy` or `ErrorCode::DatabaseLocked`** into a typed transient-error variant (`OrchestratorError::TransientLock`) via `die_orchestrator::sqlite::map_sqlite_err(err, context)`. All other `rusqlite::Error` variants retain their existing `Planning` classification with the caller-supplied context preserved. The base `ErrorCode` mask catches both base and extended busy/locked codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_LOCKED_SHAREDCACHE`, etc.) per libsqlite3-sys's `Error::new`. Direct construction of `OrchestratorError::Planning` from a `rusqlite::Error` is a policy violation — the shared helper is the only sanctioned translation site.
+
+3. **If multi-process opener contention is a documented possibility**, wrap the open path in the standard retry-with-backoff loop. Canonical implementation: `die_orchestrator::knowledge::retry_with_backoff` (generic over the success type; reusable). Loop matches *only* on `OrchestratorError::TransientLock`; any other error short-circuits immediately. Defaults: `MAX_OPEN_ATTEMPTS = 6`, `INITIAL_BACKOFF_MS = 100`, doubled per attempt up to `MAX_BACKOFF_MS = 2000`, giving the documented `100 → 200 → 400 → 800 → 1600 ms` inter-attempt sleep sequence (5 sleeps across 6 attempts). Jitter is drawn from `SystemTime` nanoseconds (no `rand` dep). Worst-case opener latency under sustained contention: `6 × 5 s busy_timeout + 3.1 s inter-attempt sleep ≈ 33 s` before a typed `TransientLock` reaches the caller.
+
+The **shared SQLite policy helpers** live in `die/orchestrator/src/sqlite.rs` as the single sanctioned home for project-wide connection-init policy. `KnowledgeStore`, `Timeline`, `GoalStore`, and `ConversationStore` all use `init_sqlite_connection` and `map_sqlite_err` from this module. Future stores must use the same helpers — copy-pasting the routing logic into per-store modules is explicitly forbidden because the next routing change would silently diverge across stores.
+
+The retry loop happens at the **store-open** level, not inside the integrity-check helpers. The integrity-check function stays single-attempt; the caller (e.g., `KnowledgeStore::open`) retries. This keeps `BEGIN IMMEDIATE` semantics atomic per attempt and makes the retry boundary an explicit, documented seam rather than implicit inside multi-statement transactions.
+
 ### WebSocket Bridge Pattern
 
 All shell-to-backend communication goes through the WebSocket bridge:

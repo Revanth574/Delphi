@@ -19,5 +19,17 @@ anyhow = { workspace = true }
 zbus = { workspace = true }
 chrono = { workspace = true }
 
+# FIX 15 (Codex re-review): `open_dir_no_follow` needs Linux libc
+# constants (O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) to register
+# allowlist roots as held directory handles rather than
+# re-resolvable path strings. libc is already in the workspace via
+# tokio + die-orchestrator transitively, so this is a
+# declaration-of-intent rather than a build-cost change.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# Allowlist tests use TempDir to construct isolated allowed roots
+# (Codex review FIX 1 + FIX 4, Task 3A.5).
+tempfile = { workspace = true }

@@ -34,9 +34,11 @@ pub mod environment;
 pub mod error;
 pub mod goals;
 pub mod health;
+pub mod knowledge;
 pub mod planner;
 pub mod reference;
 pub mod risk;
+pub mod sqlite;
 pub mod timeline;
 
 pub use error::OrchestratorError;

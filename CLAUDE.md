@@ -604,6 +604,31 @@ git branch -d phase-{N}/{task-name}
 - `PROGRESS.md` updates
 - Shell UI changes with no backend auth involvement
 
+### Dev environment sync
+
+The canonical source of truth is `origin` (the shared GitHub remote at `https://github.com/Revanth574/Delphi.git`, private). Windows tree and WSL2 mirror BOTH push and pull from origin. The prior pattern of treating Windows as authoritative and rsync'ing Windows → WSL is DEPRECATED — it caused silent `.git` divergence during Task 3A.5 round 6 (see PROGRESS.md history for the rsync-residue stash incident).
+
+Established 2026-05-16 immediately after the Task 3A.5 merge as a one-time bootstrap. WSL's prior `windows` remote (pointing at `file:///mnt/c/Users/kvlnr/OneDrive/Desktop/Delphi`) has been removed; both trees now share `origin`.
+
+**WSL HTTPS-git auth note:** WSL git's credential helper is configured locally (per-repo, not global) to delegate to the Windows Git Credential Manager at `/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe`. This shares the single Windows credential store across both trees, satisfying CLAUDE.md §10 ("never store credentials outside the Fortress vault" — the Windows credential vault is the closest available equivalent until Fortress's federated credential layer ships). If you ever see a hung WSL `git fetch`/`git push`, the credential helper is missing or misconfigured: re-run `git config --local credential.helper '/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe'` from the repo root.
+
+**Required for every cross-tree handoff:**
+
+- End of session on one tree: `git push origin <branch>`
+- Start of session on the other tree: `git fetch origin && git status`
+
+**Drift detection:** if `git status` ever shows "Your branch and 'origin/<branch>' have diverged", STOP. Do not merge or rebase blindly — diagnose which tree has the unpushed commits first. Use `git log origin/<branch>..HEAD` to see what's local-only on this tree, and `git log HEAD..origin/<branch>` to see what's remote-only. Reconcile by deciding which side is correct and either `git pull --rebase`, `git reset --hard origin/<branch>` (DESTRUCTIVE — confirm first), or manual cherry-pick.
+
+**Bootstrapping a fresh tree (e.g. a new dev machine or a cleaned WSL):**
+
+```bash
+git clone https://github.com/Revanth574/Delphi.git delphi
+cd delphi
+# If on WSL with Git for Windows installed on the host:
+git config --local credential.helper '/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe'
+git fetch --all --tags
+```
+
 ### Commit Messages
 
 **Conventional Commits format:**

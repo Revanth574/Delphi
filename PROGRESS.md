@@ -298,3 +298,4 @@ This nine-round arc establishes the following as project-wide patterns for any s
 6. **Typed transient-error variants** (`OrchestratorError::TransientLock`) over string-matching on error messages for daemon retry logic.
 7. **Shared policy helpers** (`die_orchestrator::sqlite::{init_sqlite_connection, map_sqlite_err}`) over per-store copy-pasted routing — single seam, single change site.
 8. **Stash-as-recovery-handle** during multi-round work — the rsync-residue stash (`ef33afd`) served as the rollback anchor through rounds 6–9 and was dropped only after the merge + tag landed.
+

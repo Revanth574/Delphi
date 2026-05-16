@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Tests for the TimelinePanel component
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 
 import { TimelinePanel } from "../timeline-panel";
@@ -159,7 +159,33 @@ describe("TimelinePanel", () => {
   });
 });
 
+// Pin the system clock for both `formatTimestamp` and `undoTimeRemaining`
+// describe blocks. Both production functions read `Date.now()` and
+// `Math.floor` against it; tests that create relative-time fixtures via
+// `new Date(Date.now() + N).toISOString()` and then assert exact
+// minute/hour boundaries race the few ms that elapse between fixture
+// creation and the production function reading `Date.now()` again.
+//
+// Without fake timers the `"45m left"` test failed ~50% of runs because
+// the ms gap crossed a second boundary and `Math.floor(diffMs / 60_000)`
+// returned 44 instead of 45. The `"30m ago"` and `"3h 15m left"` tests
+// shared the same root cause but happened to win more often.
+//
+// `vi.setSystemTime` pins `Date.now()` for the duration of each test,
+// so the fixture's anchor and the production code's `Date.now()` are
+// guaranteed identical. Closes Phase 3A end-verification FLAG-LOW.
+const FIXED_NOW = new Date("2026-01-01T12:00:00Z");
+
 describe("formatTimestamp", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(FIXED_NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("returns 'just now' for recent timestamps", () => {
     const now = new Date().toISOString();
     expect(formatTimestamp(now)).toBe("just now");
@@ -177,6 +203,15 @@ describe("formatTimestamp", () => {
 });
 
 describe("undoTimeRemaining", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(FIXED_NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("returns expired for past timestamps", () => {
     const past = new Date(Date.now() - 1000).toISOString();
     expect(undoTimeRemaining(past)).toBe("expired");

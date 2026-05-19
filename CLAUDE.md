@@ -110,6 +110,367 @@ This growth trajectory must be reflected in all code: features should degrade gr
 
 ---
 
+## Delphi Vision and Architecture
+
+### The North Star
+
+Delphi is a personal operating system that operates the user's existing
+software tools on their behalf to accomplish any task that can be done
+on a PC. The user provides intent and judgment; Delphi provides skilled
+tool-use and execution.
+
+Delphi's structural advantage against frontier AI labs is not just "we
+own the OS" — Microsoft and Apple own OSes too. The actual advantage is
+that Delphi provides a coherent, vendor-neutral user experience across
+all applications, owned by no single company, with user sovereignty as
+the foundational commitment. Frontier labs build intelligence services
+that generate outputs; incumbents build OS-bound assistants tied to
+their ecosystem; Delphi builds an agentic OS that operates whatever the
+user already has, with the user retaining ownership of their data and
+their tools.
+
+When asked to "draw a picture," Delphi operates Photoshop (or another
+real tool) to produce an actual editable Photoshop file with real
+layers — not a generated PNG. When asked to "build a presentation,"
+Delphi operates PowerPoint to construct real slides. The user retains
+all the power of their existing software; Delphi is the skilled
+operator. This is the architectural commitment that distinguishes
+Delphi from intelligence-as-a-service offerings.
+
+### The three components
+
+Delphi's architecture has three components that interoperate:
+
+**1. The advanced OS** — locally installed Delphi distribution, sovereign,
+capable, agentic-native via the Semantic System Interface (SSI). Runs
+entirely on user hardware. Operates applications through layered
+mechanisms with graceful degradation: SSI manifest when available,
+accessibility-tree introspection when not, screen-and-click fallback
+when neither. Cross-platform from Phase 3C onward (Linux, macOS,
+Windows) — Delphi runs on whatever OS the user already has, rather
+than requiring OS migration.
+
+**2. The shared foundation model** — cloud-hosted, large enough to grow
+toward general PC-task competence. Trained on a multi-source corpus
+that does not require user contributions to be useful: public software
+documentation, synthetic exploration data from sandboxed Delphi
+instances, and teacher signals from cloud frontier models. Customer
+contributions (with privacy guarantees) are optional upside. The
+foundation provides every Delphi deployment with substantial general
+capability from day one.
+
+**3. The per-customer and per-user specialization** — built through
+structured apprentice-style onboarding. The customer provides
+documentation, product context, process descriptions, and a designated
+human reviewer for early outputs. Delphi ingests this material, learns
+the customer's specific operational context, performs early work in
+Assisted mode under review, and gradually promotes to Autonomous mode
+per task category as competence demonstrates. Within the customer
+deployment, each user's Delphi instance further specializes to their
+role(s), tasks, and working patterns — understanding what they do,
+what good output looks like for their work, and what should escalate
+to humans.
+
+The three-layer personalization (foundation + company specialization +
+user role specialization) is the architectural commitment that enables
+both broad capability and deep contextual fit. Cross-role-within-
+company knowledge sharing is customer-configurable, defaulting to
+per-user isolation for privacy.
+
+### How the three components interact
+
+User intent flows into the local OS. The local personalization layer
+interprets the intent in the user's role context. For execution, the
+local OS draws on the shared foundation model's tool-use competence
+(provided via cloud inference or distilled local components,
+depending on the task's latency requirements). Heavy reasoning may
+invoke cloud frontier models. Tool-use itself happens locally via SSI
+or graceful fallbacks. Outputs are native artifacts in the user's
+actual software.
+
+Over time, with the customer's consent, anonymized procedural patterns
+(Layer 1) and intent context (Layer 2, where research permits) flow
+back to the shared foundation under differential privacy guarantees.
+The foundation grows; all deployments benefit. Personal/company
+content (Layer 3) never leaves the customer's environment.
+
+### Growth contract — what the cloud model learns and how
+
+The shared foundation model trains on a corpus assembled from multiple
+sources. Robust against failure of any single source:
+
+**Always available (do not require user contributions):**
+- Public software documentation (Microsoft Docs, Adobe knowledge base,
+  Stack Overflow, application tutorials, accessibility tree dumps of
+  common applications)
+- Synthetic session data from sandboxed Delphi instances exploring
+  applications according to documentation
+- Teacher signals from cloud frontier models (their reasoning about
+  software workflows produces training data without seeing user data)
+
+**Available via consenting customer contributions (optional upside):**
+- Layer 1: aggregated procedural patterns (action sequences,
+  application contexts, tool-choice distributions, error and recovery
+  patterns, parameter shapes). No content, no identifiers. Subject to
+  differential privacy guarantees on aggregation.
+- Layer 2: intent and decision context (what kind of task, which
+  choices made among alternatives, technique shape). Requires safe
+  extraction with formal privacy guarantees. Subject of parallel
+  research track. Ships when ready, in domains where ready, not on a
+  forced timeline.
+
+**Layer 3 (specific personal/company content):**
+Never leaves the customer's deployment under any circumstances. The
+boundary between Layer 2 and Layer 3 is enforced by extraction logic,
+audit, and (where appropriate) cryptographic guarantee.
+
+The foundation model is useful and growing under any combination of
+sources active. Phase 3B will run an empirical validation experiment
+to measure the foundation's capability on public + synthetic + teacher
+sources alone, before the architecture's robustness story depends on
+customer contributions.
+
+### Substrate evolution by version
+
+**v0.4 (current, tagged after Phase 3A close):** SQLite stores,
+statistical models, retrieval-based personalization, SSI auto-
+generation, cloud frontier inference for heavy reasoning, Fortress in
+progress. Functional but pre-product.
+
+**v0.5 (Phase 3B target):** Three-layer personalization substrate
+(foundation + company + user role). Retroactive Codex sweep complete.
+Shared foundation model trained on public + synthetic + teacher
+sources, with validation experiment measuring capability. Structured
+apprentice-style onboarding framework. First-customer identification
+and pilot conversations in parallel. Accessibility first-class from
+this version.
+
+**v0.6 (Phase 3C target):** First production pilot deployment with a
+software development company customer. Universal learning engine
+maturity. Cross-OS expansion (Linux + macOS + Windows). SSI authoring
+tools and 50 pre-built manifests prioritizing developer tools.
+Fortress completion of items relevant to enterprise deployment.
+Onboarding UX as first-class deliverable, not just backend.
+
+**v0.7+ (Phase 4):** Additional customer deployments. Operational
+maturity. Foundation model improvements from customer contributions
+where opted in. Federated learning with differential privacy
+infrastructure (Phase 4-relevant; Phase 3B/3C do not require it).
+Auto-improving SSI manifests. Distillation pipeline (cloud → smaller
+local) for hardware-constrained customer environments.
+
+**v1.0 (Phase 5+, "different branch, different year"):** Consumer
+edition launches. Substrate architecture preserved through earlier
+phases enables this without fundamental rework. Browser extension form
+factor as fast adoption path. Research platform capability if
+appropriate. The consumer launch is a different product than the
+enterprise editions, sharing substrate but with different deployment
+model, pricing, and UX.
+
+### Iron Law #14: Capabilities must not retreat from the North Star
+
+Every new capability and architectural decision is measured against
+the vision: does this preserve, advance, or retreat from "an OS that
+operates the user's tools on their behalf to accomplish any task
+while preserving user sovereignty?" Decisions that preserve or
+advance are evaluated on their own merits. Decisions that retreat
+require explicit justification and acknowledgment.
+
+This law is intentionally narrower than "must advance the North
+Star." Infrastructure work (security, performance, accessibility,
+testing, refactoring) qualifies as non-retreat. The bar is to avoid
+drift, not to require every commit to be visionary.
+
+### Architectural risk mitigations — auditable requirements
+
+Each commitment below is audited against implementation in its target
+phase. These are not aspirational — they are concrete architectural
+requirements.
+
+**Multi-tier operation across all applications.** SSI manifest when
+available, accessibility-tree introspection when not, screen-and-
+click fallback when neither. No application is out of reach. Computer-
+use fallback is a first-class operation mode, not a degraded one.
+
+**Multi-vendor frontier model support.** Never depend on a single AI
+lab. Architectural support for Anthropic Claude, OpenAI GPT, Google
+Gemini, and other providers as they emerge. Graceful operation when
+any provider becomes restrictive or unavailable.
+
+**Tiered local model architecture.** Not "the local personalization
+model" but a stack: ~50M parameter classifier for real-time use
+(latency budget <50ms on CPU), ~200M parameter style transformer for
+on-request operations (latency budget <2s), ~500M parameter unified
+model for batch operations. Hardware-aware deployment selects sizes
+based on available compute.
+
+**Differential privacy at every aggregation layer.** Even Layer 1
+contributions need DP guarantees on aggregation because aggregate
+patterns can reveal user categories at scale. Layer 2 contributions
+require formal DP plus federated learning infrastructure.
+
+**Multi-source cloud training corpus.** User contributions are one
+source, not the only source. Foundation model viable even without
+user contributions.
+
+**Multi-OS support from Phase 3C.** Linux, macOS, Windows. The current
+Linux-targeted compositor work is the first deployment; cross-OS
+expansion in Phase 3C. Substrate decisions made with all three
+platforms in mind from now on.
+
+**Efficiency as first-class concern.** Every capability specifies its
+latency budget per task type. Inference latency targets: real-time
+queries <100ms (local), interactive queries <2-3s (with cloud),
+batch operations bounded by task complexity not multiples of human
+time. Aggressive optimization at every layer (quantization, caching,
+parallelization, smart pre-fetching). Graceful degradation under
+load — quality reduces gradually, not failures.
+
+**Default to Assisted mode for new deployments.** Customers and users
+begin in Assisted mode (Delphi proposes, human approves). Autonomy is
+earned per task category as Delphi demonstrates competence. Auto-
+nomous mode is not the default; it is the destination.
+
+**Visible action timeline scrubbing.** Every Delphi action recorded
+in the action timeline with full context. Users can scrub backward
+through Delphi's actions. The 24-hour undo window is a first-class
+visible affordance, not invisible UI.
+
+**Open SSI standard.** SSI is published as an open specification with
+governance process. Other agentic systems can implement SSI. Delphi
+is the reference implementation. SSI manifest community registry
+enables external contributions. This is the ecosystem development
+that makes "any application" practical.
+
+**50 pre-built SSI manifests, developer tools first.** Phase 3C
+delivers manifests for the top 50 applications in the developer
+tools domain (VS Code, JetBrains IDEs, Git/GitHub CLI, common
+language runtimes, browsers, terminals, Slack, Linear/Jira,
+documentation tools, design tools commonly used by devs). Extends
+to other domains as additional customer industries are pursued.
+
+**User research / pilot feedback as Phase deliverable.** Every Phase
+3B onward ships includes structured feedback from real users (Phase
+3B: alpha testing with five users; Phase 3C onward: pilot customer
+feedback). Architecture decisions are validated against actual user
+response, not designer assumption.
+
+**Accessibility as first-class concern from v0.5.** People with
+motor disabilities, visual impairments, cognitive disabilities, and
+other accessibility needs benefit substantially from agentic OS
+operation. Accessibility is not a v1.0 feature; it is part of the
+substrate from Phase 3B.
+
+**Architectural preservation of consumer launchability.** Phase 3B-
+3C decisions consider both enterprise B2B and eventual consumer
+deployment. Some substrate complexity (10-15% additional work) is
+the cost of keeping the consumer option real. Phase 5+ consumer
+launch is a planned future, not abandoned.
+
+### Validation experiment — committed for Phase 3B
+
+Phase 3B will run an empirical validation experiment before betting
+architectural robustness on customer contributions. Build the cloud
+database with public + synthetic + teacher sources. Train an early
+version of the shared foundation model. Measure its capability on
+held-out tool-use tasks across the developer tools domain. The
+result is empirical:
+
+- If the model is substantially capable on public + synthetic +
+  teacher alone, the architecture is robust against research failure
+  of Layer 2 contributions
+- If it is marginal, Layer 2 is critical and Phase 3D research
+  becomes priority
+
+This experiment is the first-class Phase 3B deliverable that resolves
+the largest open question in the architecture.
+
+### Timing posture
+
+The roadmap is structured as a sequence of versions, each shipping a
+meaningful subset of the vision. Specific calendar dates are not
+committed. Honest working estimates calibrated to 20 hr/week
+capacity:
+
+- Phase 3A close (3A.6 + tag): 1 month
+- Phase 3B (personalization substrate + sweep + foundation +
+  validation): 16-22 months
+- Phase 3C (cross-OS + first pilot + universal learning + Fortress
+  completion + remaining capabilities): 24-36 months beyond v0.5
+- Phase 4 (additional customers + operational maturity + federated
+  learning if research permits): 18-30 months beyond v0.6
+- Phase 5+ (consumer branch launch): begins post-Phase-4, timeline
+  determined when v0.7 ships
+
+Working estimate for v0.7 (full three-component vision substantially
+operating): 5-8 years from now. This is not a deadline; it is an
+honest working range. Velocity will be measured against Phase 3B
+execution and ranges revised.
+
+### Research-grade work as parallel track
+
+Some elements of the vision are research-grade rather than
+engineering-grade:
+
+- Layer 2 extraction with formal privacy guarantees
+- Federated learning with differential privacy at production scale
+- The unified personal model (large local model that genuinely
+  reasons in the user's voice)
+
+These are pursued on a parallel research track that does not block
+production shipping. Phase 3B-3C ship the engineering-grade portions
+(Layer 1 contributions, tiered local personalization models, multi-
+source foundation training). Research outputs integrate when ready.
+This is the discipline that protects against the failure mode where
+ambitious research prerequisites stall production.
+
+### Honest acknowledgments
+
+The plan has known uncertainties. Documenting them honestly is part
+of the architecture, not separate from it.
+
+**First-customer sales execution path is uncertain.** Current
+strategy: build product through v0.5-v0.6, partnership and revenue
+identified at Phase 3C pilot deployment transition. Solo founder
+profile is acknowledged risk; possible mitigations include cofounder
+recruitment, accelerator participation, or advisor cultivation when
+appropriate.
+
+**Capacity calibration: 20 hr/week.** Phase 3B and beyond timeline
+estimates assume this capacity. Parallel commitments (coursework,
+UrbanFL, Soteria, other research) continue at their existing cadence.
+Phase 3C+ planning is contingent on post-graduation configuration.
+
+**Funding model.** Phase 3B operates at minimal infrastructure cost
+suitable for self-funding (small models, modest cloud usage,
+prototyping). Phase 3C pilot deployment transition requires funding
+source identified by then — pilot customer revenue, partnership
+investment, grants, or other source. Funding model is not committed
+in this document; it is acknowledged as a Phase 3C-critical decision.
+
+**Phase 3A.6 scope was set under previous consumer-OS framing.**
+Generative workspace creation ships with original four templates
+(research / code / document / design). Enterprise-specific developer-
+focused templates added in Phase 3B as part of the developer tools
+focus.
+
+**Three-layer personalization architecture complexity.** Composing
+foundation + company specialization + user role specialization is
+non-trivial. Phase 3B's first weeks include architectural design work
+for the layer-composition model: how the three layers compose for
+inference, how training of one affects the others, how foundation
+updates propagate without invalidating existing specializations.
+
+**Cross-OS expansion adds substantial Phase 3C scope.** Current
+codebase is Linux-targeted. Cross-OS work requires per-OS
+accessibility API implementations, cross-platform UI layer (likely
+Tauri-based or similar), per-OS Fortress hardware integrations
+(TPM, Secure Enclave), and build/test/deployment infrastructure
+across three platforms. This expansion is the cost of consumer
+launchability preservation and enterprise customer flexibility.
+
+---
+
 ## Section 2: Technology Stack
 
 **Mandatory. No substitutions without documented justification in a `# DECISION:` comment.**
@@ -1090,6 +1451,8 @@ Currently implemented: AES-256-GCM vault (Layer 2 partial), Argon2id key derivat
     **Incorrect:** "To read the user's emails, Delphi opens Gmail in a browser, takes a screenshot, and uses vision to extract the email list."
 
     **Correct:** "To read the user's emails, Delphi checks available interfaces in this order: (1) if the user has configured IMAP credentials in Fortress, use IMAP directly; (2) if they have Gmail API credentials configured, use the Gmail API; (3) if they have only a browser session, use Chromium DevTools Protocol to read the DOM of the Gmail tab; (4) if none of the above, tell the user which interface they can set up for better results and fall back to DOM scraping as a last resort. Log which interface was used so the user can see it."
+
+14. **Capabilities must not retreat from the North Star.** Every new capability and architectural decision is measured against the vision: does this preserve, advance, or retreat from "an OS that operates the user's tools on their behalf to accomplish any task while preserving user sovereignty?" Decisions that preserve or advance are evaluated on their own merits. Decisions that retreat require explicit justification and acknowledgment. This law is intentionally narrower than "must advance the North Star." Infrastructure work (security, performance, accessibility, testing, refactoring) qualifies as non-retreat. The bar is to avoid drift, not to require every commit to be visionary. (See the "Delphi Vision and Architecture" section near the top of this file for the full North Star statement and the three-component architecture this law protects.)
 
 ---
 

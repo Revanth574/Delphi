@@ -27,12 +27,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::OrchestratorError;
 use crate::timeline::Timeline;
-use crate::workspace::executor::{ExecutionOutcome, ExecutionStatus, ExecutorError, WorkspaceExecutor};
+use crate::workspace::executor::{ExecutionStatus, ExecutorError, WorkspaceExecutor};
 use crate::workspace::spec::{TemplateId, WorkspaceSpec};
 use crate::workspace::templates::{self, TemplateParams};
-use crate::workspace::validator::{validate_spec, ValidatorError};
-use crate::OrchestratorError;
+use crate::workspace::validator::{ValidatorError, validate_spec};
 
 /// Metadata describing a baseline template for the `ListTemplates` API.
 ///
@@ -40,6 +40,7 @@ use crate::OrchestratorError;
 /// template catalog as a JSON array (matching the project convention of
 /// JSON-string returns for complex D-Bus payloads, e.g. `health.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateInfo {
     /// Stable template id string (`"research"`, `"code-project"`,
     /// `"document"`, `"design"`).
@@ -94,6 +95,10 @@ pub enum WorkspaceManagerError {
     /// The action timeline could not be read or written.
     #[error("action timeline error: {0}")]
     Timeline(String),
+
+    /// The action timeline was recorded but could not be finalized.
+    #[error("action timeline update error: {0}")]
+    TimelineUpdate(String),
 }
 
 /// Coordinates template expansion, validation, safe execution, and
@@ -132,6 +137,12 @@ impl WorkspaceManager {
     #[must_use]
     pub fn allowed_root(&self) -> &Path {
         &self.allowed_root
+    }
+
+    /// The action timeline used by this manager.
+    #[must_use]
+    pub fn timeline(&self) -> &Timeline {
+        &self.timeline
     }
 
     /// List the four baseline templates and their accepted parameters.
@@ -226,8 +237,45 @@ impl WorkspaceManager {
         // also re-validates as defense in depth).
         validate_spec(spec, &self.allowed_root)?;
 
-        let outcome = self.executor.execute(spec)?;
-        self.record(spec, &outcome)
+        let description = format!(
+            "Created workspace '{}' (pending) at {}",
+            spec.name,
+            spec.root_dir.display()
+        );
+        let undo_payload = spec.root_dir.to_string_lossy();
+        let action_id = self
+            .timeline
+            .record_pending("workspace.create", &undo_payload, &description)
+            .map_err(|e: OrchestratorError| WorkspaceManagerError::Timeline(e.to_string()))?;
+
+        let outcome = match self.executor.execute(spec) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let partial_state = format!("execution failed before completion: {err}");
+                let _ = self
+                    .timeline
+                    .mark_pending_partial(&action_id, &partial_state);
+                return Err(WorkspaceManagerError::Execution(err));
+            }
+        };
+
+        let status_payload = serde_json::to_string(&outcome.status)
+            .unwrap_or_else(|_| format!("{:?}", outcome.status));
+        let finalize_result = if outcome.status.is_complete() {
+            self.timeline
+                .complete_pending(&action_id, Some(&status_payload))
+        } else {
+            self.timeline
+                .mark_pending_partial(&action_id, &status_payload)
+        };
+        finalize_result
+            .map_err(|e: OrchestratorError| WorkspaceManagerError::TimelineUpdate(e.to_string()))?;
+
+        Ok(CreateResult {
+            workspace_id: outcome.workspace_id,
+            action_timeline_id: action_id,
+            status: outcome.status,
+        })
     }
 
     /// Build a spec from a baseline template, then [`create`](Self::create) it.
@@ -261,10 +309,18 @@ impl WorkspaceManager {
     pub fn undo(&self, action_timeline_id: &str) -> Result<(), WorkspaceManagerError> {
         let root_path = self
             .timeline
-            .undo_action(action_timeline_id)
+            .begin_undo(action_timeline_id)
             .map_err(|e| WorkspaceManagerError::Timeline(e.to_string()))?;
         let root_dir = PathBuf::from(root_path);
-        self.executor.undo(&root_dir)?;
+        if let Err(err) = self.executor.undo(&root_dir) {
+            self.timeline
+                .abort_undo(action_timeline_id)
+                .map_err(|e| WorkspaceManagerError::TimelineUpdate(e.to_string()))?;
+            return Err(WorkspaceManagerError::Execution(err));
+        }
+        self.timeline
+            .complete_undo(action_timeline_id)
+            .map_err(|e| WorkspaceManagerError::TimelineUpdate(e.to_string()))?;
         Ok(())
     }
 
@@ -279,32 +335,6 @@ impl WorkspaceManager {
             .ok_or_else(|| WorkspaceManagerError::UnknownTemplate(template_id.to_string()))?;
         templates::build_baseline(&id, name, root_dir, params)
             .ok_or_else(|| WorkspaceManagerError::UnknownTemplate(template_id.to_string()))
-    }
-
-    /// Record a (possibly partial) execution in the action timeline.
-    fn record(
-        &self,
-        spec: &WorkspaceSpec,
-        outcome: &ExecutionOutcome,
-    ) -> Result<CreateResult, WorkspaceManagerError> {
-        // The undo payload is the workspace root path; `undo` reads it
-        // back and hands it to the executor's symlink-safe removal.
-        let description = format!(
-            "Created workspace '{}' ({} entries) at {}",
-            spec.name,
-            outcome.created_entry_count,
-            spec.root_dir.display()
-        );
-        let undo_payload = spec.root_dir.to_string_lossy();
-        let action_id = self
-            .timeline
-            .record_action(&description, &undo_payload)
-            .map_err(|e: OrchestratorError| WorkspaceManagerError::Timeline(e.to_string()))?;
-        Ok(CreateResult {
-            workspace_id: outcome.workspace_id.clone(),
-            action_timeline_id: action_id,
-            status: outcome.status.clone(),
-        })
     }
 }
 
@@ -338,7 +368,13 @@ fn render_preview(spec: &WorkspaceSpec) -> String {
     if !spec.setup_commands.is_empty() {
         let _ = writeln!(s, "\nSetup commands:");
         for c in &spec.setup_commands {
-            let _ = writeln!(s, "  {} {} — {}", c.program, c.args.join(" "), c.description);
+            let _ = writeln!(
+                s,
+                "  {} {} — {}",
+                c.program,
+                c.args.join(" "),
+                c.description
+            );
         }
     }
 
@@ -360,6 +396,7 @@ fn render_preview(spec: &WorkspaceSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::ActionStatus;
     use tempfile::TempDir;
 
     fn manager(allowed: &TempDir) -> WorkspaceManager {
@@ -422,8 +459,7 @@ mod tests {
         let allowed = TempDir::new().unwrap();
         let mgr = manager(&allowed);
         // root outside allowed → preview should surface a validation error.
-        let mut spec =
-            templates::build_research_template("x", &allowed.path().join("x"));
+        let mut spec = templates::build_research_template("x", &allowed.path().join("x"));
         spec.root_dir = PathBuf::from("/etc/evil");
         spec.metadata = spec.compute_metadata();
         let result = mgr.preview(&spec);
@@ -443,6 +479,22 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, WorkspaceManagerError::UnknownTemplate(_)));
+    }
+
+    #[test]
+    fn create_records_timeline_entry_when_execution_fails() {
+        let allowed = TempDir::new().unwrap();
+        let mgr = manager(&allowed);
+        let root = allowed.path().join("missing-parent").join("ws");
+        let mut spec = templates::build_document_template("ws", &root);
+        spec.setup_commands.clear();
+        spec.metadata = spec.compute_metadata();
+
+        let result = mgr.create(&spec);
+        assert!(matches!(result, Err(WorkspaceManagerError::Execution(_))));
+        let recent = mgr.timeline().list_recent(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].status, ActionStatus::PartiallyCompleted);
     }
 
     #[cfg(target_os = "linux")]
@@ -492,8 +544,7 @@ mod tests {
         fn create_rejects_unsafe_spec() {
             let allowed = TempDir::new().unwrap();
             let mgr = manager(&allowed);
-            let mut spec =
-                templates::build_research_template("ws", &allowed.path().join("ws"));
+            let mut spec = templates::build_research_template("ws", &allowed.path().join("ws"));
             spec.directory_tree[0].relative_path = "../escape".to_string();
             spec.metadata = spec.compute_metadata();
             let err = mgr.create(&spec).unwrap_err();
@@ -513,6 +564,26 @@ mod tests {
             // Second undo: timeline reports already-undone.
             let err = mgr.undo(&result.action_timeline_id).unwrap_err();
             assert!(matches!(err, WorkspaceManagerError::Timeline(_)));
+        }
+
+        #[test]
+        fn undo_remains_reversible_when_cleanup_fails() {
+            let allowed = TempDir::new().unwrap();
+            let mgr = manager(&allowed);
+            let outside = TempDir::new().unwrap();
+            let outside_root = outside.path().join("victim");
+            std::fs::create_dir(&outside_root).unwrap();
+            let action_id = mgr
+                .timeline()
+                .record_action("bad workspace payload", &outside_root.to_string_lossy())
+                .unwrap();
+
+            let first = mgr.undo(&action_id);
+            assert!(matches!(first, Err(WorkspaceManagerError::Execution(_))));
+            assert_eq!(
+                mgr.timeline().get_action_status(&action_id).unwrap(),
+                ActionStatus::Complete
+            );
         }
     }
 }

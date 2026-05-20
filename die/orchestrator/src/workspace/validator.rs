@@ -43,6 +43,9 @@ use crate::workspace::spec::{EntryKind, SetupCommand, WorkspaceSpec};
 /// working-dir). Keeps individual paths well under common `PATH_MAX`.
 pub const MAX_PATH_LEN: usize = 256;
 
+/// Maximum joined path length accepted by the Linux executor.
+pub const PATH_MAX_BYTES: usize = 4096;
+
 /// Maximum byte length of any single file's content (1 MiB).
 pub const MAX_FILE_CONTENT_BYTES: usize = 1024 * 1024;
 
@@ -77,10 +80,7 @@ pub const FORBIDDEN_CHARS: &[char] = &[';', '|', '&', '>', '<', '`', '$', '\0'];
 /// the allowlist is the single source of truth for command safety.
 pub const COMMAND_ALLOWLIST: &[(&str, &[&str])] = &[
     ("git", &["init", "init --quiet"]),
-    ("pnpm", &["install"]),
-    ("npm", &["install"]),
     ("cargo", &["init", "init --lib", "init --bin"]),
-    ("conda", &["env create -f environment.yml"]),
     ("uv", &["init"]),
     ("python", &["-m venv .venv"]),
 ];
@@ -144,6 +144,42 @@ pub enum ValidatorError {
     ForbiddenCharacter {
         /// The offending character.
         ch: char,
+        /// The offending value.
+        value: String,
+    },
+
+    /// A path or argument contained an ASCII control character.
+    #[error("path/argument contains control character U+{code:04X}: {value}")]
+    ControlCharacter {
+        /// The offending codepoint.
+        code: u32,
+        /// The offending value.
+        value: String,
+    },
+
+    /// A path or argument contained a Unicode bidirectional control.
+    #[error("path/argument contains Unicode bidi control U+{code:04X}: {value}")]
+    UnicodeBidiControl {
+        /// The offending codepoint.
+        code: u32,
+        /// The offending value.
+        value: String,
+    },
+
+    /// A path or argument contained a Unicode zero-width or format character.
+    #[error("path/argument contains Unicode format character U+{code:04X}: {value}")]
+    UnicodeFormatCharacter {
+        /// The offending codepoint.
+        code: u32,
+        /// The offending value.
+        value: String,
+    },
+
+    /// A path or argument contained a Unicode combining mark.
+    #[error("path/argument contains Unicode combining mark U+{code:04X}: {value}")]
+    UnicodeCombiningMark {
+        /// The offending codepoint.
+        code: u32,
         /// The offending value.
         value: String,
     },
@@ -274,14 +310,17 @@ pub fn validate_spec(spec: &WorkspaceSpec, allowed_root: &Path) -> Result<(), Va
     let mut total_content: u64 = 0;
     for entry in &spec.directory_tree {
         validate_relative_path(&entry.relative_path, "directory_tree")?;
+        validate_joined_path_length(&spec.root_dir, &entry.relative_path)?;
 
         match entry.kind {
             EntryKind::File => {
-                let content = entry.content.as_ref().ok_or_else(|| {
-                    ValidatorError::FileMissingContent {
-                        path: entry.relative_path.clone(),
-                    }
-                })?;
+                let content =
+                    entry
+                        .content
+                        .as_ref()
+                        .ok_or_else(|| ValidatorError::FileMissingContent {
+                            path: entry.relative_path.clone(),
+                        })?;
                 if content.len() > MAX_FILE_CONTENT_BYTES {
                     return Err(ValidatorError::FileContentTooLarge {
                         path: entry.relative_path.clone(),
@@ -309,6 +348,9 @@ pub fn validate_spec(spec: &WorkspaceSpec, allowed_root: &Path) -> Result<(), Va
     // Setup commands.
     for cmd in &spec.setup_commands {
         validate_relative_path_allow_empty(&cmd.working_dir_relative, "working_dir_relative")?;
+        if !cmd.working_dir_relative.is_empty() {
+            validate_joined_path_length(&spec.root_dir, &cmd.working_dir_relative)?;
+        }
         validate_command(cmd)?;
     }
 
@@ -345,10 +387,18 @@ pub fn validate_spec(spec: &WorkspaceSpec, allowed_root: &Path) -> Result<(), Va
 /// Validate that `root_dir` is absolute, normalized, and under
 /// `allowed_root`.
 fn validate_root_dir(root_dir: &Path, allowed_root: &Path) -> Result<(), ValidatorError> {
+    let root_string = root_dir.display().to_string();
+    sanitize_path_string(&root_string)?;
+    let root_len = root_string.len();
+    if root_len > PATH_MAX_BYTES {
+        return Err(ValidatorError::PathTooLong {
+            path: root_string,
+            len: root_len,
+        });
+    }
+
     if !root_dir.is_absolute() {
-        return Err(ValidatorError::RootNotAbsolute(
-            root_dir.display().to_string(),
-        ));
+        return Err(ValidatorError::RootNotAbsolute(root_string));
     }
 
     // Reject any `.`/`..` component. Without this, a `starts_with`
@@ -357,9 +407,7 @@ fn validate_root_dir(root_dir: &Path, allowed_root: &Path) -> Result<(), Validat
     for comp in root_dir.components() {
         match comp {
             Component::ParentDir | Component::CurDir => {
-                return Err(ValidatorError::RootNotNormalized(
-                    root_dir.display().to_string(),
-                ));
+                return Err(ValidatorError::RootNotNormalized(root_string));
             }
             _ => {}
         }
@@ -372,7 +420,7 @@ fn validate_root_dir(root_dir: &Path, allowed_root: &Path) -> Result<(), Validat
     // projects root).
     if !root_dir.starts_with(allowed_root) || root_dir == allowed_root {
         return Err(ValidatorError::RootOutsideAllowed {
-            root: root_dir.display().to_string(),
+            root: root_string,
             allowed: allowed_root.display().to_string(),
         });
     }
@@ -410,13 +458,7 @@ fn validate_path_inner(path: &str) -> Result<(), ValidatorError> {
         });
     }
 
-    // Forbidden characters (shell metacharacters + NUL).
-    if let Some(ch) = path.chars().find(|c| FORBIDDEN_CHARS.contains(c)) {
-        return Err(ValidatorError::ForbiddenCharacter {
-            ch,
-            value: path.to_string(),
-        });
-    }
+    sanitize_path_string(path)?;
 
     // Component analysis — the robust escape check. A safe relative path
     // consists ONLY of `Component::Normal` parts. Anything else (RootDir,
@@ -467,30 +509,110 @@ fn validate_path_inner(path: &str) -> Result<(), ValidatorError> {
     Ok(())
 }
 
-/// Validate a setup command against the allowlist.
-fn validate_command(cmd: &SetupCommand) -> Result<(), ValidatorError> {
-    // Forbidden-character scan on program + each arg first, so a hostile
-    // argument yields a precise error before the allowlist comparison.
-    if let Some(ch) = cmd.program.chars().find(|c| FORBIDDEN_CHARS.contains(c)) {
-        return Err(ValidatorError::ForbiddenCharacter {
-            ch,
-            value: cmd.program.clone(),
+fn validate_joined_path_length(root: &Path, relative: &str) -> Result<(), ValidatorError> {
+    let root_len = root.display().to_string().len();
+    let joined_len = root_len.saturating_add(1).saturating_add(relative.len());
+    if joined_len > PATH_MAX_BYTES {
+        return Err(ValidatorError::PathTooLong {
+            path: root.join(relative).display().to_string(),
+            len: joined_len,
         });
     }
-    for arg in &cmd.args {
-        if let Some(ch) = arg.chars().find(|c| FORBIDDEN_CHARS.contains(c)) {
+    Ok(())
+}
+
+fn sanitize_path_string(value: &str) -> Result<(), ValidatorError> {
+    for ch in value.chars() {
+        let code = ch as u32;
+        if ch == '\0' || matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$') {
             return Err(ValidatorError::ForbiddenCharacter {
                 ch,
-                value: arg.clone(),
+                value: value.to_string(),
             });
         }
+        if code < 0x20 || code == 0x7F {
+            return Err(ValidatorError::ControlCharacter {
+                code,
+                value: value.to_string(),
+            });
+        }
+        if is_bidi_control(code) {
+            return Err(ValidatorError::UnicodeBidiControl {
+                code,
+                value: value.to_string(),
+            });
+        }
+        if is_unicode_format_character(code) {
+            return Err(ValidatorError::UnicodeFormatCharacter {
+                code,
+                value: value.to_string(),
+            });
+        }
+        if is_combining_mark(code) {
+            return Err(ValidatorError::UnicodeCombiningMark {
+                code,
+                value: value.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_bidi_control(code: u32) -> bool {
+    matches!(code, 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+fn is_unicode_format_character(code: u32) -> bool {
+    matches!(
+        code,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+fn is_combining_mark(code: u32) -> bool {
+    matches!(
+        code,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
+}
+
+/// Validate a setup command against the allowlist.
+fn validate_command(cmd: &SetupCommand) -> Result<(), ValidatorError> {
+    // Character scan on program + each arg first, so a hostile argument
+    // yields a precise error before the allowlist comparison.
+    sanitize_path_string(&cmd.program)?;
+    for arg in &cmd.args {
+        sanitize_path_string(arg)?;
     }
 
     // Exact allowlist match: program name AND the space-joined argv.
     let joined = cmd.args.join(" ");
-    let allowed = COMMAND_ALLOWLIST.iter().any(|(prog, patterns)| {
-        *prog == cmd.program && patterns.iter().any(|pat| *pat == joined)
-    });
+    let allowed = COMMAND_ALLOWLIST
+        .iter()
+        .any(|(prog, patterns)| *prog == cmd.program && patterns.iter().any(|pat| *pat == joined));
     if !allowed {
         return Err(ValidatorError::CommandNotAllowed {
             program: cmd.program.clone(),
@@ -634,6 +756,26 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_root_dir_with_nul_byte() {
+        let mut spec = base_spec();
+        spec.root_dir = PathBuf::from("/home/u/projects/ws\0evil");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::ForbiddenCharacter { ch: '\0', .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_root_dir_with_bidi_control() {
+        let mut spec = base_spec();
+        spec.root_dir = PathBuf::from("/home/u/projects/\u{202E}spoof");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeBidiControl { .. })
+        ));
+    }
+
     // ── path-escape attempts ──────────────────────────────────────────
 
     #[test]
@@ -703,6 +845,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_relative_path_with_bidi_override() {
+        let mut spec = base_spec();
+        spec.directory_tree[0].relative_path = "notes/\u{202E}cod.exe".to_string();
+        spec.metadata = spec.compute_metadata();
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeBidiControl { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_relative_path_with_zero_width_no_break() {
+        let mut spec = base_spec();
+        spec.directory_tree[0].relative_path = "\u{FEFF}README.md".to_string();
+        spec.metadata = spec.compute_metadata();
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeFormatCharacter { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_relative_path_with_combining_mark() {
+        let mut spec = base_spec();
+        spec.directory_tree[0].relative_path = ".\u{0307}.".to_string();
+        spec.metadata = spec.compute_metadata();
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeCombiningMark { .. })
+        ));
+    }
+
+    #[test]
     fn rejects_windows_style_parentdir() {
         // On Unix `\..\` is a single filename component (backslash is a
         // valid filename char), so it does NOT traverse — but it is an
@@ -735,6 +910,17 @@ mod tests {
         spec.directory_tree[0].relative_path = "a".repeat(MAX_PATH_LEN);
         spec.metadata = spec.compute_metadata();
         assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    #[test]
+    fn rejects_joined_path_exceeding_path_max() {
+        let mut spec = base_spec();
+        let long_allowed = format!("/home/u/projects/{}", "a".repeat(3_840));
+        spec.root_dir = PathBuf::from(format!("{long_allowed}/ws"));
+        spec.directory_tree[0].relative_path = "b".repeat(MAX_PATH_LEN);
+        spec.metadata = spec.compute_metadata();
+        let err = validate_spec(&spec, Path::new(&long_allowed)).unwrap_err();
+        assert!(matches!(err, ValidatorError::PathTooLong { len, .. } if len > PATH_MAX_BYTES));
     }
 
     // ── forbidden characters in paths ─────────────────────────────────
@@ -985,12 +1171,11 @@ mod tests {
         let cases: &[(&str, &[&str])] = &[
             ("git", &["init"]),
             ("git", &["init", "--quiet"]),
-            ("pnpm", &["install"]),
-            ("npm", &["install"]),
             ("cargo", &["init"]),
             ("cargo", &["init", "--lib"]),
             ("cargo", &["init", "--bin"]),
             ("uv", &["init"]),
+            ("python", &["-m", "venv", ".venv"]),
         ];
         for (prog, args) in cases {
             let mut spec = base_spec();
@@ -1008,7 +1193,37 @@ mod tests {
     }
 
     #[test]
-    fn accepts_multiword_allowlisted_command() {
+    fn npm_install_rejected_by_validator() {
+        let mut spec = base_spec();
+        spec.setup_commands[0] = SetupCommand {
+            program: "npm".to_string(),
+            args: vec!["install".to_string()],
+            working_dir_relative: String::new(),
+            description: "npm install".to_string(),
+        };
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::CommandNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn pnpm_install_rejected_by_validator() {
+        let mut spec = base_spec();
+        spec.setup_commands[0] = SetupCommand {
+            program: "pnpm".to_string(),
+            args: vec!["install".to_string()],
+            working_dir_relative: String::new(),
+            description: "pnpm install".to_string(),
+        };
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::CommandNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn conda_env_create_rejected_by_validator() {
         let mut spec = base_spec();
         spec.setup_commands[0] = SetupCommand {
             program: "conda".to_string(),
@@ -1021,7 +1236,10 @@ mod tests {
             working_dir_relative: String::new(),
             description: "conda env".to_string(),
         };
-        assert!(validate_spec(&spec, allowed()).is_ok());
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::CommandNotAllowed { .. })
+        ));
     }
 
     #[test]
@@ -1082,10 +1300,10 @@ mod tests {
             content: None,
         });
         spec.setup_commands[0] = SetupCommand {
-            program: "pnpm".to_string(),
-            args: vec!["install".to_string()],
+            program: "cargo".to_string(),
+            args: vec!["init".to_string()],
             working_dir_relative: "frontend".to_string(),
-            description: "deps".to_string(),
+            description: "init nested".to_string(),
         };
         spec.metadata = spec.compute_metadata();
         assert!(validate_spec(&spec, allowed()).is_ok());

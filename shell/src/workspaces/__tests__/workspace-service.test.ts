@@ -107,6 +107,7 @@ describe("workspaceService", () => {
     vi.mocked(delphi.createWorkspace).mockResolvedValue({
       workspaceId: "ws-thesis-1",
       actionTimelineId: "tl-1",
+      status: "Completed",
     });
     const result = await workspaceService.create(sampleSpec);
     expect(delphi.createWorkspace).toHaveBeenCalledWith(
@@ -114,12 +115,14 @@ describe("workspaceService", () => {
     );
     expect(result.workspaceId).toBe("ws-thesis-1");
     expect(result.actionTimelineId).toBe("tl-1");
+    expect(result.status).toBe("Completed");
   });
 
   it("createFromTemplate forwards template id, name, root, params", async () => {
     vi.mocked(delphi.createWorkspaceFromTemplate).mockResolvedValue({
       workspaceId: "ws-x-1",
       actionTimelineId: "tl-2",
+      status: "Completed",
     });
     await workspaceService.createFromTemplate(
       "code-project",

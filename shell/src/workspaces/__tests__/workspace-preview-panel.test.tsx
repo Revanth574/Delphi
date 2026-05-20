@@ -144,6 +144,31 @@ describe("WorkspacePreviewPanel", () => {
     expect(screen.getByText(/Daily review/)).toBeInTheDocument();
   });
 
+  it("surfaces partial creation status", () => {
+    render(
+      <WorkspacePreviewPanel
+        spec={sampleSpec()}
+        validationErrors={[]}
+        loading={false}
+        createResult={{
+          workspaceId: "ws-thesis",
+          actionTimelineId: "tl-1",
+          status: {
+            TreeCreationFailed: {
+              path: "README.md",
+              error: "already exists",
+            },
+          },
+        }}
+        onCreate={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Workspace created with partial status: TreeCreationFailed"),
+    ).toBeInTheDocument();
+  });
+
   it("disables Create and shows errors when validation fails", () => {
     render(
       <WorkspacePreviewPanel

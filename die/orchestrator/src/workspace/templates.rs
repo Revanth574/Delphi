@@ -216,7 +216,11 @@ pub fn build_code_project_template(
         || language.eq_ignore_ascii_case("javascript")
         || language.eq_ignore_ascii_case("js");
 
-    let readme = format!("# {name}\n\nA code project.\n");
+    let readme = if is_ts {
+        format!("# {name}\n\nA code project.\n\nRun `pnpm install` when you're ready to install dependencies.\n")
+    } else {
+        format!("# {name}\n\nA code project.\n")
+    };
 
     let mut tree = vec![
         dir("src"),
@@ -436,6 +440,13 @@ mod tests {
             .directory_tree
             .iter()
             .any(|e| e.relative_path == "src/index.ts"));
+        let readme = spec
+            .directory_tree
+            .iter()
+            .find(|e| e.relative_path == "README.md")
+            .and_then(|e| e.content.as_deref())
+            .unwrap();
+        assert!(readme.contains("Run `pnpm install` when you're ready"));
     }
 
     #[test]

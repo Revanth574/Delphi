@@ -78,6 +78,7 @@ impl TimelineService {
                     "timestamp": r.timestamp,
                     "reversible": r.reversible,
                     "expires_at": r.expires_at,
+                    "status": r.status.as_str(),
                 })
             })
             .collect();

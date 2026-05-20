@@ -11,6 +11,8 @@
  * can arrive out of order.
  */
 
+import type { ExecutionStatus } from "../workspaces/workspace-types";
+
 // ── Types ──────────────────────────────────────────────────────
 
 /** JSON-RPC-like request sent to the bridge. */
@@ -54,6 +56,7 @@ export interface TimelineAction {
   timestamp: string;
   reversible: boolean;
   expires_at: string;
+  status?: string;
 }
 
 /** A learning suggestion. */
@@ -76,6 +79,17 @@ interface PendingCall {
 const DEFAULT_URL = "ws://127.0.0.1:9800";
 const RECONNECT_DELAY_MS = 2000;
 const REQUEST_TIMEOUT_MS = 30_000;
+
+function parseWorkspaceStatus(result: {
+  status?: ExecutionStatus;
+  status_json?: string;
+}): ExecutionStatus {
+  if (result.status) return result.status;
+  if (typeof result.status_json === "string") {
+    return JSON.parse(result.status_json) as ExecutionStatus;
+  }
+  throw new Error("workspace create response missing status");
+}
 
 /**
  * WebSocket client for the Delphi shell-bridge.
@@ -279,13 +293,23 @@ class DelphiClient {
   /** Create a workspace from a full spec. */
   async createWorkspace(
     specJson: string,
-  ): Promise<{ workspaceId: string; actionTimelineId: string }> {
+  ): Promise<{
+    workspaceId: string;
+    actionTimelineId: string;
+    status: ExecutionStatus;
+  }> {
     const result = (await this.call("workspace.create", {
       spec_json: specJson,
-    })) as { workspace_id: string; action_timeline_id: string };
+    })) as {
+      workspace_id: string;
+      action_timeline_id: string;
+      status?: ExecutionStatus;
+      status_json?: string;
+    };
     return {
       workspaceId: result.workspace_id,
       actionTimelineId: result.action_timeline_id,
+      status: parseWorkspaceStatus(result),
     };
   }
 
@@ -295,16 +319,26 @@ class DelphiClient {
     name: string,
     rootDir: string,
     params: Record<string, string> = {},
-  ): Promise<{ workspaceId: string; actionTimelineId: string }> {
+  ): Promise<{
+    workspaceId: string;
+    actionTimelineId: string;
+    status: ExecutionStatus;
+  }> {
     const result = (await this.call("workspace.create_from_template", {
       template_id: templateId,
       name,
       root_dir: rootDir,
       params,
-    })) as { workspace_id: string; action_timeline_id: string };
+    })) as {
+      workspace_id: string;
+      action_timeline_id: string;
+      status?: ExecutionStatus;
+      status_json?: string;
+    };
     return {
       workspaceId: result.workspace_id,
       actionTimelineId: result.action_timeline_id,
+      status: parseWorkspaceStatus(result),
     };
   }
 

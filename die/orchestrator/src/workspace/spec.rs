@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(spec.name, "my-research");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceSpec {
     /// Human-readable workspace display name (shown in the preview UI
     /// and recorded in the action timeline). Not used as a filesystem
@@ -143,6 +144,7 @@ pub enum TemplateId {
 ///   carry `None`
 /// - a file's `content` length is at most 1 MiB
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DirectoryEntry {
     /// Path relative to the workspace `root_dir`. Validated for escape
     /// safety before any filesystem operation.
@@ -182,6 +184,7 @@ pub enum EntryKind {
 ///   [`DirectoryEntry`] path (relative, escape-free, under `root_dir`)
 /// - no argument contains shell metacharacters or NUL bytes
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SetupCommand {
     /// The program to invoke, e.g. `"git"`. Must exactly match an
     /// allowlisted program name — no path components, no `./` prefix.
@@ -209,6 +212,7 @@ pub struct SetupCommand {
 /// command-execution authority and therefore are not part of the
 /// validator's security checks (beyond UTF-8 / size sanity).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CalendarBlock {
     /// Block title, e.g. `"Daily research review"`.
     pub title: String,
@@ -234,6 +238,7 @@ pub struct CalendarBlock {
 /// declared metadata disagrees with the computed values — a spec cannot
 /// understate its size to slip past the limits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadata {
     /// Unix epoch seconds when the spec was created. `0` is acceptable
     /// for synthetic/test specs; the executor stamps the real creation
@@ -496,5 +501,42 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&spec).unwrap();
         let back: WorkspaceSpec = serde_json::from_str(&pretty).unwrap();
         assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn workspace_spec_rejects_unknown_fields() {
+        let mut value = serde_json::to_value(sample_spec()).unwrap();
+        value["extra_field"] = serde_json::json!("should be rejected");
+        let result: Result<WorkspaceSpec, _> = serde_json::from_value(value);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("extra_field") || err.contains("unknown field"));
+    }
+
+    #[test]
+    fn directory_entry_rejects_unknown_fields() {
+        let entry = DirectoryEntry {
+            relative_path: "README.md".to_string(),
+            kind: EntryKind::File,
+            content: Some("hello".to_string()),
+        };
+        let mut value = serde_json::to_value(entry).unwrap();
+        value["extra_field"] = serde_json::json!("should be rejected");
+        let result: Result<DirectoryEntry, _> = serde_json::from_value(value);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn setup_command_rejects_unknown_fields() {
+        let command = SetupCommand {
+            program: "git".to_string(),
+            args: vec!["init".to_string(), "--quiet".to_string()],
+            working_dir_relative: String::new(),
+            description: "Initialize git repository".to_string(),
+        };
+        let mut value = serde_json::to_value(command).unwrap();
+        value["extra_field"] = serde_json::json!("should be rejected");
+        let result: Result<SetupCommand, _> = serde_json::from_value(value);
+        assert!(result.is_err());
     }
 }

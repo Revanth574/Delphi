@@ -33,9 +33,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use tracing::info;
+use tracing::{info, warn};
 
-use die_orchestrator::workspace::{TemplateParams, WorkspaceManager, WorkspaceSpec};
+use die_orchestrator::workspace::{
+    ExecutionStatus, TemplateParams, WorkspaceManager, WorkspaceManagerError, WorkspaceSpec,
+};
 
 /// D-Bus object path for the Workspace interface.
 pub const PATH: &str = "/org/delphi/Workspace";
@@ -76,8 +78,35 @@ impl WorkspaceService {
 }
 
 fn parse_spec(spec_json: &str) -> zbus::fdo::Result<WorkspaceSpec> {
-    serde_json::from_str::<WorkspaceSpec>(spec_json)
-        .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("invalid workspace spec JSON: {e}")))
+    serde_json::from_str::<WorkspaceSpec>(spec_json).map_err(|e| {
+        warn!("workspace spec JSON parse failed: {e}");
+        zbus::fdo::Error::InvalidArgs("Invalid spec format".to_string())
+    })
+}
+
+fn status_json(status: &ExecutionStatus) -> zbus::fdo::Result<String> {
+    serde_json::to_string(status).map_err(|e| {
+        warn!("workspace status serialization failed: {e}");
+        zbus::fdo::Error::Failed("Workspace status serialization failed".to_string())
+    })
+}
+
+fn map_workspace_error(context: &str, error: WorkspaceManagerError) -> zbus::fdo::Error {
+    warn!(context, error = ?error, "workspace operation failed");
+    match error {
+        WorkspaceManagerError::Validation(_) => {
+            zbus::fdo::Error::InvalidArgs("Spec failed validation".to_string())
+        }
+        WorkspaceManagerError::UnknownTemplate(_) => {
+            zbus::fdo::Error::InvalidArgs("Unknown workspace template".to_string())
+        }
+        WorkspaceManagerError::Execution(_) => {
+            zbus::fdo::Error::Failed("Workspace operation failed".to_string())
+        }
+        WorkspaceManagerError::Timeline(_) | WorkspaceManagerError::TimelineUpdate(_) => {
+            zbus::fdo::Error::Failed("Action recording failed".to_string())
+        }
+    }
 }
 
 #[zbus::interface(name = "org.delphi.Workspace")]
@@ -95,19 +124,29 @@ impl WorkspaceService {
         let spec = parse_spec(&spec_json)?;
         let mgr = self.lock()?;
         let result = mgr.preview(&spec);
-        Ok((result.preview, result.validation_errors))
+        let errors = if result.validation_errors.is_empty() {
+            Vec::new()
+        } else {
+            warn!(
+                errors = ?result.validation_errors,
+                "workspace preview validation failed"
+            );
+            vec!["Spec failed validation".to_string()]
+        };
+        Ok((result.preview, errors))
     }
 
     /// Validate, execute, and record a spec. Returns
-    /// `(workspace_id, action_timeline_id)`.
-    async fn create(&self, spec_json: String) -> zbus::fdo::Result<(String, String)> {
+    /// `(workspace_id, action_timeline_id, status_json)`.
+    async fn create(&self, spec_json: String) -> zbus::fdo::Result<(String, String, String)> {
         info!("D-Bus workspace create");
         let spec = parse_spec(&spec_json)?;
         let mgr = self.lock()?;
         let result = mgr
             .create(&spec)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("workspace create failed: {e}")))?;
-        Ok((result.workspace_id, result.action_timeline_id))
+            .map_err(|e| map_workspace_error("create", e))?;
+        let status = status_json(&result.status)?;
+        Ok((result.workspace_id, result.action_timeline_id, status))
     }
 
     /// Build a spec from a baseline template, then create it. The fast
@@ -118,16 +157,15 @@ impl WorkspaceService {
         name: String,
         root_dir: String,
         params: HashMap<String, String>,
-    ) -> zbus::fdo::Result<(String, String)> {
+    ) -> zbus::fdo::Result<(String, String, String)> {
         info!(template_id = %template_id, name = %name, "D-Bus workspace create_from_template");
         let tparams = TemplateParams::from_map(&params);
         let mgr = self.lock()?;
         let result = mgr
             .create_from_template(&template_id, &name, Path::new(&root_dir), &tparams)
-            .map_err(|e| {
-                zbus::fdo::Error::Failed(format!("workspace create_from_template failed: {e}"))
-            })?;
-        Ok((result.workspace_id, result.action_timeline_id))
+            .map_err(|e| map_workspace_error("create_from_template", e))?;
+        let status = status_json(&result.status)?;
+        Ok((result.workspace_id, result.action_timeline_id, status))
     }
 
     /// Return the four baseline templates as a JSON array of
@@ -136,8 +174,10 @@ impl WorkspaceService {
         info!("D-Bus workspace list_templates");
         let mgr = self.lock()?;
         let templates = mgr.list_templates();
-        serde_json::to_string(&templates)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize templates: {e}")))
+        serde_json::to_string(&templates).map_err(|e| {
+            warn!("workspace list_templates serialization failed: {e}");
+            zbus::fdo::Error::Failed("Template serialization failed".to_string())
+        })
     }
 
     /// Undo a recorded workspace creation by its action-timeline id.
@@ -146,7 +186,7 @@ impl WorkspaceService {
         info!(action_timeline_id = %action_timeline_id, "D-Bus workspace undo");
         let mgr = self.lock()?;
         mgr.undo(&action_timeline_id)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("workspace undo failed: {e}")))?;
+            .map_err(|e| map_workspace_error("undo", e))?;
         Ok(())
     }
 }
@@ -154,6 +194,7 @@ impl WorkspaceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use die_orchestrator::workspace::{DirectoryEntry, EntryKind, TemplateId, WorkspaceMetadata};
     use tempfile::TempDir;
 
     fn service(allowed: &TempDir) -> WorkspaceService {
@@ -225,7 +266,7 @@ mod tests {
         if !git_ok {
             return;
         }
-        let (workspace_id, action_id) = svc
+        let (workspace_id, action_id, status_json) = svc
             .create_from_template(
                 "code-project".to_string(),
                 "ws".to_string(),
@@ -234,7 +275,9 @@ mod tests {
             )
             .await
             .unwrap();
+        let status: ExecutionStatus = serde_json::from_str(&status_json).unwrap();
         assert!(workspace_id.contains("ws"));
+        assert!(status.is_complete());
         assert!(root.join("Cargo.toml").is_file());
         svc.undo(action_id).await.unwrap();
         assert!(!root.exists());
@@ -251,7 +294,9 @@ mod tests {
         spec.setup_commands.clear();
         spec.metadata = spec.compute_metadata();
         let spec_json = serde_json::to_string(&spec).unwrap();
-        let (_wid, action_id) = svc.create(spec_json).await.unwrap();
+        let (_wid, action_id, status_json) = svc.create(spec_json).await.unwrap();
+        let status: ExecutionStatus = serde_json::from_str(&status_json).unwrap();
+        assert!(status.is_complete());
         assert!(root.join("README.md").is_file());
         svc.undo(action_id).await.unwrap();
         assert!(!root.exists());
@@ -269,7 +314,62 @@ mod tests {
         spec.metadata = spec.compute_metadata();
         let spec_json = serde_json::to_string(&spec).unwrap();
         let err = svc.create(spec_json).await.unwrap_err();
-        assert!(matches!(err, zbus::fdo::Error::Failed(_)));
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn create_with_outside_root_does_not_leak_allowed_root_in_error() {
+        let allowed = TempDir::new().unwrap();
+        let svc = service(&allowed);
+        let mut spec = die_orchestrator::workspace::templates::build_research_template(
+            "x",
+            &allowed.path().join("x"),
+        );
+        spec.root_dir = std::path::PathBuf::from("/etc/evil");
+        spec.metadata = spec.compute_metadata();
+        let err = svc
+            .create(serde_json::to_string(&spec).unwrap())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(&allowed.path().to_string_lossy().to_string()));
+        assert!(!msg.contains("allowed_root"));
+        assert!(!msg.contains("/etc/evil"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn create_with_duplicate_files_returns_tree_creation_failed_status() {
+        let allowed = TempDir::new().unwrap();
+        let svc = service(&allowed);
+        let mut spec = WorkspaceSpec {
+            name: "dup".to_string(),
+            root_dir: allowed.path().join("dup"),
+            template_id: TemplateId::Research,
+            directory_tree: vec![
+                DirectoryEntry {
+                    relative_path: "README.md".to_string(),
+                    kind: EntryKind::File,
+                    content: Some("first".to_string()),
+                },
+                DirectoryEntry {
+                    relative_path: "README.md".to_string(),
+                    kind: EntryKind::File,
+                    content: Some("second".to_string()),
+                },
+            ],
+            setup_commands: vec![],
+            calendar_blocks: vec![],
+            metadata: WorkspaceMetadata::default(),
+        };
+        spec.metadata = spec.compute_metadata();
+
+        let (_workspace_id, _action_id, status_json) = svc
+            .create(serde_json::to_string(&spec).unwrap())
+            .await
+            .unwrap();
+        let status: ExecutionStatus = serde_json::from_str(&status_json).unwrap();
+        assert!(matches!(status, ExecutionStatus::TreeCreationFailed { .. }));
     }
 
     #[tokio::test]
@@ -285,7 +385,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, zbus::fdo::Error::Failed(_)));
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
     }
 
     #[tokio::test]

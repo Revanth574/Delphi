@@ -37,7 +37,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::workspace::spec::{EntryKind, WorkspaceSpec};
-use crate::workspace::validator::{validate_spec, ValidatorError};
+use crate::workspace::validator::{ValidatorError, validate_spec};
 
 /// Default per-command wall-clock timeout.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -69,7 +69,7 @@ impl CommandOutcome {
 }
 
 /// Terminal status of an [`ExecutionOutcome`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecutionStatus {
     /// All entries created and all commands exited 0.
     Completed,
@@ -245,11 +245,9 @@ impl WorkspaceExecutor {
                 if meta.file_type().is_symlink() {
                     // root_dir is itself a symlink: remove the LINK, never
                     // its target.
-                    std::fs::remove_file(root_dir).map_err(|e| {
-                        ExecutorError::AllowedRootOpen {
-                            path: root_dir.display().to_string(),
-                            source: e,
-                        }
+                    std::fs::remove_file(root_dir).map_err(|e| ExecutorError::AllowedRootOpen {
+                        path: root_dir.display().to_string(),
+                        source: e,
                     })?;
                     return Ok(());
                 }
@@ -278,21 +276,21 @@ impl WorkspaceExecutor {
 
         // strip_prefix is guaranteed to succeed by the validator, but we
         // re-check defensively.
-        let root_rel = spec.root_dir.strip_prefix(&self.allowed_root).map_err(|_| {
-            ExecutorError::RootOutsideAllowed {
+        let root_rel = spec
+            .root_dir
+            .strip_prefix(&self.allowed_root)
+            .map_err(|_| ExecutorError::RootOutsideAllowed {
                 root: spec.root_dir.display().to_string(),
                 allowed: self.allowed_root.display().to_string(),
-            }
-        })?;
+            })?;
 
         // Held directory handle for the allowed root — the trust anchor
         // for the whole operation (O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC).
-        let allowed_handle = open_dir_handle(&self.allowed_root).map_err(|e| {
-            ExecutorError::AllowedRootOpen {
+        let allowed_handle =
+            open_dir_handle(&self.allowed_root).map_err(|e| ExecutorError::AllowedRootOpen {
                 path: self.allowed_root.display().to_string(),
                 source: e,
-            }
-        })?;
+            })?;
         let allowed_fd = allowed_handle.as_raw_fd();
 
         // Root-existence gate.
@@ -301,7 +299,9 @@ impl WorkspaceExecutor {
                 // Exists as a real directory beneath the root. It must be
                 // empty (we never destroy user data on create).
                 if dir_is_nonempty(&spec.root_dir) {
-                    return Err(ExecutorError::RootExists(spec.root_dir.display().to_string()));
+                    return Err(ExecutorError::RootExists(
+                        spec.root_dir.display().to_string(),
+                    ));
                 }
             }
             Err(e) => match e.raw_os_error() {
@@ -373,15 +373,13 @@ impl WorkspaceExecutor {
             } else {
                 spec.root_dir.join(&cmd.working_dir_relative)
             };
-            let outcome = run_command(
-                &working_dir,
-                &cmd.program,
-                &cmd.args,
-                COMMAND_TIMEOUT,
-            );
+            let outcome = run_command(&working_dir, &cmd.program, &cmd.args, COMMAND_TIMEOUT);
             let failed = !outcome.succeeded();
-            let (program, exit_code, timed_out) =
-                (outcome.program.clone(), outcome.exit_code, outcome.timed_out);
+            let (program, exit_code, timed_out) = (
+                outcome.program.clone(),
+                outcome.exit_code,
+                outcome.timed_out,
+            );
             command_outcomes.push(outcome);
             if failed {
                 status = ExecutionStatus::CommandFailed {
@@ -643,6 +641,43 @@ fn linux_openat2(dirfd: i32, rel: &Path, flags: u64) -> std::io::Result<i32> {
     Ok(raw as i32)
 }
 
+fn spawn_command(builder: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    spawn_command_impl(builder)
+}
+
+#[cfg(unix)]
+fn spawn_command_impl(builder: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    builder.process_group(0).spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_command_impl(builder: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    builder.spawn()
+}
+
+#[cfg(unix)]
+fn terminate_child_tree(child: &mut std::process::Child) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let pgid = Pid::from_raw(child.id() as i32);
+    let _ = killpg(pgid, Signal::SIGTERM);
+    std::thread::sleep(Duration::from_millis(500));
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = killpg(pgid, Signal::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_child_tree(child: &mut std::process::Child) {
+    // Windows/macOS are not target deployment platforms for the secure
+    // executor yet; retain direct-child cleanup there.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run one command with a wall-clock timeout, capturing stdout/stderr.
 ///
 /// The command runs via explicit argv (never a shell) with a minimal
@@ -676,7 +711,7 @@ fn run_command(
         builder.env("PATH", path);
     }
 
-    let mut child = match builder.spawn() {
+    let mut child = match spawn_command(&mut builder) {
         Ok(c) => c,
         Err(e) => {
             return CommandOutcome {
@@ -715,15 +750,13 @@ fn run_command(
             Ok(Some(status)) => break (status.code(), false),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_child_tree(&mut child);
                     break (None, true);
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_tree(&mut child);
                 break (None, false);
             }
         }
@@ -745,9 +778,7 @@ fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::spec::{
-        DirectoryEntry, TemplateId, WorkspaceMetadata, WorkspaceSpec,
-    };
+    use crate::workspace::spec::{DirectoryEntry, TemplateId, WorkspaceMetadata, WorkspaceSpec};
     use crate::workspace::templates;
     use tempfile::TempDir;
 
@@ -777,10 +808,7 @@ mod tests {
 
     #[test]
     fn is_strictly_under_accepts_child() {
-        assert!(is_strictly_under(
-            Path::new("/a/b/c"),
-            Path::new("/a/b")
-        ));
+        assert!(is_strictly_under(Path::new("/a/b/c"), Path::new("/a/b")));
     }
 
     #[test]
@@ -790,10 +818,7 @@ mod tests {
 
     #[test]
     fn is_strictly_under_rejects_sibling_prefix() {
-        assert!(!is_strictly_under(
-            Path::new("/a/bcd"),
-            Path::new("/a/b")
-        ));
+        assert!(!is_strictly_under(Path::new("/a/bcd"), Path::new("/a/b")));
     }
 
     #[test]
@@ -845,17 +870,21 @@ mod tests {
     #[test]
     fn execution_status_is_complete_predicate() {
         assert!(ExecutionStatus::Completed.is_complete());
-        assert!(!ExecutionStatus::CommandFailed {
-            program: "git".into(),
-            exit_code: Some(1),
-            timed_out: false,
-        }
-        .is_complete());
-        assert!(!ExecutionStatus::TreeCreationFailed {
-            path: "x".into(),
-            error: "e".into(),
-        }
-        .is_complete());
+        assert!(
+            !ExecutionStatus::CommandFailed {
+                program: "git".into(),
+                exit_code: Some(1),
+                timed_out: false,
+            }
+            .is_complete()
+        );
+        assert!(
+            !ExecutionStatus::TreeCreationFailed {
+                path: "x".into(),
+                error: "e".into(),
+            }
+            .is_complete()
+        );
     }
 
     // ── Linux-only: real filesystem execution ─────────────────────────
@@ -1086,7 +1115,10 @@ mod tests {
             });
             let outcome = exec.execute(&spec).unwrap();
             assert!(outcome.status.is_complete());
-            assert_eq!(std::fs::read_to_string(root.join("a/b/c/deep.txt")).unwrap(), "deep");
+            assert_eq!(
+                std::fs::read_to_string(root.join("a/b/c/deep.txt")).unwrap(),
+                "deep"
+            );
         }
 
         #[test]
@@ -1162,7 +1194,10 @@ mod tests {
             std::fs::create_dir(&victim).unwrap();
             let err = exec.undo(&victim).unwrap_err();
             assert!(matches!(err, ExecutorError::RootOutsideAllowed { .. }));
-            assert!(victim.exists(), "undo must not touch paths outside allowed root");
+            assert!(
+                victim.exists(),
+                "undo must not touch paths outside allowed root"
+            );
         }
 
         #[test]
@@ -1180,7 +1215,10 @@ mod tests {
 
             exec.undo(&spec.root_dir).unwrap();
             assert!(!spec.root_dir.exists());
-            assert!(sentinel.exists(), "undo must not follow symlink to delete external target");
+            assert!(
+                sentinel.exists(),
+                "undo must not follow symlink to delete external target"
+            );
             assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "do not delete");
         }
 
@@ -1264,15 +1302,14 @@ mod tests {
                 })
                 .collect();
             let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            // At least one attempt must not report a fully-complete
-            // success, OR both ran but the loser hit RootExists / an
-            // O_EXCL collision recorded in its status. The invariant we
-            // assert: not both report Completed with all files.
+            // Exactly one attempt may report a fully-complete success.
+            // If both complete, overlapping create calls raced past the
+            // root/leaf O_EXCL boundary.
             let complete_count = results
                 .iter()
                 .filter(|r| matches!(r, Ok(o) if o.status.is_complete()))
                 .count();
-            assert!(complete_count >= 1, "at least one creation should proceed");
+            assert_eq!(complete_count, 1, "only one creation should complete");
         }
 
         #[test]
@@ -1294,7 +1331,10 @@ mod tests {
             restore.set_mode(0o755);
             std::fs::set_permissions(allowed.path(), restore).unwrap();
 
-            assert!(result.is_err(), "creation under an unwritable root must fail");
+            assert!(
+                result.is_err(),
+                "creation under an unwritable root must fail"
+            );
         }
 
         // ── command execution primitive ────────────────────────────────
@@ -1302,12 +1342,7 @@ mod tests {
         #[test]
         fn run_command_captures_success() {
             let dir = TempDir::new().unwrap();
-            let outcome = run_command(
-                dir.path(),
-                "true",
-                &[],
-                Duration::from_secs(5),
-            );
+            let outcome = run_command(dir.path(), "true", &[], Duration::from_secs(5));
             assert!(outcome.succeeded());
             assert_eq!(outcome.exit_code, Some(0));
             assert!(!outcome.timed_out);
@@ -1316,12 +1351,7 @@ mod tests {
         #[test]
         fn run_command_captures_nonzero_exit() {
             let dir = TempDir::new().unwrap();
-            let outcome = run_command(
-                dir.path(),
-                "false",
-                &[],
-                Duration::from_secs(5),
-            );
+            let outcome = run_command(dir.path(), "false", &[], Duration::from_secs(5));
             assert!(!outcome.succeeded());
             assert_eq!(outcome.exit_code, Some(1));
         }
@@ -1353,6 +1383,40 @@ mod tests {
             assert!(outcome.exit_code.is_none());
             // Should return promptly after the timeout, not after 30s.
             assert!(start.elapsed() < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn timeout_kills_descendant_processes() {
+            use nix::errno::Errno;
+            use nix::sys::signal;
+            use nix::unistd::Pid;
+
+            let dir = TempDir::new().unwrap();
+            let pid_file = dir.path().join("descendant.pid");
+            let script = format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display());
+            let outcome = run_command(
+                dir.path(),
+                "/bin/sh",
+                &["-c".to_string(), script],
+                Duration::from_millis(300),
+            );
+            assert!(outcome.timed_out, "shell command should time out");
+
+            let mut pid_text = String::new();
+            for _ in 0..20 {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    pid_text = text;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let descendant_pid: i32 = pid_text.trim().parse().expect("descendant pid");
+            std::thread::sleep(Duration::from_millis(500));
+            let still_exists = signal::kill(Pid::from_raw(descendant_pid), None);
+            assert!(
+                matches!(still_exists, Err(Errno::ESRCH)),
+                "descendant {descendant_pid} should be gone, got {still_exists:?}"
+            );
         }
 
         #[test]
@@ -1409,19 +1473,42 @@ mod tests {
 
         #[test]
         fn execute_records_command_failure_in_status() {
-            // A custom (validated) spec whose command is `git init` run in
-            // a working dir, but we force failure by making `git` see an
-            // impossible state is hard; instead assert the status-capture
-            // path via a spec with NO commands completes, and rely on the
-            // run_command unit tests for the failure primitive. Here we
-            // assert that a completed run reports Completed + zero cmds.
             let (allowed, exec) = fixture();
-            let mut spec = templates::build_research_template("ws", &ws_root(&allowed, "ws"));
-            spec.setup_commands.clear();
-            spec.metadata = spec.compute_metadata();
+            let spec = finalize(WorkspaceSpec {
+                name: "ws".to_string(),
+                root_dir: ws_root(&allowed, "ws"),
+                template_id: TemplateId::Research,
+                directory_tree: vec![DirectoryEntry {
+                    relative_path: "Cargo.toml".to_string(),
+                    kind: EntryKind::File,
+                    content: Some(
+                        "[package]\nname = \"already-here\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                            .to_string(),
+                    ),
+                }],
+                setup_commands: vec![crate::workspace::spec::SetupCommand {
+                    program: "cargo".to_string(),
+                    args: vec!["init".to_string()],
+                    working_dir_relative: String::new(),
+                    description: "cargo init must fail on an existing Cargo.toml".to_string(),
+                }],
+                calendar_blocks: vec![],
+                metadata: WorkspaceMetadata::default(),
+            });
             let outcome = exec.execute(&spec).unwrap();
-            assert!(outcome.status.is_complete());
-            assert!(outcome.command_outcomes.is_empty());
+            assert!(
+                matches!(
+                    outcome.status,
+                    ExecutionStatus::CommandFailed {
+                        program: ref p,
+                        ..
+                    } if p == "cargo"
+                ),
+                "expected cargo CommandFailed, got {:?}",
+                outcome.status
+            );
+            assert_eq!(outcome.command_outcomes.len(), 1);
+            assert!(!outcome.command_outcomes[0].succeeded());
         }
 
         #[test]

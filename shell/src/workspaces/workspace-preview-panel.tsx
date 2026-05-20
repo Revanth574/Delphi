@@ -4,7 +4,11 @@
 import React, { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { WorkspaceSpec } from "./workspace-types";
+import {
+  executionStatusKind,
+  type CreateResult,
+  type WorkspaceSpec,
+} from "./workspace-types";
 
 /** Props for the WorkspacePreviewPanel. */
 export interface WorkspacePreviewPanelProps {
@@ -14,6 +18,8 @@ export interface WorkspacePreviewPanelProps {
   validationErrors: string[];
   /** Whether a preview/create request is in flight. */
   loading: boolean;
+  /** Latest creation result, if the workspace was created. */
+  createResult?: CreateResult | null;
   /** Invoked when the user confirms creation. */
   onCreate: () => void;
   /** Invoked when the user cancels. */
@@ -53,7 +59,7 @@ TreeEntryRow.displayName = "TreeEntryRow";
  * workspace service.
  */
 export const WorkspacePreviewPanel: React.FC<WorkspacePreviewPanelProps> =
-  React.memo(({ spec, validationErrors, loading, onCreate, onCancel }) => {
+  React.memo(({ spec, validationErrors, loading, createResult, onCreate, onCancel }) => {
     const { t } = useTranslation();
 
     const handleCreate = useCallback(() => {
@@ -92,6 +98,10 @@ export const WorkspacePreviewPanel: React.FC<WorkspacePreviewPanelProps> =
     }
 
     const hasErrors = validationErrors.length > 0;
+    const createStatusKind = createResult
+      ? executionStatusKind(createResult.status)
+      : null;
+    const partialStatus = createStatusKind && createStatusKind !== "Completed";
     const sortedTree = [...spec.directory_tree].sort((a, b) =>
       a.relative_path.localeCompare(b.relative_path),
     );
@@ -137,6 +147,17 @@ export const WorkspacePreviewPanel: React.FC<WorkspacePreviewPanelProps> =
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {partialStatus && (
+          <div
+            className="rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/30"
+            role="status"
+          >
+            <p className="text-xs font-medium text-amber-900 dark:text-amber-100">
+              Workspace created with partial status: {createStatusKind}
+            </p>
           </div>
         )}
 

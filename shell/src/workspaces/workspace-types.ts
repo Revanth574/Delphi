@@ -79,13 +79,33 @@ export interface WorkspacePreview {
   validationErrors: string[];
 }
 
+/** Terminal execution status. Mirrors Rust `ExecutionStatus`. */
+export type ExecutionStatus =
+  | "Completed"
+  | { TreeCreationFailed: { path: string; error: string } }
+  | {
+      CommandFailed: {
+        program: string;
+        exit_code: number | null;
+        timed_out: boolean;
+      };
+    };
+
 /** Result of a workspace creation. */
 export interface CreateResult {
   workspaceId: string;
   actionTimelineId: string;
+  status: ExecutionStatus;
 }
 
 /** Whether a preview is safe to create (no validation errors). */
 export function isPreviewCreatable(preview: WorkspacePreview | null): boolean {
   return preview !== null && preview.validationErrors.length === 0;
+}
+
+/** Stable discriminator for an execution status. */
+export function executionStatusKind(status: ExecutionStatus): string {
+  if (status === "Completed") return "Completed";
+  if ("TreeCreationFailed" in status) return "TreeCreationFailed";
+  return "CommandFailed";
 }

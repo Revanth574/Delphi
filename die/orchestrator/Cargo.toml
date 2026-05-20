@@ -33,6 +33,7 @@ sha2 = { workspace = true }
 # this is a declaration-of-intent change, not a build-cost change.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+nix = { version = "0.30", features = ["signal", "process"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

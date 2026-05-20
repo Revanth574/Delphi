@@ -51,6 +51,23 @@ const en = {
       undoFailed: "Could not undo action.",
     },
 
+    // ── Workspace creation (capability #18) ─────
+    workspace: {
+      title: "Create workspace",
+      location: "Location",
+      contents: "Contents",
+      tree: "Files & folders",
+      commands: "Setup steps",
+      calendar: "Suggested calendar blocks",
+      loading: "Preparing workspace preview…",
+      empty: "No workspace to preview yet.",
+      summary: "{{dirs}} folders, {{files}} files ({{bytes}} bytes)",
+      create: "Create workspace",
+      cancel: "Cancel",
+      validationTitle: "This workspace can't be created yet:",
+      once: "once",
+    },
+
     // ── Onboarding ─────────────────────────────
     onboarding: {
       welcome: "Welcome to Delphi",

@@ -26,6 +26,10 @@ chrono = { workspace = true }
 pulldown-cmark = { workspace = true }
 scraper = { workspace = true }
 sha2 = { workspace = true }
+# Workspace creation (Task 3A.6, Codex round-2 FIX R3-2): Unicode
+# General_Category lookups to reject combining marks in workspace paths
+# (visual-spoofing defense). Property-table backed, not hand-rolled ranges.
+unicode-general-category = "1"
 
 # FIX 8 (Codex re-review P1-high): libc::O_NOFOLLOW closes the
 # validate→read TOCTOU window in `safe_open_no_follow` on Unix. The

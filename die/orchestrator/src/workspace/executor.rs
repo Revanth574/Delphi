@@ -662,11 +662,22 @@ fn terminate_child_tree(child: &mut std::process::Child) {
     use nix::unistd::Pid;
 
     let pgid = Pid::from_raw(child.id() as i32);
+    // Graceful first: SIGTERM the whole process group.
     let _ = killpg(pgid, Signal::SIGTERM);
     std::thread::sleep(Duration::from_millis(500));
-    if matches!(child.try_wait(), Ok(None)) {
-        let _ = killpg(pgid, Signal::SIGKILL);
-    }
+
+    // **Codex round-2 finding R2-1:** escalate to SIGKILL *unconditionally*
+    // after the grace period — do NOT gate it on the direct child still
+    // being alive. The previous `if matches!(child.try_wait(), Ok(None))`
+    // guard only fired SIGKILL when the immediate child survived SIGTERM;
+    // a descendant that ignored SIGTERM (`trap '' TERM`) while its parent
+    // exited cleanly would slip through the gap and outlive the cleanup.
+    // SIGKILL cannot be trapped, so this reaps any signal-ignoring
+    // descendant still in the group. `killpg` returns `ESRCH` when the
+    // group is already gone — that is the success case, and it (like any
+    // other error on this best-effort teardown path) is intentionally
+    // ignored since the function has no Result to propagate.
+    let _ = killpg(pgid, Signal::SIGKILL);
     let _ = child.wait();
 }
 
@@ -1416,6 +1427,69 @@ mod tests {
             assert!(
                 matches!(still_exists, Err(Errno::ESRCH)),
                 "descendant {descendant_pid} should be gone, got {still_exists:?}"
+            );
+        }
+
+        #[test]
+        fn timeout_kills_descendant_that_ignored_sigterm() {
+            // **Codex round-2 finding R2-1 regression.** Exposes the gap
+            // the existing `timeout_kills_descendant_processes` test does
+            // NOT: a descendant that *ignores* SIGTERM while its parent
+            // shell *exits* on it. Pre-fix, `terminate_child_tree` only
+            // escalated to SIGKILL when the direct child was still alive,
+            // so once the parent exited cleanly the SIGTERM-ignoring
+            // descendant was never reaped. Post-fix (unconditional SIGKILL
+            // to the group) the descendant — which cannot trap SIGKILL —
+            // is killed.
+            //
+            // Script design (vs. the sibling test): the parent shell does
+            // NOT `trap '' TERM` (so it dies from the group SIGTERM and the
+            // old `if child alive` guard goes false), while the backgrounded
+            // subshell DOES `trap '' TERM` (so only SIGKILL can reap it).
+            use nix::errno::Errno;
+            use nix::sys::signal;
+            use nix::unistd::Pid;
+
+            let dir = TempDir::new().unwrap();
+            let pid_file = dir.path().join("ignorer.pid");
+            // The backgrounded subshell's stdout/stderr are redirected to
+            // /dev/null so it does NOT hold `run_command`'s capture pipes
+            // open. Otherwise the reader-thread `read_to_end` join would
+            // block until the descendant's own `sleep 30` finished, by
+            // which point it has exited naturally — masking whether the
+            // cleanup actually killed it. With the redirect, run_command
+            // returns promptly after teardown and the liveness check below
+            // runs while the descendant is still sleeping (so a surviving
+            // descendant is observably alive → the test fails pre-fix).
+            let script = format!(
+                "(trap '' TERM; sleep 30) >/dev/null 2>&1 & echo $! > {}; sleep 30",
+                pid_file.display()
+            );
+            let outcome = run_command(
+                dir.path(),
+                "/bin/sh",
+                &["-c".to_string(), script],
+                Duration::from_millis(300),
+            );
+            assert!(outcome.timed_out, "shell command should time out");
+
+            let mut pid_text = String::new();
+            for _ in 0..20 {
+                if let Ok(text) = std::fs::read_to_string(&pid_file)
+                    && !text.trim().is_empty()
+                {
+                    pid_text = text;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let descendant_pid: i32 = pid_text.trim().parse().expect("descendant pid");
+            // Allow the unconditional SIGKILL + reap to complete.
+            std::thread::sleep(Duration::from_millis(500));
+            let still_exists = signal::kill(Pid::from_raw(descendant_pid), None);
+            assert!(
+                matches!(still_exists, Err(Errno::ESRCH)),
+                "SIGTERM-ignoring descendant {descendant_pid} should be SIGKILL'd, got {still_exists:?}"
             );
         }
 

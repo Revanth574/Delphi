@@ -175,9 +175,22 @@ pub enum ValidatorError {
         value: String,
     },
 
-    /// A path or argument contained a Unicode combining mark.
+    /// A path or argument contained a Unicode combining mark
+    /// (General_Category = Spacing_Mark / Nonspacing_Mark / Enclosing_Mark).
     #[error("path/argument contains Unicode combining mark U+{code:04X}: {value}")]
     UnicodeCombiningMark {
+        /// The offending codepoint.
+        code: u32,
+        /// The offending value.
+        value: String,
+    },
+
+    /// A path or argument contained a Unicode variation selector
+    /// (VS1–VS16 U+FE00–U+FE0F, Mongolian FVS U+180B–U+180D, or
+    /// VS17–VS256 U+E0100–U+E01EF). These alter glyph rendering and can
+    /// be used to spoof filenames.
+    #[error("path/argument contains Unicode variation selector U+{code:04X}: {value}")]
+    UnicodeVariationSelector {
         /// The offending codepoint.
         code: u32,
         /// The offending value.
@@ -521,6 +534,37 @@ fn validate_joined_path_length(root: &Path, relative: &str) -> Result<(), Valida
     Ok(())
 }
 
+/// Reject paths/arguments containing characters that could enable
+/// escape, visual spoofing, or system-level errors.
+///
+/// Rejection categories (in check order):
+/// - NUL byte and shell metacharacters (`; | & > < ` `$`) — defense in depth
+/// - C0 controls (U+0000–U+001F) and DEL (U+007F)
+/// - Bidi controls (U+202A–U+202E, U+2066–U+2069) — visual reordering
+/// - Unicode format characters (Cf): zero-width, BOM, joiners, etc.
+/// - Variation selectors (U+FE00–U+FE0F, U+180B–U+180D, U+E0100–U+E01EF)
+/// - General_Category = Mark (Spacing_Mark, Nonspacing_Mark,
+///   Enclosing_Mark) across all scripts — combining marks enable
+///   visual filename spoofing
+///
+/// **Codex round-2 finding R2-2:** the combining-mark check was
+/// previously hand-rolled with a handful of explicit ranges, which
+/// missed Hebrew (U+0591…), Arabic (U+064B…), Devanagari (U+093E…), and
+/// other scripts' marks plus the U+FE00–U+FE0F / U+180B–U+180D variation
+/// selectors. It is now backed by the Unicode `General_Category`
+/// property table (`unicode-general-category`), which covers every
+/// script's marks. Variation selectors are checked explicitly first so
+/// they get their own precise error variant (they are also category Mn,
+/// so the category sweep would otherwise absorb them).
+///
+/// **Policy note:** rejecting `General_Category = Mark` blocks legitimate
+/// non-Latin filenames that contain combining characters (Hebrew,
+/// Arabic, Devanagari, and many others). This is acceptable for the
+/// current enterprise B2B target (English-dominant filename conventions
+/// at software-development customers). The future consumer branch
+/// (Phase 5+, international users) should revisit this with proper
+/// Unicode-aware UX (e.g. NFC normalization + confusable detection
+/// rather than a blanket Mark ban).
 fn sanitize_path_string(value: &str) -> Result<(), ValidatorError> {
     for ch in value.chars() {
         let code = ch as u32;
@@ -548,7 +592,17 @@ fn sanitize_path_string(value: &str) -> Result<(), ValidatorError> {
                 value: value.to_string(),
             });
         }
-        if is_combining_mark(code) {
+        // Variation selectors first: they are General_Category = Mn, so
+        // the category sweep below would otherwise classify them as a
+        // generic combining mark. Checking them explicitly yields a
+        // precise error.
+        if is_variation_selector(code) {
+            return Err(ValidatorError::UnicodeVariationSelector {
+                code,
+                value: value.to_string(),
+            });
+        }
+        if is_mark_category(ch) {
             return Err(ValidatorError::UnicodeCombiningMark {
                 code,
                 value: value.to_string(),
@@ -588,14 +642,22 @@ fn is_unicode_format_character(code: u32) -> bool {
     )
 }
 
-fn is_combining_mark(code: u32) -> bool {
+/// Variation selectors: VS1–VS16, Mongolian free variation selectors,
+/// and the supplementary-plane VS17–VS256.
+fn is_variation_selector(code: u32) -> bool {
+    matches!(code, 0xFE00..=0xFE0F | 0x180B..=0x180D | 0xE0100..=0xE01EF)
+}
+
+/// Whether `ch` has General_Category = Mark (Spacing_Mark,
+/// Nonspacing_Mark, or Enclosing_Mark). Property-table backed so it
+/// covers combining marks across every script, not a hand-rolled subset.
+fn is_mark_category(ch: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
     matches!(
-        code,
-        0x0300..=0x036F
-            | 0x1AB0..=0x1AFF
-            | 0x1DC0..=0x1DFF
-            | 0x20D0..=0x20FF
-            | 0xFE20..=0xFE2F
+        get_general_category(ch),
+        GeneralCategory::SpacingMark
+            | GeneralCategory::NonspacingMark
+            | GeneralCategory::EnclosingMark
     )
 }
 
@@ -875,6 +937,95 @@ mod tests {
             validate_spec(&spec, allowed()),
             Err(ValidatorError::UnicodeCombiningMark { .. })
         ));
+    }
+
+    // ── Codex round-2 finding R2-2: comprehensive Unicode sanitation ──
+
+    /// Build a base spec whose first tree entry has the given path, with
+    /// metadata recomputed so only the path under test drives the result.
+    fn spec_with_first_path(path: &str) -> WorkspaceSpec {
+        let mut spec = base_spec();
+        spec.directory_tree[0].relative_path = path.to_string();
+        spec.metadata = spec.compute_metadata();
+        spec
+    }
+
+    #[test]
+    fn rejects_variation_selector_16() {
+        // U+FE0F — emoji presentation selector (also category Mn, but
+        // must report the precise variation-selector error).
+        let spec = spec_with_first_path("file\u{FE0F}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeVariationSelector { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_mongolian_variation_selector() {
+        // U+180B — Mongolian free variation selector one.
+        let spec = spec_with_first_path("file\u{180B}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeVariationSelector { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_hebrew_combining_mark() {
+        // U+0591 — Hebrew accent etnahta (Nonspacing_Mark). Missed by the
+        // round-1 hand-rolled ranges; caught by the category-table sweep.
+        let spec = spec_with_first_path("file\u{0591}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeCombiningMark { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_devanagari_combining_mark() {
+        // U+093E — Devanagari vowel sign aa (Spacing_Mark).
+        let spec = spec_with_first_path("file\u{093E}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeCombiningMark { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_arabic_combining_mark() {
+        // U+064B — Arabic fathatan (Nonspacing_Mark).
+        let spec = spec_with_first_path("file\u{064B}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeCombiningMark { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_enclosing_mark() {
+        // U+20DD — combining enclosing circle (Enclosing_Mark).
+        let spec = spec_with_first_path("file\u{20DD}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeCombiningMark { .. })
+        ));
+    }
+
+    #[test]
+    fn pure_ascii_path_validates_cleanly() {
+        // Sanity: legitimate ASCII filenames must still validate (no
+        // over-blocking from the broadened Mark sweep).
+        let spec = spec_with_first_path("normal-file.txt");
+        assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    #[test]
+    fn precomposed_unicode_path_validates_cleanly() {
+        // U+00E9 (é precomposed, category Lowercase_Letter) is NOT a Mark
+        // and must validate — only base+combining sequences are rejected.
+        let spec = spec_with_first_path("caf\u{00E9}.txt");
+        assert!(validate_spec(&spec, allowed()).is_ok());
     }
 
     #[test]

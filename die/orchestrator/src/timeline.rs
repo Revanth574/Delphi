@@ -14,14 +14,73 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::sqlite::{init_sqlite_connection, map_sqlite_err};
 use crate::OrchestratorError;
+use crate::sqlite::{init_sqlite_connection, map_sqlite_err};
 
 /// Duration of the undo window in seconds (24 hours).
 const UNDO_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Lifecycle status for an action timeline entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionStatus {
+    /// Action was recorded before execution and has not reached a terminal outcome.
+    Pending,
+    /// Action completed and can be undone until `expires_at`.
+    Complete,
+    /// Action partially completed and remains undoable for cleanup.
+    PartiallyCompleted,
+    /// Undo is currently in progress.
+    Undoing,
+    /// Undo completed; the action cannot be undone again.
+    Undone,
+    /// Audit-only action with no undo operation.
+    Irreversible,
+}
+
+impl ActionStatus {
+    /// Stable database representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::PartiallyCompleted => "partially_completed",
+            Self::Undoing => "undoing",
+            Self::Undone => "undone",
+            Self::Irreversible => "irreversible",
+        }
+    }
+
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "complete" => Ok(Self::Complete),
+            "partially_completed" => Ok(Self::PartiallyCompleted),
+            "undoing" => Ok(Self::Undoing),
+            "undone" => Ok(Self::Undone),
+            "irreversible" => Ok(Self::Irreversible),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown action status: {other}"),
+                )),
+            )),
+        }
+    }
+
+    fn is_reversible_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Complete | Self::PartiallyCompleted
+        )
+    }
+}
 
 /// A record of an AI action that can be undone.
 ///
@@ -37,6 +96,9 @@ const UNDO_WINDOW_SECS: i64 = 24 * 60 * 60;
 ///     reversible: true,
 ///     undo_command: "mv /home/user/Archive/report.pdf /home/user/Documents/report.pdf".to_string(),
 ///     expires_at: 1712400000 + 86400,
+///     status: die_orchestrator::timeline::ActionStatus::Complete,
+///     action_type: "generic".to_string(),
+///     outputs: None,
 /// };
 /// assert!(record.reversible);
 /// ```
@@ -54,6 +116,12 @@ pub struct ActionRecord {
     pub undo_command: String,
     /// When the undo window expires (UTC epoch seconds).
     pub expires_at: i64,
+    /// Current lifecycle state.
+    pub status: ActionStatus,
+    /// Stable action type, e.g. `workspace.create`.
+    pub action_type: String,
+    /// Optional serialized outputs or partial-failure details.
+    pub outputs: Option<String>,
 }
 
 /// Action timeline backed by SQLite.
@@ -87,8 +155,8 @@ impl Timeline {
     /// let tl = Timeline::open(Path::new("/tmp/timeline.db")).unwrap();
     /// ```
     pub fn open(path: &Path) -> Result<Self, OrchestratorError> {
-        let conn = Connection::open(path)
-            .map_err(|e| map_sqlite_err(e, "failed to open timeline db"))?;
+        let conn =
+            Connection::open(path).map_err(|e| map_sqlite_err(e, "failed to open timeline db"))?;
         // **Codex re-review FIX 22 (round 8):** route through the
         // shared `init_sqlite_connection` helper (CLAUDE.md SQLite
         // Connection Policy). Round-7 set `busy_timeout` directly
@@ -123,8 +191,7 @@ impl Timeline {
         // Pinning it anyway keeps the init path uniform with `open` —
         // future drift where someone copies an init path and forgets
         // the pragma gets caught by the regression test.
-        init_sqlite_connection(&conn)
-            .map_err(|e| map_sqlite_err(e, "timeline in_memory init"))?;
+        init_sqlite_connection(&conn).map_err(|e| map_sqlite_err(e, "timeline in_memory init"))?;
         let tl = Self { conn };
         tl.init_schema()?;
         Ok(tl)
@@ -158,8 +225,20 @@ impl Timeline {
 
         self.conn
             .execute(
-                "INSERT INTO actions (action_id, description, timestamp, reversible, undo_command, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![action_id, description, now, true, undo_command, expires_at],
+                "INSERT INTO actions (
+                    action_id, description, timestamp, reversible, undo_command, expires_at,
+                    status, action_type, outputs
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    action_id,
+                    description,
+                    now,
+                    true,
+                    undo_command,
+                    expires_at,
+                    ActionStatus::Complete.as_str(),
+                    "generic"
+                ],
             )
             .map_err(|e| map_sqlite_err(e, "failed to record action"))?;
 
@@ -181,22 +260,259 @@ impl Timeline {
     /// let tl = Timeline::in_memory().unwrap();
     /// let id = tl.record_irreversible("Sent email to user@example.com").unwrap();
     /// ```
-    pub fn record_irreversible(
-        &self,
-        description: &str,
-    ) -> Result<String, OrchestratorError> {
+    pub fn record_irreversible(&self, description: &str) -> Result<String, OrchestratorError> {
         let now = current_timestamp();
         let action_id = format!("tl-{now}-{}", rand_suffix());
 
         self.conn
             .execute(
-                "INSERT INTO actions (action_id, description, timestamp, reversible, undo_command, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![action_id, description, now, false, "", now],
+                "INSERT INTO actions (
+                    action_id, description, timestamp, reversible, undo_command, expires_at,
+                    status, action_type, outputs
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    action_id,
+                    description,
+                    now,
+                    false,
+                    "",
+                    now,
+                    ActionStatus::Irreversible.as_str(),
+                    "generic"
+                ],
             )
             .map_err(|e| map_sqlite_err(e, "failed to record action"))?;
 
         debug!(action_id = %action_id, description, "irreversible action recorded");
         Ok(action_id)
+    }
+
+    /// Record an action before it mutates state.
+    ///
+    /// The `payload` is the undo payload the caller will need later.
+    /// For workspace creation this is the workspace root path.
+    pub fn record_pending(
+        &self,
+        action_type: &str,
+        payload: &str,
+        description: &str,
+    ) -> Result<String, OrchestratorError> {
+        let now = current_timestamp();
+        let expires_at = now + UNDO_WINDOW_SECS;
+        let action_id = format!("tl-{now}-{}", rand_suffix());
+
+        self.conn
+            .execute(
+                "INSERT INTO actions (
+                    action_id, description, timestamp, reversible, undo_command, expires_at,
+                    status, action_type, outputs
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    action_id,
+                    description,
+                    now,
+                    true,
+                    payload,
+                    expires_at,
+                    ActionStatus::Pending.as_str(),
+                    action_type
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "failed to record pending action"))?;
+
+        debug!(action_id = %action_id, action_type, "pending action recorded");
+        Ok(action_id)
+    }
+
+    /// Transition a pending action to complete.
+    pub fn complete_pending(
+        &self,
+        action_id: &str,
+        outputs: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        self.transition_pending(action_id, ActionStatus::Complete, outputs)
+    }
+
+    /// Transition a pending action to partially completed.
+    pub fn mark_pending_partial(
+        &self,
+        action_id: &str,
+        partial_state: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.transition_pending(
+            action_id,
+            ActionStatus::PartiallyCompleted,
+            Some(partial_state),
+        )
+    }
+
+    fn transition_pending(
+        &self,
+        action_id: &str,
+        status: ActionStatus,
+        outputs: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE actions
+                 SET status = ?1, outputs = ?2
+                 WHERE action_id = ?3 AND status = ?4",
+                params![
+                    status.as_str(),
+                    outputs,
+                    action_id,
+                    ActionStatus::Pending.as_str()
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "failed to finalize pending action"))?;
+        if changed == 0 {
+            return Err(OrchestratorError::Planning(format!(
+                "action {action_id} is not pending"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Transition a reversible action to `Undoing` and return its undo payload.
+    pub fn begin_undo(&self, action_id: &str) -> Result<String, OrchestratorError> {
+        let now = current_timestamp();
+        let record = self.get_action(action_id)?;
+
+        if !record.reversible || !record.status.is_reversible_terminal() {
+            return Err(OrchestratorError::Planning(format!(
+                "action {action_id} is not reversible"
+            )));
+        }
+
+        if now > record.expires_at {
+            return Err(OrchestratorError::Planning(format!(
+                "undo window expired for {action_id} (expired at {})",
+                record.expires_at
+            )));
+        }
+
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE actions
+                 SET status = ?1, undo_restore_status = ?2
+                 WHERE action_id = ?3 AND status = ?2 AND reversible = 1",
+                params![
+                    ActionStatus::Undoing.as_str(),
+                    record.status.as_str(),
+                    action_id
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "failed to mark undoing"))?;
+        if changed == 0 {
+            return Err(OrchestratorError::Planning(format!(
+                "action {action_id} could not enter undoing state"
+            )));
+        }
+
+        Ok(record.undo_command)
+    }
+
+    /// Mark a previously begun undo as complete.
+    pub fn complete_undo(&self, action_id: &str) -> Result<(), OrchestratorError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE actions
+                 SET reversible = 0, undo_command = '[UNDONE]', status = ?1,
+                     undo_restore_status = NULL
+                 WHERE action_id = ?2 AND status = ?3",
+                params![
+                    ActionStatus::Undone.as_str(),
+                    action_id,
+                    ActionStatus::Undoing.as_str()
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "failed to mark undone"))?;
+        if changed == 0 {
+            return Err(OrchestratorError::Planning(format!(
+                "action {action_id} is not undoing"
+            )));
+        }
+        info!(action_id, "action undone");
+        Ok(())
+    }
+
+    /// Return an undoing action to its prior reversible state.
+    pub fn abort_undo(&self, action_id: &str) -> Result<(), OrchestratorError> {
+        let restore_status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT undo_restore_status FROM actions WHERE action_id = ?1 AND status = ?2",
+                params![action_id, ActionStatus::Undoing.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| map_sqlite_err(e, "abort_undo lookup"))?;
+        let restore_status =
+            restore_status.unwrap_or_else(|| ActionStatus::Complete.as_str().to_string());
+        ActionStatus::from_db(&restore_status)
+            .map_err(|e| map_sqlite_err(e, "abort_undo restore status"))?;
+
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE actions
+                 SET status = ?1, reversible = 1, undo_restore_status = NULL
+                 WHERE action_id = ?2 AND status = ?3",
+                params![restore_status, action_id, ActionStatus::Undoing.as_str()],
+            )
+            .map_err(|e| map_sqlite_err(e, "failed to abort undo"))?;
+        if changed == 0 {
+            return Err(OrchestratorError::Planning(format!(
+                "action {action_id} is not undoing"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return the current status for tests and service diagnostics.
+    pub fn get_action_status(&self, action_id: &str) -> Result<ActionStatus, OrchestratorError> {
+        Ok(self.get_action(action_id)?.status)
+    }
+
+    /// List actions still in pending state.
+    pub fn list_pending_actions(&self) -> Result<Vec<ActionRecord>, OrchestratorError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT action_id, description, timestamp, reversible, undo_command, expires_at,
+                        status, action_type, outputs
+                 FROM actions WHERE status = ?1 ORDER BY timestamp DESC",
+            )
+            .map_err(|e| map_sqlite_err(e, "pending query prepare failed"))?;
+        let rows = stmt
+            .query_map(
+                params![ActionStatus::Pending.as_str()],
+                row_to_action_record,
+            )
+            .map_err(|e| map_sqlite_err(e, "pending query failed"))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| map_sqlite_err(e, "pending row read failed"))?);
+        }
+        Ok(results)
+    }
+
+    fn get_action(&self, action_id: &str) -> Result<ActionRecord, OrchestratorError> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT action_id, description, timestamp, reversible, undo_command, expires_at,
+                        status, action_type, outputs
+                 FROM actions WHERE action_id = ?1",
+                params![action_id],
+                row_to_action_record,
+            )
+            .optional()
+            .map_err(|e| map_sqlite_err(e, "action lookup"))?
+            .ok_or_else(|| OrchestratorError::Planning(format!("action not found: {action_id}")))
     }
 
     /// Attempt to undo an action.
@@ -241,7 +557,9 @@ impl Timeline {
         let record: ActionRecord = self
             .conn
             .query_row(
-                "SELECT action_id, description, timestamp, reversible, undo_command, expires_at FROM actions WHERE action_id = ?1",
+                "SELECT action_id, description, timestamp, reversible, undo_command, expires_at,
+                        status, action_type, outputs
+                 FROM actions WHERE action_id = ?1",
                 params![action_id],
                 |row| {
                     Ok(ActionRecord {
@@ -251,16 +569,17 @@ impl Timeline {
                         reversible: row.get(3)?,
                         undo_command: row.get(4)?,
                         expires_at: row.get(5)?,
+                        status: ActionStatus::from_db(row.get::<_, String>(6)?.as_str())?,
+                        action_type: row.get(7)?,
+                        outputs: row.get(8)?,
                     })
                 },
             )
             .optional()
             .map_err(|e| map_sqlite_err(e, "undo_action lookup"))?
-            .ok_or_else(|| {
-                OrchestratorError::Planning(format!("action not found: {action_id}"))
-            })?;
+            .ok_or_else(|| OrchestratorError::Planning(format!("action not found: {action_id}")))?;
 
-        if !record.reversible {
+        if !record.reversible || !record.status.is_reversible_terminal() {
             return Err(OrchestratorError::Planning(format!(
                 "action {action_id} is not reversible"
             )));
@@ -274,12 +593,25 @@ impl Timeline {
         }
 
         // Mark as undone.
-        self.conn
+        let changed = self
+            .conn
             .execute(
-                "UPDATE actions SET reversible = 0, undo_command = '[UNDONE]' WHERE action_id = ?1",
-                params![action_id],
+                "UPDATE actions
+                 SET reversible = 0, undo_command = '[UNDONE]', status = ?1,
+                     undo_restore_status = NULL
+                  WHERE action_id = ?2 AND status = ?3 AND reversible = 1",
+                params![
+                    ActionStatus::Undone.as_str(),
+                    action_id,
+                    record.status.as_str()
+                ],
             )
             .map_err(|e| map_sqlite_err(e, "failed to mark undone"))?;
+        if changed == 0 {
+            return Err(OrchestratorError::Planning(format!(
+                "action {action_id} could not be marked undone"
+            )));
+        }
 
         info!(action_id, "action undone");
         Ok(record.undo_command)
@@ -306,28 +638,19 @@ impl Timeline {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT action_id, description, timestamp, reversible, undo_command, expires_at FROM actions ORDER BY timestamp DESC LIMIT ?1",
+                "SELECT action_id, description, timestamp, reversible, undo_command, expires_at,
+                        status, action_type, outputs
+                 FROM actions ORDER BY timestamp DESC LIMIT ?1",
             )
             .map_err(|e| map_sqlite_err(e, "query prepare failed"))?;
 
         let rows = stmt
-            .query_map(params![count], |row| {
-                Ok(ActionRecord {
-                    action_id: row.get(0)?,
-                    description: row.get(1)?,
-                    timestamp: row.get(2)?,
-                    reversible: row.get(3)?,
-                    undo_command: row.get(4)?,
-                    expires_at: row.get(5)?,
-                })
-            })
+            .query_map(params![count], row_to_action_record)
             .map_err(|e| map_sqlite_err(e, "query failed"))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| map_sqlite_err(e, "row read failed"))?,
-            );
+            results.push(row.map_err(|e| map_sqlite_err(e, "row read failed"))?);
         }
 
         Ok(results)
@@ -354,10 +677,7 @@ impl Timeline {
         let now = current_timestamp();
         let deleted = self
             .conn
-            .execute(
-                "DELETE FROM actions WHERE expires_at < ?1",
-                params![now],
-            )
+            .execute("DELETE FROM actions WHERE expires_at < ?1", params![now])
             .map_err(|e| map_sqlite_err(e, "cleanup failed"))?;
 
         if deleted > 0 {
@@ -404,8 +724,69 @@ impl Timeline {
                 CREATE INDEX IF NOT EXISTS idx_actions_expires ON actions(expires_at);",
             )
             .map_err(|e| map_sqlite_err(e, "schema init failed"))?;
+        self.ensure_column("status", "TEXT NOT NULL DEFAULT 'complete'")?;
+        self.ensure_column("action_type", "TEXT NOT NULL DEFAULT 'generic'")?;
+        self.ensure_column("outputs", "TEXT")?;
+        self.ensure_column("undo_restore_status", "TEXT")?;
+        self.conn
+            .execute(
+                "UPDATE actions
+                 SET status = ?1
+                 WHERE reversible = 0 AND undo_command = '[UNDONE]' AND status = ?2",
+                params![
+                    ActionStatus::Undone.as_str(),
+                    ActionStatus::Complete.as_str()
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "schema status backfill undone"))?;
+        self.conn
+            .execute(
+                "UPDATE actions
+                 SET status = ?1
+                 WHERE reversible = 0 AND undo_command != '[UNDONE]' AND status = ?2",
+                params![
+                    ActionStatus::Irreversible.as_str(),
+                    ActionStatus::Complete.as_str()
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "schema status backfill irreversible"))?;
         Ok(())
     }
+
+    fn ensure_column(&self, name: &str, ddl: &str) -> Result<(), OrchestratorError> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(actions)")
+            .map_err(|e| map_sqlite_err(e, "schema inspect failed"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| map_sqlite_err(e, "schema inspect query failed"))?;
+        for column in columns {
+            if column.map_err(|e| map_sqlite_err(e, "schema inspect row failed"))? == name {
+                return Ok(());
+            }
+        }
+
+        self.conn
+            .execute_batch(&format!("ALTER TABLE actions ADD COLUMN {name} {ddl};"))
+            .map_err(|e| map_sqlite_err(e, "schema migration failed"))?;
+        Ok(())
+    }
+}
+
+fn row_to_action_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRecord> {
+    let status = row.get::<_, String>(6)?;
+    Ok(ActionRecord {
+        action_id: row.get(0)?,
+        description: row.get(1)?,
+        timestamp: row.get(2)?,
+        reversible: row.get(3)?,
+        undo_command: row.get(4)?,
+        expires_at: row.get(5)?,
+        status: ActionStatus::from_db(&status)?,
+        action_type: row.get(7)?,
+        outputs: row.get(8)?,
+    })
 }
 
 /// Get current UTC timestamp as epoch seconds.
@@ -460,6 +841,29 @@ mod tests {
     }
 
     #[test]
+    fn pending_action_can_complete() {
+        let tl = Timeline::in_memory().unwrap();
+        let id = tl
+            .record_pending("workspace.create", "/tmp/ws", "create ws")
+            .unwrap();
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Pending);
+        tl.complete_pending(&id, Some(r#""Completed""#)).unwrap();
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Complete);
+    }
+
+    #[test]
+    fn abort_undo_restores_reversible_status() {
+        let tl = Timeline::in_memory().unwrap();
+        let id = tl.record_action("test action", "echo undone").unwrap();
+        let payload = tl.begin_undo(&id).unwrap();
+        assert_eq!(payload, "echo undone");
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Undoing);
+        tl.abort_undo(&id).unwrap();
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Complete);
+        assert_eq!(tl.begin_undo(&id).unwrap(), "echo undone");
+    }
+
+    #[test]
     fn undo_nonexistent_action_fails() {
         let tl = Timeline::in_memory().unwrap();
         assert!(tl.undo_action("nope").is_err());
@@ -491,7 +895,8 @@ mod tests {
     fn list_recent_respects_limit() {
         let tl = Timeline::in_memory().unwrap();
         for i in 0..5 {
-            tl.record_action(&format!("action {i}"), &format!("undo {i}")).unwrap();
+            tl.record_action(&format!("action {i}"), &format!("undo {i}"))
+                .unwrap();
         }
         let recent = tl.list_recent(3).unwrap();
         assert_eq!(recent.len(), 3);

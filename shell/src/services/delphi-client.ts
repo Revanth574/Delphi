@@ -11,6 +11,8 @@
  * can arrive out of order.
  */
 
+import type { ExecutionStatus } from "../workspaces/workspace-types";
+
 // ── Types ──────────────────────────────────────────────────────
 
 /** JSON-RPC-like request sent to the bridge. */
@@ -54,6 +56,7 @@ export interface TimelineAction {
   timestamp: string;
   reversible: boolean;
   expires_at: string;
+  status?: string;
 }
 
 /** A learning suggestion. */
@@ -76,6 +79,17 @@ interface PendingCall {
 const DEFAULT_URL = "ws://127.0.0.1:9800";
 const RECONNECT_DELAY_MS = 2000;
 const REQUEST_TIMEOUT_MS = 30_000;
+
+function parseWorkspaceStatus(result: {
+  status?: ExecutionStatus;
+  status_json?: string;
+}): ExecutionStatus {
+  if (result.status) return result.status;
+  if (typeof result.status_json === "string") {
+    return JSON.parse(result.status_json) as ExecutionStatus;
+  }
+  throw new Error("workspace create response missing status");
+}
 
 /**
  * WebSocket client for the Delphi shell-bridge.
@@ -254,6 +268,94 @@ class DelphiClient {
       count: number;
     };
     return result.count;
+  }
+
+  // ── Workspace (capability #18) ─────────────────────────────
+
+  /**
+   * Dry-run preview a workspace spec. Returns the human-readable
+   * preview text and any validation errors (empty = safe to create).
+   */
+  async previewWorkspace(
+    specJson: string,
+    dryRun = true,
+  ): Promise<{ preview: string; validationErrors: string[] }> {
+    const result = (await this.call("workspace.preview", {
+      spec_json: specJson,
+      dry_run: dryRun,
+    })) as { preview: string; validation_errors: string[] };
+    return {
+      preview: result.preview,
+      validationErrors: result.validation_errors,
+    };
+  }
+
+  /** Create a workspace from a full spec. */
+  async createWorkspace(
+    specJson: string,
+  ): Promise<{
+    workspaceId: string;
+    actionTimelineId: string;
+    status: ExecutionStatus;
+  }> {
+    const result = (await this.call("workspace.create", {
+      spec_json: specJson,
+    })) as {
+      workspace_id: string;
+      action_timeline_id: string;
+      status?: ExecutionStatus;
+      status_json?: string;
+    };
+    return {
+      workspaceId: result.workspace_id,
+      actionTimelineId: result.action_timeline_id,
+      status: parseWorkspaceStatus(result),
+    };
+  }
+
+  /** Create a workspace from a baseline template. */
+  async createWorkspaceFromTemplate(
+    templateId: string,
+    name: string,
+    rootDir: string,
+    params: Record<string, string> = {},
+  ): Promise<{
+    workspaceId: string;
+    actionTimelineId: string;
+    status: ExecutionStatus;
+  }> {
+    const result = (await this.call("workspace.create_from_template", {
+      template_id: templateId,
+      name,
+      root_dir: rootDir,
+      params,
+    })) as {
+      workspace_id: string;
+      action_timeline_id: string;
+      status?: ExecutionStatus;
+      status_json?: string;
+    };
+    return {
+      workspaceId: result.workspace_id,
+      actionTimelineId: result.action_timeline_id,
+      status: parseWorkspaceStatus(result),
+    };
+  }
+
+  /** List the baseline workspace templates as a JSON array string. */
+  async listWorkspaceTemplates(): Promise<string> {
+    const result = (await this.call("workspace.list_templates", {})) as {
+      templates: string;
+    };
+    // The bridge maps the D-Bus String return to `{ templates: <json> }`.
+    return result.templates;
+  }
+
+  /** Undo a workspace creation by its action-timeline id. */
+  async undoWorkspace(actionTimelineId: string): Promise<void> {
+    await this.call("workspace.undo", {
+      action_timeline_id: actionTimelineId,
+    });
   }
 
   // ── Internal ───────────────────────────────────────────────

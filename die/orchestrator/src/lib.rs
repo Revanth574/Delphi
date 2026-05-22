@@ -40,6 +40,7 @@ pub mod reference;
 pub mod risk;
 pub mod sqlite;
 pub mod timeline;
+pub mod workspace;
 
 pub use error::OrchestratorError;
 

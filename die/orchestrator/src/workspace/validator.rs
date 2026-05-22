@@ -97,6 +97,29 @@ pub const COMMAND_ALLOWLIST: &[(&str, &[&str])] = &[
     ("uv", &["init"]),
 ];
 
+/// Inert leaf dotfiles a spec MAY create.
+///
+/// Path components beginning with `.` are rejected by default
+/// ([`ValidatorError::DotPrefixedPath`]): tools discover configuration
+/// from dot-prefixed *directories* (`.git/`, `.cargo/`) and dot-prefixed
+/// config *files* (`.npmrc`, `.env`) in their working directory. A
+/// spec-planted `.git/config` was the Codex round-4 file-exfiltration
+/// vector — `git init` honoring a spec-controlled `[init] templateDir`
+/// and copying files from outside the workspace into `.git/`.
+/// `env_clear()` already kills the env-based discovery paths
+/// (GIT_TEMPLATE_DIR, GIT_CONFIG, …); this list closes the
+/// workspace-dotfile path at the validator.
+///
+/// These three names are the only exceptions: they are inert *data*
+/// files (git reads `.gitignore` for ignore rules; `.gitkeep` is a
+/// convention to retain empty dirs; `.gitattributes` sets per-path git
+/// attributes) carrying no `templateDir`/hooks/exec directives, and are
+/// permitted ONLY as the final path component (never as a directory, so
+/// `.gitignore/evil` is still rejected). Same deny-by-default +
+/// tiny-explicit-allowlist discipline as [`COMMAND_ALLOWLIST`];
+/// extending it requires a code change + review + a new test.
+pub const ALLOWED_LEAF_DOTFILES: &[&str] = &[".gitignore", ".gitkeep", ".gitattributes"];
+
 /// Reasons a [`WorkspaceSpec`] can be rejected.
 ///
 /// Every variant names the offending spec field and value so the D-Bus
@@ -147,6 +170,27 @@ pub enum ValidatorError {
     #[error("path contains a current-directory ('.') component: {path}")]
     PathCurrentDir {
         /// The offending path.
+        path: String,
+    },
+
+    /// A path component began with `.` and was not one of the inert leaf
+    /// dotfiles in [`ALLOWED_LEAF_DOTFILES`] (or was used as a directory
+    /// rather than a final-component file). Dot-prefixed directories and
+    /// config dotfiles are config-discovery targets for tools run in the
+    /// workspace — the Codex round-4 `.git/config` -> `init.templateDir`
+    /// file-exfiltration vector.
+    #[error(
+        "path component {component:?} starts with '.', a config-discovery \
+         target for tools run in the workspace: {path}. Specs may create \
+         only the inert leaf dotfiles .gitignore/.gitkeep/.gitattributes \
+         (and only as the final component); .git/, .cargo/, .env, .npmrc, \
+         etc. are rejected. Other dotfiles must be produced by a setup \
+         command (e.g. git init) or by Delphi after setup commands run."
+    )]
+    DotPrefixedPath {
+        /// The offending dot-prefixed component.
+        component: String,
+        /// The full offending path.
         path: String,
     },
 
@@ -450,6 +494,28 @@ fn validate_root_dir(root_dir: &Path, allowed_root: &Path) -> Result<(), Validat
         });
     }
 
+    // Leading-dot policy (Codex R5-1) for the spec-controlled tail below
+    // `allowed_root`: the workspace root directory itself must not be
+    // dot-prefixed. No inert-leaf exception here — a workspace root is a
+    // directory, never a `.gitignore`-style file. Strip the `allowed_root`
+    // prefix first so a legitimately dot-containing allowed_root (e.g.
+    // `~/.local/share/delphi/projects`) is not mis-flagged; only the
+    // spec-chosen tail is inspected.
+    if let Ok(tail) = root_dir.strip_prefix(allowed_root) {
+        for comp in tail.components() {
+            let Component::Normal(name) = comp else {
+                continue;
+            };
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                return Err(ValidatorError::DotPrefixedPath {
+                    component: name_str.into_owned(),
+                    path: root_string,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -489,9 +555,25 @@ fn validate_path_inner(path: &str) -> Result<(), ValidatorError> {
     // consists ONLY of `Component::Normal` parts. Anything else (RootDir,
     // Prefix, ParentDir, CurDir) is rejected with a specific error.
     let p = Path::new(path);
-    for comp in p.components() {
+    let comps: Vec<Component> = p.components().collect();
+    let last = comps.len().saturating_sub(1);
+    for (i, comp) in comps.iter().enumerate() {
         match comp {
-            Component::Normal(_) => {}
+            Component::Normal(name) => {
+                // Leading-dot policy (Codex R5-1): a `.`-prefixed
+                // component is a config-discovery target unless it is one
+                // of the inert leaf dotfiles AND is the final component
+                // (leaf-only, so `.gitignore/evil` is still rejected).
+                let name_str = name.to_string_lossy();
+                let is_allowed_leaf =
+                    i == last && ALLOWED_LEAF_DOTFILES.contains(&name_str.as_ref());
+                if name_str.starts_with('.') && !is_allowed_leaf {
+                    return Err(ValidatorError::DotPrefixedPath {
+                        component: name_str.into_owned(),
+                        path: path.to_string(),
+                    });
+                }
+            }
             Component::ParentDir => {
                 return Err(ValidatorError::PathTraversal {
                     path: path.to_string(),
@@ -510,8 +592,8 @@ fn validate_path_inner(path: &str) -> Result<(), ValidatorError> {
         }
     }
 
-    // Depth limit: count Normal components.
-    let depth = p.components().count();
+    // Depth limit: count components (all Normal after the checks above).
+    let depth = comps.len();
     if depth > MAX_TREE_DEPTH {
         return Err(ValidatorError::TreeTooDeep {
             path: path.to_string(),
@@ -1600,6 +1682,153 @@ mod tests {
         }];
         // Calendar blocks carry no FS/command authority, so even
         // metacharacter-laden titles do not fail validation.
+        assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    // ── leading-dot path policy (Codex R5-1) ──────────────────────────
+    //
+    // Deny dot-prefixed components by default; permit only the inert leaf
+    // dotfiles in ALLOWED_LEAF_DOTFILES, and only as the final component.
+
+    #[test]
+    fn dot_git_dir_rejected() {
+        // The Codex round-4 vector: a spec-created `.git/config` that
+        // `git init` would read (honoring `init.templateDir` to copy
+        // files from outside the workspace into `.git/`). `.git` is a
+        // dot-prefixed *directory* component, so the spec is rejected
+        // before the executor ever writes it.
+        let spec = spec_with_first_path(".git/config");
+        assert!(
+            matches!(
+                validate_spec(&spec, allowed()),
+                Err(ValidatorError::DotPrefixedPath { .. })
+            ),
+            "spec-created .git/config must be rejected (config-discovery bypass)"
+        );
+    }
+
+    #[test]
+    fn dot_cargo_dir_rejected() {
+        let spec = spec_with_first_path(".cargo/config.toml");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn dot_python_version_rejected() {
+        // A leaf dotfile, but not in the inert allowlist.
+        let spec = spec_with_first_path(".python-version");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn dot_env_rejected() {
+        let spec = spec_with_first_path(".env");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn dot_npmrc_rejected() {
+        let spec = spec_with_first_path(".npmrc");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn dotfile_in_nested_subdir_rejected() {
+        // Component-based, not just top-level: src/.config is rejected.
+        let spec = spec_with_first_path("src/.config");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn allowlisted_dotfile_as_directory_rejected() {
+        // The inert-leaf exception is LEAF-ONLY: an allowlisted name used
+        // as a directory (non-final component) is still rejected, so a
+        // spec cannot smuggle `.gitignore/config` past the policy.
+        let spec = spec_with_first_path(".gitignore/evil");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn dot_prefixed_working_dir_rejected() {
+        // The leading-dot policy also covers setup_command working dirs.
+        let mut spec = base_spec();
+        spec.setup_commands.push(SetupCommand {
+            program: "git".to_string(),
+            args: vec!["init".to_string(), "--quiet".to_string()],
+            working_dir_relative: ".hidden".to_string(),
+            description: "test".to_string(),
+        });
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn dot_prefixed_workspace_root_rejected() {
+        // Defense-in-depth on root_dir: the spec-controlled tail below
+        // allowed_root must not be dot-prefixed. (The allowed_root prefix
+        // itself may legitimately contain dot dirs, e.g. ~/.local/...,
+        // so only the strip_prefix tail is checked.)
+        let mut spec = base_spec();
+        spec.root_dir = PathBuf::from("/home/u/projects/.hidden");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::DotPrefixedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn gitignore_leaf_dotfile_validates() {
+        // .gitignore is inert (git reads it for ignore rules; it carries
+        // no templateDir/hooks/exec directives) and is in the allowlist,
+        // so the baseline templates that ship a .gitignore still validate.
+        let spec = spec_with_first_path(".gitignore");
+        assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    #[test]
+    fn gitkeep_leaf_dotfile_validates() {
+        // The design template creates assets/.gitkeep etc.
+        let spec = spec_with_first_path("assets/.gitkeep");
+        assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    #[test]
+    fn gitattributes_leaf_dotfile_validates() {
+        let spec = spec_with_first_path(".gitattributes");
+        assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    #[test]
+    fn file_with_internal_dots_validates() {
+        // Internal dots (extensions, version suffixes) are not dotfiles:
+        // package.json's final component does not START with '.'.
+        let spec = spec_with_first_path("package.json");
+        assert!(validate_spec(&spec, allowed()).is_ok());
+    }
+
+    #[test]
+    fn nested_path_with_multiple_dots_validates() {
+        let spec = spec_with_first_path("src/utils/helpers.test.ts");
         assert!(validate_spec(&spec, allowed()).is_ok());
     }
 }

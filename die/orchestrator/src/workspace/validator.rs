@@ -78,11 +78,23 @@ pub const FORBIDDEN_CHARS: &[char] = &[';', '|', '&', '>', '<', '`', '$', '\0'];
 ///
 /// Extending this list requires a code change + review + a new test —
 /// the allowlist is the single source of truth for command safety.
+///
+/// **User-content-execution exclusion (Codex R1 + R4-1):** an allowlisted
+/// `(program, argv)` guards against shell/argv injection but NOT against
+/// the program *itself* executing attacker-controlled content found in
+/// the spec-controlled workspace. On those grounds npm/pnpm/conda were
+/// excluded in round 1, and `python -m venv .venv` in round 4: Python's
+/// `-m` searches the current directory (the executor's cwd = the
+/// workspace root) before stdlib, so a spec-planted `venv.py` would run
+/// instead of the stdlib `venv` module. Until a vetted, content-safe
+/// pattern exists (Phase 3B), the allowlist holds only `init`-style
+/// subcommands that neither compile nor execute workspace files (see the
+/// allowlist audit in the R4 commit message for why git/cargo/uv init
+/// are safe under the executor's `env_clear()` regime).
 pub const COMMAND_ALLOWLIST: &[(&str, &[&str])] = &[
     ("git", &["init", "init --quiet"]),
     ("cargo", &["init", "init --lib", "init --bin"]),
     ("uv", &["init"]),
-    ("python", &["-m venv .venv"]),
 ];
 
 /// Reasons a [`WorkspaceSpec`] can be rejected.
@@ -186,9 +198,9 @@ pub enum ValidatorError {
     },
 
     /// A path or argument contained a Unicode variation selector
-    /// (VS1–VS16 U+FE00–U+FE0F, Mongolian FVS U+180B–U+180D, or
-    /// VS17–VS256 U+E0100–U+E01EF). These alter glyph rendering and can
-    /// be used to spoof filenames.
+    /// (VS1–VS16 U+FE00–U+FE0F, Mongolian FVS1–FVS4 U+180B–U+180D and
+    /// U+180F, or VS17–VS256 U+E0100–U+E01EF). These alter glyph rendering
+    /// and can be used to spoof filenames.
     #[error("path/argument contains Unicode variation selector U+{code:04X}: {value}")]
     UnicodeVariationSelector {
         /// The offending codepoint.
@@ -542,7 +554,8 @@ fn validate_joined_path_length(root: &Path, relative: &str) -> Result<(), Valida
 /// - C0 controls (U+0000–U+001F) and DEL (U+007F)
 /// - Bidi controls (U+202A–U+202E, U+2066–U+2069) — visual reordering
 /// - Unicode format characters (Cf): zero-width, BOM, joiners, etc.
-/// - Variation selectors (U+FE00–U+FE0F, U+180B–U+180D, U+E0100–U+E01EF)
+/// - Variation selectors (U+FE00–U+FE0F, U+180B–U+180D, U+180F,
+///   U+E0100–U+E01EF)
 /// - General_Category = Mark (Spacing_Mark, Nonspacing_Mark,
 ///   Enclosing_Mark) across all scripts — combining marks enable
 ///   visual filename spoofing
@@ -642,10 +655,16 @@ fn is_unicode_format_character(code: u32) -> bool {
     )
 }
 
-/// Variation selectors: VS1–VS16, Mongolian free variation selectors,
-/// and the supplementary-plane VS17–VS256.
+/// Variation selectors: VS1–VS16 (U+FE00–U+FE0F), the Mongolian free
+/// variation selectors (FVS1–FVS3 at U+180B–U+180D and FVS4 at U+180F,
+/// the latter assigned in Unicode 16.0), and the supplementary-plane
+/// VS17–VS256 (U+E0100–U+E01EF).
+///
+/// The Mongolian range is deliberately discontinuous: U+180E (between
+/// FVS3 and FVS4) is the Mongolian Vowel Separator, a *format* character
+/// (caught by [`is_unicode_format_character`]), not a variation selector.
 fn is_variation_selector(code: u32) -> bool {
-    matches!(code, 0xFE00..=0xFE0F | 0x180B..=0x180D | 0xE0100..=0xE01EF)
+    matches!(code, 0xFE00..=0xFE0F | 0x180B..=0x180D | 0x180F | 0xE0100..=0xE01EF)
 }
 
 /// Whether `ch` has General_Category = Mark (Spacing_Mark,
@@ -965,6 +984,24 @@ mod tests {
     fn rejects_mongolian_variation_selector() {
         // U+180B — Mongolian free variation selector one.
         let spec = spec_with_first_path("file\u{180B}.txt");
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::UnicodeVariationSelector { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_mongolian_fvs4_as_variation_selector() {
+        // R4-2: U+180F — Mongolian Free Variation Selector Four. The
+        // FVS block is U+180B..=U+180D plus U+180F; U+180E in between is
+        // the Mongolian Vowel Separator (a format character, handled by
+        // is_unicode_format_character), NOT a variation selector, so the
+        // explicit VS range is deliberately discontinuous here. Because
+        // the explicit variation-selector check runs before the
+        // General_Category=Mark sweep, U+180F must surface as the precise
+        // UnicodeVariationSelector error, not the generic
+        // UnicodeCombiningMark.
+        let spec = spec_with_first_path("file\u{180F}.txt");
         assert!(matches!(
             validate_spec(&spec, allowed()),
             Err(ValidatorError::UnicodeVariationSelector { .. })
@@ -1326,7 +1363,6 @@ mod tests {
             ("cargo", &["init", "--lib"]),
             ("cargo", &["init", "--bin"]),
             ("uv", &["init"]),
-            ("python", &["-m", "venv", ".venv"]),
         ];
         for (prog, args) in cases {
             let mut spec = base_spec();
@@ -1386,6 +1422,56 @@ mod tests {
             ],
             working_dir_relative: String::new(),
             description: "conda env".to_string(),
+        };
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::CommandNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn python_venv_rejected_by_validator() {
+        // R4-1: `python -m venv .venv` was removed from COMMAND_ALLOWLIST.
+        // Python's `-m` resolves modules with sys.path[0] = "" (the
+        // current directory), and the executor runs setup commands with
+        // current_dir set to the spec-controlled workspace root. A spec
+        // that plants `venv.py` (or `venv/__main__.py`) there would have
+        // Python execute it instead of the stdlib venv module. The
+        // allowlist guards argv shape, not the program's own
+        // content-execution behavior — same attack class as round 1's
+        // npm/pnpm/conda removal.
+        let mut spec = base_spec();
+        spec.setup_commands[0] = SetupCommand {
+            program: "python".to_string(),
+            args: vec!["-m".to_string(), "venv".to_string(), ".venv".to_string()],
+            working_dir_relative: String::new(),
+            description: "python venv".to_string(),
+        };
+        assert!(matches!(
+            validate_spec(&spec, allowed()),
+            Err(ValidatorError::CommandNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn python_with_isolated_flag_also_rejected() {
+        // `python -I -m venv .venv` (isolated mode, which removes "" from
+        // sys.path and so would actually neutralize the venv.py attack) is
+        // ALSO rejected: the allowlist is closed to every python
+        // invocation until a vetted, flag-order-robust pattern is designed
+        // (Phase 3B). We intentionally do not allowlist a flag-sensitive
+        // invocation, because the safety would hinge on exact argv order.
+        let mut spec = base_spec();
+        spec.setup_commands[0] = SetupCommand {
+            program: "python".to_string(),
+            args: vec![
+                "-I".to_string(),
+                "-m".to_string(),
+                "venv".to_string(),
+                ".venv".to_string(),
+            ],
+            working_dir_relative: String::new(),
+            description: "python isolated venv".to_string(),
         };
         assert!(matches!(
             validate_spec(&spec, allowed()),

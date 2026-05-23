@@ -965,11 +965,47 @@ git branch -d phase-{N}/{task-name}
 - `PROGRESS.md` updates
 - Shell UI changes with no backend auth involvement
 
+### Codex Adversarial Review Process
+
+Delphi uses an external second model — Codex CLI, run by the human operator — as a cold adversarial reviewer. This process is distinct from, and complementary to, the per-task security-review *gate* in Section 8: the gate decides *whether* a task needs review; this process defines *how* a multi-round adversarial sweep is conducted once review is warranted. The methodology was proven across Task 3A.5 (nine rounds, 23 findings F4–F26) and Task 3A.6 (five rounds, 14 findings R1–R5); this section promotes that precedent from PROGRESS.md narrative into project law.
+
+**Two modes:**
+
+1. **New-code review** — security-critical code written for a task is swept before its merge to main. Rounds are authorized incrementally and run to convergence.
+2. **Retroactive sweep** — an already-merged crate is re-reviewed to apply threat-model lessons learned later. Retroactive sweeps run on a dedicated `phase-{N}/sweep-{crate}` branch with a **3-round budget** unless the operator explicitly extends it. (The Phase 3B.0 sweeps of `services/`, `die/orchestrator/`, and `fortress/` apply Task 3A.6's threat model — see "Phase 3B priority items" in PROGRESS.md.)
+
+**Separation of duties (non-negotiable):** Claude Code does NOT run Codex — it is a separate tool on the operator's machine. Claude Code *prepares* the adversarial review prompt and then STOPS. The operator runs Codex and pastes the verdict back. Claude Code never declares a sweep "passed" on its own authority; only a pasted Codex verdict closes a round.
+
+**The cold-reviewer prompt MUST:**
+
+- Scope the review to an exact, named target — a commit range (`git diff A..B`), the uncommitted diff, or a specific crate/module — and state the diff stat the reviewer should expect, so scope drift is detectable.
+- Demand tool grounding: the reviewer verifies library/API claims against Context7 (or docs.rs / official docs) and inspects the live code via the Codex CLI rather than reasoning from memory (Iron Law #12 / Section 13 applied to the reviewer).
+- Focus on a named attack surface (e.g. D-Bus input validation, path-safety / TOCTOU, SQLite migration atomicity under concurrent openers, subprocess argv / working-directory containment).
+- Require a structured verdict — **APPROVE** / **REVISE** / **FAIL** — with every finding carrying an ID, a severity (P1-high → P2-medium → P2-low → P3-informational), a root-cause statement, an impact statement, and a fix sketch.
+
+**The round loop:**
+
+1. Operator runs Codex with the prepared prompt and pastes the verdict.
+2. APPROVE → proceed to merge. REVISE / FAIL → continue.
+3. Claude Code fixes **every** finding at its root cause (Iron Law #8) — no workarounds, no scope creep into adjacent issues.
+4. Each fix ships a regression test verified to **fail against the pre-fix code** and pass after. A test that passes against buggy code is worse than no test (Task 3A.6 Round 3 caught exactly this — a descendant-survival test that passed for the wrong reason because the backgrounded process inherited the capture pipes).
+5. One focused commit per round, with the verbatim Codex finding IDs in the body. Carried-forward noise (Cargo.lock, PROGRESS.md) defers to a final cleanup commit so each round's diff stays narrow and auditable.
+6. Claude Code prepares the next round's prompt (scoped to the new fix commit) and STOPS for the operator to re-run Codex.
+
+**Stopping criteria, budget, and merge:**
+
+- Convergence signal: findings degrade from new-attack-surface (P1) to inherited-policy-drift (P2-low / P3). A round returning only policy nits, or APPROVE, means the sweep has converged.
+- A REVISE / FAIL verdict at the 3-round budget boundary escalates to an explicit human decision — *merge-with-documented-risk* vs. *extend the budget* — and does NOT auto-stretch to another round. Record the decision in the merge commit body and PROGRESS.md.
+- On APPROVE, merge to main via `git merge --no-ff phase-{N}/sweep-{crate}`; the branch carries the round fix-commits and their regression tests. A sweep that returns APPROVE on round 1 with zero findings has nothing to merge — record the clean result in PROGRESS.md and delete the branch.
+- Every sweep keeps a per-finding ledger (ID, severity, root cause, fix commit) in the merge commit body and a summary in PROGRESS.md, so the full review history is reconstructable from git alone.
+
 ### Dev environment sync
 
 The canonical source of truth is `origin` (the shared GitHub remote at `https://github.com/Revanth574/Delphi.git`, private). Windows tree and WSL2 mirror BOTH push and pull from origin. The prior pattern of treating Windows as authoritative and rsync'ing Windows → WSL is DEPRECATED — it caused silent `.git` divergence during Task 3A.5 round 6 (see PROGRESS.md history for the rsync-residue stash incident).
 
 Established 2026-05-16 immediately after the Task 3A.5 merge as a one-time bootstrap. WSL's prior `windows` remote (pointing at `file:///mnt/c/Users/kvlnr/OneDrive/Desktop/Delphi`) has been removed; both trees now share `origin`.
+
+**Windows tree location (relocated 2026-05):** the Windows working tree now lives at `C:\dev\Delphi` (a non-cloud-synced path). It was moved out of its former location under OneDrive (`C:\Users\kvlnr\OneDrive\Desktop\Delphi`), which is retained as `Delphi-onedrive-archived-2026-05`. Keeping the working tree and its `.git` directory outside a continuously-syncing cloud folder avoids object-store corruption and lock contention from background sync racing git operations. The origin-canonical sync model above is unchanged — the relocated tree pushes / pulls from the same `origin`; only the local filesystem path changed. (Any tooling, scripts, or PROGRESS.md notes still referencing the OneDrive path are stale and should be updated to `C:\dev\Delphi`.)
 
 **WSL HTTPS-git auth note:** WSL git's credential helper is configured locally (per-repo, not global) to delegate to the Windows Git Credential Manager at `/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe`. This shares the single Windows credential store across both trees, satisfying CLAUDE.md §10 ("never store credentials outside the Fortress vault" — the Windows credential vault is the closest available equivalent until Fortress's federated credential layer ships). If you ever see a hung WSL `git fetch`/`git push`, the credential helper is missing or misconfigured: re-run `git config --local credential.helper '/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe'` from the repo root.
 

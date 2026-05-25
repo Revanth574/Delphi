@@ -48,7 +48,7 @@ use crate::protocol::{Request, Response};
 ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
 ///     Arc::new(RwLock::new(HashMap::new())),
 ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-///     Arc::new(RwLock::new(Vec::new())),
+///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
 /// ));
 ///
 /// let server = BridgeServer::new(handler, "127.0.0.1:9800");
@@ -81,7 +81,7 @@ impl BridgeServer {
     ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     ///     Arc::new(RwLock::new(HashMap::new())),
     ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    ///     Arc::new(RwLock::new(Vec::new())),
+    ///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// ));
     ///
     /// let server = BridgeServer::new(handler, "127.0.0.1:9800");
@@ -112,7 +112,7 @@ impl BridgeServer {
     /// #     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     /// #     Arc::new(RwLock::new(HashMap::new())),
     /// #     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    /// #     Arc::new(RwLock::new(Vec::new())),
+    /// #     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// # ));
     /// let server = BridgeServer::new(handler, "127.0.0.1:9800");
     /// assert_eq!(server.addr(), "127.0.0.1:9800");
@@ -149,7 +149,7 @@ impl BridgeServer {
     /// #     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     /// #     Arc::new(RwLock::new(HashMap::new())),
     /// #     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    /// #     Arc::new(RwLock::new(Vec::new())),
+    /// #     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// # ));
     /// let server = BridgeServer::new(handler, "127.0.0.1:9800");
     /// server.run().await.unwrap();
@@ -200,7 +200,7 @@ impl BridgeServer {
     /// #     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     /// #     Arc::new(RwLock::new(HashMap::new())),
     /// #     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    /// #     Arc::new(RwLock::new(Vec::new())),
+    /// #     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// # ));
     /// let server = BridgeServer::new(handler, "127.0.0.1:9800");
     /// let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -338,7 +338,7 @@ mod tests {
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
         ))
     }
 

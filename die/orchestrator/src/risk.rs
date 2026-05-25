@@ -164,6 +164,14 @@ fn oldest_mtime_age(repo_root: &Path, paths: &[String]) -> Option<Duration> {
     Duration::from_std(dur).ok()
 }
 
+/// Platform null device, used to neutralize git's config / hook discovery
+/// when running `git` inside a caller-supplied (possibly hostile) repo.
+/// (SVC-3 / 3A.6 R4 config-discovery class.)
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+
 /// Per-repo git risk monitor. Stateless — re-runs `git status` each check.
 #[derive(Debug, Default)]
 pub struct GitRiskMonitor;
@@ -176,8 +184,30 @@ impl GitRiskMonitor {
     /// Probe a single repo. Returns empty findings on any subprocess failure
     /// (missing binary, not a repo) — never errors out.
     pub fn check_repo(&self, repo: &Path) -> Vec<HealthFinding> {
+        // SVC-3: `git status` on a caller-supplied repo must not let that
+        // repo's own config execute code. A hostile `.git/config` can set
+        // `core.fsmonitor` (a program git runs during index refresh),
+        // `core.hooksPath`, `core.sshCommand`, etc. Command-line `-c` beats
+        // repo-local config, so override every such knob; env isolation closes
+        // the global/system config channels `-c` does not cover.
+        let hooks_path = format!("core.hooksPath={NULL_DEVICE}");
         let output = Command::new("git")
+            .arg("-c")
+            .arg("core.fsmonitor=false")
+            .arg("-c")
+            .arg(&hooks_path)
+            .arg("-c")
+            .arg("core.sshCommand=")
+            .arg("-c")
+            .arg("protocol.version=2")
+            .arg("-c")
+            .arg("gc.auto=0")
             .args(["status", "--porcelain=v2", "--branch"])
+            .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+            .env("GIT_CONFIG_SYSTEM", NULL_DEVICE)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
             .current_dir(repo)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -716,6 +746,58 @@ fn _unused_keep_orchestrator_error_in_scope() -> Result<(), OrchestratorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SVC-3 (3A.6 R4 config-discovery class): running `git status` in a
+    /// caller-supplied repo must NOT execute a hostile `core.fsmonitor` hook.
+    /// A repo can set `core.fsmonitor = <script>` in its local config; git
+    /// executes that program during the `git status` index refresh. The
+    /// monitor must neutralize it. RED pre-fix (the script runs and creates
+    /// the sentinel), GREEN once the git invocation is hardened.
+    #[cfg(unix)]
+    #[test]
+    fn git_check_does_not_execute_malicious_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        // Skip cleanly if git is unavailable on this host.
+        let git_ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        // A tracked file gives the index an entry so `git status` refreshes it
+        // (the point at which git consults core.fsmonitor).
+        std::fs::write(repo.join("tracked.txt"), "hi\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .status();
+
+        // Malicious fsmonitor hook: touches a sentinel when git executes it.
+        let sentinel = repo.join("PWNED");
+        let script = repo.join("evil-fsmonitor.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()))
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = Command::new("git")
+            .args(["config", "core.fsmonitor", script.to_str().unwrap()])
+            .current_dir(repo)
+            .status();
+
+        // Run the monitored check (which shells out to `git status`).
+        let _ = GitRiskMonitor::new().check_repo(repo);
+
+        assert!(
+            !sentinel.exists(),
+            "core.fsmonitor hook executed during git status — containment bypass"
+        );
+    }
     use std::fs;
     use tempfile::TempDir;
 

@@ -73,6 +73,7 @@ impl InferenceService {
             sensitive,
             "D-Bus inference query"
         );
+        crate::limits::ensure_within(&prompt, crate::limits::MAX_STRING_BYTES, "prompt")?;
 
         let router = self.router.read().await;
         let req = InferenceRequest {
@@ -83,7 +84,7 @@ impl InferenceService {
 
         match router.route(req).await {
             Ok(resp) => Ok((resp.output, format!("{:?}", resp.tier), resp.model_id)),
-            Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
+            Err(e) => Err(crate::error::opaque("inference query failed", e)),
         }
     }
 

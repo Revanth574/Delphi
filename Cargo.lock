@@ -3972,6 +3972,7 @@ version = "0.1.0"
 dependencies = [
  "delphi-services",
  "die-inference",
+ "die-learning",
  "die-orchestrator",
  "futures-util",
  "semantic-fs",

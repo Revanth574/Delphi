@@ -55,13 +55,14 @@ impl ConversationService {
     /// Pass an empty string for `title` to leave it untitled.
     async fn start_conversation(&self, title: String) -> zbus::fdo::Result<String> {
         info!(title = %title, "D-Bus start_conversation");
+        crate::limits::ensure_within(&title, crate::limits::MAX_STRING_BYTES, "title")?;
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
         let title_opt = if title.is_empty() { None } else { Some(title.as_str()) };
         store
             .start_conversation(title_opt)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))
     }
 
     /// Append a message to a conversation.
@@ -74,6 +75,7 @@ impl ConversationService {
         role: String,
         content: String,
     ) -> zbus::fdo::Result<String> {
+        crate::limits::ensure_within(&content, crate::limits::MAX_STRING_BYTES, "content")?;
         let role = MessageRole::from_str(&role)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
         let store = self.store.lock().map_err(|e| {
@@ -81,7 +83,7 @@ impl ConversationService {
         })?;
         store
             .add_message(&conversation_id, role, &content, None)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))
     }
 
     /// Fetch the most recent messages from a conversation as JSON.
@@ -95,7 +97,7 @@ impl ConversationService {
         })?;
         let msgs = store
             .recent_messages(&conversation_id, limit)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))?;
         let json: Vec<serde_json::Value> = msgs
             .iter()
             .map(|m| {
@@ -115,12 +117,13 @@ impl ConversationService {
     /// Full-text search across all stored messages.
     async fn search(&self, query: String, limit: u32) -> zbus::fdo::Result<String> {
         info!(query = %query, "D-Bus conversation search");
+        crate::limits::ensure_within(&query, crate::limits::MAX_STRING_BYTES, "query")?;
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
         let hits = store
             .search(&query, limit)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))?;
         let json: Vec<serde_json::Value> = hits
             .iter()
             .map(|m| {
@@ -144,7 +147,7 @@ impl ConversationService {
         })?;
         let convs = store
             .list_conversations(limit)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))?;
         let json: Vec<serde_json::Value> = convs
             .iter()
             .map(|c| {
@@ -170,20 +173,21 @@ impl ConversationService {
         store
             .forget_today()
             .map(|n| n as u32)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))
     }
 
     /// Delete all messages matching the given topic via FTS.
     /// Returns the number of messages deleted.
     async fn forget_topic(&self, topic: String) -> zbus::fdo::Result<u32> {
         info!(topic = %topic, "D-Bus forget_topic");
+        crate::limits::ensure_within(&topic, crate::limits::MAX_STRING_BYTES, "topic")?;
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
         store
             .forget_topic(&topic)
             .map(|n| n as u32)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))
     }
 
     /// Delete messages older than `days` days.
@@ -196,7 +200,7 @@ impl ConversationService {
         store
             .forget_older_than(days)
             .map(|n| n as u32)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))
     }
 
     /// Total number of stored messages across all conversations.
@@ -207,7 +211,7 @@ impl ConversationService {
         store
             .count()
             .map(|n| n as u32)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("conversation store operation failed", e))
     }
 }
 

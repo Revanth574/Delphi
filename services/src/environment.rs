@@ -95,7 +95,7 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let state = monitor
             .snapshot(&obs)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("environment read failed", e))?;
         serde_json::to_string(&environment_state_to_json(&state))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -112,7 +112,7 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let state = monitor
             .snapshot(&obs)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("environment read failed", e))?;
         match state.battery {
             Some(b) => serde_json::to_string(&battery_to_json(&b))
                 .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}"))),
@@ -129,7 +129,7 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let state = monitor
             .snapshot(&obs)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("environment read failed", e))?;
         serde_json::to_string(&thermal_to_json(&state.thermal))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -143,7 +143,7 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let state = monitor
             .snapshot(&obs)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("environment read failed", e))?;
         serde_json::to_string(&memory_to_json(&state.memory))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -157,7 +157,7 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let state = monitor
             .snapshot(&obs)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("environment read failed", e))?;
         serde_json::to_string(&time_context_to_json(&state.time))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -171,7 +171,7 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let state = monitor
             .snapshot(&obs)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("environment read failed", e))?;
         serde_json::to_string(&location_to_json(&state.location))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -186,8 +186,10 @@ impl EnvironmentService {
             .monitor
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
-        monitor.location_map_mut().set_label(&key, &label);
-        Ok(true)
+        // SVC-7: the domain validates the key/label grammar and returns
+        // whether the entry was accepted; surface that to the caller instead
+        // of always claiming success.
+        Ok(monitor.location_map_mut().set_label(&key, &label))
     }
 
     /// Remove a label from the location map.
@@ -324,6 +326,7 @@ fn parse_activity_observations(json: &str) -> zbus::fdo::Result<ActivityObservat
     if json.is_empty() {
         return Ok(ActivityObservations::default());
     }
+    crate::limits::ensure_within(json, crate::limits::MAX_STRING_BYTES, "activity_obs_json")?;
     serde_json::from_str(json).map_err(|e| {
         zbus::fdo::Error::InvalidArgs(format!("invalid activity observations JSON: {e}"))
     })
@@ -541,6 +544,18 @@ mod tests {
         assert!(ok);
         let json = svc.get_location(String::new()).await.unwrap();
         assert!(json.contains(r#""label":"home""#));
+    }
+
+    #[tokio::test]
+    async fn set_location_label_rejects_invalid_key() {
+        let svc = mk_svc_rich();
+        // SVC-7: an invalid key is rejected by the domain grammar; the
+        // transport surfaces `false` rather than a bogus success.
+        let ok = svc
+            .set_location_label("evil:key".to_string(), "x".to_string())
+            .await
+            .unwrap();
+        assert!(!ok);
     }
 
     #[tokio::test]

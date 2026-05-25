@@ -121,6 +121,7 @@ impl WorkspaceService {
         dry_run: bool,
     ) -> zbus::fdo::Result<(String, Vec<String>)> {
         info!(dry_run, "D-Bus workspace preview");
+        crate::limits::ensure_within(&spec_json, crate::limits::MAX_STRING_BYTES, "spec_json")?;
         let spec = parse_spec(&spec_json)?;
         let mgr = self.lock()?;
         let result = mgr.preview(&spec);
@@ -140,6 +141,7 @@ impl WorkspaceService {
     /// `(workspace_id, action_timeline_id, status_json)`.
     async fn create(&self, spec_json: String) -> zbus::fdo::Result<(String, String, String)> {
         info!("D-Bus workspace create");
+        crate::limits::ensure_within(&spec_json, crate::limits::MAX_STRING_BYTES, "spec_json")?;
         let spec = parse_spec(&spec_json)?;
         let mgr = self.lock()?;
         let result = mgr
@@ -159,6 +161,9 @@ impl WorkspaceService {
         params: HashMap<String, String>,
     ) -> zbus::fdo::Result<(String, String, String)> {
         info!(template_id = %template_id, name = %name, "D-Bus workspace create_from_template");
+        crate::limits::ensure_within(&template_id, crate::limits::MAX_STRING_BYTES, "template_id")?;
+        crate::limits::ensure_within(&name, crate::limits::MAX_STRING_BYTES, "name")?;
+        crate::limits::ensure_within(&root_dir, crate::limits::MAX_STRING_BYTES, "root_dir")?;
         let tparams = TemplateParams::from_map(&params);
         let mgr = self.lock()?;
         let result = mgr
@@ -235,15 +240,34 @@ mod tests {
     async fn preview_unsafe_spec_reports_validation_error() {
         let allowed = TempDir::new().unwrap();
         let svc = service(&allowed);
+        // SVC-10: isolate the out-of-bounds root as the *cause* of rejection.
+        // The in-bounds template previews with zero validation errors; mutating
+        // ONLY the root to a path outside `allowed_root` must flip it to one
+        // error. Without this control, `errors.len() == 1` passed for ANY
+        // validation failure — the "passes for the wrong reason" gap.
         let mut spec = die_orchestrator::workspace::templates::build_research_template(
             "x",
             &allowed.path().join("x"),
         );
+        let safe_json = serde_json::to_string(&spec).unwrap();
+        let (_p, safe_errors) = svc.preview(safe_json, true).await.unwrap();
+        assert!(
+            safe_errors.is_empty(),
+            "in-bounds template must validate cleanly: {safe_errors:?}"
+        );
+
         spec.root_dir = std::path::PathBuf::from("/etc/evil");
         spec.metadata = spec.compute_metadata();
-        let spec_json = serde_json::to_string(&spec).unwrap();
-        let (_preview, errors) = svc.preview(spec_json, true).await.unwrap();
-        assert_eq!(errors.len(), 1);
+        let unsafe_json = serde_json::to_string(&spec).unwrap();
+        let (_p2, errors) = svc.preview(unsafe_json, true).await.unwrap();
+        assert_eq!(errors.len(), 1, "out-of-bounds root must be rejected");
+        // SVC-10: the collapsed error must not leak the server-side allowed
+        // root or validator internals (matches the no-leak discipline of
+        // create_with_outside_root_does_not_leak_allowed_root_in_error).
+        let allowed_str = allowed.path().to_string_lossy().to_string();
+        let joined = errors.join(" ");
+        assert!(!joined.contains(&allowed_str), "leaked allowed-root path: {joined}");
+        assert!(!joined.contains("allowed_root"), "leaked validator internals: {joined}");
     }
 
     #[cfg(target_os = "linux")]
@@ -313,8 +337,25 @@ mod tests {
         spec.directory_tree[0].relative_path = "../escape".to_string();
         spec.metadata = spec.compute_metadata();
         let spec_json = serde_json::to_string(&spec).unwrap();
+
+        // SVC-10: prove the rejection is the path-traversal *validation*, not
+        // an incidental JSON-parse failure (which would ALSO surface as
+        // InvalidArgs). A successful preview confirms the spec is well-formed
+        // and parses, yet the validator still flags exactly one error for the
+        // `../escape` component.
+        let (_p, errors) = svc.preview(spec_json.clone(), true).await.unwrap();
+        assert_eq!(errors.len(), 1, "../ traversal must be flagged by the validator");
+
+        // create() then rejects the same well-formed spec at validation,
+        // before any filesystem mutation.
         let err = svc.create(spec_json).await.unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        // SVC-10: the rejection must not leak the server-side allowed root or
+        // validator internals across the bus.
+        let msg = err.to_string();
+        let allowed_str = allowed.path().to_string_lossy().to_string();
+        assert!(!msg.contains(&allowed_str), "leaked allowed-root path: {msg}");
+        assert!(!msg.contains("allowed_root"), "leaked validator internals: {msg}");
     }
 
     #[tokio::test]
@@ -394,5 +435,22 @@ mod tests {
         let svc = service(&allowed);
         let err = svc.undo("tl-nope".to_string()).await.unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::Failed(_)));
+    }
+
+    /// SVC-6: a `spec_json` larger than the general cap must be rejected with
+    /// a size error BEFORE deserialization. RED pre-fix (an oversize blob
+    /// reaches `parse_spec` and fails as "Invalid spec format", not a size
+    /// error), GREEN once the cap is enforced at the method boundary.
+    #[tokio::test]
+    async fn create_rejects_oversize_spec_json() {
+        let allowed = TempDir::new().unwrap();
+        let svc = service(&allowed);
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        let err = svc.create(oversize).await.unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(
+            err.to_string().contains("limit"),
+            "expected a size-limit error, got: {err}"
+        );
     }
 }

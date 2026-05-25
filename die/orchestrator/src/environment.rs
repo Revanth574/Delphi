@@ -799,6 +799,28 @@ pub struct LocationMap {
     pub labels: HashMap<String, String>,
 }
 
+/// Maximum length (in Unicode scalar values) of a location label (SVC-7).
+const MAX_LOCATION_LABEL_CHARS: usize = 256;
+/// Maximum length (in Unicode scalar values) of an SSID in a location key.
+const MAX_LOCATION_SSID_CHARS: usize = 64;
+
+/// Validate a [`LocationMap`] key against the SVC-7 grammar: the literal
+/// `"wired:true"`, or `"ssid:<name>"` with `<name>` 1–64 characters and no
+/// control characters. Non-ASCII *printable* SSIDs are accepted (non-English
+/// network names are legitimate); control characters (C0 `U+0000`–`U+001F`,
+/// `U+007F`, and C1) are rejected via [`char::is_control`].
+fn is_valid_location_key(key: &str) -> bool {
+    if key == "wired:true" {
+        return true;
+    }
+    if let Some(name) = key.strip_prefix("ssid:") {
+        let len = name.chars().count();
+        return (1..=MAX_LOCATION_SSID_CHARS).contains(&len)
+            && !name.chars().any(char::is_control);
+    }
+    false
+}
+
 impl LocationMap {
     /// Resolve the label for the current network situation. SSID
     /// precedence over wired fallback (an SSID is more specific).
@@ -815,8 +837,18 @@ impl LocationMap {
         None
     }
 
-    pub fn set_label(&mut self, key: &str, label: &str) {
+    /// Set a label, enforcing the key/label grammar (SVC-7). Returns `true`
+    /// if the entry was valid and stored, `false` if rejected. The grammar is
+    /// authoritative here in the domain, not transport-only: the key must be
+    /// the literal `"wired:true"` or `"ssid:<name>"` (name 1–64 chars, no
+    /// control characters), and the label at most
+    /// [`MAX_LOCATION_LABEL_CHARS`] characters.
+    pub fn set_label(&mut self, key: &str, label: &str) -> bool {
+        if !is_valid_location_key(key) || label.chars().count() > MAX_LOCATION_LABEL_CHARS {
+            return false;
+        }
         self.labels.insert(key.to_string(), label.to_string());
+        true
     }
 
     pub fn remove_label(&mut self, key: &str) -> bool {
@@ -1724,6 +1756,32 @@ mod tests {
         map.set_label("wired:true", "office");
         // SSID match wins over wired fallback
         assert_eq!(map.label_for(Some("home-net"), true), Some("home"));
+    }
+
+    /// SVC-7: `set_label` enforces the key/label grammar in the domain so the
+    /// invariant is authoritative (not transport-only). Invalid keys and
+    /// oversized labels must be rejected and NOT stored. RED pre-fix (the
+    /// unvalidated `insert` stored anything), GREEN once validation lands.
+    #[test]
+    fn set_label_rejects_invalid_grammar() {
+        let mut map = LocationMap::default();
+        // Invalid: arbitrary scheme, non-literal wired, empty SSID, control
+        // character in SSID, oversized SSID (65 > 64), oversized label (257 > 256).
+        map.set_label("evil:key", "x");
+        map.set_label("wired:false", "x");
+        map.set_label("ssid:", "x");
+        map.set_label("ssid:has\u{0007}bell", "x");
+        map.set_label(&format!("ssid:{}", "s".repeat(65)), "x");
+        map.set_label("ssid:longlabel", &"a".repeat(257));
+        assert!(
+            map.labels.is_empty(),
+            "invalid keys/labels were stored: {:?}",
+            map.labels
+        );
+        // Valid keys accepted, including a non-ASCII (printable) SSID.
+        map.set_label("wired:true", "office");
+        map.set_label("ssid:café-net", "home");
+        assert_eq!(map.labels.len(), 2);
     }
 
     #[test]

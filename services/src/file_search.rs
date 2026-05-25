@@ -66,12 +66,13 @@ impl FileSearchService {
         limit: u32,
     ) -> zbus::fdo::Result<String> {
         info!(query = %query, limit, "D-Bus file search");
+        crate::limits::ensure_within(&query, crate::limits::MAX_STRING_BYTES, "query")?;
 
         let indexer = self.indexer.lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let results = indexer
             .search(&query, limit as usize)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("file search failed", e))?;
 
         // Serialize results as JSON for transport over D-Bus.
         let json: Vec<serde_json::Value> = results
@@ -103,5 +104,28 @@ mod tests {
     fn service_creation() {
         let indexer = Arc::new(Mutex::new(Indexer::in_memory().unwrap()));
         let _svc = FileSearchService::new(indexer);
+    }
+
+    /// SVC-4 (3A.5 F7 class): a failing domain operation must not echo its
+    /// error detail across the D-Bus boundary. A query naming a
+    /// non-existent field forces a deterministic `SemanticFsError::Search`
+    /// from the Tantivy `QueryParser`; the offending token must NOT appear
+    /// in the wire error. This test is RED against the pre-fix
+    /// `Failed(e.to_string())` mapping and GREEN once the error is
+    /// sanitized to a fixed, content-free message.
+    #[tokio::test]
+    async fn search_error_does_not_leak_domain_detail() {
+        let indexer = Arc::new(Mutex::new(Indexer::in_memory().unwrap()));
+        let svc = FileSearchService::new(indexer);
+        let sentinel = "ZZZSENTINELFIELDZZZ";
+        let err = svc
+            .search(format!("{sentinel}:term"), 5)
+            .await
+            .expect_err("bogus-field query must error");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(sentinel),
+            "D-Bus error leaked domain detail: {msg}"
+        );
     }
 }

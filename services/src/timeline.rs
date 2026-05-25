@@ -67,7 +67,7 @@ impl TimelineService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let records = tl
             .list_recent(limit)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("timeline operation failed", e))?;
 
         let json: Vec<serde_json::Value> = records
             .iter()
@@ -96,7 +96,7 @@ impl TimelineService {
         let tl = self.timeline.lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         tl.undo_action(&action_id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::opaque("timeline operation failed", e))
     }
 
     /// Get the total action count.
@@ -105,7 +105,7 @@ impl TimelineService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let count = tl
             .count()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::opaque("timeline operation failed", e))?;
         Ok(count as u32)
     }
 }

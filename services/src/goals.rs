@@ -30,13 +30,11 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
 use tracing::info;
 use zbus::object_server::SignalEmitter;
 
 use die_orchestrator::goals::{
-    DeadlineRisk, Goal, GoalId, GoalPatch, GoalStatus, GoalStore, GoalTimeline, Priority,
-    TimelineBasis, UserPace,
+    DeadlineRisk, Goal, GoalPatch, GoalStore, GoalTimeline, Priority, TimelineBasis,
 };
 
 /// D-Bus object path for the Goals interface.
@@ -113,14 +111,17 @@ impl GoalsService {
         deadline_rfc3339: String,
     ) -> zbus::fdo::Result<i64> {
         info!(title = %title, priority = %priority, "D-Bus create_goal");
+        crate::limits::ensure_within(&title, crate::limits::MAX_STRING_BYTES, "title")?;
+        crate::limits::ensure_within(&description, crate::limits::MAX_STRING_BYTES, "description")?;
         let priority = Priority::from_str(&priority)
-            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("create goal", e))?;
         let parent = if parent_id == NO_PARENT {
             None
         } else {
             Some(parent_id)
         };
-        let deadline = parse_optional_deadline(&deadline_rfc3339)?;
+        let deadline = die_orchestrator::goals::parse_optional_deadline_rfc3339(&deadline_rfc3339)
+            .map_err(|e| crate::error::map_orchestrator("create goal", e))?;
 
         let store = self
             .store
@@ -128,7 +129,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let id = store
             .create_goal(&title, &description, priority, parent)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
 
         if let Some(dt) = deadline {
             let patch = GoalPatch {
@@ -137,7 +138,7 @@ impl GoalsService {
             };
             store
                 .update_goal(id, patch)
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         }
         Ok(id)
     }
@@ -159,28 +160,33 @@ impl GoalsService {
     /// An empty object `{}` is a valid no-op patch.
     async fn update_goal(&self, id: i64, patch_json: String) -> zbus::fdo::Result<()> {
         info!(goal_id = id, "D-Bus update_goal");
-        let patch = parse_goal_patch(&patch_json)?;
+        crate::limits::ensure_within(&patch_json, crate::limits::MAX_STRING_BYTES, "patch_json")?;
+        let patch = GoalPatch::from_json(&patch_json)
+            .map_err(|e| crate::error::map_orchestrator("update goal", e))?;
         let store = self
             .store
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         store
             .update_goal(id, patch)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))
     }
 
-    /// Record progress on a goal. `progress` is clamped to `0..=100`
-    /// server-side.
+    /// Record progress on a goal.
+    ///
+    /// `progress` must be in `0..=100`. A value `> 100` is **rejected** with a
+    /// typed `InvalidArgs` validation error — it is no longer silently clamped
+    /// (SVC-9: silent clamping hid caller bugs; the wire contract now surfaces
+    /// out-of-range input instead of masking it).
     async fn update_progress(&self, id: i64, progress: u32) -> zbus::fdo::Result<()> {
         info!(goal_id = id, progress, "D-Bus update_progress");
-        let progress_u8 = if progress > 100 { 100 } else { progress as u8 };
         let store = self
             .store
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         store
-            .update_progress(id, progress_u8)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .update_progress(id, progress)
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))
     }
 
     /// Fetch a single goal as JSON.
@@ -191,7 +197,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let goal = store
             .get_goal(id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         serde_json::to_string(&goal_to_json(&goal))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -204,7 +210,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let goals = store
             .list_active()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         serialize_goal_list(&goals)
     }
 
@@ -216,7 +222,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let goals = store
             .list_children(parent_id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         serialize_goal_list(&goals)
     }
 
@@ -229,7 +235,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let goals = store
             .find_stale(inactive_days)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         serialize_goal_list(&goals)
     }
 
@@ -242,7 +248,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let goals = store
             .find_approaching_deadline(within_days)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         serialize_goal_list(&goals)
     }
 
@@ -261,21 +267,18 @@ impl GoalsService {
         hours_per_session: f64,
         work_hours_remaining: f64,
     ) -> zbus::fdo::Result<String> {
-        let pace = if sessions_per_week <= 0.0 || hours_per_session <= 0.0 {
-            UserPace::NoHistory
-        } else {
-            UserPace::Learned {
-                sessions_per_week,
-                hours_per_session,
-            }
-        };
         let store = self
             .store
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let timeline = store
-            .estimate_timeline(id, pace, work_hours_remaining)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .estimate_timeline_from_raw_pace(
+                id,
+                sessions_per_week,
+                hours_per_session,
+                work_hours_remaining,
+            )
+            .map_err(|e| crate::error::map_orchestrator("estimate timeline", e))?;
         serde_json::to_string(&timeline_to_json(&timeline))
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -288,7 +291,7 @@ impl GoalsService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let n = store
             .count()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))?;
         Ok(n as u32)
     }
 
@@ -304,7 +307,8 @@ impl GoalsService {
         timestamp: i64,
     ) -> zbus::Result<()>;
 
-    /// Emitted when a goal transitions to [`GoalStatus::Completed`].
+    /// Emitted when a goal transitions to
+    /// [`GoalStatus::Completed`](die_orchestrator::goals::GoalStatus::Completed).
     ///
     /// `timestamp` is UTC epoch seconds.
     #[zbus(signal)]
@@ -404,100 +408,10 @@ fn serialize_goal_list(goals: &[Goal]) -> zbus::fdo::Result<String> {
         .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
 }
 
-/// Parse an RFC 3339 timestamp, or return `None` for the empty string.
-///
-/// Any non-empty string that fails to parse yields `InvalidArgs`.
-fn parse_optional_deadline(s: &str) -> zbus::fdo::Result<Option<DateTime<Utc>>> {
-    if s.is_empty() {
-        return Ok(None);
-    }
-    let dt = DateTime::parse_from_rfc3339(s)
-        .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("invalid deadline: {e}")))?;
-    Ok(Some(dt.with_timezone(&Utc)))
-}
-
-/// Parse a goal patch from a JSON object string.
-///
-/// Only keys present in the JSON object are interpreted; absent keys leave the
-/// corresponding `GoalPatch` field as `None` (unchanged).
-fn parse_goal_patch(json: &str) -> zbus::fdo::Result<GoalPatch> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("invalid JSON: {e}")))?;
-    let obj = value.as_object().ok_or_else(|| {
-        zbus::fdo::Error::InvalidArgs("patch must be a JSON object".to_string())
-    })?;
-
-    let mut title: Option<String> = None;
-    let mut description: Option<String> = None;
-    let mut deadline: Option<Option<DateTime<Utc>>> = None;
-    let mut priority: Option<Priority> = None;
-    let mut parent_goal: Option<Option<GoalId>> = None;
-    let mut status: Option<GoalStatus> = None;
-
-    if let Some(val) = obj.get("title") {
-        let s = val
-            .as_str()
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("title must be a string".to_string()))?;
-        title = Some(s.to_string());
-    }
-    if let Some(val) = obj.get("description") {
-        let s = val.as_str().ok_or_else(|| {
-            zbus::fdo::Error::InvalidArgs("description must be a string".to_string())
-        })?;
-        description = Some(s.to_string());
-    }
-    if let Some(val) = obj.get("priority") {
-        let s = val.as_str().ok_or_else(|| {
-            zbus::fdo::Error::InvalidArgs("priority must be a string".to_string())
-        })?;
-        let p = Priority::from_str(s)
-            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
-        priority = Some(p);
-    }
-    if let Some(val) = obj.get("status") {
-        let s = val
-            .as_str()
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("status must be a string".to_string()))?;
-        let st = GoalStatus::from_str(s)
-            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
-        status = Some(st);
-    }
-    if let Some(val) = obj.get("deadline") {
-        if val.is_null() {
-            deadline = Some(None);
-        } else {
-            let s = val.as_str().ok_or_else(|| {
-                zbus::fdo::Error::InvalidArgs("deadline must be an RFC 3339 string or null".into())
-            })?;
-            let dt = DateTime::parse_from_rfc3339(s)
-                .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("invalid deadline: {e}")))?;
-            deadline = Some(Some(dt.with_timezone(&Utc)));
-        }
-    }
-    if let Some(val) = obj.get("parent") {
-        if val.is_null() {
-            parent_goal = Some(None);
-        } else {
-            let id = val.as_i64().ok_or_else(|| {
-                zbus::fdo::Error::InvalidArgs("parent must be an integer or null".into())
-            })?;
-            parent_goal = Some(Some(id));
-        }
-    }
-
-    Ok(GoalPatch {
-        title,
-        description,
-        deadline,
-        priority,
-        parent_goal,
-        status,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn mk_svc() -> GoalsService {
         let store = Arc::new(Mutex::new(GoalStore::in_memory().unwrap()));
@@ -614,8 +528,16 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // Empty title surfaces as Failed (domain error), not InvalidArgs.
-        assert!(err.to_string().to_lowercase().contains("title"));
+        // SVC-9: the empty-title rejection is a domain `Validation` whose fields
+        // are `&'static str`, so the transport surfaces them as a typed
+        // `InvalidArgs` ("bad argument") rather than a content-free `Failed`.
+        // No caller content / path can ride the static field+reason.
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(
+            err.to_string()
+                .ends_with("validation failed: title (must not be empty)"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -818,8 +740,12 @@ mod tests {
             .update_goal(9999, r#"{"title":"ghost"}"#.to_string())
             .await
             .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("not found") || msg.contains("9999"));
+        // SVC-9: a missing goal is a domain `NotFound { entity: "goal" }`. The
+        // entity label is a static string (never the caller-supplied id), so the
+        // transport surfaces it as `InvalidArgs("goal not found")` — typed, and
+        // with no id / existence-oracle leak.
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(err.to_string().ends_with("goal not found"), "got: {err}");
     }
 
     #[tokio::test]
@@ -861,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_progress_clamps_to_100() {
+    async fn update_progress_rejects_out_of_range() {
         let svc = mk_svc();
         let id = svc
             .create_goal(
@@ -873,9 +799,18 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.update_progress(id, 500).await.unwrap();
+        // SVC-9: out-of-range progress is a typed domain `Validation`, not a
+        // silent clamp. Assert the rejection is typed and the stored value is
+        // left untouched (still the create-time default of 0).
+        let err = svc.update_progress(id, 500).await.unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(
+            err.to_string()
+                .ends_with("validation failed: progress (must be between 0 and 100)"),
+            "got: {err}"
+        );
         let json = svc.get_goal(id).await.unwrap();
-        assert!(json.contains(r#""progress_estimate":100"#));
+        assert!(json.contains(r#""progress_estimate":0"#));
     }
 
     #[tokio::test]
@@ -955,7 +890,10 @@ mod tests {
     async fn get_timeline_nonexistent_goal_fails() {
         let svc = mk_svc();
         let err = svc.get_timeline(9999, 0.0, 0.0, 0.0).await.unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("not found")
-            || err.to_string().contains("9999"));
+        // SVC-9: the timeline estimator fetches the goal first, so a missing goal
+        // is the same domain `NotFound { entity: "goal" }` surfaced as the typed
+        // `InvalidArgs("goal not found")` — no id / existence-oracle leak.
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(err.to_string().ends_with("goal not found"), "got: {err}");
     }
 }

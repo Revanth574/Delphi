@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use die_inference::router::Router;
 use die_inference::InferenceRequest;
 use die_orchestrator::timeline::Timeline;
-use delphi_services::learning::Suggestion;
+use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
 use semantic_fs::indexer::Indexer;
 
 use crate::protocol::{Request, Response};
@@ -52,7 +52,7 @@ use crate::protocol::{Request, Response};
 ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
 ///     Arc::new(RwLock::new(HashMap::new())),
 ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-///     Arc::new(RwLock::new(Vec::new())),
+///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
 /// );
 /// ```
 pub struct Handler {
@@ -64,8 +64,10 @@ pub struct Handler {
     modes: Arc<RwLock<HashMap<String, String>>>,
     /// Action timeline (shared with D-Bus TimelineService).
     timeline: Arc<Mutex<Timeline>>,
-    /// Learning suggestions (shared with D-Bus LearningService).
-    suggestions: Arc<RwLock<Vec<Suggestion>>>,
+    /// Shared learning facade (shared with the D-Bus LearningService) — one
+    /// authoritative accept/dismiss implementation across both transports
+    /// instead of duplicated, independently-buggy `Vec<Suggestion>` copies (SVC-5).
+    learning: Arc<Mutex<LearningFacade>>,
 }
 
 impl Handler {
@@ -87,7 +89,7 @@ impl Handler {
     ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     ///     Arc::new(RwLock::new(HashMap::new())),
     ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    ///     Arc::new(RwLock::new(Vec::new())),
+    ///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// );
     /// ```
     #[must_use]
@@ -96,14 +98,14 @@ impl Handler {
         indexer: Arc<Mutex<Indexer>>,
         modes: Arc<RwLock<HashMap<String, String>>>,
         timeline: Arc<Mutex<Timeline>>,
-        suggestions: Arc<RwLock<Vec<Suggestion>>>,
+        learning: Arc<Mutex<LearningFacade>>,
     ) -> Self {
         Self {
             router,
             indexer,
             modes,
             timeline,
-            suggestions,
+            learning,
         }
     }
 
@@ -130,7 +132,7 @@ impl Handler {
     ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     ///     Arc::new(RwLock::new(HashMap::new())),
     ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    ///     Arc::new(RwLock::new(Vec::new())),
+    ///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// );
     ///
     /// let req = Request { id: 1, method: "inference.status".to_string(), params: serde_json::Value::Null };
@@ -411,21 +413,16 @@ impl Handler {
 // ── Learning handlers ──────────────────────────────────────────
 
 impl Handler {
-    /// Handle `learning.suggestions` — get all active suggestions.
+    /// Handle `learning.suggestions` — pending suggestions via the facade.
     async fn handle_learning_suggestions(&self, id: u64) -> Response {
-        let suggestions = self.suggestions.read().await;
-        let json: Vec<serde_json::Value> = suggestions
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "description": s.description,
-                    "confidence": s.confidence,
-                    "observed_count": s.observed_count,
-                })
-            })
-            .collect();
-        Response::ok(id, serde_json::json!(json))
+        let suggestions = match self.learning.lock() {
+            Ok(facade) => facade.list_suggestions(),
+            Err(_) => return Response::err(id, -1, "learning state unavailable"),
+        };
+        match serde_json::to_value(&suggestions) {
+            Ok(v) => Response::ok(id, v),
+            Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+        }
     }
 
     /// Handle `learning.accept` — accept a suggestion.
@@ -439,19 +436,24 @@ impl Handler {
             None => return Response::err(id, -32602, "missing required param: suggestion_id"),
         };
 
-        let mut suggestions = self.suggestions.write().await;
-        let before = suggestions.len();
-        suggestions.retain(|s| s.id != suggestion_id);
-
-        if suggestions.len() == before {
-            return Response::err(
-                id,
-                -1,
-                &format!("suggestion not found: {suggestion_id}"),
-            );
+        let result = {
+            let mut facade = match self.learning.lock() {
+                Ok(f) => f,
+                Err(_) => return Response::err(id, -1, "learning state unavailable"),
+            };
+            facade.accept(&suggestion_id)
+        };
+        match result {
+            Ok(r) => match serde_json::to_value(&r) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(LearningFacadeError::NotFound) => Response::err(id, -1, "suggestion not found"),
+            Err(LearningFacadeError::FocusMode) => {
+                Response::err(id, -1, "cannot accept suggestions while in Focus mode")
+            }
+            Err(_) => Response::err(id, -1, "learning operation failed"),
         }
-
-        Response::ok(id, serde_json::json!({ "accepted": suggestion_id }))
     }
 
     /// Handle `learning.dismiss` — dismiss a suggestion.
@@ -465,28 +467,30 @@ impl Handler {
             None => return Response::err(id, -32602, "missing required param: suggestion_id"),
         };
 
-        let mut suggestions = self.suggestions.write().await;
-        let before = suggestions.len();
-        suggestions.retain(|s| s.id != suggestion_id);
-
-        if suggestions.len() == before {
-            return Response::err(
-                id,
-                -1,
-                &format!("suggestion not found: {suggestion_id}"),
-            );
+        let result = {
+            let mut facade = match self.learning.lock() {
+                Ok(f) => f,
+                Err(_) => return Response::err(id, -1, "learning state unavailable"),
+            };
+            facade.dismiss(&suggestion_id)
+        };
+        match result {
+            Ok(r) => match serde_json::to_value(&r) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(LearningFacadeError::NotFound) => Response::err(id, -1, "suggestion not found"),
+            Err(_) => Response::err(id, -1, "learning operation failed"),
         }
-
-        Response::ok(id, serde_json::json!({ "dismissed": suggestion_id }))
     }
 
-    /// Handle `learning.count` — get active suggestion count.
+    /// Handle `learning.count` — count of pending suggestions via the facade.
     async fn handle_learning_count(&self, id: u64) -> Response {
-        let suggestions = self.suggestions.read().await;
-        Response::ok(
-            id,
-            serde_json::json!({ "count": suggestions.len() }),
-        )
+        let count = match self.learning.lock() {
+            Ok(facade) => facade.list_suggestions().len(),
+            Err(_) => return Response::err(id, -1, "learning state unavailable"),
+        };
+        Response::ok(id, serde_json::json!({ "count": count }))
     }
 }
 
@@ -501,7 +505,7 @@ mod tests {
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
         )
     }
 
@@ -715,48 +719,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learning_accept_existing() {
-        let suggestions = vec![Suggestion {
-            id: "sug-001".to_string(),
-            description: "Auto-archive reports".to_string(),
-            confidence: 0.9,
-            observed_count: 5,
-        }];
+    async fn learning_accept_transitions_to_practicing() {
+        use die_learning::{EventCategory, LearningEvent};
+
+        // Seed a Proposed suggestion in a shared facade (deterministic
+        // firefox→code recipe; see die_orchestrator::learning tests).
+        let mut facade = LearningFacade::in_memory().unwrap();
+        for i in 0..10 {
+            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "firefox",
+                None,
+                i * 100,
+            ));
+            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "code",
+                None,
+                i * 100 + 10,
+            ));
+        }
+        let _ = facade.engine_mut().run_detection();
+        let suggestion_id = facade
+            .list_suggestions()
+            .first()
+            .expect("seed must produce a pending suggestion")
+            .id
+            .clone();
+
         let handler = Handler::new(
             Arc::new(RwLock::new(Router::new())),
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(RwLock::new(suggestions)),
+            Arc::new(Mutex::new(facade)),
         );
 
-        // Verify suggestion exists
-        let count_req = Request {
-            id: 17,
-            method: "learning.count".to_string(),
-            params: serde_json::Value::Null,
-        };
-        let resp = handler.dispatch(count_req).await;
-        assert_eq!(resp.result.unwrap()["count"], 1);
-
-        // Accept it
         let accept_req = Request {
             id: 18,
             method: "learning.accept".to_string(),
-            params: serde_json::json!({ "suggestion_id": "sug-001" }),
+            params: serde_json::json!({ "suggestion_id": suggestion_id }),
         };
         let resp = handler.dispatch(accept_req).await;
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap()["accepted"], "sug-001");
-
-        // Verify removed
-        let count_req = Request {
-            id: 19,
-            method: "learning.count".to_string(),
-            params: serde_json::Value::Null,
-        };
-        let resp = handler.dispatch(count_req).await;
-        assert_eq!(resp.result.unwrap()["count"], 0);
+        assert!(resp.error.is_none(), "accept failed: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        // Strengthened (SVC-5): accept TRANSITIONS to Practicing and records a
+        // reversible timeline action — it no longer silently deletes the
+        // suggestion (the old broken accept ≡ dismiss behavior).
+        assert_eq!(result["new_stage"], "practicing");
+        assert!(
+            result["action_timeline_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("tl-")
+        );
     }
 
     #[tokio::test]

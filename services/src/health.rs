@@ -152,6 +152,7 @@ impl HealthService {
     /// `false` if already present.
     async fn add_watched_repo(&self, path: String) -> zbus::fdo::Result<bool> {
         info!(path = %path, "D-Bus add_watched_repo");
+        crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
         let mut monitor = self
             .monitor
             .lock()
@@ -165,6 +166,7 @@ impl HealthService {
     /// Stop monitoring a git repo. Returns `true` if the path was removed.
     async fn remove_watched_repo(&self, path: String) -> zbus::fdo::Result<bool> {
         info!(path = %path, "D-Bus remove_watched_repo");
+        crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
         let mut monitor = self
             .monitor
             .lock()
@@ -179,6 +181,8 @@ impl HealthService {
         purpose: String,
     ) -> zbus::fdo::Result<bool> {
         info!(host = %host, purpose = %purpose, "D-Bus add_expected_network_destination");
+        crate::limits::ensure_within(&host, crate::limits::MAX_STRING_BYTES, "host")?;
+        crate::limits::ensure_within(&purpose, crate::limits::MAX_STRING_BYTES, "purpose")?;
         let mut monitor = self
             .monitor
             .lock()

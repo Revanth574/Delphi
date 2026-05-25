@@ -97,6 +97,43 @@ pub enum OrchestratorError {
         #[source]
         source: rusqlite::Error,
     },
+
+    /// A caller-supplied value failed domain validation (e.g. an empty
+    /// title, out-of-range progress, a malformed deadline). The fields are
+    /// `&'static str` — the subsystem, the offending input's field name, and
+    /// a short controlled reason — so the variant carries no caller content,
+    /// filesystem path, or raw downstream error. Specific values (e.g. the
+    /// rejected number, the underlying parse error) go to `tracing`, never
+    /// into the variant. (services-sweep SVC-9.)
+    #[error("validation failed in {domain}: {field} ({reason})")]
+    Validation {
+        /// Subsystem that rejected the input (e.g. `"goal"`).
+        domain: &'static str,
+        /// Name of the offending input field (e.g. `"title"`).
+        field: &'static str,
+        /// Short, controlled cause (e.g. `"must not be empty"`).
+        reason: &'static str,
+    },
+
+    /// A referenced entity does not exist. `entity` is a short static label
+    /// (e.g. `"goal"`), never the caller-supplied id — so no id / existence
+    /// detail leaks across the bus.
+    #[error("{entity} not found")]
+    NotFound {
+        /// Short static entity label (e.g. `"goal"`).
+        entity: &'static str,
+    },
+
+    /// The operation conflicts with current domain state (e.g. a goal-graph
+    /// cycle, an illegal state transition). `reason` is a short controlled
+    /// string, not a raw downstream error.
+    #[error("{domain} state conflict: {reason}")]
+    Conflict {
+        /// Subsystem reporting the conflict.
+        domain: &'static str,
+        /// Short, controlled cause.
+        reason: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -144,5 +181,30 @@ mod tests {
             "could not decompose intent: ambiguous file reference".to_string(),
         );
         assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn typed_variants_display_is_controlled() {
+        // SVC-9: the typed variants carry only static, controlled strings —
+        // their Display output must contain no caller content or raw
+        // downstream error.
+        let v = OrchestratorError::Validation {
+            domain: "goal",
+            field: "title",
+            reason: "must not be empty",
+        };
+        assert_eq!(
+            v.to_string(),
+            "validation failed in goal: title (must not be empty)"
+        );
+
+        let nf = OrchestratorError::NotFound { entity: "goal" };
+        assert_eq!(nf.to_string(), "goal not found");
+
+        let c = OrchestratorError::Conflict {
+            domain: "goal",
+            reason: "deadline graph cycle",
+        };
+        assert_eq!(c.to_string(), "goal state conflict: deadline graph cycle");
     }
 }

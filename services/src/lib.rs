@@ -41,6 +41,14 @@ pub mod mode;
 pub mod timeline;
 pub mod workspace;
 
+/// Internal: D-Bus error sanitization at the trust boundary (not an
+/// interface). See `error::opaque` and services-sweep finding SVC-4.
+pub(crate) mod error;
+
+/// D-Bus payload size caps (not an interface). Single source of truth for the
+/// per-parameter byte limits. See services-sweep finding SVC-6.
+pub mod limits;
+
 /// D-Bus well-known name for the Delphi services.
 pub const DBUS_NAME: &str = "org.delphi.Services";
 

@@ -2,195 +2,190 @@
 
 //! D-Bus Learning interface.
 //!
-//! Exposes the Universal Learning Loop's suggestion system over D-Bus.
-//! The shell displays learned task suggestions; the user can accept
-//! or dismiss them.
+//! Thin transport over the domain [`LearningFacade`] (services-sweep finding
+//! SVC-5). All suggestion semantics — accept (`Proposed → Practicing`,
+//! recorded as a reversible action), dismiss (`→ Dismissed` + tombstone), and
+//! Focus gating — live in `die_orchestrator::learning`; this file just locks,
+//! calls, and serializes. The *same* `Arc<Mutex<LearningFacade>>` is shared
+//! with the WebSocket bridge (`shell-bridge`) so both transports operate on one
+//! authoritative state instead of duplicated, independently-buggy copies.
 //!
 //! Interface: `org.delphi.Learning`
 //!
-//! # Learning Loop
-//!
-//! ```text
-//! OBSERVE → MODEL → PROPOSE → PRACTICE → REFINE → AUTOMATE → EVOLVE
-//! ```
+//! Methods return JSON strings (the richer `AcceptSuggestionResult` /
+//! `DismissSuggestionResult` carry state the previous `()`-returning methods
+//! could not). Uses `std::sync::Mutex` (not `tokio`) because the facade embeds
+//! a `Timeline` whose `rusqlite::Connection` is `!Send`; no method holds the
+//! lock across an `.await`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::RwLock;
 use tracing::info;
+
+use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
 
 /// D-Bus object path for the Learning interface.
 pub const PATH: &str = "/org/delphi/Learning";
 
-/// A learning suggestion proposed to the user.
-///
-/// # Examples
-///
-/// ```
-/// use delphi_services::learning::Suggestion;
-///
-/// let s = Suggestion {
-///     id: "sug-001".to_string(),
-///     description: "I noticed you archive reports weekly. Want me to do it?".to_string(),
-///     confidence: 0.85,
-///     observed_count: 5,
-/// };
-/// assert!(s.confidence > 0.5);
-/// ```
-#[derive(Debug, Clone)]
-pub struct Suggestion {
-    /// Unique suggestion identifier.
-    pub id: String,
-    /// Human-readable description of the proposed automation.
-    pub description: String,
-    /// Confidence level (0.0–1.0).
-    pub confidence: f64,
-    /// Number of times the task was observed.
-    pub observed_count: u32,
-}
-
-/// Learning D-Bus service.
-///
-/// Stores and serves learning suggestions. In a future phase, this
-/// will be backed by the full learning engine with observation and
-/// behavioral modeling.
+/// Learning D-Bus service — a thin pass-through to the shared domain facade.
 ///
 /// # Examples
 ///
 /// ```
 /// use delphi_services::learning::LearningService;
-/// use std::sync::Arc;
-/// use tokio::sync::RwLock;
+/// use die_orchestrator::learning::LearningFacade;
+/// use std::sync::{Arc, Mutex};
 ///
-/// let svc = LearningService::new(Arc::new(RwLock::new(Vec::new())));
+/// let facade = LearningFacade::in_memory().unwrap();
+/// let svc = LearningService::new(Arc::new(Mutex::new(facade)));
 /// ```
 pub struct LearningService {
-    suggestions: Arc<RwLock<Vec<Suggestion>>>,
+    facade: Arc<Mutex<LearningFacade>>,
 }
 
 impl LearningService {
-    /// Create a new learning service.
+    /// Wrap a shared [`LearningFacade`] for D-Bus exposure.
     ///
     /// # Examples
     ///
     /// ```
     /// use delphi_services::learning::LearningService;
-    /// use std::sync::Arc;
-    /// use tokio::sync::RwLock;
+    /// use die_orchestrator::learning::LearningFacade;
+    /// use std::sync::{Arc, Mutex};
     ///
-    /// let svc = LearningService::new(Arc::new(RwLock::new(Vec::new())));
+    /// let svc = LearningService::new(Arc::new(Mutex::new(
+    ///     LearningFacade::in_memory().unwrap(),
+    /// )));
     /// ```
     #[must_use]
-    pub fn new(suggestions: Arc<RwLock<Vec<Suggestion>>>) -> Self {
-        Self { suggestions }
+    pub fn new(facade: Arc<Mutex<LearningFacade>>) -> Self {
+        Self { facade }
+    }
+
+    fn lock(&self) -> zbus::fdo::Result<std::sync::MutexGuard<'_, LearningFacade>> {
+        self.facade
+            .lock()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("learning facade lock poisoned: {e}")))
+    }
+}
+
+/// Translate a facade error into a sanitized D-Bus error. `FocusMode` and
+/// `NotFound` carry no caller/server detail, so their fixed messages are safe
+/// to surface; engine/timeline internals are routed through the SVC-4
+/// [`opaque`](crate::error::opaque) sanitizer.
+fn map_learning_error(e: LearningFacadeError) -> zbus::fdo::Error {
+    match e {
+        LearningFacadeError::FocusMode => {
+            zbus::fdo::Error::Failed("cannot accept suggestions while in Focus mode".to_string())
+        }
+        LearningFacadeError::NotFound => {
+            zbus::fdo::Error::InvalidArgs("suggestion not found".to_string())
+        }
+        other => crate::error::opaque("learning operation failed", other),
     }
 }
 
 #[zbus::interface(name = "org.delphi.Learning")]
 impl LearningService {
-    /// Get all active suggestions.
-    ///
-    /// Returns a JSON array of suggestion objects.
+    /// Pending suggestions as a JSON array of `LearningSuggestion`.
     async fn get_suggestions(&self) -> zbus::fdo::Result<String> {
-        let suggestions = self.suggestions.read().await;
-        let json: Vec<serde_json::Value> = suggestions
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "description": s.description,
-                    "confidence": s.confidence,
-                    "observed_count": s.observed_count,
-                })
-            })
-            .collect();
-
-        serde_json::to_string(&json)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialization failed: {e}")))
+        let suggestions = {
+            let facade = self.lock()?;
+            facade.list_suggestions()
+        };
+        serde_json::to_string(&suggestions)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    /// Accept a suggestion (enable the automation).
-    async fn accept_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<()> {
-        info!(suggestion_id = %suggestion_id, "suggestion accepted");
-
-        let mut suggestions = self.suggestions.write().await;
-        suggestions.retain(|s| s.id != suggestion_id);
-        Ok(())
+    /// Accept a suggestion (`Proposed → Practicing`). Returns a JSON
+    /// `AcceptSuggestionResult` (includes the reversible action-timeline id).
+    async fn accept_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<String> {
+        info!(suggestion_id = %suggestion_id, "D-Bus accept_suggestion");
+        let result = {
+            let mut facade = self.lock()?;
+            facade.accept(&suggestion_id).map_err(map_learning_error)?
+        };
+        serde_json::to_string(&result)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    /// Dismiss a suggestion (don't automate this).
-    async fn dismiss_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<()> {
-        info!(suggestion_id = %suggestion_id, "suggestion dismissed");
-
-        let mut suggestions = self.suggestions.write().await;
-        suggestions.retain(|s| s.id != suggestion_id);
-        Ok(())
+    /// Dismiss a suggestion (`→ Dismissed` + tombstone). Returns a JSON
+    /// `DismissSuggestionResult`.
+    async fn dismiss_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<String> {
+        info!(suggestion_id = %suggestion_id, "D-Bus dismiss_suggestion");
+        let result = {
+            let mut facade = self.lock()?;
+            facade.dismiss(&suggestion_id).map_err(map_learning_error)?
+        };
+        serde_json::to_string(&result)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    /// Get the count of active suggestions.
+    /// Count of pending (non-tombstoned, non-Focus-suppressed) suggestions.
     async fn suggestion_count(&self) -> zbus::fdo::Result<u32> {
-        let suggestions = self.suggestions.read().await;
-        Ok(suggestions.len() as u32)
+        let count = {
+            let facade = self.lock()?;
+            facade.list_suggestions().len()
+        };
+        Ok(count as u32)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use die_orchestrator::learning::LearningFacade;
+
+    fn svc() -> LearningService {
+        LearningService::new(Arc::new(Mutex::new(LearningFacade::in_memory().unwrap())))
+    }
 
     #[test]
     fn path_is_valid() {
         assert!(PATH.starts_with("/org/delphi"));
-    }
-
-    #[test]
-    fn suggestion_fields() {
-        let s = Suggestion {
-            id: "sug-001".to_string(),
-            description: "Archive reports".to_string(),
-            confidence: 0.9,
-            observed_count: 7,
-        };
-        assert_eq!(s.observed_count, 7);
-        assert!(s.confidence > 0.5);
+        assert!(PATH.ends_with("Learning"));
     }
 
     #[tokio::test]
-    async fn empty_suggestions() {
-        let svc = LearningService::new(Arc::new(RwLock::new(Vec::new())));
-        let json = svc.get_suggestions().await.unwrap();
-        assert_eq!(json, "[]");
-        assert_eq!(svc.suggestion_count().await.unwrap(), 0);
+    async fn get_suggestions_empty_is_json_array() {
+        let s = svc();
+        assert_eq!(s.get_suggestions().await.unwrap(), "[]");
+        assert_eq!(s.suggestion_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn accept_removes_suggestion() {
-        let suggestions = vec![Suggestion {
-            id: "sug-001".to_string(),
-            description: "test".to_string(),
-            confidence: 0.8,
-            observed_count: 3,
-        }];
-        let svc = LearningService::new(Arc::new(RwLock::new(suggestions)));
-
-        assert_eq!(svc.suggestion_count().await.unwrap(), 1);
-        svc.accept_suggestion("sug-001".to_string()).await.unwrap();
-        assert_eq!(svc.suggestion_count().await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn dismiss_removes_suggestion() {
-        let suggestions = vec![Suggestion {
-            id: "sug-002".to_string(),
-            description: "test".to_string(),
-            confidence: 0.6,
-            observed_count: 2,
-        }];
-        let svc = LearningService::new(Arc::new(RwLock::new(suggestions)));
-
-        svc.dismiss_suggestion("sug-002".to_string())
+    async fn accept_unknown_id_is_not_found_without_leak() {
+        let s = svc();
+        let err = s
+            .accept_suggestion("pat-9999".to_string())
             .await
-            .unwrap();
-        assert_eq!(svc.suggestion_count().await.unwrap(), 0);
+            .unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(err.to_string().ends_with("suggestion not found"));
+    }
+
+    #[tokio::test]
+    async fn dismiss_unknown_id_is_not_found() {
+        let s = svc();
+        let err = s
+            .dismiss_suggestion("pat-9999".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn accept_in_focus_is_rejected_clearly() {
+        // A facade in Focus rejects accept before any id lookup, so no seeded
+        // pattern is needed to exercise the FocusMode -> Failed mapping.
+        let mut facade = LearningFacade::in_memory().unwrap();
+        facade.enter_focus();
+        let s = LearningService::new(Arc::new(Mutex::new(facade)));
+        let err = s
+            .accept_suggestion("anything".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::Failed(_)));
+        assert!(err.to_string().contains("Focus mode"));
     }
 }

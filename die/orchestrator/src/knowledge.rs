@@ -654,18 +654,23 @@ impl Embedder for CloudEmbedder {
         // enough for autonomous transmission; if it's false, the caller
         // (or human) must explicitly confirm before transmitting.
         let sanitized = self.sanitizer.sanitize(text);
-        if sanitized.requires_confirmation {
+        if sanitized.requires_confirmation() {
             return Err(OrchestratorError::Planning(format!(
                 "cloud embedding refused: privacy score {} requires user confirmation",
-                sanitized.score.total
+                sanitized.score().total
             )));
         }
         // Real network call happens here in a future task. For now return
         // an empty vector tagged Subprocess to indicate the pathway exists.
+        // SVC-1 NOTE: when the real embedding network call lands, this is a
+        // SECOND cloud-egress path (alongside CloudEgressGateway for
+        // completions) and should get the same structural capability gate —
+        // today it sanitizes correctly but the egress is not yet
+        // type-enforced because there is no transmission yet.
         debug!(
-            sanitized_len = sanitized.sanitized_text.len(),
+            sanitized_len = sanitized.sanitized_text().len(),
             pii_count = sanitized.pii_count(),
-            score = sanitized.score.total,
+            score = sanitized.score().total,
             "cloud embedder ZKQP gate passed (no real transmission yet)"
         );
         // Explicit drop: SanitizationResult contains the in-memory PII map

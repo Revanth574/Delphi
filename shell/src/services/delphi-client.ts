@@ -29,12 +29,27 @@ interface BridgeResponse {
   error?: { code: number; message: string };
 }
 
-/** Result from an inference query. */
-export interface InferenceResult {
-  output: string;
-  tier: string;
-  model_id: string;
-}
+/**
+ * Result from an inference query (SVC-1: discriminated by `status`).
+ *
+ * A cloud query whose ZKQP privacy score is too high pauses for explicit
+ * user confirmation instead of sending — so the result is either a completed
+ * response or a confirmation request carrying the sanitized preview.
+ */
+export type InferenceResult =
+  | {
+      status: "completed";
+      output: string;
+      tier: string;
+      model_id: string;
+    }
+  | {
+      status: "confirmation_required";
+      /** ZKQP privacy score (0-100) that triggered the pause. */
+      privacy_score: number;
+      /** The sanitized query awaiting approval (PII already replaced). */
+      sanitized_preview: string;
+    };
 
 /** Backend availability status. */
 export interface InferenceStatus {
@@ -165,16 +180,27 @@ class DelphiClient {
 
   // ── Inference ──────────────────────────────────────────────
 
-  /** Send a natural language query through the inference engine. */
+  /**
+   * Send a natural language query through the inference engine.
+   *
+   * `cloudConfirmed` (SVC-1) carries the user's explicit consent to send a
+   * high-privacy-score query's sanitized version past the ZKQP confirmation
+   * pause. Leave `false` on the first call; if the result is
+   * `status: "confirmation_required"`, show the preview and, on the user's
+   * approval, re-call with `cloudConfirmed = true`. It never sends
+   * unsanitized text — ZKQP applies regardless.
+   */
   async query(
     prompt: string,
     maxTokens = 256,
     sensitive = false,
+    cloudConfirmed = false,
   ): Promise<InferenceResult> {
     return this.call("inference.query", {
       prompt,
       max_tokens: maxTokens,
       sensitive,
+      cloud_confirmed: cloudConfirmed,
     }) as Promise<InferenceResult>;
   }
 

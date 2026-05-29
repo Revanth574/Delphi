@@ -20,6 +20,12 @@ const en = {
       loading: "Thinking\u2026",
       error: "Something went wrong. Try again.",
       noBackend: "No AI backend available. Check connection.",
+      // SVC-1: ZKQP privacy-score confirmation (CLAUDE.md ZKQP rule 4).
+      confirmTitle: "This query may contain sensitive information",
+      confirmScore: "Privacy score: {{score}}/100",
+      confirmPreview: "Delphi will send this sanitized version to the cloud:",
+      confirmSend: "Send sanitized version",
+      confirmCancel: "Cancel",
     },
 
     // ── Dock ────────────────────────────────────

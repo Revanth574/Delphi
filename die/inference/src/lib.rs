@@ -18,6 +18,7 @@
 //! Does **not** depend on any module above it in the hierarchy.
 
 pub mod cloud;
+pub mod egress;
 pub mod error;
 pub mod hardware;
 pub mod model;
@@ -36,6 +37,7 @@ pub use error::InferenceError;
 ///     input: "Summarize this document".to_string(),
 ///     max_tokens: 512,
 ///     sensitive: false,
+///     cloud_confirmed: false,
 /// };
 /// assert!(!req.sensitive);
 /// ```
@@ -46,7 +48,56 @@ pub struct InferenceRequest {
     /// Maximum tokens to generate.
     pub max_tokens: u32,
     /// Whether this request contains sensitive data (forces local routing).
+    ///
+    /// This is the ROUTING signal (Iron Law #1 — explicit caller intent):
+    /// `true` means "never leaves the device." It governs *whether* a query
+    /// may reach the cloud at all. It is **independent** of ZKQP protection
+    /// — ZKQP sanitization is applied structurally to anything that does go
+    /// to cloud, regardless of this flag (SVC-1).
     pub sensitive: bool,
+    /// Explicit user consent to send the *sanitized* query to the cloud even
+    /// when its privacy score is high enough to normally require confirmation
+    /// (SVC-1). `false` by default: a high-privacy-score query pauses with
+    /// [`RouteOutcome::CloudConfirmationRequired`] instead of sending. After
+    /// the user reviews the sanitized preview and accepts, the caller
+    /// re-issues with `cloud_confirmed = true`. This never sends unsanitized
+    /// text — ZKQP still applies; it only overrides the *pause*, honoring the
+    /// user's explicit decision (Iron Law #1).
+    pub cloud_confirmed: bool,
+}
+
+/// The outcome of routing an inference request (SVC-1).
+///
+/// The cloud path can pause for user confirmation when ZKQP judges a query's
+/// privacy score too high, so routing no longer always yields a response —
+/// it yields either a completed response or a confirmation request. This
+/// typed outcome propagates the pause to the caller (router -> service ->
+/// shell) rather than swallowing it mid-pipeline.
+#[derive(Debug, Clone)]
+pub enum RouteOutcome {
+    /// The request completed (local, or cloud with the response de-sanitized).
+    Completed(InferenceResponse),
+    /// The cloud query was sanitized but its privacy score is high enough to
+    /// require explicit user confirmation before sending (CLAUDE.md ZKQP
+    /// rule 4). Nothing was sent; no PII mapping is retained. The caller
+    /// shows the preview and, on acceptance, re-issues with
+    /// `cloud_confirmed = true`.
+    CloudConfirmationRequired(CloudConfirmation),
+}
+
+/// Details of a paused cloud query awaiting user confirmation (SVC-1).
+///
+/// Carries only non-sensitive decision data: the privacy score and the
+/// already-sanitized preview (PII replaced with placeholders). It deliberately
+/// does NOT carry the PII->placeholder mapping — that mapping never outlives
+/// the single send/restore cycle and never spans user think-time.
+#[derive(Debug, Clone)]
+pub struct CloudConfirmation {
+    /// The ZKQP privacy score (0-100) that triggered the pause.
+    pub privacy_score: u32,
+    /// The sanitized query the user is being asked to approve sending. Safe
+    /// to display: PII is already replaced with placeholders.
+    pub sanitized_preview: String,
 }
 
 /// The response from an inference operation.
@@ -103,6 +154,7 @@ mod tests {
             input: "my password is hunter2".to_string(),
             max_tokens: 100,
             sensitive: true,
+            cloud_confirmed: false,
         };
         assert!(req.sensitive);
     }

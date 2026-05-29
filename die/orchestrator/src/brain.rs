@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use die_browser::engine::{BrowserConfig, BrowserEngine};
 use die_inference::router::Router;
-use die_inference::InferenceRequest;
+use die_inference::{CloudConfirmation, InferenceRequest, RouteOutcome};
 
 use crate::OrchestratorError;
 
@@ -70,21 +70,30 @@ const WEB_AUGMENT_MARKER: &str = "[web-augmented]";
 ///     model_id: "qwen3-7b".to_string(),
 ///     web_augmented: false,
 ///     web_url: None,
+///     cloud_confirmation: None,
 /// };
 /// assert!(!resp.web_augmented);
 /// ```
 #[derive(Debug, Clone)]
 pub struct BrainResponse {
-    /// The LLM's response text.
+    /// The LLM's response text. Empty when `cloud_confirmation` is `Some`
+    /// (the query paused before producing a response).
     pub output: String,
-    /// Which inference tier was used.
+    /// Which inference tier was used. `"ConfirmationRequired"` when the
+    /// cloud query paused for user confirmation (SVC-1).
     pub tier: String,
-    /// Which model produced the response.
+    /// Which model produced the response. Empty when paused.
     pub model_id: String,
     /// Whether web data was included in the context.
     pub web_augmented: bool,
     /// The URL fetched for augmentation, if any.
     pub web_url: Option<String>,
+    /// `Some` when the cloud query's ZKQP privacy score required user
+    /// confirmation before sending (SVC-1). Carries the score and the
+    /// sanitized preview; nothing was sent. The caller shows the preview and,
+    /// on acceptance, re-issues `query` with `cloud_confirmed = true`. `None`
+    /// for completed (local or sent-and-restored) responses.
+    pub cloud_confirmation: Option<CloudConfirmation>,
 }
 
 /// The orchestrator brain — coordinates LLM + web for queries.
@@ -215,7 +224,7 @@ impl Brain {
     /// # use tokio::sync::RwLock;
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let brain = Brain::new(Arc::new(RwLock::new(Router::new())));
-    /// let response = brain.query("What is Rust?", 256, false).await;
+    /// let response = brain.query("What is Rust?", 256, false, false).await;
     /// # });
     /// ```
     pub async fn query(
@@ -223,6 +232,7 @@ impl Brain {
         input: &str,
         max_tokens: u32,
         sensitive: bool,
+        cloud_confirmed: bool,
     ) -> Result<BrainResponse, OrchestratorError> {
         let needs_web = self.needs_web_access(input);
         let mut web_context: Option<String> = None;
@@ -262,17 +272,30 @@ impl Brain {
             input: prompt,
             max_tokens,
             sensitive,
+            cloud_confirmed,
         };
 
-        let resp = router.route(req).await?;
-
-        Ok(BrainResponse {
-            output: resp.output,
-            tier: format!("{:?}", resp.tier),
-            model_id: resp.model_id,
-            web_augmented: web_context.is_some(),
-            web_url,
-        })
+        // SVC-1: a cloud query may pause for ZKQP confirmation. Surface that
+        // as a typed BrainResponse (output empty, cloud_confirmation set)
+        // rather than swallowing it as a completed response or an error.
+        match router.route(req).await? {
+            RouteOutcome::Completed(resp) => Ok(BrainResponse {
+                output: resp.output,
+                tier: format!("{:?}", resp.tier),
+                model_id: resp.model_id,
+                web_augmented: web_context.is_some(),
+                web_url,
+                cloud_confirmation: None,
+            }),
+            RouteOutcome::CloudConfirmationRequired(c) => Ok(BrainResponse {
+                output: String::new(),
+                tier: "ConfirmationRequired".to_string(),
+                model_id: String::new(),
+                web_augmented: web_context.is_some(),
+                web_url,
+                cloud_confirmation: Some(c),
+            }),
+        }
     }
 
     /// Fetch web context for a query using the browser engine.
@@ -468,7 +491,7 @@ mod tests {
     async fn brain_query_no_backends() {
         let router = Arc::new(RwLock::new(Router::new()));
         let brain = Brain::new(router);
-        let result = brain.query("hello", 256, false).await;
+        let result = brain.query("hello", 256, false, false).await;
         // Should fail because no inference backends
         assert!(result.is_err());
     }
@@ -481,9 +504,11 @@ mod tests {
             model_id: "test-model".to_string(),
             web_augmented: true,
             web_url: Some("https://example.com".to_string()),
+            cloud_confirmation: None,
         };
         assert!(resp.web_augmented);
         assert_eq!(resp.web_url.as_deref(), Some("https://example.com"));
+        assert!(resp.cloud_confirmation.is_none());
     }
 
     #[test]

@@ -13,6 +13,12 @@ interface ResponseState {
   text: string | null;
   tier: string | null;
   error: string | null;
+  /**
+   * SVC-1: set when a cloud query's ZKQP privacy score requires explicit
+   * user confirmation before sending. Carries the score and the sanitized
+   * preview; nothing has been sent. `null` otherwise.
+   */
+  confirmation: { privacyScore: number; sanitizedPreview: string } | null;
 }
 
 const INITIAL_RESPONSE: ResponseState = {
@@ -20,6 +26,7 @@ const INITIAL_RESPONSE: ResponseState = {
   text: null,
   tier: null,
   error: null,
+  confirmation: null,
 };
 
 /**
@@ -37,6 +44,7 @@ export const CommandBar = memo(function CommandBar() {
   const [query, setQuery] = useState("");
   const [response, setResponse] = useState<ResponseState>(INITIAL_RESPONSE);
   const inputRef = useRef<HTMLInputElement>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement>(null);
 
   // Connect to bridge on mount
   useEffect(() => {
@@ -49,26 +57,67 @@ export const CommandBar = memo(function CommandBar() {
     setOpen((prev) => !prev);
   }, [mode]);
 
-  const handleSubmit = useCallback(async () => {
-    const trimmed = query.trim();
-    if (trimmed.length === 0) return;
+  // SVC-1: a single runner for both the initial submit (cloudConfirmed=false)
+  // and the post-confirmation retry (cloudConfirmed=true). A cloud query whose
+  // privacy score is too high comes back as `confirmation_required` instead of
+  // a completed response; we surface the sanitized preview and let the user
+  // approve sending it.
+  const runQuery = useCallback(
+    async (cloudConfirmed: boolean) => {
+      const trimmed = query.trim();
+      if (trimmed.length === 0) return;
 
-    setResponse({ loading: true, text: null, tier: null, error: null });
-
-    try {
-      const result = await delphi.query(trimmed);
       setResponse({
-        loading: false,
-        text: result.output,
-        tier: result.tier,
+        loading: true,
+        text: null,
+        tier: null,
         error: null,
+        confirmation: null,
       });
-    } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : t("commandBar.error");
-      setResponse({ loading: false, text: null, tier: null, error: message });
-    }
-  }, [query, t]);
+
+      try {
+        const result = await delphi.query(trimmed, 256, false, cloudConfirmed);
+        if (result.status === "confirmation_required") {
+          setResponse({
+            loading: false,
+            text: null,
+            tier: null,
+            error: null,
+            confirmation: {
+              privacyScore: result.privacy_score,
+              sanitizedPreview: result.sanitized_preview,
+            },
+          });
+        } else {
+          setResponse({
+            loading: false,
+            text: result.output,
+            tier: result.tier,
+            error: null,
+            confirmation: null,
+          });
+        }
+      } catch (err: unknown) {
+        const message =
+          err instanceof Error ? err.message : t("commandBar.error");
+        setResponse({
+          loading: false,
+          text: null,
+          tier: null,
+          error: message,
+          confirmation: null,
+        });
+      }
+    },
+    [query, t],
+  );
+
+  const handleSubmit = useCallback(() => runQuery(false), [runQuery]);
+  const handleConfirmSend = useCallback(() => runQuery(true), [runQuery]);
+  const handleCancelConfirm = useCallback(
+    () => setResponse(INITIAL_RESPONSE),
+    [],
+  );
 
   // Alt+Space global shortcut
   useEffect(() => {
@@ -96,6 +145,15 @@ export const CommandBar = memo(function CommandBar() {
       setResponse(INITIAL_RESPONSE);
     }
   }, [open]);
+
+  // SVC-1 a11y: when the confirmation prompt appears, move focus to the
+  // primary action so a keyboard/screen-reader user lands on it (CLAUDE.md
+  // focus-management rule).
+  useEffect(() => {
+    if (response.confirmation) {
+      confirmButtonRef.current?.focus();
+    }
+  }, [response.confirmation]);
 
   if (!open) return null;
 
@@ -149,6 +207,50 @@ export const CommandBar = memo(function CommandBar() {
                 {response.tier}
               </p>
             )}
+          </div>
+        )}
+
+        {/* SVC-1: ZKQP privacy-score confirmation prompt. A high-score cloud
+            query pauses here; the user reviews the already-sanitized preview
+            and explicitly approves sending it (or cancels). */}
+        {response.confirmation && (
+          <div
+            className="border-t border-amber-500/30 px-4 py-3"
+            role="group"
+            aria-live="assertive"
+            aria-label={t("commandBar.confirmTitle")}
+          >
+            <p className="text-sm font-medium text-text-primary">
+              {t("commandBar.confirmTitle")}
+            </p>
+            <p className="mt-1 text-xs text-amber-300">
+              {t("commandBar.confirmScore", {
+                score: response.confirmation.privacyScore,
+              })}
+            </p>
+            <p className="mt-2 text-xs text-text-muted">
+              {t("commandBar.confirmPreview")}
+            </p>
+            <p className="mt-1 whitespace-pre-wrap rounded-lg bg-black/20 px-3 py-2 text-sm text-text-primary">
+              {response.confirmation.sanitizedPreview}
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                ref={confirmButtonRef}
+                type="button"
+                onClick={() => void handleConfirmSend()}
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              >
+                {t("commandBar.confirmSend")}
+              </button>
+              <button
+                type="button"
+                onClick={handleCancelConfirm}
+                className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-text-primary hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/40"
+              >
+                {t("commandBar.confirmCancel")}
+              </button>
+            </div>
           </div>
         )}
 

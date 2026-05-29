@@ -17,6 +17,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::egress::SanitizedPrompt;
 use crate::error::InferenceError;
 
 /// Default request timeout for cloud API calls.
@@ -151,6 +152,14 @@ impl CloudClient {
 
     /// Send a completion request to the Anthropic API.
     ///
+    /// **SVC-1: capability-gated and crate-internal.** This method is the raw
+    /// cloud-egress mechanic. It is `pub(crate)` and accepts a
+    /// [`SanitizedPrompt`] — never a raw `&str` — so it cannot be reached with
+    /// un-sanitized text. The only caller is
+    /// [`CloudEgressGateway`](crate::egress::CloudEgressGateway), which mints
+    /// the capability immediately after a ZKQP `sanitize`. External crates
+    /// must go through the gateway; there is no public raw-prompt overload.
+    ///
     /// Implements retry logic with exponential backoff (max 3 retries)
     /// per CLAUDE.md Section 4 (network operations must have retries).
     ///
@@ -158,22 +167,9 @@ impl CloudClient {
     ///
     /// Returns `InferenceError::CloudApi` on API errors,
     /// `InferenceError::Timeout` on timeout.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use die_inference::cloud::{CloudClient, CloudModel};
-    ///
-    /// # async fn example() -> Result<(), die_inference::InferenceError> {
-    /// let client = CloudClient::new("sk-ant-key".to_string());
-    /// let response = client.complete("Hello!", 256, CloudModel::ClaudeSonnet).await?;
-    /// println!("{}", response.text);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn complete(
+    pub(crate) async fn complete(
         &self,
-        prompt: &str,
+        prompt: &SanitizedPrompt,
         max_tokens: u32,
         model: CloudModel,
     ) -> Result<CloudResponse, InferenceError> {
@@ -190,7 +186,9 @@ impl CloudClient {
             max_tokens,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
-                content: prompt.to_string(),
+                // SVC-1: the only text that crosses the network is the
+                // sanitized capability's payload.
+                content: prompt.as_str().to_string(),
             }],
         };
 
@@ -369,16 +367,10 @@ mod tests {
         assert!(!client.is_available());
     }
 
-    #[tokio::test]
-    async fn complete_fails_without_key() {
-        let client = CloudClient::new(String::new());
-        let result = client
-            .complete("test", 100, CloudModel::ClaudeSonnet)
-            .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("no API key"));
-    }
+    // SVC-1: the "no API key -> CloudApi error on send" behavior moved to
+    // `egress::tests::clean_query_without_key_errors_on_send`. `complete` now
+    // requires a `SanitizedPrompt` (private to the egress module), so it can
+    // only be exercised through the gateway.
 
     #[test]
     fn cloud_response_fields() {

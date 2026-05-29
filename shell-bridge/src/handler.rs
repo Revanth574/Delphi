@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use die_inference::router::Router;
-use die_inference::InferenceRequest;
+use die_inference::{InferenceRequest, RouteOutcome};
 use die_orchestrator::timeline::Timeline;
 use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
 use semantic_fs::indexer::Indexer;
@@ -199,20 +199,41 @@ impl Handler {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // SVC-1: explicit consent to send a high-privacy-score query (the
+        // sanitized version) past the ZKQP confirmation pause. Defaults false;
+        // the shell sets it on the retry after the user approves the preview.
+        let cloud_confirmed = params
+            .get("cloud_confirmed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let router = self.router.read().await;
         let req = InferenceRequest {
             input: prompt,
             max_tokens,
             sensitive,
+            cloud_confirmed,
         };
 
         match router.route(req).await {
-            Ok(resp) => Response::ok(
+            // SVC-1: a cloud query may pause for confirmation. Surface the
+            // typed outcome to the shell discriminated by `status` rather than
+            // swallowing the pause or pretending it completed.
+            Ok(RouteOutcome::Completed(resp)) => Response::ok(
                 id,
                 serde_json::json!({
+                    "status": "completed",
                     "output": resp.output,
                     "tier": format!("{:?}", resp.tier),
                     "model_id": resp.model_id,
+                }),
+            ),
+            Ok(RouteOutcome::CloudConfirmationRequired(c)) => Response::ok(
+                id,
+                serde_json::json!({
+                    "status": "confirmation_required",
+                    "privacy_score": c.privacy_score,
+                    "sanitized_preview": c.sanitized_preview,
                 }),
             ),
             Err(e) => Response::err(id, -1, &e.to_string()),

@@ -65,8 +65,8 @@ impl FileSearchService {
         query: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
-        info!(query = %query, limit, "D-Bus file search");
         crate::limits::ensure_within(&query, crate::limits::MAX_STRING_BYTES, "query")?;
+        info!(query = %query, limit, "D-Bus file search");
 
         let indexer = self.indexer.lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
@@ -127,5 +127,17 @@ mod tests {
             !msg.contains(sentinel),
             "D-Bus error leaked domain detail: {msg}"
         );
+    }
+
+    /// SVC-6-R2-3: `search(query)` is capped at the boundary.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let indexer = Arc::new(Mutex::new(Indexer::in_memory().unwrap()));
+        let svc = FileSearchService::new(indexer);
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        assert!(matches!(
+            svc.search(oversize, 10).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

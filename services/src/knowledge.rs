@@ -241,8 +241,9 @@ impl KnowledgeService {
     /// through `ingest_text`, accepting that the safe-open boundary
     /// is the shell's responsibility on those platforms.
     async fn ingest_file(&self, path: String) -> zbus::fdo::Result<String> {
-        info!(path = %path, "D-Bus ingest_file");
+        // SVC-6-R2-3: cap BEFORE info!()/validation/store.
         crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
+        info!(path = %path, "D-Bus ingest_file");
 
         // SVC-8: the domain gate validates the path and, on success, mints
         // a capability token bundling the canonical path with the held root
@@ -274,10 +275,11 @@ impl KnowledgeService {
         source_uri: String,
         format: String,
     ) -> zbus::fdo::Result<String> {
-        info!(uri = %source_uri, fmt = %format, "D-Bus ingest_text");
+        // SVC-6-R2-3: cap every String param BEFORE info!()/parse/store.
         crate::limits::ensure_within(&text, crate::limits::MAX_INGEST_TEXT_BYTES, "text")?;
         crate::limits::ensure_within(&source_uri, crate::limits::MAX_STRING_BYTES, "source_uri")?;
         crate::limits::ensure_within(&format, crate::limits::MAX_STRING_BYTES, "format")?;
+        info!(uri = %source_uri, fmt = %format, "D-Bus ingest_text");
         let store = self
             .store
             .lock()
@@ -1420,5 +1422,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
+    /// `ingest_text(text)` has its own dedicated test
+    /// (`ingest_text_rejects_oversize_text`) at `MAX_INGEST_TEXT_BYTES`; this
+    /// covers the remaining `MAX_STRING_BYTES` fields across the surface.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = mk_svc();
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // ingest_file(path)
+        assert!(matches!(
+            svc.ingest_file(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // ingest_text(text, source_uri, format) — source_uri and format
+        // (the `text` cap is at MAX_INGEST_TEXT_BYTES, exercised separately).
+        assert!(matches!(
+            svc.ingest_text("hello".to_string(), oversize.clone(), "markdown".to_string())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.ingest_text("hello".to_string(), "u".to_string(), oversize.clone())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // search(query)
+        assert!(matches!(
+            svc.search(oversize.clone(), 5).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

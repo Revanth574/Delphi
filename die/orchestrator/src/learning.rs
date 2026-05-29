@@ -41,7 +41,7 @@
 use std::collections::HashSet;
 
 use die_learning::engine::{PatternStage, TrackedPattern};
-use die_learning::{LearningEngine, LearningError};
+use die_learning::{EventCategory, LearningEngine, LearningError, LearningEvent};
 use serde::Serialize;
 use tracing::info;
 
@@ -170,15 +170,6 @@ impl LearningFacade {
         Ok(Self::new(LearningEngine::new(), Timeline::in_memory()?))
     }
 
-    /// Mutable access to the underlying engine, for observation wiring and
-    /// Focus/category control (`observe`, `pause`/`resume`, `disable_category`).
-    ///
-    /// `accept`/`dismiss` MUST go through the facade (not the engine directly)
-    /// so the timeline record and tombstone semantics are applied.
-    pub fn engine_mut(&mut self) -> &mut LearningEngine {
-        &mut self.engine
-    }
-
     /// Whether Focus mode is active (the engine is paused).
     ///
     /// # Examples
@@ -302,6 +293,82 @@ impl LearningFacade {
             tombstoned: true,
         })
     }
+
+    // ── SVC-5-R2-2: narrow facade methods (replace the engine_mut escape) ──
+    //
+    // Round 1 exposed `engine_mut() -> &mut LearningEngine`, letting any
+    // caller reach `accept_pattern` / `dismiss_pattern` directly and skip
+    // the facade's tombstone + timeline contract. The escape is removed and
+    // replaced with these narrow public methods. The only public mutation
+    // paths now are:
+    //
+    //   - `observe`            (record an event — safe; just appends)
+    //   - `disable_category` / `enable_category` (category control — safe)
+    //   - `run_detection`      (compute patterns — safe; pure analysis)
+    //   - `accept` / `dismiss` (facade-gated — applies tombstone + timeline)
+    //   - `enter_focus` / `leave_focus` (Focus arming, called from the
+    //      shared mode/facade coordinator — see services::mode)
+    //
+    // No public method returns a `&mut LearningEngine`, so reaching the raw
+    // `accept_pattern` / `dismiss_pattern` from outside this module is now
+    // a compile error. That is the boundary half of the SVC-5 fix — the
+    // arming half lives in `services::mode::apply_focus_from_modes`.
+
+    /// Record an observation for pattern detection. Returns any patterns
+    /// the engine detected synchronously off the new event (the engine may
+    /// run incremental detection as observations arrive).
+    ///
+    /// Production observation pipeline goes here. The engine's category
+    /// gate (set via [`disable_category`](Self::disable_category)) rejects
+    /// events of a disabled category at the call site — this is the
+    /// observation-only gating Wave 1 shipped; suggestion-level
+    /// retro-filtering of patterns formed before a category was disabled
+    /// is deferred (Phase 3B.0a/3B.1; see PROGRESS.md).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LearningError`] if the engine rejects the event (e.g. the
+    /// category is disabled).
+    pub fn observe(
+        &mut self,
+        event: LearningEvent,
+    ) -> Result<Vec<TrackedPattern>, LearningError> {
+        self.engine.observe(event)
+    }
+
+    /// Disable a category. Subsequent calls to [`observe`](Self::observe)
+    /// for that category are rejected.
+    pub fn disable_category(&mut self, category: EventCategory) {
+        self.engine.disable_category(category);
+    }
+
+    /// Re-enable a previously-disabled category.
+    pub fn enable_category(&mut self, category: EventCategory) {
+        self.engine.enable_category(category);
+    }
+
+    /// Run pattern detection over the observation buffer.
+    ///
+    /// Production code calls this periodically (e.g. from a daemon tick);
+    /// tests call it synchronously after seeding observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LearningError`] on engine failure.
+    pub fn run_detection(&mut self) -> Result<Vec<TrackedPattern>, LearningError> {
+        self.engine.run_detection()
+    }
+
+    /// Test-only: look up the [`PatternStage`] of a pattern by id.
+    ///
+    /// Domain tests use this to assert state transitions; the production
+    /// surface intentionally has no engine-internals accessor (callers
+    /// consume [`list_suggestions`](Self::list_suggestions) instead).
+    #[cfg(test)]
+    #[must_use]
+    pub fn pattern_stage(&self, id: &str) -> Option<PatternStage> {
+        self.engine.get_pattern(id).map(|p| p.stage)
+    }
 }
 
 #[cfg(test)]
@@ -317,13 +384,13 @@ mod tests {
     fn seeded() -> (LearningFacade, String) {
         let mut facade = LearningFacade::in_memory().unwrap();
         for i in 0..10 {
-            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+            let _ = facade.observe(LearningEvent::at_time(
                 EventCategory::AppLaunch,
                 "firefox",
                 None,
                 i * 100,
             ));
-            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+            let _ = facade.observe(LearningEvent::at_time(
                 EventCategory::AppLaunch,
                 "code",
                 None,
@@ -331,7 +398,6 @@ mod tests {
             ));
         }
         let detected = facade
-            .engine_mut()
             .run_detection()
             .expect("firefox→code repetition must yield a significant pattern");
         assert!(!detected.is_empty(), "seed recipe failed to produce a pattern");
@@ -357,7 +423,7 @@ mod tests {
         );
         // Engine state reflects the transition.
         assert_eq!(
-            facade.engine_mut().get_pattern(&id).unwrap().stage,
+            facade.pattern_stage(&id).unwrap(),
             PatternStage::Practicing
         );
     }
@@ -369,7 +435,7 @@ mod tests {
         assert_eq!(result.suggestion_id, id);
         assert!(result.tombstoned);
         assert_eq!(
-            facade.engine_mut().get_pattern(&id).unwrap().stage,
+            facade.pattern_stage(&id).unwrap(),
             PatternStage::Dismissed
         );
     }
@@ -383,11 +449,11 @@ mod tests {
         let (mut facade_d, id_d) = seeded();
         facade_d.dismiss(&id_d).unwrap();
         assert_eq!(
-            facade_a.engine_mut().get_pattern(&id_a).unwrap().stage,
+            facade_a.pattern_stage(&id_a).unwrap(),
             PatternStage::Practicing
         );
         assert_eq!(
-            facade_d.engine_mut().get_pattern(&id_d).unwrap().stage,
+            facade_d.pattern_stage(&id_d).unwrap(),
             PatternStage::Dismissed
         );
     }
@@ -409,7 +475,7 @@ mod tests {
         assert!(matches!(facade.accept(&id), Err(LearningFacadeError::FocusMode)));
         // The suggestion is untouched (still Proposed).
         assert_eq!(
-            facade.engine_mut().get_pattern(&id).unwrap().stage,
+            facade.pattern_stage(&id).unwrap(),
             PatternStage::Proposed
         );
     }
@@ -421,7 +487,7 @@ mod tests {
         let result = facade.dismiss(&id).unwrap();
         assert!(result.tombstoned);
         assert_eq!(
-            facade.engine_mut().get_pattern(&id).unwrap().stage,
+            facade.pattern_stage(&id).unwrap(),
             PatternStage::Dismissed
         );
     }
@@ -448,20 +514,20 @@ mod tests {
         // detection pass assigns new ids, but the tombstone (keyed on
         // description) must keep it out of the surfaced list.
         for i in 0..10 {
-            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+            let _ = facade.observe(LearningEvent::at_time(
                 EventCategory::AppLaunch,
                 "firefox",
                 None,
                 1000 + i * 100,
             ));
-            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+            let _ = facade.observe(LearningEvent::at_time(
                 EventCategory::AppLaunch,
                 "code",
                 None,
                 1000 + i * 100 + 10,
             ));
         }
-        let _ = facade.engine_mut().run_detection();
+        let _ = facade.run_detection();
         assert!(
             facade.list_suggestions().iter().all(|s| s.description != desc),
             "a tombstoned pattern (desc={desc:?}) was re-proposed"
@@ -474,8 +540,8 @@ mod tests {
         // disabled category are rejected, so no pattern (hence no suggestion)
         // can form from them.
         let mut facade = LearningFacade::in_memory().unwrap();
-        facade.engine_mut().disable_category(EventCategory::FileAccess);
-        let rejected = facade.engine_mut().observe(LearningEvent::new(
+        facade.disable_category(EventCategory::FileAccess);
+        let rejected = facade.observe(LearningEvent::new(
             EventCategory::FileAccess,
             "/secret/path",
             None,

@@ -67,13 +67,13 @@ impl InferenceService {
         max_tokens: u32,
         sensitive: bool,
     ) -> zbus::fdo::Result<(String, String, String)> {
+        crate::limits::ensure_within(&prompt, crate::limits::MAX_STRING_BYTES, "prompt")?;
         info!(
             prompt_len = prompt.len(),
             max_tokens,
             sensitive,
             "D-Bus inference query"
         );
-        crate::limits::ensure_within(&prompt, crate::limits::MAX_STRING_BYTES, "prompt")?;
 
         let router = self.router.read().await;
         let req = InferenceRequest {
@@ -110,5 +110,17 @@ mod tests {
     fn service_creation() {
         let router = Arc::new(RwLock::new(Router::new()));
         let _svc = InferenceService::new(router);
+    }
+
+    /// SVC-6-R2-3: `query(prompt)` is capped at the boundary BEFORE info!()
+    /// logs `prompt_len`.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = InferenceService::new(Arc::new(RwLock::new(Router::new())));
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        assert!(matches!(
+            svc.query(oversize, 16, false).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

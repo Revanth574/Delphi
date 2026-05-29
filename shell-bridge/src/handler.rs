@@ -324,6 +324,14 @@ impl Handler {
 
         let mut modes = self.modes.write().await;
         modes.insert(window_id, mode.clone());
+        // SVC-5-R2-1: arm the learning facade inside the same mode-lock
+        // critical section that updated the mode map. The shell-bridge and
+        // the D-Bus ModeService both route mode changes through the shared
+        // helper so a Focus transition arrives at the facade no matter which
+        // transport carried the request.
+        if let Err(msg) = delphi_services::mode::apply_focus_from_modes(&modes, &self.learning) {
+            return Response::err(id, -32603, &format!("internal: {msg}"));
+        }
 
         Response::ok(id, serde_json::json!({ "mode": mode }))
     }
@@ -726,20 +734,20 @@ mod tests {
         // firefox→code recipe; see die_orchestrator::learning tests).
         let mut facade = LearningFacade::in_memory().unwrap();
         for i in 0..10 {
-            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+            let _ = facade.observe(LearningEvent::at_time(
                 EventCategory::AppLaunch,
                 "firefox",
                 None,
                 i * 100,
             ));
-            let _ = facade.engine_mut().observe(LearningEvent::at_time(
+            let _ = facade.observe(LearningEvent::at_time(
                 EventCategory::AppLaunch,
                 "code",
                 None,
                 i * 100 + 10,
             ));
         }
-        let _ = facade.engine_mut().run_detection();
+        let _ = facade.run_detection();
         let suggestion_id = facade
             .list_suggestions()
             .first()
@@ -772,6 +780,114 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("tl-")
+        );
+    }
+
+    /// SVC-5-R2-1 cross-transport integration: a Focus mode-change must arm
+    /// the [`LearningFacade`] regardless of *which* transport carried the
+    /// request. This drives Focus via the shell-bridge `handle_mode_set`
+    /// path and clears it via the D-Bus `ModeService::set_mode` path against
+    /// the SAME shared facade and modes Arcs.
+    ///
+    /// **This is the RED→GREEN proof** for SVC-5-R2-1. Pre-round-2, the
+    /// transports only called `modes.insert(...)` and the facade stayed
+    /// disarmed; the `focus_active() / list_suggestions().is_empty() /
+    /// accept → FocusMode` assertions all failed because the gate, though
+    /// implemented, was never wired up. Post-round-2 both transports route
+    /// the mode change through `apply_focus_from_modes` and the facade
+    /// arms/disarms in lock-step with the mode map.
+    #[tokio::test]
+    async fn focus_arms_facade_through_both_transports() {
+        use delphi_services::mode::ModeService;
+        use die_learning::{EventCategory, LearningEvent};
+        use die_orchestrator::learning::LearningFacadeError;
+
+        // Seed a Proposed suggestion (firefox→code recipe).
+        let mut facade = LearningFacade::in_memory().unwrap();
+        for i in 0..10 {
+            let _ = facade.observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "firefox",
+                None,
+                i * 100,
+            ));
+            let _ = facade.observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "code",
+                None,
+                i * 100 + 10,
+            ));
+        }
+        let _ = facade.run_detection();
+        let suggestion_id = facade
+            .list_suggestions()
+            .first()
+            .expect("seed must produce a pending suggestion")
+            .id
+            .clone();
+
+        // Shared state for both transports.
+        let modes = Arc::new(RwLock::new(HashMap::<String, String>::new()));
+        let facade_arc = Arc::new(Mutex::new(facade));
+
+        let handler = Handler::new(
+            Arc::new(RwLock::new(Router::new())),
+            Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
+            modes.clone(),
+            Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
+            facade_arc.clone(),
+        );
+        let mode_svc = ModeService::new(modes.clone(), facade_arc.clone());
+
+        // Sanity: facade starts disarmed and the seeded suggestion is listed.
+        assert!(!facade_arc.lock().unwrap().focus_active());
+        assert!(!facade_arc.lock().unwrap().list_suggestions().is_empty());
+
+        // ── Path 1: arm Focus via the shell-bridge (WebSocket) handler ──
+        let focus_req = Request {
+            id: 100,
+            method: "mode.set".to_string(),
+            params: serde_json::json!({ "window_id": "win-1", "mode": "Focus" }),
+        };
+        let focus_resp = handler.dispatch(focus_req).await;
+        assert!(
+            focus_resp.error.is_none(),
+            "handler mode.set failed: {:?}",
+            focus_resp.error
+        );
+
+        assert!(
+            facade_arc.lock().unwrap().focus_active(),
+            "shell-bridge mode.set(\"Focus\") must arm the facade (SVC-5-R2-1)"
+        );
+        assert!(
+            facade_arc.lock().unwrap().list_suggestions().is_empty(),
+            "armed facade must filter all suggestions"
+        );
+        let accept_err = facade_arc.lock().unwrap().accept(&suggestion_id);
+        assert!(
+            matches!(accept_err, Err(LearningFacadeError::FocusMode)),
+            "armed facade must reject accept with FocusMode; got: {accept_err:?}"
+        );
+
+        // ── Path 2: clear Focus via the D-Bus ModeService ──────────────
+        mode_svc
+            .set_mode("win-1".to_string(), "Direct".to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            !facade_arc.lock().unwrap().focus_active(),
+            "ModeService::set_mode(\"Direct\") must disarm the facade (SVC-5-R2-1)"
+        );
+        assert!(
+            facade_arc
+                .lock()
+                .unwrap()
+                .list_suggestions()
+                .iter()
+                .any(|s| s.id == suggestion_id),
+            "disarmed facade must surface the seeded suggestion again"
         );
     }
 

@@ -110,9 +110,16 @@ impl GoalsService {
         parent_id: i64,
         deadline_rfc3339: String,
     ) -> zbus::fdo::Result<i64> {
-        info!(title = %title, priority = %priority, "D-Bus create_goal");
+        // SVC-6-R2-3: cap every String param BEFORE any info!()/parse/store.
         crate::limits::ensure_within(&title, crate::limits::MAX_STRING_BYTES, "title")?;
         crate::limits::ensure_within(&description, crate::limits::MAX_STRING_BYTES, "description")?;
+        crate::limits::ensure_within(&priority, crate::limits::MAX_STRING_BYTES, "priority")?;
+        crate::limits::ensure_within(
+            &deadline_rfc3339,
+            crate::limits::MAX_STRING_BYTES,
+            "deadline_rfc3339",
+        )?;
+        info!(title = %title, priority = %priority, "D-Bus create_goal");
         let priority = Priority::from_str(&priority)
             .map_err(|e| crate::error::map_orchestrator("create goal", e))?;
         let parent = if parent_id == NO_PARENT {
@@ -159,8 +166,8 @@ impl GoalsService {
     ///
     /// An empty object `{}` is a valid no-op patch.
     async fn update_goal(&self, id: i64, patch_json: String) -> zbus::fdo::Result<()> {
-        info!(goal_id = id, "D-Bus update_goal");
         crate::limits::ensure_within(&patch_json, crate::limits::MAX_STRING_BYTES, "patch_json")?;
+        info!(goal_id = id, "D-Bus update_goal");
         let patch = GoalPatch::from_json(&patch_json)
             .map_err(|e| crate::error::map_orchestrator("update goal", e))?;
         let store = self
@@ -895,5 +902,68 @@ mod tests {
         // `InvalidArgs("goal not found")` — no id / existence-oracle leak.
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
         assert!(err.to_string().ends_with("goal not found"), "got: {err}");
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped *before* logging,
+    /// parsing, or storage. Enumerates the full surface of [`GoalsService`].
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = mk_svc();
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // create_goal(title, description, priority, parent_id, deadline_rfc3339)
+        assert!(matches!(
+            svc.create_goal(
+                oversize.clone(),
+                String::new(),
+                "low".to_string(),
+                0,
+                String::new()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.create_goal(
+                "t".to_string(),
+                oversize.clone(),
+                "low".to_string(),
+                0,
+                String::new()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.create_goal(
+                "t".to_string(),
+                String::new(),
+                oversize.clone(),
+                0,
+                String::new()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.create_goal(
+                "t".to_string(),
+                String::new(),
+                "low".to_string(),
+                0,
+                oversize.clone()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // update_goal(id, patch_json)
+        assert!(matches!(
+            svc.update_goal(1, oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

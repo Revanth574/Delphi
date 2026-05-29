@@ -181,6 +181,9 @@ impl EnvironmentService {
     /// `key` must be either `"ssid:<name>"` or `"wired:true"`.
     /// Returns `true` on success.
     async fn set_location_label(&self, key: String, label: String) -> zbus::fdo::Result<bool> {
+        // SVC-6-R2-3: cap BEFORE info!()/validation/store.
+        crate::limits::ensure_within(&key, crate::limits::MAX_STRING_BYTES, "key")?;
+        crate::limits::ensure_within(&label, crate::limits::MAX_STRING_BYTES, "label")?;
         info!(key = %key, label = %label, "D-Bus set_location_label");
         let mut monitor = self
             .monitor
@@ -196,6 +199,7 @@ impl EnvironmentService {
     ///
     /// Returns `true` if the key existed, `false` otherwise.
     async fn remove_location_label(&self, key: String) -> zbus::fdo::Result<bool> {
+        crate::limits::ensure_within(&key, crate::limits::MAX_STRING_BYTES, "key")?;
         info!(key = %key, "D-Bus remove_location_label");
         let mut monitor = self
             .monitor
@@ -612,5 +616,59 @@ mod tests {
             .await
             .unwrap();
         assert!(json.contains(r#""activity":"meeting""#));
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
+    /// The 6 `get_*` methods take `activity_obs_json` which is capped inside
+    /// `parse_activity_observations`; the set/remove_location_label methods
+    /// cap their `key` and `label` directly.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = mk_svc_rich();
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // The 6 get_* methods all take `activity_obs_json: String`.
+        assert!(matches!(
+            svc.get_state(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.get_battery(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.get_thermal(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.get_memory(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.get_time_context(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.get_location(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // set_location_label(key, label) — each String position.
+        assert!(matches!(
+            svc.set_location_label(oversize.clone(), "label".to_string())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.set_location_label("ssid:home".to_string(), oversize.clone())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // remove_location_label(key)
+        assert!(matches!(
+            svc.remove_location_label(oversize).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

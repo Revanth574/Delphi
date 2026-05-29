@@ -54,8 +54,9 @@ impl ConversationService {
     ///
     /// Pass an empty string for `title` to leave it untitled.
     async fn start_conversation(&self, title: String) -> zbus::fdo::Result<String> {
-        info!(title = %title, "D-Bus start_conversation");
+        // SVC-6-R2-3: cap BEFORE info!()/parse/store.
         crate::limits::ensure_within(&title, crate::limits::MAX_STRING_BYTES, "title")?;
+        info!(title = %title, "D-Bus start_conversation");
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
@@ -75,6 +76,13 @@ impl ConversationService {
         role: String,
         content: String,
     ) -> zbus::fdo::Result<String> {
+        // SVC-6-R2-3: cap every String param BEFORE any parse/store.
+        crate::limits::ensure_within(
+            &conversation_id,
+            crate::limits::MAX_STRING_BYTES,
+            "conversation_id",
+        )?;
+        crate::limits::ensure_within(&role, crate::limits::MAX_STRING_BYTES, "role")?;
         crate::limits::ensure_within(&content, crate::limits::MAX_STRING_BYTES, "content")?;
         let role = MessageRole::from_str(&role)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
@@ -92,6 +100,11 @@ impl ConversationService {
         conversation_id: String,
         limit: u32,
     ) -> zbus::fdo::Result<String> {
+        crate::limits::ensure_within(
+            &conversation_id,
+            crate::limits::MAX_STRING_BYTES,
+            "conversation_id",
+        )?;
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
@@ -116,8 +129,8 @@ impl ConversationService {
 
     /// Full-text search across all stored messages.
     async fn search(&self, query: String, limit: u32) -> zbus::fdo::Result<String> {
-        info!(query = %query, "D-Bus conversation search");
         crate::limits::ensure_within(&query, crate::limits::MAX_STRING_BYTES, "query")?;
+        info!(query = %query, "D-Bus conversation search");
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
@@ -179,8 +192,8 @@ impl ConversationService {
     /// Delete all messages matching the given topic via FTS.
     /// Returns the number of messages deleted.
     async fn forget_topic(&self, topic: String) -> zbus::fdo::Result<u32> {
-        info!(topic = %topic, "D-Bus forget_topic");
         crate::limits::ensure_within(&topic, crate::limits::MAX_STRING_BYTES, "topic")?;
+        info!(topic = %topic, "D-Bus forget_topic");
         let store = self.store.lock().map_err(|e| {
             zbus::fdo::Error::Failed(format!("lock poisoned: {e}"))
         })?;
@@ -335,5 +348,53 @@ mod tests {
         // 0 days ≡ delete nothing (timestamps must be <cutoff, and cutoff=now).
         let deleted = svc.forget_older_than(0).await.unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped *before* logging,
+    /// parsing, or storage. Enumerates the full surface of [`ConversationService`].
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = mk_svc();
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // start_conversation(title)
+        assert!(matches!(
+            svc.start_conversation(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // add_message(conversation_id, role, content) — each String position.
+        assert!(matches!(
+            svc.add_message(oversize.clone(), "user".to_string(), "c".to_string())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.add_message("c1".to_string(), oversize.clone(), "c".to_string())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.add_message("c1".to_string(), "user".to_string(), oversize.clone())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // recent_messages(conversation_id)
+        assert!(matches!(
+            svc.recent_messages(oversize.clone(), 10).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // search(query)
+        assert!(matches!(
+            svc.search(oversize.clone(), 10).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // forget_topic(topic)
+        assert!(matches!(
+            svc.forget_topic(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

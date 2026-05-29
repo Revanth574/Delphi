@@ -91,6 +91,7 @@ impl TimelineService {
     ///
     /// Returns the undo command that was executed.
     async fn undo(&self, action_id: String) -> zbus::fdo::Result<String> {
+        crate::limits::ensure_within(&action_id, crate::limits::MAX_STRING_BYTES, "action_id")?;
         info!(action_id = %action_id, "D-Bus undo request");
 
         let tl = self.timeline.lock()
@@ -139,5 +140,17 @@ mod tests {
         let svc = TimelineService::new(tl);
         let count = svc.count().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// SVC-6-R2-3: undo's `action_id` is capped at the boundary.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let tl = Arc::new(Mutex::new(Timeline::in_memory().unwrap()));
+        let svc = TimelineService::new(tl);
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        assert!(matches!(
+            svc.undo(oversize).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

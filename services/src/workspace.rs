@@ -120,8 +120,9 @@ impl WorkspaceService {
         spec_json: String,
         dry_run: bool,
     ) -> zbus::fdo::Result<(String, Vec<String>)> {
-        info!(dry_run, "D-Bus workspace preview");
+        // SVC-6-R2-3: cap BEFORE info!()/parse/store, never after.
         crate::limits::ensure_within(&spec_json, crate::limits::MAX_STRING_BYTES, "spec_json")?;
+        info!(dry_run, "D-Bus workspace preview");
         let spec = parse_spec(&spec_json)?;
         let mgr = self.lock()?;
         let result = mgr.preview(&spec);
@@ -140,8 +141,8 @@ impl WorkspaceService {
     /// Validate, execute, and record a spec. Returns
     /// `(workspace_id, action_timeline_id, status_json)`.
     async fn create(&self, spec_json: String) -> zbus::fdo::Result<(String, String, String)> {
-        info!("D-Bus workspace create");
         crate::limits::ensure_within(&spec_json, crate::limits::MAX_STRING_BYTES, "spec_json")?;
+        info!("D-Bus workspace create");
         let spec = parse_spec(&spec_json)?;
         let mgr = self.lock()?;
         let result = mgr
@@ -160,10 +161,17 @@ impl WorkspaceService {
         root_dir: String,
         params: HashMap<String, String>,
     ) -> zbus::fdo::Result<(String, String, String)> {
-        info!(template_id = %template_id, name = %name, "D-Bus workspace create_from_template");
+        // SVC-6-R2-3: every cap (including the params map) BEFORE info!()/parse/store.
         crate::limits::ensure_within(&template_id, crate::limits::MAX_STRING_BYTES, "template_id")?;
         crate::limits::ensure_within(&name, crate::limits::MAX_STRING_BYTES, "name")?;
         crate::limits::ensure_within(&root_dir, crate::limits::MAX_STRING_BYTES, "root_dir")?;
+        crate::limits::ensure_map_within(
+            &params,
+            crate::limits::MAX_MAP_ENTRIES,
+            crate::limits::MAX_STRING_BYTES,
+            "params",
+        )?;
+        info!(template_id = %template_id, name = %name, "D-Bus workspace create_from_template");
         let tparams = TemplateParams::from_map(&params);
         let mgr = self.lock()?;
         let result = mgr
@@ -188,6 +196,11 @@ impl WorkspaceService {
     /// Undo a recorded workspace creation by its action-timeline id.
     /// Errors if outside the 24-hour window, already undone, or unknown.
     async fn undo(&self, action_timeline_id: String) -> zbus::fdo::Result<()> {
+        crate::limits::ensure_within(
+            &action_timeline_id,
+            crate::limits::MAX_STRING_BYTES,
+            "action_timeline_id",
+        )?;
         info!(action_timeline_id = %action_timeline_id, "D-Bus workspace undo");
         let mgr = self.lock()?;
         mgr.undo(&action_timeline_id)
@@ -452,5 +465,104 @@ mod tests {
             err.to_string().contains("limit"),
             "expected a size-limit error, got: {err}"
         );
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter (and the `params` map) is
+    /// capped at the boundary *before* logging, parsing, or storage.
+    /// Enumerates the full surface of [`WorkspaceService`].
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let allowed = TempDir::new().unwrap();
+        let svc = service(&allowed);
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // preview(spec_json)
+        assert!(matches!(
+            svc.preview(oversize.clone(), false).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // create(spec_json) — already covered above by create_rejects_oversize_spec_json.
+        // create_from_template — each String field
+        assert!(matches!(
+            svc.create_from_template(
+                oversize.clone(),
+                "n".to_string(),
+                "/tmp".to_string(),
+                HashMap::new()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.create_from_template(
+                "research".to_string(),
+                oversize.clone(),
+                "/tmp".to_string(),
+                HashMap::new()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.create_from_template(
+                "research".to_string(),
+                "n".to_string(),
+                oversize.clone(),
+                HashMap::new()
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // create_from_template(params: HashMap) — over the entry-count cap.
+        let too_many: HashMap<String, String> = (0..=crate::limits::MAX_MAP_ENTRIES)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        assert!(matches!(
+            svc.create_from_template(
+                "research".to_string(),
+                "n".to_string(),
+                "/tmp".to_string(),
+                too_many,
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // create_from_template(params: HashMap) — oversize VALUE.
+        let mut big_value = HashMap::new();
+        big_value.insert("k".to_string(), oversize.clone());
+        assert!(matches!(
+            svc.create_from_template(
+                "research".to_string(),
+                "n".to_string(),
+                "/tmp".to_string(),
+                big_value,
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // create_from_template(params: HashMap) — oversize KEY.
+        let mut big_key = HashMap::new();
+        big_key.insert(oversize.clone(), "v".to_string());
+        assert!(matches!(
+            svc.create_from_template(
+                "research".to_string(),
+                "n".to_string(),
+                "/tmp".to_string(),
+                big_key,
+            )
+            .await
+            .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // undo(action_timeline_id)
+        assert!(matches!(
+            svc.undo(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

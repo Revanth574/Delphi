@@ -151,8 +151,8 @@ impl HealthService {
     /// Register a git repo for monitoring. Returns `true` if newly added,
     /// `false` if already present.
     async fn add_watched_repo(&self, path: String) -> zbus::fdo::Result<bool> {
-        info!(path = %path, "D-Bus add_watched_repo");
         crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
+        info!(path = %path, "D-Bus add_watched_repo");
         let mut monitor = self
             .monitor
             .lock()
@@ -165,8 +165,8 @@ impl HealthService {
 
     /// Stop monitoring a git repo. Returns `true` if the path was removed.
     async fn remove_watched_repo(&self, path: String) -> zbus::fdo::Result<bool> {
-        info!(path = %path, "D-Bus remove_watched_repo");
         crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
+        info!(path = %path, "D-Bus remove_watched_repo");
         let mut monitor = self
             .monitor
             .lock()
@@ -180,9 +180,9 @@ impl HealthService {
         host: String,
         purpose: String,
     ) -> zbus::fdo::Result<bool> {
-        info!(host = %host, purpose = %purpose, "D-Bus add_expected_network_destination");
         crate::limits::ensure_within(&host, crate::limits::MAX_STRING_BYTES, "host")?;
         crate::limits::ensure_within(&purpose, crate::limits::MAX_STRING_BYTES, "purpose")?;
+        info!(host = %host, purpose = %purpose, "D-Bus add_expected_network_destination");
         let mut monitor = self
             .monitor
             .lock()
@@ -418,5 +418,36 @@ mod tests {
         // No deadline-related finding should be emitted.
         assert!(!s.contains(r#""severity":"critical""#));
         assert!(!s.contains(r#""severity":"warning""#));
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = mk_svc();
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // add_watched_repo(path)
+        assert!(matches!(
+            svc.add_watched_repo(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // remove_watched_repo(path)
+        assert!(matches!(
+            svc.remove_watched_repo(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // add_expected_network_destination(host, purpose) — each String position.
+        assert!(matches!(
+            svc.add_expected_network_destination(oversize.clone(), "p".to_string())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.add_expected_network_destination("1.2.3.4".to_string(), oversize.clone())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

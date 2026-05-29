@@ -100,6 +100,11 @@ impl LearningService {
     /// Accept a suggestion (`Proposed → Practicing`). Returns a JSON
     /// `AcceptSuggestionResult` (includes the reversible action-timeline id).
     async fn accept_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<String> {
+        crate::limits::ensure_within(
+            &suggestion_id,
+            crate::limits::MAX_STRING_BYTES,
+            "suggestion_id",
+        )?;
         info!(suggestion_id = %suggestion_id, "D-Bus accept_suggestion");
         let result = {
             let mut facade = self.lock()?;
@@ -112,6 +117,11 @@ impl LearningService {
     /// Dismiss a suggestion (`→ Dismissed` + tombstone). Returns a JSON
     /// `DismissSuggestionResult`.
     async fn dismiss_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<String> {
+        crate::limits::ensure_within(
+            &suggestion_id,
+            crate::limits::MAX_STRING_BYTES,
+            "suggestion_id",
+        )?;
         info!(suggestion_id = %suggestion_id, "D-Bus dismiss_suggestion");
         let result = {
             let mut facade = self.lock()?;
@@ -187,5 +197,22 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::Failed(_)));
         assert!(err.to_string().contains("Focus mode"));
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = LearningService::new(Arc::new(Mutex::new(
+            LearningFacade::in_memory().unwrap(),
+        )));
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        assert!(matches!(
+            svc.accept_suggestion(oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.dismiss_suggestion(oversize).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
     }
 }

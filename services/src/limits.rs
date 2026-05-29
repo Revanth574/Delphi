@@ -19,6 +19,12 @@ pub const MAX_STRING_BYTES: usize = 1 << 20; // 1 MiB
 /// legitimately larger than a typical parameter (it can be a whole document).
 pub const MAX_INGEST_TEXT_BYTES: usize = 8 << 20; // 8 MiB
 
+/// Maximum number of entries in a caller-supplied `HashMap<String, String>`
+/// parameter (currently only `workspace.create_from_template`'s `params`).
+/// Bounds both unbounded-allocation DoS and per-entry oversize via
+/// [`ensure_map_within`] (SVC-6-R2-3).
+pub const MAX_MAP_ENTRIES: usize = 256;
+
 /// Reject a caller-supplied string that exceeds `max` bytes, *before* it is
 /// parsed or stored. The error names only the field and the limit — never the
 /// oversized content — so it leaks no caller data across the bus.
@@ -35,6 +41,35 @@ pub(crate) fn ensure_within(
         return Err(zbus::fdo::Error::InvalidArgs(format!(
             "{field} exceeds the {max}-byte limit"
         )));
+    }
+    Ok(())
+}
+
+/// Reject a caller-supplied `HashMap<String, String>` whose cardinality
+/// exceeds `max_entries` or whose keys/values exceed `max_bytes` each
+/// (SVC-6-R2-3). The leak-safe guarantees of [`ensure_within`] extend
+/// transitively: only the field name and the limits are surfaced, never the
+/// rejected key/value content.
+pub(crate) fn ensure_map_within(
+    map: &std::collections::HashMap<String, String>,
+    max_entries: usize,
+    max_bytes: usize,
+    field: &'static str,
+) -> zbus::fdo::Result<()> {
+    if map.len() > max_entries {
+        tracing::warn!(
+            field,
+            entries = map.len(),
+            max_entries,
+            "D-Bus map exceeds entry cap"
+        );
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "{field} exceeds the {max_entries}-entry limit"
+        )));
+    }
+    for (k, v) in map {
+        ensure_within(k, max_bytes, field)?;
+        ensure_within(v, max_bytes, field)?;
     }
     Ok(())
 }

@@ -745,7 +745,14 @@ fn is_unicode_format_character(code: u32) -> bool {
 /// The Mongolian range is deliberately discontinuous: U+180E (between
 /// FVS3 and FVS4) is the Mongolian Vowel Separator, a *format* character
 /// (caught by [`is_unicode_format_character`]), not a variation selector.
-fn is_variation_selector(code: u32) -> bool {
+///
+/// **Shared helper (SVC-7-R3-1).** Promoted to `pub(crate)` so the
+/// `environment` SSID validator rejects the same variation-selector ranges
+/// without a parallel copy — the two validators stay in sync by construction
+/// rather than by discipline. Variation selectors are General_Category = Mn,
+/// so a category sweep would otherwise miss them; both callers check this
+/// explicitly.
+pub(crate) fn is_variation_selector(code: u32) -> bool {
     matches!(code, 0xFE00..=0xFE0F | 0x180B..=0x180D | 0x180F | 0xE0100..=0xE01EF)
 }
 

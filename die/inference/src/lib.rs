@@ -26,7 +26,7 @@ pub mod router;
 pub mod token;
 
 pub use error::InferenceError;
-pub use token::ConfirmationToken;
+pub use token::{ConfirmationToken, ConfirmationTokenWire};
 
 /// An inference request to be routed to the appropriate tier.
 ///
@@ -64,16 +64,17 @@ pub struct InferenceRequest {
     /// instead of sending. After the user reviews the sanitized preview and
     /// accepts, the caller re-issues with this set to the token's wire string.
     ///
-    /// This is the opaque **wire form** of a [`ConfirmationToken`] — a plain
-    /// `String` so this request (and the boundary types it flows through) stay
-    /// `Debug`/`Clone`, and because the token must serialize to a string to
-    /// cross D-Bus / the WebSocket anyway. Forgery resistance is the token's
-    /// HMAC, NOT this field's type: a fabricated string fails the gateway's
+    /// This is the opaque **wire form** of a [`ConfirmationToken`], carried as
+    /// a [`ConfirmationTokenWire`] — a `String` newtype with a redacted `Debug`
+    /// (SVC-1-R1-1-02) so this request (and every boundary type it flows
+    /// through) stays `Debug`/`Clone` without a stray `{:?}` ever persisting
+    /// the live token. Forgery resistance is the token's HMAC, NOT this field's
+    /// type: a fabricated string fails the gateway's
     /// [`verify_token`](crate::egress::CloudEgressGateway::verify_token) and is
     /// treated as "no confirmation" (the query pauses again). It never causes
     /// unsanitized text to be sent — ZKQP applies regardless; a valid token
     /// only overrides the *pause* (Iron Law #1).
-    pub cloud_confirmation_token: Option<String>,
+    pub cloud_confirmation_token: Option<ConfirmationTokenWire>,
 }
 
 /// The outcome of routing an inference request (SVC-1).
@@ -109,12 +110,14 @@ pub struct CloudConfirmation {
     /// The sanitized query the user is being asked to approve sending. Safe
     /// to display: PII is already replaced with placeholders.
     pub sanitized_preview: String,
-    /// Opaque confirmation-token wire string (SVC-1-R1-1). The caller echoes
-    /// this back as [`InferenceRequest::cloud_confirmation_token`] on the
-    /// confirmed retry. It is HMAC-bound to this exact sanitized prompt /
-    /// model / max_tokens and expires shortly, so it cannot be reused for a
-    /// different query or replayed later.
-    pub token: String,
+    /// Opaque confirmation-token wire form (SVC-1-R1-1), carried as a
+    /// [`ConfirmationTokenWire`] with redacted `Debug` (SVC-1-R1-1-02). The
+    /// caller echoes it back as
+    /// [`InferenceRequest::cloud_confirmation_token`] on the confirmed retry.
+    /// It is HMAC-bound to this exact sanitized prompt / model / max_tokens and
+    /// expires shortly, so it cannot be reused for a different query or
+    /// replayed later.
+    pub token: ConfirmationTokenWire,
 }
 
 /// The response from an inference operation.
@@ -180,5 +183,31 @@ mod tests {
     fn inference_tier_equality() {
         assert_eq!(InferenceTier::Local, InferenceTier::Local);
         assert_ne!(InferenceTier::Local, InferenceTier::Cloud);
+    }
+
+    #[test]
+    fn cloud_confirmation_debug_redacts_token() {
+        // SVC-1-R1-1-02: a transitively-carrying boundary type must not leak
+        // the token via its derived Debug. RED against the pre-fix
+        // `token: String` (whose Debug printed the MAC verbatim inside the
+        // CloudConfirmation dump).
+        let mac = "cd".repeat(32);
+        let confirmation = CloudConfirmation {
+            privacy_score: 90,
+            sanitized_preview: "[EMAIL_001]".to_string(),
+            token: ConfirmationTokenWire::new(format!("1700000000:{mac}")),
+        };
+        let debug = format!("{confirmation:?}");
+        assert!(
+            !debug.contains(&mac),
+            "CloudConfirmation Debug leaked the token MAC: {debug}"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "token should render redacted inside CloudConfirmation Debug: {debug}"
+        );
+        // Non-secret decision data is still visible for diagnostics.
+        assert!(debug.contains("90"));
+        assert!(debug.contains("[EMAIL_001]"));
     }
 }

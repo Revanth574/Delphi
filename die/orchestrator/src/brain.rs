@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use die_browser::engine::{BrowserConfig, BrowserEngine};
 use die_inference::router::Router;
-use die_inference::{CloudConfirmation, InferenceRequest, RouteOutcome};
+use die_inference::{CloudConfirmation, ConfirmationTokenWire, InferenceRequest, RouteOutcome};
 
 use crate::OrchestratorError;
 
@@ -281,7 +281,9 @@ impl Brain {
             input: prompt,
             max_tokens,
             sensitive,
-            cloud_confirmation_token,
+            // Wrap the raw wire string into the redacted-Debug newtype
+            // (SVC-1-R1-1-02) as it enters the boundary type.
+            cloud_confirmation_token: cloud_confirmation_token.map(ConfirmationTokenWire::new),
         };
 
         // SVC-1: a cloud query may pause for ZKQP confirmation. Surface that

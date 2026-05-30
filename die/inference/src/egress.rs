@@ -48,7 +48,7 @@ use tracing::{info, warn};
 
 use crate::cloud::{CloudClient, CloudModel, CloudResponse};
 use crate::error::InferenceError;
-use crate::token::{self, ConfirmationToken};
+use crate::token::{self, ConfirmationToken, ConfirmationTokenWire};
 
 /// A prompt that has passed ZKQP sanitization and is cleared for cloud
 /// transmission (SVC-1 capability token).
@@ -107,10 +107,12 @@ pub enum EgressOutcome {
         privacy_score: u32,
         /// The sanitized query for the user to review (PII already replaced).
         sanitized_preview: String,
-        /// Opaque [`ConfirmationToken`] wire string (SVC-1-R1-1). The caller
+        /// Opaque [`ConfirmationToken`] wire form (SVC-1-R1-1), carried as a
+        /// [`ConfirmationTokenWire`] with redacted `Debug` (SVC-1-R1-1-02) so a
+        /// `{:?}` on this outcome can't persist the live token. The caller
         /// echoes it back to approve sending; it is HMAC-bound to this exact
         /// sanitized prompt / model / max_tokens and expires shortly.
-        token_wire: String,
+        token_wire: ConfirmationTokenWire,
     },
 }
 
@@ -189,7 +191,7 @@ impl CloudEgressGateway {
                 return Ok(EgressOutcome::ConfirmationRequired {
                     privacy_score: result.score().total,
                     sanitized_preview: result.sanitized_text().to_string(),
-                    token_wire: fresh.to_wire(),
+                    token_wire: ConfirmationTokenWire::new(fresh.to_wire()),
                 });
             }
         }
@@ -312,7 +314,7 @@ mod tests {
                 assert!(!sanitized_preview.contains("a@a.com"));
                 assert!(!sanitized_preview.contains("e@e.com"));
                 // A token bound to this prompt is supplied for the retry.
-                assert!(!token_wire.is_empty());
+                assert!(!token_wire.as_str().is_empty());
             }
             EgressOutcome::Completed(_) => {
                 panic!("a high-score query must pause, not send")
@@ -357,7 +359,7 @@ mod tests {
         // The GENUINE token for prompt A authorizes the send (errors only on
         // the empty key, proving it reached the capability-gated client).
         let err = gw
-            .complete(prompt_a, 64, CloudModel::ClaudeSonnet, Some(&token_a))
+            .complete(prompt_a, 64, CloudModel::ClaudeSonnet, Some(token_a.as_str()))
             .await
             .expect_err("valid token + empty key must attempt send and error");
         assert!(err.to_string().contains("no API key"), "got: {err}");
@@ -372,7 +374,7 @@ mod tests {
         // surrounding words, changing the sanitized text.
         let prompt_b = "URGENT please notify a@a.com b@b.com c@c.com d@d.com e@e.com today";
         match gw
-            .complete(prompt_b, 64, CloudModel::ClaudeSonnet, Some(&token_a))
+            .complete(prompt_b, 64, CloudModel::ClaudeSonnet, Some(token_a.as_str()))
             .await
             .unwrap()
         {

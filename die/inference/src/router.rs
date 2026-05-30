@@ -386,7 +386,7 @@ impl Router {
                 &req.input,
                 req.max_tokens,
                 model,
-                req.cloud_confirmation_token.as_deref(),
+                req.cloud_confirmation_token.as_ref().map(|t| t.as_str()),
             )
             .await?
         {

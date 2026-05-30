@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use die_inference::router::Router;
-use die_inference::{InferenceRequest, RouteOutcome};
+use die_inference::{ConfirmationTokenWire, InferenceRequest, RouteOutcome};
 use die_orchestrator::timeline::Timeline;
 use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
 use semantic_fs::indexer::Indexer;
@@ -209,7 +209,9 @@ impl Handler {
             .get("cloud_confirmation_token")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(str::to_string);
+            // Wrap into the redacted-Debug newtype (SVC-1-R1-1-02) at the
+            // boundary, so the live token never sits in a bare String field.
+            .map(|s| ConfirmationTokenWire::new(s.to_string()));
 
         let router = self.router.read().await;
         let req = InferenceRequest {
@@ -238,7 +240,8 @@ impl Handler {
                     "status": "confirmation_required",
                     "privacy_score": c.privacy_score,
                     "sanitized_preview": c.sanitized_preview,
-                    "token": c.token,
+                    // Explicit transport read of the redacted-Debug newtype.
+                    "token": c.token.as_str(),
                 }),
             ),
             Err(e) => Response::err(id, -1, &e.to_string()),

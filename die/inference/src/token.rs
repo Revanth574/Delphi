@@ -115,6 +115,59 @@ impl ConfirmationToken {
     }
 }
 
+/// The opaque **wire form** of a confirmation token as it crosses process
+/// boundaries (D-Bus / WebSocket) and flows through the boundary types
+/// ([`InferenceRequest`](crate::InferenceRequest),
+/// [`CloudConfirmation`](crate::CloudConfirmation),
+/// [`RouteOutcome`](crate::RouteOutcome),
+/// [`EgressOutcome`](crate::egress::EgressOutcome)).
+///
+/// # Why this is a newtype, not a `String` (SVC-1-R1-1-02)
+///
+/// Those boundary types derive `Debug` for diagnostics. If the token were a
+/// bare `String`, a single accidental `{:?}` anywhere in the type graph would
+/// persist a live bearer credential to a log. Codex round-2 finding
+/// SVC-1-R1-1-02 (P2-low) flagged this. The fix is structural, not
+/// convention-based: this newtype carries a **redacted** [`Debug`] impl, so
+/// every type that transitively contains it inherits redaction for free via
+/// its derived `Debug` — no per-site discipline required.
+///
+/// It has no `Display` and no `Deref`: the ONLY way to read the underlying
+/// wire string is the explicit [`as_str`](Self::as_str), which makes every
+/// genuine transport-serialization site greppable and prevents a stray
+/// format-arg or auto-deref from leaking the token.
+///
+/// This is leak resistance; forgery resistance remains the HMAC on the
+/// in-process [`ConfirmationToken`].
+#[derive(Clone)]
+pub struct ConfirmationTokenWire(String);
+
+impl ConfirmationTokenWire {
+    /// Wrap a wire string — e.g. one parsed from a D-Bus / WebSocket parameter,
+    /// or minted via [`ConfirmationToken::to_wire`].
+    #[must_use]
+    pub fn new(wire: String) -> Self {
+        Self(wire)
+    }
+
+    /// Borrow the underlying wire string for transport serialization. The sole
+    /// read path (no `Display`/`Deref`), so transport sites are auditable by
+    /// grepping for `.as_str()` and the redacted `Debug` cannot be bypassed.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ConfirmationTokenWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SVC-1-R1-1-02: never render the wire string (it contains the live
+        // MAC). Any `{:?}` on a transitively-carrying boundary type prints this
+        // redaction instead of the token.
+        f.write_str("ConfirmationTokenWire(<redacted>)")
+    }
+}
+
 /// Build the keyed, field-fed HMAC for the bound tuple, ready to `finalize`
 /// (issue) or `verify_slice` (verify). The variable-length sanitized text is
 /// length-prefixed so no concatenation ambiguity exists between fields.
@@ -192,6 +245,26 @@ mod tests {
         assert!(ConfirmationToken::from_wire("123:abcd").is_none());
         // Non-hex MAC.
         assert!(ConfirmationToken::from_wire(&format!("123:{}", "zz".repeat(32))).is_none());
+    }
+
+    #[test]
+    fn wire_debug_is_redacted_but_as_str_is_intact() {
+        // SVC-1-R1-1-02: the MAC must never appear in Debug output, yet the
+        // real wire string must remain readable for transport. RED against the
+        // pre-fix bare `String` token (whose Debug printed the MAC verbatim).
+        let mac = "ab".repeat(32);
+        let wire = ConfirmationTokenWire::new(format!("1700000000:{mac}"));
+        let debug = format!("{wire:?}");
+        assert!(
+            !debug.contains(&mac),
+            "Debug leaked the MAC: {debug}"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "Debug should mark the value redacted: {debug}"
+        );
+        // The transport read path still yields the genuine wire string.
+        assert_eq!(wire.as_str(), format!("1700000000:{mac}"));
     }
 
     #[test]

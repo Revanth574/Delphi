@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use die_inference::router::Router;
-use die_inference::{InferenceRequest, RouteOutcome};
+use die_inference::{ConfirmationTokenWire, InferenceRequest, RouteOutcome};
 
 /// D-Bus object path for the Inference interface.
 pub const PATH: &str = "/org/delphi/Inference";
@@ -106,11 +106,12 @@ impl InferenceService {
             input: prompt,
             max_tokens,
             sensitive,
-            // Empty string -> None (no confirmation presented).
+            // Empty string -> None (no confirmation presented). Wrap into the
+            // redacted-Debug newtype (SVC-1-R1-1-02) at the boundary.
             cloud_confirmation_token: if cloud_confirmation_token.is_empty() {
                 None
             } else {
-                Some(cloud_confirmation_token)
+                Some(ConfirmationTokenWire::new(cloud_confirmation_token))
             },
         };
 
@@ -129,7 +130,8 @@ impl InferenceService {
                 "status": "confirmation_required",
                 "privacy_score": c.privacy_score,
                 "sanitized_preview": c.sanitized_preview,
-                "token": c.token,
+                // Explicit transport read of the redacted-Debug newtype.
+                "token": c.token.as_str(),
             }),
         };
         serde_json::to_string(&json)

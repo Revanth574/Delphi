@@ -89,10 +89,12 @@ pub struct BrainResponse {
     /// The URL fetched for augmentation, if any.
     pub web_url: Option<String>,
     /// `Some` when the cloud query's ZKQP privacy score required user
-    /// confirmation before sending (SVC-1). Carries the score and the
-    /// sanitized preview; nothing was sent. The caller shows the preview and,
-    /// on acceptance, re-issues `query` with `cloud_confirmed = true`. `None`
-    /// for completed (local or sent-and-restored) responses.
+    /// confirmation before sending (SVC-1). Carries the score, the sanitized
+    /// preview, and an opaque confirmation token (SVC-1-R1-1); nothing was
+    /// sent. The caller shows the preview and, on acceptance, re-issues `query`
+    /// with `cloud_confirmation_token` set to the `CloudConfirmation`'s `token`
+    /// wire string. `None` for completed (local or sent-and-restored)
+    /// responses.
     pub cloud_confirmation: Option<CloudConfirmation>,
 }
 
@@ -224,7 +226,7 @@ impl Brain {
     /// # use tokio::sync::RwLock;
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let brain = Brain::new(Arc::new(RwLock::new(Router::new())));
-    /// let response = brain.query("What is Rust?", 256, false, false).await;
+    /// let response = brain.query("What is Rust?", 256, false, None).await;
     /// # });
     /// ```
     pub async fn query(
@@ -232,7 +234,7 @@ impl Brain {
         input: &str,
         max_tokens: u32,
         sensitive: bool,
-        cloud_confirmed: bool,
+        cloud_confirmation_token: Option<String>,
     ) -> Result<BrainResponse, OrchestratorError> {
         let needs_web = self.needs_web_access(input);
         let mut web_context: Option<String> = None;
@@ -268,11 +270,18 @@ impl Brain {
 
         // Route through inference
         let router = self.router.read().await;
+        // SVC-1-R1-1: the confirmation token must be bound to the FULL prompt
+        // that is actually routed (including any web-augmentation context). If
+        // the brain re-augments with different context on a retry, the token
+        // issued for the previous augmented prompt will not verify against the
+        // new sanitized text — the gateway re-pauses with a fresh token. The
+        // brain therefore simply forwards the caller's token; it never caches
+        // or rebinds one across differing augmented prompts.
         let req = InferenceRequest {
             input: prompt,
             max_tokens,
             sensitive,
-            cloud_confirmed,
+            cloud_confirmation_token,
         };
 
         // SVC-1: a cloud query may pause for ZKQP confirmation. Surface that
@@ -491,7 +500,7 @@ mod tests {
     async fn brain_query_no_backends() {
         let router = Arc::new(RwLock::new(Router::new()));
         let brain = Brain::new(router);
-        let result = brain.query("hello", 256, false, false).await;
+        let result = brain.query("hello", 256, false, None).await;
         // Should fail because no inference backends
         assert!(result.is_err());
     }

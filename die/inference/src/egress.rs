@@ -42,10 +42,13 @@
 //! long-lived struct, never logs, and cannot outlive the single request.
 
 use fortress::zkqp::QuerySanitizer;
+use hmac::Mac;
+use rand::RngCore;
 use tracing::{info, warn};
 
 use crate::cloud::{CloudClient, CloudModel, CloudResponse};
 use crate::error::InferenceError;
+use crate::token::{self, ConfirmationToken};
 
 /// A prompt that has passed ZKQP sanitization and is cleared for cloud
 /// transmission (SVC-1 capability token).
@@ -83,6 +86,11 @@ impl SanitizedPrompt {
 pub struct CloudEgressGateway {
     client: CloudClient,
     sanitizer: QuerySanitizer,
+    /// Ephemeral per-gateway HMAC key for [`ConfirmationToken`]s (SVC-1-R1-1).
+    /// Generated once at construction, never exposed. Only this gateway can
+    /// mint or verify a token, so a caller cannot forge consent. Rotating it
+    /// (gateway reconstruction) simply invalidates any outstanding token.
+    token_key: [u8; 32],
 }
 
 /// The result of an egress attempt.
@@ -99,6 +107,10 @@ pub enum EgressOutcome {
         privacy_score: u32,
         /// The sanitized query for the user to review (PII already replaced).
         sanitized_preview: String,
+        /// Opaque [`ConfirmationToken`] wire string (SVC-1-R1-1). The caller
+        /// echoes it back to approve sending; it is HMAC-bound to this exact
+        /// sanitized prompt / model / max_tokens and expires shortly.
+        token_wire: String,
     },
 }
 
@@ -107,9 +119,12 @@ impl CloudEgressGateway {
     /// default [`QuerySanitizer`].
     #[must_use]
     pub fn new(api_key: String) -> Self {
+        let mut token_key = [0u8; 32];
+        rand::rng().fill_bytes(&mut token_key);
         Self {
             client: CloudClient::new(api_key),
             sanitizer: QuerySanitizer::new(),
+            token_key,
         }
     }
 
@@ -120,14 +135,20 @@ impl CloudEgressGateway {
     }
 
     /// Sanitize `raw_prompt`, send it to the cloud (unless a high privacy
-    /// score requires confirmation the caller has not yet given), and restore
-    /// PII placeholders in the response — the ONLY public cloud-egress path.
+    /// score requires confirmation the caller has not yet supplied a valid
+    /// token for), and restore PII placeholders in the response — the ONLY
+    /// public cloud-egress path.
     ///
-    /// - If the privacy score is too high and `confirmed == false`, returns
-    ///   [`EgressOutcome::ConfirmationRequired`] WITHOUT sending; the PII
-    ///   mapping is dropped at function exit and never spans the user round
-    ///   trip. On the user's accept, the caller re-issues with
-    ///   `confirmed == true`, which re-sanitizes deterministically and sends.
+    /// `confirmation_token_wire` is the opaque wire string the caller echoes
+    /// back from a prior [`EgressOutcome::ConfirmationRequired`] (SVC-1-R1-1).
+    ///
+    /// - If the privacy score is too high and no VALID token is presented,
+    ///   returns [`EgressOutcome::ConfirmationRequired`] WITHOUT sending,
+    ///   carrying a freshly-issued token bound to this sanitized prompt. The
+    ///   PII mapping is dropped at function exit and never spans the user
+    ///   round trip. A token verifies only if the gateway issued it for this
+    ///   exact sanitized prompt / model / max_tokens and it has not expired;
+    ///   an edited prompt or a forged/expired token fails and re-pauses.
     /// - Otherwise sends the sanitized text via the capability-gated
     ///   [`CloudClient::complete`](crate::cloud::CloudClient::complete) and
     ///   returns [`EgressOutcome::Completed`] with the response de-sanitized.
@@ -141,25 +162,36 @@ impl CloudEgressGateway {
         raw_prompt: &str,
         max_tokens: u32,
         model: CloudModel,
-        confirmed: bool,
+        confirmation_token_wire: Option<&str>,
     ) -> Result<EgressOutcome, InferenceError> {
         // Step 1: ZKQP sanitize. `result` owns the PII mapping; it is a local
         // held across the `.await` below, restored immediately, then dropped.
         let result = self.sanitizer.sanitize(raw_prompt);
 
-        // Step 2: privacy-score pause. If too risky and the user has not
-        // explicitly consented, return WITHOUT sending. `result` (and its
-        // mapping) drops here — it never spans the user confirmation round
-        // trip; the confirmed retry re-sanitizes deterministically.
-        if result.requires_confirmation() && !confirmed {
-            warn!(
-                score = result.score().total,
-                "ZKQP: cloud query paused — privacy score requires user confirmation"
-            );
-            return Ok(EgressOutcome::ConfirmationRequired {
-                privacy_score: result.score().total,
-                sanitized_preview: result.sanitized_text().to_string(),
-            });
+        // Step 2: privacy-score pause. If too risky, require a VALID token
+        // bound to THIS sanitized prompt. A bool can be forged by any caller
+        // (Codex SVC-1-R1-1); an HMAC token cannot. Verify against the freshly
+        // re-sanitized text — an edited prompt, a forged token, or an expired
+        // token all fail and re-pause. `result` (and its mapping) drops here
+        // on the pause path; it never spans the user confirmation round trip.
+        if result.requires_confirmation() {
+            let approved = confirmation_token_wire
+                .and_then(ConfirmationToken::from_wire)
+                .is_some_and(|t| {
+                    self.verify_token(&t, result.sanitized_text(), model, max_tokens)
+                });
+            if !approved {
+                let fresh = self.issue_token(result.sanitized_text(), model, max_tokens);
+                warn!(
+                    score = result.score().total,
+                    "ZKQP: cloud query paused — privacy score requires user confirmation"
+                );
+                return Ok(EgressOutcome::ConfirmationRequired {
+                    privacy_score: result.score().total,
+                    sanitized_preview: result.sanitized_text().to_string(),
+                    token_wire: fresh.to_wire(),
+                });
+            }
         }
 
         // Step 3: mint the capability from the sanitized text and send. This
@@ -182,6 +214,57 @@ impl CloudEgressGateway {
             model: cloud_resp.model,
             latency_ms: cloud_resp.latency_ms,
         }))
+    }
+
+    /// Mint a [`ConfirmationToken`] bound to `(sanitized_prompt, model,
+    /// max_tokens)` and the current time, MAC'd with the gateway's ephemeral
+    /// key (SVC-1-R1-1). The SOLE trusted minting path — only the gateway has
+    /// the key, so only the gateway can produce a token that
+    /// [`verify_token`](Self::verify_token) will accept.
+    fn issue_token(
+        &self,
+        sanitized_prompt: &str,
+        model: CloudModel,
+        max_tokens: u32,
+    ) -> ConfirmationToken {
+        let issued_at = token::now_unix();
+        let mac = token::build_mac(&self.token_key, sanitized_prompt, model, max_tokens, issued_at)
+            .finalize()
+            .into_bytes();
+        ConfirmationToken::from_parts(issued_at, token::hex_encode(&mac))
+    }
+
+    /// Verify a [`ConfirmationToken`] against the freshly re-sanitized prompt
+    /// (SVC-1-R1-1): the HMAC must match (constant-time, via the hmac crate's
+    /// `verify_slice`) AND the token must be within its TTL. Any mismatch —
+    /// forged token, a different/edited prompt, or expiry — returns `false`,
+    /// causing the caller to re-pause with a fresh token.
+    ///
+    /// `pub(crate)` so the router-level test surface can exercise it; the
+    /// security rests on the private `token_key`, not on this method's
+    /// visibility.
+    pub(crate) fn verify_token(
+        &self,
+        token: &ConfirmationToken,
+        sanitized_prompt: &str,
+        model: CloudModel,
+        max_tokens: u32,
+    ) -> bool {
+        if !token::within_ttl(token.issued_at_unix(), token::now_unix()) {
+            return false;
+        }
+        let Some(expected) = token::hex_decode(token.mac_hex()) else {
+            return false;
+        };
+        token::build_mac(
+            &self.token_key,
+            sanitized_prompt,
+            model,
+            max_tokens,
+            token.issued_at_unix(),
+        )
+        .verify_slice(&expected)
+        .is_ok()
     }
 }
 
@@ -215,18 +298,21 @@ mod tests {
         // of other PII types.
         let risky = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com for the rollout";
         let outcome = gw
-            .complete(risky, 64, CloudModel::ClaudeSonnet, false)
+            .complete(risky, 64, CloudModel::ClaudeSonnet, None)
             .await
             .expect("pause is an Ok outcome, not an error");
         match outcome {
             EgressOutcome::ConfirmationRequired {
                 privacy_score,
                 sanitized_preview,
+                token_wire,
             } => {
                 assert!(privacy_score > 80, "score {privacy_score} should exceed 80");
                 // The preview is already sanitized — no raw PII in it.
                 assert!(!sanitized_preview.contains("a@a.com"));
                 assert!(!sanitized_preview.contains("e@e.com"));
+                // A token bound to this prompt is supplied for the retry.
+                assert!(!token_wire.is_empty());
             }
             EgressOutcome::Completed(_) => {
                 panic!("a high-score query must pause, not send")
@@ -234,20 +320,98 @@ mod tests {
         }
     }
 
-    /// SVC-1: explicit confirmation (`confirmed = true`) overrides the pause
-    /// — the same high-score query then proceeds to send (and, with an empty
-    /// key, errors on send rather than pausing). Proves `cloud_confirmed`
-    /// honors the user's explicit decision (Iron Law #1) without ever
-    /// skipping sanitization.
+    /// SVC-1-R1-1: the confirmation gate is a CAPABILITY, not a bool. A
+    /// caller cannot skip the pause on the first call — there is no token to
+    /// present (`None`), and a fabricated token fails verification. Only the
+    /// gateway-issued token (obtained from a prior pause) authorizes the send.
+    /// This is the full pause -> token -> retry -> send cycle, AND the
+    /// input-change rejection (a token bound to prompt A does not authorize a
+    /// different prompt B). RED against the pre-fix `confirmed: bool` (which
+    /// any caller could set true on the first call).
     #[tokio::test]
-    async fn confirmed_high_score_query_proceeds_to_send() {
+    async fn confirmation_requires_a_valid_gateway_issued_token() {
         let gw = CloudEgressGateway::new(String::new());
-        let risky = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com for the rollout";
-        let err = gw
-            .complete(risky, 64, CloudModel::ClaudeSonnet, true)
+        let prompt_a = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com for the rollout";
+
+        // First call, no token -> pause, carrying a token bound to prompt A.
+        let token_a = match gw
+            .complete(prompt_a, 64, CloudModel::ClaudeSonnet, None)
             .await
-            .expect_err("confirmed + empty key must attempt send and error");
+            .unwrap()
+        {
+            EgressOutcome::ConfirmationRequired { token_wire, .. } => token_wire,
+            EgressOutcome::Completed(_) => panic!("first call must pause"),
+        };
+
+        // A FORGED token (valid shape, wrong MAC) must NOT authorize: re-pause.
+        let forged = format!("{}:{}", token::now_unix(), "ab".repeat(32));
+        match gw
+            .complete(prompt_a, 64, CloudModel::ClaudeSonnet, Some(&forged))
+            .await
+            .unwrap()
+        {
+            EgressOutcome::ConfirmationRequired { .. } => {}
+            EgressOutcome::Completed(_) => panic!("a forged token must not authorize send"),
+        }
+
+        // The GENUINE token for prompt A authorizes the send (errors only on
+        // the empty key, proving it reached the capability-gated client).
+        let err = gw
+            .complete(prompt_a, 64, CloudModel::ClaudeSonnet, Some(&token_a))
+            .await
+            .expect_err("valid token + empty key must attempt send and error");
         assert!(err.to_string().contains("no API key"), "got: {err}");
+
+        // Prompt A's token must NOT authorize a prompt whose SANITIZED text
+        // differs (the HMAC binds to the sanitized payload, SVC-1-R1-1). NB:
+        // the binding is to the *sanitized* text, so swapping PII values alone
+        // (a@a.com -> z@z.com) yields the SAME placeholders and SAME token —
+        // which is correct (the cloud receives exactly the approved payload).
+        // Invalidation triggers on an edit to the non-PII structure, which is
+        // what a user "editing the query" changes. So prompt_b alters the
+        // surrounding words, changing the sanitized text.
+        let prompt_b = "URGENT please notify a@a.com b@b.com c@c.com d@d.com e@e.com today";
+        match gw
+            .complete(prompt_b, 64, CloudModel::ClaudeSonnet, Some(&token_a))
+            .await
+            .unwrap()
+        {
+            EgressOutcome::ConfirmationRequired { .. } => {}
+            EgressOutcome::Completed(_) => {
+                panic!("a token bound to prompt A's sanitized text must not authorize a differently-sanitized prompt")
+            }
+        }
+    }
+
+    /// SVC-1-R1-1 (c): an EXPIRED but otherwise-valid token is rejected. We
+    /// mint a correctly-MAC'd token with an old `issued_at` using the
+    /// gateway's own key (same-module test access) — proving the TTL check is
+    /// independent of MAC validity. A fresh token for the same inputs verifies.
+    #[test]
+    fn expired_token_is_rejected() {
+        let gw = CloudEgressGateway::new(String::new());
+        let sanitized = "[EMAIL_001] [EMAIL_002]";
+        let model = CloudModel::ClaudeSonnet;
+
+        let old = token::now_unix().saturating_sub(token::TOKEN_TTL_SECS + 5);
+        let mac_old = token::build_mac(&gw.token_key, sanitized, model, 64, old)
+            .finalize()
+            .into_bytes();
+        let expired = ConfirmationToken::from_parts(old, token::hex_encode(&mac_old));
+        assert!(
+            !gw.verify_token(&expired, sanitized, model, 64),
+            "an expired token must be rejected even with a valid MAC"
+        );
+
+        let now = token::now_unix();
+        let mac_now = token::build_mac(&gw.token_key, sanitized, model, 64, now)
+            .finalize()
+            .into_bytes();
+        let fresh = ConfirmationToken::from_parts(now, token::hex_encode(&mac_now));
+        assert!(
+            gw.verify_token(&fresh, sanitized, model, 64),
+            "a fresh, correctly-bound token must verify"
+        );
     }
 
     /// SVC-1 (moved from cloud.rs): a clean (no-PII) query does NOT pause, so
@@ -258,7 +422,7 @@ mod tests {
     async fn clean_query_without_key_errors_on_send() {
         let gw = CloudEgressGateway::new(String::new());
         let outcome = gw
-            .complete("What is 2 + 2?", 64, CloudModel::ClaudeSonnet, false)
+            .complete("What is 2 + 2?", 64, CloudModel::ClaudeSonnet, None)
             .await;
         let err = outcome.expect_err("empty key must error on send").to_string();
         assert!(err.contains("no API key"), "got: {err}");

@@ -23,8 +23,10 @@ pub mod error;
 pub mod hardware;
 pub mod model;
 pub mod router;
+pub mod token;
 
 pub use error::InferenceError;
+pub use token::ConfirmationToken;
 
 /// An inference request to be routed to the appropriate tier.
 ///
@@ -37,7 +39,7 @@ pub use error::InferenceError;
 ///     input: "Summarize this document".to_string(),
 ///     max_tokens: 512,
 ///     sensitive: false,
-///     cloud_confirmed: false,
+///     cloud_confirmation_token: None,
 /// };
 /// assert!(!req.sensitive);
 /// ```
@@ -55,15 +57,23 @@ pub struct InferenceRequest {
     /// — ZKQP sanitization is applied structurally to anything that does go
     /// to cloud, regardless of this flag (SVC-1).
     pub sensitive: bool,
-    /// Explicit user consent to send the *sanitized* query to the cloud even
-    /// when its privacy score is high enough to normally require confirmation
-    /// (SVC-1). `false` by default: a high-privacy-score query pauses with
-    /// [`RouteOutcome::CloudConfirmationRequired`] instead of sending. After
-    /// the user reviews the sanitized preview and accepts, the caller
-    /// re-issues with `cloud_confirmed = true`. This never sends unsanitized
-    /// text — ZKQP still applies; it only overrides the *pause*, honoring the
-    /// user's explicit decision (Iron Law #1).
-    pub cloud_confirmed: bool,
+    /// Opaque confirmation token carrying the user's explicit consent to send
+    /// a high-privacy-score query's *sanitized* version to the cloud
+    /// (SVC-1-R1-1). `None` by default: a high-privacy-score query pauses with
+    /// [`RouteOutcome::CloudConfirmationRequired`] (which supplies a token)
+    /// instead of sending. After the user reviews the sanitized preview and
+    /// accepts, the caller re-issues with this set to the token's wire string.
+    ///
+    /// This is the opaque **wire form** of a [`ConfirmationToken`] — a plain
+    /// `String` so this request (and the boundary types it flows through) stay
+    /// `Debug`/`Clone`, and because the token must serialize to a string to
+    /// cross D-Bus / the WebSocket anyway. Forgery resistance is the token's
+    /// HMAC, NOT this field's type: a fabricated string fails the gateway's
+    /// [`verify_token`](crate::egress::CloudEgressGateway::verify_token) and is
+    /// treated as "no confirmation" (the query pauses again). It never causes
+    /// unsanitized text to be sent — ZKQP applies regardless; a valid token
+    /// only overrides the *pause* (Iron Law #1).
+    pub cloud_confirmation_token: Option<String>,
 }
 
 /// The outcome of routing an inference request (SVC-1).
@@ -81,7 +91,8 @@ pub enum RouteOutcome {
     /// require explicit user confirmation before sending (CLAUDE.md ZKQP
     /// rule 4). Nothing was sent; no PII mapping is retained. The caller
     /// shows the preview and, on acceptance, re-issues with
-    /// `cloud_confirmed = true`.
+    /// [`InferenceRequest::cloud_confirmation_token`] set to the carried
+    /// [`CloudConfirmation::token`] wire string (SVC-1-R1-1).
     CloudConfirmationRequired(CloudConfirmation),
 }
 
@@ -98,6 +109,12 @@ pub struct CloudConfirmation {
     /// The sanitized query the user is being asked to approve sending. Safe
     /// to display: PII is already replaced with placeholders.
     pub sanitized_preview: String,
+    /// Opaque confirmation-token wire string (SVC-1-R1-1). The caller echoes
+    /// this back as [`InferenceRequest::cloud_confirmation_token`] on the
+    /// confirmed retry. It is HMAC-bound to this exact sanitized prompt /
+    /// model / max_tokens and expires shortly, so it cannot be reused for a
+    /// different query or replayed later.
+    pub token: String,
 }
 
 /// The response from an inference operation.
@@ -154,7 +171,7 @@ mod tests {
             input: "my password is hunter2".to_string(),
             max_tokens: 100,
             sensitive: true,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
         assert!(req.sensitive);
     }

@@ -64,33 +64,40 @@ impl InferenceService {
     ///
     /// - `{"status":"completed","output":..,"tier":..,"model_id":..}` —
     ///   normal response (local, or cloud with PII placeholders restored).
-    /// - `{"status":"confirmation_required","privacy_score":N,"sanitized_preview":..}`
+    /// - `{"status":"confirmation_required","privacy_score":N,"sanitized_preview":..,"token":".."}`
     ///   — a cloud query whose ZKQP privacy score is too high to send without
     ///   explicit user confirmation. Nothing was sent. The shell shows the
-    ///   preview and, on acceptance, re-calls `query` with
-    ///   `cloud_confirmed = true`.
+    ///   preview and, on acceptance, re-calls `query` echoing the `token` back
+    ///   as `cloud_confirmation_token`.
     ///
-    /// `cloud_confirmed` carries that explicit consent. It never sends
-    /// unsanitized text — ZKQP applies regardless; it only overrides the
-    /// privacy-score *pause* (Iron Law #1).
+    /// `cloud_confirmation_token` carries that explicit consent (SVC-1-R1-1):
+    /// the opaque, HMAC-bound token string from a prior `confirmation_required`
+    /// response. The empty string means "no token presented". A forged or
+    /// stale token simply fails verification and re-pauses; it never sends
+    /// unsanitized text — ZKQP applies regardless; a valid token only
+    /// overrides the privacy-score *pause* (Iron Law #1). Replacing the old
+    /// `cloud_confirmed: bool` closes the caller-forgeable-consent bypass.
     ///
-    /// **Wire-contract change (SVC-1):** previously returned the tuple
-    /// `(response_text, tier, model_id)`; now returns the JSON union above
-    /// and takes the additional `cloud_confirmed` parameter, so cloud queries
-    /// can pause for confirmation instead of silently sending.
+    /// **Wire-contract change (SVC-1):** returns the JSON union above and
+    /// takes a `cloud_confirmation_token` string parameter.
     async fn query(
         &self,
         prompt: String,
         max_tokens: u32,
         sensitive: bool,
-        cloud_confirmed: bool,
+        cloud_confirmation_token: String,
     ) -> zbus::fdo::Result<String> {
         crate::limits::ensure_within(&prompt, crate::limits::MAX_STRING_BYTES, "prompt")?;
+        crate::limits::ensure_within(
+            &cloud_confirmation_token,
+            crate::limits::MAX_STRING_BYTES,
+            "cloud_confirmation_token",
+        )?;
         info!(
             prompt_len = prompt.len(),
             max_tokens,
             sensitive,
-            cloud_confirmed,
+            has_token = !cloud_confirmation_token.is_empty(),
             "D-Bus inference query"
         );
 
@@ -99,7 +106,12 @@ impl InferenceService {
             input: prompt,
             max_tokens,
             sensitive,
-            cloud_confirmed,
+            // Empty string -> None (no confirmation presented).
+            cloud_confirmation_token: if cloud_confirmation_token.is_empty() {
+                None
+            } else {
+                Some(cloud_confirmation_token)
+            },
         };
 
         let outcome = router
@@ -117,6 +129,7 @@ impl InferenceService {
                 "status": "confirmation_required",
                 "privacy_score": c.privacy_score,
                 "sanitized_preview": c.sanitized_preview,
+                "token": c.token,
             }),
         };
         serde_json::to_string(&json)
@@ -147,14 +160,25 @@ mod tests {
         let _svc = InferenceService::new(router);
     }
 
-    /// SVC-6-R2-3: `query(prompt)` is capped at the boundary BEFORE info!()
-    /// logs `prompt_len`.
+    /// SVC-6-R2-3: every `String` param of `query` is capped at the boundary
+    /// BEFORE info!()/routing. Covers `prompt` and (SVC-1-R1-1) the new
+    /// `cloud_confirmation_token`.
     #[tokio::test]
     async fn every_string_param_rejects_oversize() {
         let svc = InferenceService::new(Arc::new(RwLock::new(Router::new())));
         let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        // prompt
         assert!(matches!(
-            svc.query(oversize, 16, false, false).await.unwrap_err(),
+            svc.query(oversize.clone(), 16, false, String::new())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // cloud_confirmation_token
+        assert!(matches!(
+            svc.query("hi".to_string(), 16, false, oversize)
+                .await
+                .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
     }

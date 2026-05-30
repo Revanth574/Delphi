@@ -199,20 +199,24 @@ impl Handler {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // SVC-1: explicit consent to send a high-privacy-score query (the
-        // sanitized version) past the ZKQP confirmation pause. Defaults false;
-        // the shell sets it on the retry after the user approves the preview.
-        let cloud_confirmed = params
-            .get("cloud_confirmed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // SVC-1-R1-1: explicit consent token to send a high-privacy-score
+        // query (the sanitized version) past the ZKQP confirmation pause. The
+        // opaque, HMAC-bound token comes from a prior `confirmation_required`
+        // response; absent on the first call. A forged/stale token simply
+        // re-pauses — it can't force an unsanitized send (replaces the old
+        // caller-forgeable `cloud_confirmed` bool).
+        let cloud_confirmation_token = params
+            .get("cloud_confirmation_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let router = self.router.read().await;
         let req = InferenceRequest {
             input: prompt,
             max_tokens,
             sensitive,
-            cloud_confirmed,
+            cloud_confirmation_token,
         };
 
         match router.route(req).await {
@@ -234,6 +238,7 @@ impl Handler {
                     "status": "confirmation_required",
                     "privacy_score": c.privacy_score,
                     "sanitized_preview": c.sanitized_preview,
+                    "token": c.token,
                 }),
             ),
             Err(e) => Response::err(id, -1, &e.to_string()),

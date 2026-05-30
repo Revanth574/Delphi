@@ -15,10 +15,15 @@ interface ResponseState {
   error: string | null;
   /**
    * SVC-1: set when a cloud query's ZKQP privacy score requires explicit
-   * user confirmation before sending. Carries the score and the sanitized
-   * preview; nothing has been sent. `null` otherwise.
+   * user confirmation before sending. Carries the score, the sanitized
+   * preview, and the opaque confirmation token (SVC-1-R1-1) echoed back on
+   * approval; nothing has been sent. `null` otherwise.
    */
-  confirmation: { privacyScore: number; sanitizedPreview: string } | null;
+  confirmation: {
+    privacyScore: number;
+    sanitizedPreview: string;
+    token: string;
+  } | null;
 }
 
 const INITIAL_RESPONSE: ResponseState = {
@@ -57,13 +62,15 @@ export const CommandBar = memo(function CommandBar() {
     setOpen((prev) => !prev);
   }, [mode]);
 
-  // SVC-1: a single runner for both the initial submit (cloudConfirmed=false)
-  // and the post-confirmation retry (cloudConfirmed=true). A cloud query whose
-  // privacy score is too high comes back as `confirmation_required` instead of
-  // a completed response; we surface the sanitized preview and let the user
-  // approve sending it.
+  // SVC-1: a single runner for both the initial submit (no token) and the
+  // post-confirmation retry (echoing the gateway-issued token). A cloud query
+  // whose privacy score is too high comes back as `confirmation_required`
+  // instead of a completed response; we surface the sanitized preview and the
+  // opaque token, then let the user approve sending it. The token (SVC-1-R1-1)
+  // is HMAC-bound to the exact sanitized prompt, so it cannot be forged or
+  // reused for a different query.
   const runQuery = useCallback(
-    async (cloudConfirmed: boolean) => {
+    async (confirmationToken?: string) => {
       const trimmed = query.trim();
       if (trimmed.length === 0) return;
 
@@ -76,7 +83,7 @@ export const CommandBar = memo(function CommandBar() {
       });
 
       try {
-        const result = await delphi.query(trimmed, 256, false, cloudConfirmed);
+        const result = await delphi.query(trimmed, 256, false, confirmationToken);
         if (result.status === "confirmation_required") {
           setResponse({
             loading: false,
@@ -86,6 +93,7 @@ export const CommandBar = memo(function CommandBar() {
             confirmation: {
               privacyScore: result.privacy_score,
               sanitizedPreview: result.sanitized_preview,
+              token: result.token,
             },
           });
         } else {
@@ -112,12 +120,30 @@ export const CommandBar = memo(function CommandBar() {
     [query, t],
   );
 
-  const handleSubmit = useCallback(() => runQuery(false), [runQuery]);
-  const handleConfirmSend = useCallback(() => runQuery(true), [runQuery]);
+  const handleSubmit = useCallback(() => runQuery(), [runQuery]);
+  // Echo the gateway-issued token from the pending confirmation back on the
+  // approved retry (SVC-1-R1-1). If there is somehow no token, this is a
+  // no-token call that simply re-pauses — it can never force an unsanitized
+  // send.
+  const handleConfirmSend = useCallback(
+    () => runQuery(response.confirmation?.token),
+    [runQuery, response.confirmation],
+  );
   const handleCancelConfirm = useCallback(
     () => setResponse(INITIAL_RESPONSE),
     [],
   );
+
+  // SVC-1-R1-1: a pending confirmation token is bound to the exact prompt that
+  // produced it. Editing the input makes that token stale (the gateway would
+  // re-pause anyway), so drop the confirmation panel rather than leave a
+  // preview on screen that no longer matches what would be sent.
+  const handleQueryChange = useCallback((value: string) => {
+    setQuery(value);
+    setResponse((prev) =>
+      prev.confirmation ? { ...prev, confirmation: null } : prev,
+    );
+  }, []);
 
   // Alt+Space global shortcut
   useEffect(() => {
@@ -179,7 +205,7 @@ export const CommandBar = memo(function CommandBar() {
             ref={inputRef}
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => handleQueryChange(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !response.loading) {
                 e.preventDefault();

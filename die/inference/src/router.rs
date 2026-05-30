@@ -282,7 +282,7 @@ impl Router {
     ///     input: "Hello".to_string(),
     ///     max_tokens: 100,
     ///     sensitive: false,
-    ///     cloud_confirmed: false,
+    ///     cloud_confirmation_token: None,
     /// };
     /// let result = router.route(req).await;
     /// # }
@@ -350,7 +350,7 @@ impl Router {
     ///
     /// Returns a [`RouteOutcome`]: `Completed` with the de-sanitized response,
     /// or `CloudConfirmationRequired` when the privacy score is too high and
-    /// the caller has not set `cloud_confirmed`.
+    /// the caller has not supplied a valid `cloud_confirmation_token`.
     async fn try_cloud(&self, req: &InferenceRequest) -> Result<RouteOutcome, InferenceError> {
         let gateway = self
             .cloud_gateway
@@ -378,10 +378,16 @@ impl Router {
             "routing to cloud (ZKQP-sanitized)"
         );
 
-        // SVC-1: the gateway sanitizes, optionally pauses, sends, and
-        // restores. The router never sees raw cloud transmission.
+        // SVC-1: the gateway sanitizes, optionally pauses (requiring a valid
+        // HMAC confirmation token, SVC-1-R1-1), sends, and restores. The
+        // router never sees raw cloud transmission.
         match gateway
-            .complete(&req.input, req.max_tokens, model, req.cloud_confirmed)
+            .complete(
+                &req.input,
+                req.max_tokens,
+                model,
+                req.cloud_confirmation_token.as_deref(),
+            )
             .await?
         {
             EgressOutcome::Completed(response) => Ok(RouteOutcome::Completed(InferenceResponse {
@@ -392,9 +398,11 @@ impl Router {
             EgressOutcome::ConfirmationRequired {
                 privacy_score,
                 sanitized_preview,
+                token_wire,
             } => Ok(RouteOutcome::CloudConfirmationRequired(CloudConfirmation {
                 privacy_score,
                 sanitized_preview,
+                token: token_wire,
             })),
         }
     }
@@ -422,7 +430,7 @@ impl Default for Router {
 ///     input: "Hello".to_string(),
 ///     max_tokens: 100,
 ///     sensitive: false,
-///     cloud_confirmed: false,
+///     cloud_confirmation_token: None,
 /// };
 /// assert_eq!(select_cloud_model(&short), CloudModel::ClaudeSonnet);
 /// ```
@@ -446,7 +454,7 @@ mod tests {
             input: "test".to_string(),
             max_tokens: 50,
             sensitive: false,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
         let err = router.route(req).await.unwrap_err();
         assert!(matches!(err, InferenceError::NoBackend));
@@ -461,7 +469,7 @@ mod tests {
             input: "secret data".to_string(),
             max_tokens: 50,
             sensitive: true,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
 
         // Should fail with ModelLoad (no local model), NOT try cloud.
@@ -487,7 +495,7 @@ mod tests {
             input: "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to all".to_string(),
             max_tokens: 50,
             sensitive: true,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
         let err = router.route(req).await.unwrap_err();
         assert!(
@@ -505,7 +513,7 @@ mod tests {
             input: "test".to_string(),
             max_tokens: 50,
             sensitive: false,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
 
         // Local fails (no model) → cloud fails (empty key) → NoBackend.
@@ -547,7 +555,7 @@ mod tests {
             input: "Hi".to_string(),
             max_tokens: 100,
             sensitive: false,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
         assert_eq!(select_cloud_model(&req), CloudModel::ClaudeSonnet);
     }
@@ -558,7 +566,7 @@ mod tests {
             input: "x".repeat(600),
             max_tokens: 100,
             sensitive: false,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
         assert_eq!(select_cloud_model(&req), CloudModel::ClaudeOpus);
     }
@@ -569,7 +577,7 @@ mod tests {
             input: "short".to_string(),
             max_tokens: 2000,
             sensitive: false,
-            cloud_confirmed: false,
+            cloud_confirmation_token: None,
         };
         assert_eq!(select_cloud_model(&req), CloudModel::ClaudeOpus);
     }

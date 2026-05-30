@@ -49,6 +49,13 @@ export type InferenceResult =
       privacy_score: number;
       /** The sanitized query awaiting approval (PII already replaced). */
       sanitized_preview: string;
+      /**
+       * Opaque, HMAC-bound confirmation token (SVC-1-R1-1). Echo this back
+       * verbatim as `cloudConfirmationToken` on the approved retry. It is
+       * bound to this exact sanitized prompt / model / max_tokens and expires
+       * shortly; the shell treats it as an opaque blob.
+       */
+      token: string;
     };
 
 /** Backend availability status. */
@@ -183,24 +190,28 @@ class DelphiClient {
   /**
    * Send a natural language query through the inference engine.
    *
-   * `cloudConfirmed` (SVC-1) carries the user's explicit consent to send a
-   * high-privacy-score query's sanitized version past the ZKQP confirmation
-   * pause. Leave `false` on the first call; if the result is
-   * `status: "confirmation_required"`, show the preview and, on the user's
-   * approval, re-call with `cloudConfirmed = true`. It never sends
-   * unsanitized text — ZKQP applies regardless.
+   * `cloudConfirmationToken` (SVC-1-R1-1) carries the user's explicit consent
+   * to send a high-privacy-score query's sanitized version past the ZKQP
+   * confirmation pause. Omit it on the first call; if the result is
+   * `status: "confirmation_required"`, show the `sanitized_preview` and, on
+   * the user's approval, re-call passing back the result's `token` verbatim.
+   * The token is opaque, HMAC-bound to this exact sanitized prompt, and
+   * short-lived: a forged, stale, or edited-prompt token simply re-pauses —
+   * it never sends unsanitized text, because ZKQP applies regardless.
    */
   async query(
     prompt: string,
     maxTokens = 256,
     sensitive = false,
-    cloudConfirmed = false,
+    cloudConfirmationToken?: string,
   ): Promise<InferenceResult> {
     return this.call("inference.query", {
       prompt,
       max_tokens: maxTokens,
       sensitive,
-      cloud_confirmed: cloudConfirmed,
+      // Empty string means "no token presented" (bridge treats absent and
+      // empty identically); a genuine token overrides only the pause.
+      cloud_confirmation_token: cloudConfirmationToken ?? "",
     }) as Promise<InferenceResult>;
   }
 

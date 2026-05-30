@@ -433,4 +433,28 @@ mod tests {
         let restored = result.restore(&echoed);
         assert!(restored.contains("user@test.com"));
     }
+
+    /// SVC-1-R1-1 PRECONDITION: sanitization must be deterministic.
+    ///
+    /// The cloud-egress `ConfirmationToken` (die-inference) binds an HMAC to
+    /// the sanitized text, so a confirmed retry re-sanitizes and re-checks the
+    /// HMAC. That only works if `sanitize` is byte-stable for the same input:
+    /// same input -> same `sanitized_text`, across repeated calls AND across
+    /// fresh sanitizer instances (no per-instance state perturbs the
+    /// placeholder assignment). If this ever fails, the token design is
+    /// unsound and the non-determinism must be fixed before relying on it.
+    #[test]
+    fn sanitize_is_deterministic() {
+        let input = "Email a@a.com and b@b.com from 10.0.0.1 on 2024-06-15";
+        let s1 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        let s2 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        assert_eq!(s1, s2, "sanitization must be deterministic for token HMAC binding");
+
+        // Also stable across repeated calls on the same instance.
+        let sanitizer = QuerySanitizer::new();
+        let a = sanitizer.sanitize(input).sanitized_text().to_string();
+        let b = sanitizer.sanitize(input).sanitized_text().to_string();
+        assert_eq!(a, b);
+        assert_eq!(a, s1);
+    }
 }

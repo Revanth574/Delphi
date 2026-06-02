@@ -45,6 +45,15 @@ pub mod workspace;
 /// interface). See `error::opaque` and services-sweep finding SVC-4.
 pub(crate) mod error;
 
+/// Internal: caller-identity + permission-tier authorization at the D-Bus
+/// boundary (not an interface). The SVC-2 auth seam — typed outcomes, the tier
+/// catalogue, and the synchronous decision functions including the
+/// SVC-1-R1-1-01 same-caller-binding cloud-send closure. The async caller
+/// resolver (zbus header + fdo credentials + NameOwnerChanged cache) and the
+/// per-method guard rollout build on this foundation. See services-sweep
+/// finding SVC-2.
+pub mod auth;
+
 /// D-Bus payload size caps (not an interface). Single source of truth for the
 /// per-parameter byte limits. See services-sweep finding SVC-6.
 pub mod limits;

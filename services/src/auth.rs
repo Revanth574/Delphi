@@ -634,11 +634,25 @@ pub fn authorize_cloud_send(
         };
     }
 
-    // (2) Deployed hardening: the completer must also be the authenticated shell.
-    if matches!(policy.bus(), BusTrust::DeployedDeny) && !policy.is_recognized_shell(caller) {
-        return AuthOutcome::AuthorizationDenied {
-            reason: "cloud-send requires the authenticated shell (deployed policy)",
-        };
+    // (2) Deployed hardening: the completer must also be the authenticated
+    //     shell. Decision 1 — degrade-to-DENY (must NOT fail open): deployed
+    //     shell verification relies on the caller's resolved credentials (the
+    //     authenticated peer). If the resolver degraded to unique-name-only
+    //     because the credential fetch failed (`uid` is `None`), deployment
+    //     cannot verify the caller is the shell, so it must DENY — never
+    //     "couldn't verify, so allow". In dev this whole branch is skipped; the
+    //     same-caller binding in (1) carries cloud-send regardless.
+    if matches!(policy.bus(), BusTrust::DeployedDeny) {
+        if caller.uid.is_none() {
+            return AuthOutcome::AuthorizationDenied {
+                reason: "deployed cloud-send: caller credentials unavailable, cannot verify shell",
+            };
+        }
+        if !policy.is_recognized_shell(caller) {
+            return AuthOutcome::AuthorizationDenied {
+                reason: "cloud-send requires the authenticated shell (deployed policy)",
+            };
+        }
     }
 
     AuthOutcome::Authorized
@@ -650,6 +664,16 @@ mod tests {
 
     fn caller(name: &str) -> CallerIdentity {
         CallerIdentity::from_unique_name(name)
+    }
+
+    /// A caller whose credentials were resolved (the deployed authenticated-peer
+    /// case). Decision 1: the deployed cloud-send shell check requires creds.
+    fn caller_with_creds(name: &str, uid: u32) -> CallerIdentity {
+        CallerIdentity {
+            unique_name: name.to_string(),
+            uid: Some(uid),
+            pid: Some(4242),
+        }
     }
 
     // ── Tier table fidelity (Codex's verbatim Q1 classification) ──
@@ -826,7 +850,10 @@ mod tests {
         // Same caller (passes binding) but NOT the recognized shell → denied
         // under the deployed policy (the additional hardening layer).
         let mut reg = CloudSendConfirmations::default();
-        let nonshell = caller(":1.50");
+        // Has creds (passes the credential gate) but is NOT the recorded shell,
+        // so it is denied specifically on the shell-mismatch (not on missing
+        // creds — that is a separate test below).
+        let nonshell = caller_with_creds(":1.50", 1000);
         reg.issue("fp-abc", &nonshell);
         let mut policy = AuthPolicy::deployed();
         policy.record_shell(":1.1"); // the real shell is someone else
@@ -836,15 +863,37 @@ mod tests {
     }
 
     #[test]
-    fn cloud_send_deployed_shell_same_caller_is_authorized() {
+    fn cloud_send_deployed_shell_same_caller_with_creds_is_authorized() {
         let mut reg = CloudSendConfirmations::default();
-        let shell = caller(":1.1");
+        let shell = caller_with_creds(":1.1", 1000); // resolved creds (authenticated peer)
         reg.issue("fp-abc", &shell);
         let mut policy = AuthPolicy::deployed();
         policy.record_shell(":1.1");
         assert_eq!(
             authorize_cloud_send(&shell, "fp-abc", Instant::now(), &reg, &policy),
             AuthOutcome::Authorized
+        );
+    }
+
+    #[test]
+    fn cloud_send_deployed_denies_when_creds_unavailable() {
+        // Decision 1 — degrade-to-DENY. A deployed caller whose credentials could
+        // not be resolved (resolver degraded to unique-name-only, uid=None)
+        // cannot be verified as the authenticated shell, so cloud-send is denied
+        // EVEN THOUGH it matches the recorded shell unique name and is
+        // same-caller bound. RED against pre-Decision-1 code, which returned
+        // Authorized on the unique-name match alone.
+        let mut reg = CloudSendConfirmations::default();
+        let degraded = caller(":1.1"); // same unique name as the shell, but uid=None
+        reg.issue("fp-abc", &degraded);
+        let mut policy = AuthPolicy::deployed();
+        policy.record_shell(":1.1");
+        assert!(
+            matches!(
+                authorize_cloud_send(&degraded, "fp-abc", Instant::now(), &reg, &policy),
+                AuthOutcome::AuthorizationDenied { .. }
+            ),
+            "deployed cloud-send must deny when caller credentials are unavailable"
         );
     }
 

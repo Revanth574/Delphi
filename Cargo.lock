@@ -955,6 +955,7 @@ dependencies = [
  "die-inference",
  "die-orchestrator",
  "fortress",
+ "futures-util",
  "libc",
  "semantic-fs",
  "serde",

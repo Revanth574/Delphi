@@ -54,6 +54,12 @@ pub(crate) mod error;
 /// finding SVC-2.
 pub mod auth;
 
+/// Internal: async caller-identity resolver (SVC-2 Stage 1b) — resolves a
+/// [`auth::CallerIdentity`] from a live D-Bus message header + connection
+/// (`fdo::DBusProxy` credentials) with a `NameOwnerChanged`-invalidated cache.
+/// The bus-facing producer for the bus-free `auth` policy core. See SVC-2.
+pub mod caller_resolver;
+
 /// D-Bus payload size caps (not an interface). Single source of truth for the
 /// per-parameter byte limits. See services-sweep finding SVC-6.
 pub mod limits;

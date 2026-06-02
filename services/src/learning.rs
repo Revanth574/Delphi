@@ -12,6 +12,10 @@
 //!
 //! Interface: `org.delphi.Learning`
 //!
+//! SVC-2: every method enforces authorization via the shared [`AuthGuard`] on
+//! its first line. `get_suggestions`/`suggestion_count` are Autonomous;
+//! `accept_suggestion`/`dismiss_suggestion` are Confirm.
+//!
 //! Methods return JSON strings (the richer `AcceptSuggestionResult` /
 //! `DismissSuggestionResult` carry state the previous `()`-returning methods
 //! could not). Uses `std::sync::Mutex` (not `tokio`) because the facade embeds
@@ -21,8 +25,11 @@
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
+use zbus::message::Header;
 
 use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
+
+use crate::auth_guard::AuthGuard;
 
 /// D-Bus object path for the Learning interface.
 pub const PATH: &str = "/org/delphi/Learning";
@@ -33,33 +40,38 @@ pub const PATH: &str = "/org/delphi/Learning";
 ///
 /// ```
 /// use delphi_services::learning::LearningService;
+/// use delphi_services::auth_guard::AuthGuard;
 /// use die_orchestrator::learning::LearningFacade;
 /// use std::sync::{Arc, Mutex};
 ///
 /// let facade = LearningFacade::in_memory().unwrap();
-/// let svc = LearningService::new(Arc::new(Mutex::new(facade)));
+/// let svc = LearningService::new(Arc::new(Mutex::new(facade)), Arc::new(AuthGuard::dev_in_memory()));
 /// ```
 pub struct LearningService {
     facade: Arc<Mutex<LearningFacade>>,
+    guard: Arc<AuthGuard>,
 }
 
 impl LearningService {
-    /// Wrap a shared [`LearningFacade`] for D-Bus exposure.
+    /// Wrap a shared [`LearningFacade`] for D-Bus exposure, guarded by the
+    /// shared [`AuthGuard`].
     ///
     /// # Examples
     ///
     /// ```
     /// use delphi_services::learning::LearningService;
+    /// use delphi_services::auth_guard::AuthGuard;
     /// use die_orchestrator::learning::LearningFacade;
     /// use std::sync::{Arc, Mutex};
     ///
-    /// let svc = LearningService::new(Arc::new(Mutex::new(
-    ///     LearningFacade::in_memory().unwrap(),
-    /// )));
+    /// let svc = LearningService::new(
+    ///     Arc::new(Mutex::new(LearningFacade::in_memory().unwrap())),
+    ///     Arc::new(AuthGuard::dev_in_memory()),
+    /// );
     /// ```
     #[must_use]
-    pub fn new(facade: Arc<Mutex<LearningFacade>>) -> Self {
-        Self { facade }
+    pub fn new(facade: Arc<Mutex<LearningFacade>>, guard: Arc<AuthGuard>) -> Self {
+        Self { facade, guard }
     }
 
     fn lock(&self) -> zbus::fdo::Result<std::sync::MutexGuard<'_, LearningFacade>> {
@@ -88,7 +100,8 @@ fn map_learning_error(e: LearningFacadeError) -> zbus::fdo::Error {
 #[zbus::interface(name = "org.delphi.Learning")]
 impl LearningService {
     /// Pending suggestions as a JSON array of `LearningSuggestion`.
-    async fn get_suggestions(&self) -> zbus::fdo::Result<String> {
+    async fn get_suggestions(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<String> {
+        self.guard.enforce("learning.get_suggestions", &header)?;
         let suggestions = {
             let facade = self.lock()?;
             facade.list_suggestions()
@@ -99,7 +112,12 @@ impl LearningService {
 
     /// Accept a suggestion (`Proposed → Practicing`). Returns a JSON
     /// `AcceptSuggestionResult` (includes the reversible action-timeline id).
-    async fn accept_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<String> {
+    async fn accept_suggestion(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        suggestion_id: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("learning.accept_suggestion", &header)?;
         crate::limits::ensure_within(
             &suggestion_id,
             crate::limits::MAX_STRING_BYTES,
@@ -116,7 +134,12 @@ impl LearningService {
 
     /// Dismiss a suggestion (`→ Dismissed` + tombstone). Returns a JSON
     /// `DismissSuggestionResult`.
-    async fn dismiss_suggestion(&self, suggestion_id: String) -> zbus::fdo::Result<String> {
+    async fn dismiss_suggestion(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        suggestion_id: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("learning.dismiss_suggestion", &header)?;
         crate::limits::ensure_within(
             &suggestion_id,
             crate::limits::MAX_STRING_BYTES,
@@ -132,7 +155,8 @@ impl LearningService {
     }
 
     /// Count of pending (non-tombstoned, non-Focus-suppressed) suggestions.
-    async fn suggestion_count(&self) -> zbus::fdo::Result<u32> {
+    async fn suggestion_count(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<u32> {
+        self.guard.enforce("learning.suggestion_count", &header)?;
         let count = {
             let facade = self.lock()?;
             facade.list_suggestions().len()
@@ -146,8 +170,26 @@ mod tests {
     use super::*;
     use die_orchestrator::learning::LearningFacade;
 
+    use crate::auth::AuthPolicy;
+    use crate::auth_guard::completeness::{
+        assert_all_methods_classified, assert_behavioral_covers_all, header_msg as msg,
+    };
+
     fn svc() -> LearningService {
-        LearningService::new(Arc::new(Mutex::new(LearningFacade::in_memory().unwrap())))
+        LearningService::new(
+            Arc::new(Mutex::new(LearningFacade::in_memory().unwrap())),
+            Arc::new(AuthGuard::dev_in_memory()),
+        )
+    }
+
+    fn svc_with(policy: AuthPolicy) -> LearningService {
+        LearningService::new(
+            Arc::new(Mutex::new(LearningFacade::in_memory().unwrap())),
+            Arc::new(AuthGuard::new(
+                policy,
+                Arc::new(Mutex::new(fortress::audit::AuditLog::in_memory())),
+            )),
+        )
     }
 
     #[test]
@@ -159,15 +201,18 @@ mod tests {
     #[tokio::test]
     async fn get_suggestions_empty_is_json_array() {
         let s = svc();
-        assert_eq!(s.get_suggestions().await.unwrap(), "[]");
-        assert_eq!(s.suggestion_count().await.unwrap(), 0);
+        let m = msg(":1.5");
+        assert_eq!(s.get_suggestions(m.header()).await.unwrap(), "[]");
+        let m = msg(":1.5");
+        assert_eq!(s.suggestion_count(m.header()).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn accept_unknown_id_is_not_found_without_leak() {
         let s = svc();
+        let m = msg(":1.5");
         let err = s
-            .accept_suggestion("pat-9999".to_string())
+            .accept_suggestion(m.header(), "pat-9999".to_string())
             .await
             .unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
@@ -177,8 +222,9 @@ mod tests {
     #[tokio::test]
     async fn dismiss_unknown_id_is_not_found() {
         let s = svc();
+        let m = msg(":1.5");
         let err = s
-            .dismiss_suggestion("pat-9999".to_string())
+            .dismiss_suggestion(m.header(), "pat-9999".to_string())
             .await
             .unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
@@ -190,29 +236,81 @@ mod tests {
         // pattern is needed to exercise the FocusMode -> Failed mapping.
         let mut facade = LearningFacade::in_memory().unwrap();
         facade.enter_focus();
-        let s = LearningService::new(Arc::new(Mutex::new(facade)));
+        let s = LearningService::new(
+            Arc::new(Mutex::new(facade)),
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
+        let m = msg(":1.5");
         let err = s
-            .accept_suggestion("anything".to_string())
+            .accept_suggestion(m.header(), "anything".to_string())
             .await
             .unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::Failed(_)));
         assert!(err.to_string().contains("Focus mode"));
     }
 
-    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary
+    /// (after the SVC-2 guard).
     #[tokio::test]
     async fn every_string_param_rejects_oversize() {
-        let svc = LearningService::new(Arc::new(Mutex::new(
-            LearningFacade::in_memory().unwrap(),
-        )));
+        let s = svc();
         let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.accept_suggestion(oversize.clone()).await.unwrap_err(),
+            s.accept_suggestion(m.header(), oversize.clone()).await.unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.dismiss_suggestion(oversize).await.unwrap_err(),
+            s.dismiss_suggestion(m.header(), oversize).await.unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+    }
+
+    // ── SVC-2 completeness (Decision 3) ──
+
+    #[test]
+    fn svc2_every_method_is_classified() {
+        use zbus::object_server::Interface;
+        let s = svc();
+        let mut xml = String::new();
+        s.introspect_to_writer(&mut xml, 0);
+        assert_all_methods_classified("learning", &xml);
+    }
+
+    #[tokio::test]
+    async fn svc2_every_method_denies_unrecognized_caller_when_deployed() {
+        let s = svc_with(AuthPolicy::deployed());
+        let mut exercised: Vec<&str> = Vec::new();
+
+        exercised.push("GetSuggestions");
+        let m = msg(":1.999");
+        assert!(matches!(
+            s.get_suggestions(m.header()).await.unwrap_err(),
+            zbus::fdo::Error::AccessDenied(_)
+        ));
+        exercised.push("AcceptSuggestion");
+        let m = msg(":1.999");
+        assert!(matches!(
+            s.accept_suggestion(m.header(), "x".to_string()).await.unwrap_err(),
+            zbus::fdo::Error::AccessDenied(_)
+        ));
+        exercised.push("DismissSuggestion");
+        let m = msg(":1.999");
+        assert!(matches!(
+            s.dismiss_suggestion(m.header(), "x".to_string()).await.unwrap_err(),
+            zbus::fdo::Error::AccessDenied(_)
+        ));
+        exercised.push("SuggestionCount");
+        let m = msg(":1.999");
+        assert!(matches!(
+            s.suggestion_count(m.header()).await.unwrap_err(),
+            zbus::fdo::Error::AccessDenied(_)
+        ));
+
+        use zbus::object_server::Interface;
+        let mut xml = String::new();
+        s.introspect_to_writer(&mut xml, 0);
+        assert_behavioral_covers_all("learning", &xml, &exercised);
     }
 }

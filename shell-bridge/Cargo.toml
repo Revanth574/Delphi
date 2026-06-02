@@ -23,3 +23,7 @@ thiserror = { workspace = true }
 # SVC-5: seed a Proposed suggestion in shell-bridge handler tests via the
 # learning engine's deterministic detection recipe.
 die-learning = { workspace = true }
+# SVC-2: the cross-transport focus test drives the D-Bus ModeService::set_mode
+# path directly and must build a message Header (the caller-identity the guard
+# reads) — needs zbus's message builder.
+zbus = { workspace = true }

@@ -866,7 +866,11 @@ mod tests {
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
             facade_arc.clone(),
         );
-        let mode_svc = ModeService::new(modes.clone(), facade_arc.clone());
+        let mode_svc = ModeService::new(
+            modes.clone(),
+            facade_arc.clone(),
+            Arc::new(delphi_services::auth_guard::AuthGuard::dev_in_memory()),
+        );
 
         // Sanity: facade starts disarmed and the seeded suggestion is listed.
         assert!(!facade_arc.lock().unwrap().focus_active());
@@ -900,8 +904,16 @@ mod tests {
         );
 
         // ── Path 2: clear Focus via the D-Bus ModeService ──────────────
+        // Build a message Header carrying a sender so the SVC-2 guard can read
+        // the caller identity (dev policy → proceed-and-audit, so set_mode runs).
+        let setmode_msg = zbus::message::Message::method_call("/org/delphi/Mode", "SetMode")
+            .unwrap()
+            .sender(":1.5")
+            .unwrap()
+            .build(&())
+            .unwrap();
         mode_svc
-            .set_mode("win-1".to_string(), "Direct".to_string())
+            .set_mode(setmode_msg.header(), "win-1".to_string(), "Direct".to_string())
             .await
             .unwrap();
 

@@ -68,6 +68,24 @@ impl AuthGuard {
         }
     }
 
+    /// Build a dev guard with an in-memory audit log — the v0.4 wiring/test
+    /// convenience (log-and-allow policy, no on-disk audit). Lets callers above
+    /// `fortress` (e.g. shell-bridge) construct a guard without importing
+    /// [`AuditLog`]. Production wiring uses [`new`](Self::new) with the deployed
+    /// policy and a persistent audit log.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use delphi_services::auth_guard::AuthGuard;
+    /// let guard = AuthGuard::dev_in_memory();
+    /// let _ = guard;
+    /// ```
+    #[must_use]
+    pub fn dev_in_memory() -> Self {
+        Self::new(AuthPolicy::dev(), Arc::new(Mutex::new(AuditLog::in_memory())))
+    }
+
     /// Enforce SVC-2 authorization for a general (non-cloud-send) method, given
     /// its `action` string and the message `header`. Call on the FIRST line of
     /// every `#[zbus::interface]` method, before any domain state access
@@ -131,6 +149,21 @@ impl AuthGuard {
 #[cfg(test)]
 pub(crate) mod completeness {
     use crate::auth::METHOD_POLICY;
+
+    /// Build a bus-free method-call message carrying `sender` as its unique bus
+    /// name, for guard testing: `header_msg(":1.5").header()` yields a `Header`
+    /// with that sender. The path/member are placeholders — the guard keys on
+    /// the action string passed to `enforce`, not the header's member. Shared so
+    /// every service's behavioral completeness test constructs headers
+    /// identically.
+    pub(crate) fn header_msg(sender: &str) -> zbus::message::Message {
+        zbus::message::Message::method_call("/org/delphi/Probe", "Probe")
+            .expect("valid path/member")
+            .sender(sender)
+            .expect("valid unique sender name")
+            .build(&())
+            .expect("empty body builds")
+    }
 
     /// Extract D-Bus method names from an interface's introspection XML.
     pub(crate) fn method_names(introspection_xml: &str) -> Vec<String> {

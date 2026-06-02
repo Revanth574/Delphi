@@ -161,9 +161,9 @@ mod tests {
     use super::*;
 
     use fortress::audit::AuditLog;
-    use zbus::message::Message;
 
     use crate::auth::AuthPolicy;
+    use crate::auth_guard::completeness::header_msg as msg;
 
     /// Build a guarded TimelineService with the given caller-identity policy.
     fn mk_svc(policy: AuthPolicy) -> TimelineService {
@@ -173,17 +173,6 @@ mod tests {
             Arc::new(Mutex::new(AuditLog::in_memory())),
         ));
         TimelineService::new(tl, guard)
-    }
-
-    /// A bus-free method-call message carrying `sender` as its unique name, so
-    /// `msg.header()` yields a `Header` with that sender for guard testing.
-    fn msg(sender: &str) -> Message {
-        Message::method_call("/org/delphi/Timeline", "Probe")
-            .unwrap()
-            .sender(sender)
-            .unwrap()
-            .build(&())
-            .unwrap()
     }
 
     #[test]

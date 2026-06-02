@@ -4,39 +4,33 @@
 //!
 //! Exposes the orchestrator's [`EnvironmentMonitor`] over D-Bus. The
 //! shell, the learning engine, and the orchestrator's brain all
-//! consume the published state to make policy decisions (e.g., reduce
-//! batched workloads when on battery, defer notifications during a
-//! Meeting, suggest a break when DeepWork has run a long time).
+//! consume the published state to make policy decisions.
 //!
 //! Interface: `org.delphi.Environment`
 //!
+//! SVC-2: every method enforces authorization via the shared [`AuthGuard`] on
+//! its first line. The six `get_*` readers are Autonomous;
+//! `set_location_label`/`remove_location_label` are Confirm. (The six
+//! `#[zbus(signal)]` declarations are not inbound methods and carry no guard.)
+//!
 //! # Fidelity provenance (Iron Law #13)
 //!
-//! Every reading carries a [`Fidelity`] tag. Consumers can filter
-//! out `Fidelity::Unavailable` readings or weigh `Fidelity::Subprocess`
-//! lower than `Fidelity::Direct`. The JSON serialization preserves
-//! this provenance verbatim under each domain object's `"fidelity"`
-//! key.
+//! Every reading carries a [`Fidelity`] tag preserved verbatim in the JSON
+//! under each domain object's `"fidelity"` key.
 //!
 //! # Signal emission
 //!
-//! The five state-change signals (`BatteryLow`, `ThermalWarning`,
-//! `MemoryPressureHigh`, `TimeBandChanged`, `LocationChanged`,
-//! `ActivityStateChanged`) are **declared** here for D-Bus
-//! introspection. **Emission** is the orchestrator daemon's
-//! responsibility — it polls [`get_state`](EnvironmentService::get_state)
-//! on an interval, diffs against the previous snapshot, and emits via a
-//! [`zbus::object_server::SignalEmitter`] when transitions occur. This
-//! mirrors the goals-service pattern: the wrapper stays unit-testable
-//! without a live D-Bus connection.
+//! The state-change signals are **declared** here for introspection; emission
+//! is the orchestrator daemon's responsibility (it polls, diffs, and emits via
+//! a [`SignalEmitter`]). The wrapper stays unit-testable without a live bus.
 //!
-//! Uses `std::sync::Mutex` (not `tokio::sync`) because the underlying
-//! sensor may hold `!Send` types — see CLAUDE.md Section 3 "D-Bus
-//! Service Pattern" rule 6.
+//! Uses `std::sync::Mutex` (not `tokio::sync`) because the underlying sensor may
+//! hold `!Send` types — see CLAUDE.md Section 3 rule 6.
 
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 
 use die_orchestrator::environment::{
@@ -44,50 +38,51 @@ use die_orchestrator::environment::{
     LocationContext, MemoryInfo, ThermalInfo, TimeContext,
 };
 
+use crate::auth_guard::AuthGuard;
+
 /// D-Bus object path for the Environment interface.
 pub const PATH: &str = "/org/delphi/Environment";
 
 /// Environment D-Bus service.
 ///
-/// Wraps an [`EnvironmentMonitor`] in `Arc<Mutex<...>>` so D-Bus async
-/// methods can lock it briefly to read state or mutate the location
-/// map. The Mutex is the standard `std::sync::Mutex` because the
-/// underlying sensor may not be `Send` across await points.
+/// Wraps an [`EnvironmentMonitor`] in `Arc<Mutex<...>>` so D-Bus async methods
+/// can lock it briefly. The Mutex is `std::sync::Mutex` because the underlying
+/// sensor may not be `Send` across await points.
 ///
 /// # Examples
 ///
 /// ```
 /// use delphi_services::environment::EnvironmentService;
+/// use delphi_services::auth_guard::AuthGuard;
 /// use die_orchestrator::environment::EnvironmentMonitor;
 /// use std::sync::{Arc, Mutex};
 ///
 /// let monitor = EnvironmentMonitor::new_linux();
-/// let svc = EnvironmentService::new(Arc::new(Mutex::new(monitor)));
+/// let svc = EnvironmentService::new(Arc::new(Mutex::new(monitor)), Arc::new(AuthGuard::dev_in_memory()));
 /// ```
 pub struct EnvironmentService {
     monitor: Arc<Mutex<EnvironmentMonitor>>,
+    guard: Arc<AuthGuard>,
 }
 
 impl EnvironmentService {
-    /// Create a new environment service.
+    /// Create a new environment service guarded by the shared [`AuthGuard`].
     #[must_use]
-    pub fn new(monitor: Arc<Mutex<EnvironmentMonitor>>) -> Self {
-        Self { monitor }
+    pub fn new(monitor: Arc<Mutex<EnvironmentMonitor>>, guard: Arc<AuthGuard>) -> Self {
+        Self { monitor, guard }
     }
 }
 
 #[zbus::interface(name = "org.delphi.Environment")]
 impl EnvironmentService {
-    /// Capture the full environment state.
-    ///
-    /// `activity_obs_json` is a JSON-encoded [`ActivityObservations`]
-    /// supplied by the caller (the orchestrator daemon collects it
-    /// from the compositor and learning observer). An empty string is
-    /// treated as the default (zeroed) observations — useful for
-    /// callers that don't have signal sources wired up yet.
-    ///
-    /// Returns a JSON-encoded [`EnvironmentState`].
-    async fn get_state(&self, activity_obs_json: String) -> zbus::fdo::Result<String> {
+    /// Capture the full environment state. Returns a JSON-encoded
+    /// [`EnvironmentState`].
+    async fn get_state(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        activity_obs_json: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("environment.get_state", &header)?;
         let obs = parse_activity_observations(&activity_obs_json)?;
         let monitor = self
             .monitor
@@ -100,11 +95,13 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    /// Get just the battery sub-snapshot.
-    ///
-    /// Returns the empty string when no battery is present (desktop
-    /// hosts), otherwise a JSON-encoded [`BatteryInfo`].
-    async fn get_battery(&self, activity_obs_json: String) -> zbus::fdo::Result<String> {
+    /// Get just the battery sub-snapshot (empty string when no battery present).
+    async fn get_battery(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        activity_obs_json: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("environment.get_battery", &header)?;
         let obs = parse_activity_observations(&activity_obs_json)?;
         let monitor = self
             .monitor
@@ -121,7 +118,12 @@ impl EnvironmentService {
     }
 
     /// Get just the thermal sub-snapshot.
-    async fn get_thermal(&self, activity_obs_json: String) -> zbus::fdo::Result<String> {
+    async fn get_thermal(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        activity_obs_json: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("environment.get_thermal", &header)?;
         let obs = parse_activity_observations(&activity_obs_json)?;
         let monitor = self
             .monitor
@@ -135,7 +137,12 @@ impl EnvironmentService {
     }
 
     /// Get just the memory sub-snapshot.
-    async fn get_memory(&self, activity_obs_json: String) -> zbus::fdo::Result<String> {
+    async fn get_memory(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        activity_obs_json: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("environment.get_memory", &header)?;
         let obs = parse_activity_observations(&activity_obs_json)?;
         let monitor = self
             .monitor
@@ -149,7 +156,12 @@ impl EnvironmentService {
     }
 
     /// Get just the time-context sub-snapshot.
-    async fn get_time_context(&self, activity_obs_json: String) -> zbus::fdo::Result<String> {
+    async fn get_time_context(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        activity_obs_json: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("environment.get_time_context", &header)?;
         let obs = parse_activity_observations(&activity_obs_json)?;
         let monitor = self
             .monitor
@@ -163,7 +175,12 @@ impl EnvironmentService {
     }
 
     /// Get just the location sub-snapshot.
-    async fn get_location(&self, activity_obs_json: String) -> zbus::fdo::Result<String> {
+    async fn get_location(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        activity_obs_json: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("environment.get_location", &header)?;
         let obs = parse_activity_observations(&activity_obs_json)?;
         let monitor = self
             .monitor
@@ -176,11 +193,15 @@ impl EnvironmentService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    /// Set a label in the location map.
-    ///
-    /// `key` must be either `"ssid:<name>"` or `"wired:true"`.
-    /// Returns `true` on success.
-    async fn set_location_label(&self, key: String, label: String) -> zbus::fdo::Result<bool> {
+    /// Set a label in the location map. `key` must be `"ssid:<name>"` or
+    /// `"wired:true"`. Returns `true` on success.
+    async fn set_location_label(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        key: String,
+        label: String,
+    ) -> zbus::fdo::Result<bool> {
+        self.guard.enforce("environment.set_location_label", &header)?;
         // SVC-6-R2-3: cap BEFORE info!()/validation/store.
         crate::limits::ensure_within(&key, crate::limits::MAX_STRING_BYTES, "key")?;
         crate::limits::ensure_within(&label, crate::limits::MAX_STRING_BYTES, "label")?;
@@ -189,16 +210,17 @@ impl EnvironmentService {
             .monitor
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
-        // SVC-7: the domain validates the key/label grammar and returns
-        // whether the entry was accepted; surface that to the caller instead
-        // of always claiming success.
+        // SVC-7: the domain validates the key/label grammar.
         Ok(monitor.location_map_mut().set_label(&key, &label))
     }
 
-    /// Remove a label from the location map.
-    ///
-    /// Returns `true` if the key existed, `false` otherwise.
-    async fn remove_location_label(&self, key: String) -> zbus::fdo::Result<bool> {
+    /// Remove a label from the location map. Returns `true` if the key existed.
+    async fn remove_location_label(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        key: String,
+    ) -> zbus::fdo::Result<bool> {
+        self.guard.enforce("environment.remove_location_label", &header)?;
         crate::limits::ensure_within(&key, crate::limits::MAX_STRING_BYTES, "key")?;
         info!(key = %key, "D-Bus remove_location_label");
         let mut monitor = self
@@ -215,7 +237,6 @@ impl EnvironmentService {
     async fn battery_low(signal_emitter: &SignalEmitter<'_>, percent: u8) -> zbus::Result<()>;
 
     /// Emitted when CPU temperature crosses the throttling threshold.
-    /// `fidelity` is the wire-stable fidelity name (`"direct"`, `"subprocess"`, etc).
     #[zbus(signal)]
     async fn thermal_warning(
         signal_emitter: &SignalEmitter<'_>,
@@ -224,8 +245,6 @@ impl EnvironmentService {
     ) -> zbus::Result<()>;
 
     /// Emitted when memory pressure transitions to High or Critical.
-    /// `level` is the wire-stable pressure-level name. `fidelity` is the
-    /// wire-stable fidelity name.
     #[zbus(signal)]
     async fn memory_pressure_high(
         signal_emitter: &SignalEmitter<'_>,
@@ -240,8 +259,7 @@ impl EnvironmentService {
         new_band: &str,
     ) -> zbus::Result<()>;
 
-    /// Emitted when the resolved location label changes (e.g. user
-    /// connects to a network with a different label).
+    /// Emitted when the resolved location label changes.
     #[zbus(signal)]
     async fn location_changed(
         signal_emitter: &SignalEmitter<'_>,
@@ -322,10 +340,8 @@ fn environment_state_to_json(s: &EnvironmentState) -> serde_json::Value {
     })
 }
 
-/// Parse [`ActivityObservations`] from a JSON object string.
-///
-/// Accepts the empty string as a sentinel for the zeroed default —
-/// callers without compositor wiring just pass `""`.
+/// Parse [`ActivityObservations`] from a JSON object string. Accepts the empty
+/// string as a sentinel for the zeroed default.
 fn parse_activity_observations(json: &str) -> zbus::fdo::Result<ActivityObservations> {
     if json.is_empty() {
         return Ok(ActivityObservations::default());
@@ -343,7 +359,10 @@ mod tests {
         ActivityState, EnvironmentSensor, MemoryInfo, PowerState, PressureLevel, ThermalInfo,
     };
 
-    // ── Mock sensor for service tests ────────────────────────────────
+    use crate::auth::AuthPolicy;
+    use crate::auth_guard::completeness::{
+        assert_all_methods_classified, assert_behavioral_covers_all, header_msg as msg,
+    };
 
     struct StubSensor {
         battery: Option<BatteryInfo>,
@@ -411,17 +430,27 @@ mod tests {
         }
     }
 
+    fn guard(policy: AuthPolicy) -> Arc<AuthGuard> {
+        Arc::new(AuthGuard::new(
+            policy,
+            Arc::new(Mutex::new(fortress::audit::AuditLog::in_memory())),
+        ))
+    }
+
     fn mk_svc_rich() -> EnvironmentService {
         let monitor = EnvironmentMonitor::with_sensor(Box::new(StubSensor::rich()));
-        EnvironmentService::new(Arc::new(Mutex::new(monitor)))
+        EnvironmentService::new(Arc::new(Mutex::new(monitor)), guard(AuthPolicy::dev()))
     }
 
     fn mk_svc_no_battery() -> EnvironmentService {
         let monitor = EnvironmentMonitor::with_sensor(Box::new(StubSensor::no_battery()));
-        EnvironmentService::new(Arc::new(Mutex::new(monitor)))
+        EnvironmentService::new(Arc::new(Mutex::new(monitor)), guard(AuthPolicy::dev()))
     }
 
-    // ── Smoke + path ────────────────────────────────────────────────
+    fn mk_svc_deployed() -> EnvironmentService {
+        let monitor = EnvironmentMonitor::with_sensor(Box::new(StubSensor::rich()));
+        EnvironmentService::new(Arc::new(Mutex::new(monitor)), guard(AuthPolicy::deployed()))
+    }
 
     #[test]
     fn path_is_valid() {
@@ -434,12 +463,11 @@ mod tests {
         let _ = mk_svc_rich();
     }
 
-    // ── get_state JSON shape ────────────────────────────────────────
-
     #[tokio::test]
     async fn get_state_returns_full_json_shape() {
         let svc = mk_svc_rich();
-        let json = svc.get_state(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_state(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""captured_at":"#));
         assert!(json.contains(r#""thermal":"#));
         assert!(json.contains(r#""memory":"#));
@@ -451,10 +479,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_state_handles_default_observations() {
-        // Empty string sentinel → default observations (no input, no keystrokes)
         let svc = mk_svc_rich();
-        let json = svc.get_state(String::new()).await.unwrap();
-        // With zero observations, classifier returns Unknown.
+        let m = msg(":1.5");
+        let json = svc.get_state(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""activity":"unknown""#));
     }
 
@@ -466,8 +493,9 @@ mod tests {
             active_window_switches_last_minute: 2,
             ..Default::default()
         };
+        let m = msg(":1.5");
         let json = svc
-            .get_state(serde_json::to_string(&obs).unwrap())
+            .get_state(m.header(), serde_json::to_string(&obs).unwrap())
             .await
             .unwrap();
         assert!(json.contains(r#""activity":"deep_work""#));
@@ -476,16 +504,16 @@ mod tests {
     #[tokio::test]
     async fn get_state_rejects_malformed_observations_json() {
         let svc = mk_svc_rich();
-        let err = svc.get_state("not-json".to_string()).await.unwrap_err();
+        let m = msg(":1.5");
+        let err = svc.get_state(m.header(), "not-json".to_string()).await.unwrap_err();
         assert!(err.to_string().to_lowercase().contains("invalid"));
     }
-
-    // ── Per-domain getters ──────────────────────────────────────────
 
     #[tokio::test]
     async fn get_battery_returns_json_when_present() {
         let svc = mk_svc_rich();
-        let json = svc.get_battery(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_battery(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""percent":75"#));
         assert!(json.contains(r#""state":"battery""#));
         assert!(json.contains(r#""time_remaining_sec":7200"#));
@@ -495,14 +523,16 @@ mod tests {
     #[tokio::test]
     async fn get_battery_returns_empty_string_when_absent() {
         let svc = mk_svc_no_battery();
-        let json = svc.get_battery(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_battery(m.header(), String::new()).await.unwrap();
         assert!(json.is_empty());
     }
 
     #[tokio::test]
     async fn get_thermal_returns_fidelity_tagged_json() {
         let svc = mk_svc_rich();
-        let json = svc.get_thermal(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_thermal(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""cpu_temp_celsius":55.0"#));
         assert!(json.contains(r#""throttling":false"#));
         assert!(json.contains(r#""fidelity":"direct""#));
@@ -511,7 +541,8 @@ mod tests {
     #[tokio::test]
     async fn get_memory_returns_pressure_level_string() {
         let svc = mk_svc_rich();
-        let json = svc.get_memory(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_memory(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""pressure_level":"normal""#));
         assert!(json.contains(r#""total_kb":16000000"#));
         assert!(json.contains(r#""psi_some_avg10":0.0"#));
@@ -521,7 +552,8 @@ mod tests {
     #[tokio::test]
     async fn get_time_context_returns_band_and_weekend_flag() {
         let svc = mk_svc_rich();
-        let json = svc.get_time_context(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_time_context(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""band":"#));
         assert!(json.contains(r#""is_weekend":"#));
         assert!(json.contains(r#""local_datetime":"#));
@@ -530,33 +562,33 @@ mod tests {
     #[tokio::test]
     async fn get_location_returns_ssid_and_fidelity() {
         let svc = mk_svc_rich();
-        let json = svc.get_location(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_location(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""wifi_ssid":"home-net""#));
         assert!(json.contains(r#""fidelity":"subprocess""#));
         assert!(json.contains(r#""on_wired":false"#));
     }
 
-    // ── Location label mutations ────────────────────────────────────
-
     #[tokio::test]
     async fn set_location_label_persists_across_calls() {
         let svc = mk_svc_rich();
+        let m = msg(":1.5");
         let ok = svc
-            .set_location_label("ssid:home-net".to_string(), "home".to_string())
+            .set_location_label(m.header(), "ssid:home-net".to_string(), "home".to_string())
             .await
             .unwrap();
         assert!(ok);
-        let json = svc.get_location(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_location(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""label":"home""#));
     }
 
     #[tokio::test]
     async fn set_location_label_rejects_invalid_key() {
         let svc = mk_svc_rich();
-        // SVC-7: an invalid key is rejected by the domain grammar; the
-        // transport surfaces `false` rather than a bogus success.
+        let m = msg(":1.5");
         let ok = svc
-            .set_location_label("evil:key".to_string(), "x".to_string())
+            .set_location_label(m.header(), "evil:key".to_string(), "x".to_string())
             .await
             .unwrap();
         assert!(!ok);
@@ -565,30 +597,31 @@ mod tests {
     #[tokio::test]
     async fn remove_location_label_returns_true_on_existing_key() {
         let svc = mk_svc_rich();
-        svc.set_location_label("ssid:home-net".to_string(), "home".to_string())
+        let m = msg(":1.5");
+        svc.set_location_label(m.header(), "ssid:home-net".to_string(), "home".to_string())
             .await
             .unwrap();
+        let m = msg(":1.5");
         let removed = svc
-            .remove_location_label("ssid:home-net".to_string())
+            .remove_location_label(m.header(), "ssid:home-net".to_string())
             .await
             .unwrap();
         assert!(removed);
-        // After removal, label is no longer resolved.
-        let json = svc.get_location(String::new()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_location(m.header(), String::new()).await.unwrap();
         assert!(json.contains(r#""label":null"#));
     }
 
     #[tokio::test]
     async fn remove_location_label_returns_false_on_missing_key() {
         let svc = mk_svc_rich();
+        let m = msg(":1.5");
         let removed = svc
-            .remove_location_label("ssid:never-set".to_string())
+            .remove_location_label(m.header(), "ssid:never-set".to_string())
             .await
             .unwrap();
         assert!(!removed);
     }
-
-    // ── activity classification round-trip ─────────────────────────
 
     #[tokio::test]
     async fn get_state_reports_idle_when_observations_say_idle() {
@@ -597,8 +630,9 @@ mod tests {
             seconds_since_last_input: 9_999,
             ..Default::default()
         };
+        let m = msg(":1.5");
         let json = svc
-            .get_state(serde_json::to_string(&obs).unwrap())
+            .get_state(m.header(), serde_json::to_string(&obs).unwrap())
             .await
             .unwrap();
         assert!(json.contains(&format!(r#""activity":"{}""#, ActivityState::Idle.as_str())));
@@ -611,64 +645,98 @@ mod tests {
             microphone_in_use: true,
             ..Default::default()
         };
+        let m = msg(":1.5");
         let json = svc
-            .get_state(serde_json::to_string(&obs).unwrap())
+            .get_state(m.header(), serde_json::to_string(&obs).unwrap())
             .await
             .unwrap();
         assert!(json.contains(r#""activity":"meeting""#));
     }
 
-    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
-    /// The 6 `get_*` methods take `activity_obs_json` which is capped inside
-    /// `parse_activity_observations`; the set/remove_location_label methods
-    /// cap their `key` and `label` directly.
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary
+    /// (after the SVC-2 guard).
     #[tokio::test]
     async fn every_string_param_rejects_oversize() {
         let svc = mk_svc_rich();
         let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
 
-        // The 6 get_* methods all take `activity_obs_json: String`.
+        for getter in ["state", "battery", "thermal", "memory", "time", "location"] {
+            let m = msg(":1.5");
+            let err = match getter {
+                "state" => svc.get_state(m.header(), oversize.clone()).await,
+                "battery" => svc.get_battery(m.header(), oversize.clone()).await,
+                "thermal" => svc.get_thermal(m.header(), oversize.clone()).await,
+                "memory" => svc.get_memory(m.header(), oversize.clone()).await,
+                "time" => svc.get_time_context(m.header(), oversize.clone()).await,
+                _ => svc.get_location(m.header(), oversize.clone()).await,
+            };
+            assert!(matches!(err.unwrap_err(), zbus::fdo::Error::InvalidArgs(_)), "{getter}");
+        }
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.get_state(oversize.clone()).await.unwrap_err(),
-            zbus::fdo::Error::InvalidArgs(_)
-        ));
-        assert!(matches!(
-            svc.get_battery(oversize.clone()).await.unwrap_err(),
-            zbus::fdo::Error::InvalidArgs(_)
-        ));
-        assert!(matches!(
-            svc.get_thermal(oversize.clone()).await.unwrap_err(),
-            zbus::fdo::Error::InvalidArgs(_)
-        ));
-        assert!(matches!(
-            svc.get_memory(oversize.clone()).await.unwrap_err(),
-            zbus::fdo::Error::InvalidArgs(_)
-        ));
-        assert!(matches!(
-            svc.get_time_context(oversize.clone()).await.unwrap_err(),
-            zbus::fdo::Error::InvalidArgs(_)
-        ));
-        assert!(matches!(
-            svc.get_location(oversize.clone()).await.unwrap_err(),
-            zbus::fdo::Error::InvalidArgs(_)
-        ));
-        // set_location_label(key, label) — each String position.
-        assert!(matches!(
-            svc.set_location_label(oversize.clone(), "label".to_string())
+            svc.set_location_label(m.header(), oversize.clone(), "label".to_string())
                 .await
                 .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.set_location_label("ssid:home".to_string(), oversize.clone())
+            svc.set_location_label(m.header(), "ssid:home".to_string(), oversize.clone())
                 .await
                 .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
-        // remove_location_label(key)
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.remove_location_label(oversize).await.unwrap_err(),
+            svc.remove_location_label(m.header(), oversize).await.unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+    }
+
+    // ── SVC-2 completeness (Decision 3) ──
+
+    #[test]
+    fn svc2_every_method_is_classified() {
+        use zbus::object_server::Interface;
+        let svc = mk_svc_rich();
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_all_methods_classified("environment", &xml);
+    }
+
+    #[tokio::test]
+    async fn svc2_every_method_denies_unrecognized_caller_when_deployed() {
+        let svc = mk_svc_deployed();
+        let mut exercised: Vec<&str> = Vec::new();
+
+        exercised.push("GetState");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_state(m.header(), String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetBattery");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_battery(m.header(), String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetThermal");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_thermal(m.header(), String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetMemory");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_memory(m.header(), String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetTimeContext");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_time_context(m.header(), String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetLocation");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_location(m.header(), String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("SetLocationLabel");
+        let m = msg(":1.999");
+        assert!(matches!(svc.set_location_label(m.header(), "ssid:x".to_string(), "l".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("RemoveLocationLabel");
+        let m = msg(":1.999");
+        assert!(matches!(svc.remove_location_label(m.header(), "ssid:x".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+
+        use zbus::object_server::Interface;
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_behavioral_covers_all("environment", &xml, &exercised);
     }
 }

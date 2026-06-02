@@ -2,115 +2,79 @@
 
 //! D-Bus Goals interface.
 //!
-//! Exposes the persistent goal graph over D-Bus. The shell uses this to
-//! create, update, and query goals, plus request timeline estimates and
-//! find stale or deadline-approaching goals.
+//! Exposes the persistent goal graph over D-Bus.
 //!
 //! Interface: `org.delphi.Goals`
 //!
-//! # Signal emission
-//!
-//! All four signals (`GoalCreated`, `GoalCompleted`, `GoalDeadlineApproaching`,
-//! `GoalStale`) are **declared** here so they appear in the D-Bus introspection
-//! XML and external subscribers can register for them. **Emission** is done by
-//! the orchestrator daemon, which:
-//!
-//! - Calls a method on this service
-//! - Observes the result
-//! - Uses an [`zbus::object_server::InterfaceRef`] to obtain a `SignalEmitter`
-//! - Calls the generated emission method on the emitter
-//!
-//! This keeps the service wrapper pure (unit-testable without a live D-Bus
-//! connection) while preserving the complete D-Bus surface.
+//! SVC-2: every method enforces authorization via the shared [`AuthGuard`] on
+//! its first line. The read methods (`get_goal`, `list_active`, `list_children`,
+//! `find_stale`, `find_approaching_deadline`, `get_timeline`, `count`) are
+//! Autonomous; `create_goal`/`update_goal`/`update_progress` are Confirm. (The
+//! four `#[zbus(signal)]` declarations carry no guard.)
 //!
 //! Uses `std::sync::Mutex` (not `tokio::sync`) because `rusqlite::Connection`
-//! is `!Send` across await points — see CLAUDE.md Section 3 "D-Bus Service
-//! Pattern" rule 6.
+//! is `!Send` across await points — see CLAUDE.md Section 3 rule 6.
 
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 
 use die_orchestrator::goals::{
     DeadlineRisk, Goal, GoalPatch, GoalStore, GoalTimeline, Priority, TimelineBasis,
 };
 
+use crate::auth_guard::AuthGuard;
+
 /// D-Bus object path for the Goals interface.
 pub const PATH: &str = "/org/delphi/Goals";
 
 /// Sentinel used over D-Bus to mean "no parent goal".
-///
-/// SQLite `AUTOINCREMENT` ids always start at 1, so 0 is safely unused and
-/// avoids the need to introduce a wire-level optional type.
 const NO_PARENT: i64 = 0;
 
 /// Goals D-Bus service.
-///
-/// Wraps the orchestrator [`GoalStore`] and exposes it over D-Bus.
 ///
 /// # Examples
 ///
 /// ```
 /// use delphi_services::goals::GoalsService;
+/// use delphi_services::auth_guard::AuthGuard;
 /// use die_orchestrator::goals::GoalStore;
 /// use std::sync::{Arc, Mutex};
 ///
 /// let store = Arc::new(Mutex::new(GoalStore::in_memory().unwrap()));
-/// let svc = GoalsService::new(store);
+/// let svc = GoalsService::new(store, Arc::new(AuthGuard::dev_in_memory()));
 /// ```
 pub struct GoalsService {
     store: Arc<Mutex<GoalStore>>,
+    guard: Arc<AuthGuard>,
 }
 
 impl GoalsService {
-    /// Create a new goals service.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use delphi_services::goals::GoalsService;
-    /// use die_orchestrator::goals::GoalStore;
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// let _svc = GoalsService::new(
-    ///     Arc::new(Mutex::new(GoalStore::in_memory().unwrap())),
-    /// );
-    /// ```
+    /// Create a new goals service guarded by the shared [`AuthGuard`].
     #[must_use]
-    pub fn new(store: Arc<Mutex<GoalStore>>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<Mutex<GoalStore>>, guard: Arc<AuthGuard>) -> Self {
+        Self { store, guard }
     }
 }
 
 #[zbus::interface(name = "org.delphi.Goals")]
 impl GoalsService {
-    /// Create a new goal. Returns the new goal id.
-    ///
-    /// - `title` — required, non-empty.
-    /// - `description` — may be empty.
-    /// - `priority` — one of `"low"`, `"medium"` (or `"med"`), `"high"`,
-    ///   `"critical"` (or `"crit"`), case-insensitive; or the digits
-    ///   `"1"`..`"4"`.
-    /// - `parent_id` — a positive goal id to set a parent, or `0` for no
-    ///   parent.
-    /// - `deadline_rfc3339` — an RFC 3339 UTC timestamp (e.g.
-    ///   `"2026-05-01T12:00:00Z"`), or the empty string for no deadline.
-    ///
-    /// If the deadline is provided, it is set in a second step via
-    /// [`GoalStore::update_goal`]. If that second step fails (rare — only on
-    /// SQLite error), the goal still exists without the deadline and an error
-    /// is returned; the caller may retry setting the deadline.
+    /// Create a new goal. Returns the new goal id. See the field docs in the
+    /// repository history; `parent_id == 0` means no parent, empty
+    /// `deadline_rfc3339` means no deadline.
     async fn create_goal(
         &self,
+        #[zbus(header)] header: Header<'_>,
         title: String,
         description: String,
         priority: String,
         parent_id: i64,
         deadline_rfc3339: String,
     ) -> zbus::fdo::Result<i64> {
-        // SVC-6-R2-3: cap every String param BEFORE any info!()/parse/store.
+        self.guard.enforce("goals.create_goal", &header)?;
         crate::limits::ensure_within(&title, crate::limits::MAX_STRING_BYTES, "title")?;
         crate::limits::ensure_within(&description, crate::limits::MAX_STRING_BYTES, "description")?;
         crate::limits::ensure_within(&priority, crate::limits::MAX_STRING_BYTES, "priority")?;
@@ -151,21 +115,13 @@ impl GoalsService {
     }
 
     /// Update a subset of a goal's fields via a JSON patch.
-    ///
-    /// The patch is a JSON object. Only keys that are **present** are
-    /// updated — keys that are absent leave the field unchanged.
-    ///
-    /// | Key           | JSON type           | Meaning                                  |
-    /// |---------------|---------------------|------------------------------------------|
-    /// | `title`       | string              | Replace title.                           |
-    /// | `description` | string              | Replace description.                     |
-    /// | `priority`    | string              | Replace priority (see `create_goal`).    |
-    /// | `status`      | string              | `active`/`paused`/`completed`/`archived`.|
-    /// | `deadline`    | string or `null`    | Set to RFC 3339 string, or clear (null). |
-    /// | `parent`      | integer or `null`   | Set to new parent id, or clear (null).   |
-    ///
-    /// An empty object `{}` is a valid no-op patch.
-    async fn update_goal(&self, id: i64, patch_json: String) -> zbus::fdo::Result<()> {
+    async fn update_goal(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        id: i64,
+        patch_json: String,
+    ) -> zbus::fdo::Result<()> {
+        self.guard.enforce("goals.update_goal", &header)?;
         crate::limits::ensure_within(&patch_json, crate::limits::MAX_STRING_BYTES, "patch_json")?;
         info!(goal_id = id, "D-Bus update_goal");
         let patch = GoalPatch::from_json(&patch_json)
@@ -179,13 +135,14 @@ impl GoalsService {
             .map_err(|e| crate::error::map_orchestrator("goal store operation failed", e))
     }
 
-    /// Record progress on a goal.
-    ///
-    /// `progress` must be in `0..=100`. A value `> 100` is **rejected** with a
-    /// typed `InvalidArgs` validation error — it is no longer silently clamped
-    /// (SVC-9: silent clamping hid caller bugs; the wire contract now surfaces
-    /// out-of-range input instead of masking it).
-    async fn update_progress(&self, id: i64, progress: u32) -> zbus::fdo::Result<()> {
+    /// Record progress on a goal. `progress` must be in `0..=100`.
+    async fn update_progress(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        id: i64,
+        progress: u32,
+    ) -> zbus::fdo::Result<()> {
+        self.guard.enforce("goals.update_progress", &header)?;
         info!(goal_id = id, progress, "D-Bus update_progress");
         let store = self
             .store
@@ -197,7 +154,8 @@ impl GoalsService {
     }
 
     /// Fetch a single goal as JSON.
-    async fn get_goal(&self, id: i64) -> zbus::fdo::Result<String> {
+    async fn get_goal(&self, #[zbus(header)] header: Header<'_>, id: i64) -> zbus::fdo::Result<String> {
+        self.guard.enforce("goals.get_goal", &header)?;
         let store = self
             .store
             .lock()
@@ -210,7 +168,8 @@ impl GoalsService {
     }
 
     /// List all active goals as a JSON array, newest first.
-    async fn list_active(&self) -> zbus::fdo::Result<String> {
+    async fn list_active(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<String> {
+        self.guard.enforce("goals.list_active", &header)?;
         let store = self
             .store
             .lock()
@@ -222,7 +181,12 @@ impl GoalsService {
     }
 
     /// List direct children of a parent goal as a JSON array, newest first.
-    async fn list_children(&self, parent_id: i64) -> zbus::fdo::Result<String> {
+    async fn list_children(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        parent_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("goals.list_children", &header)?;
         let store = self
             .store
             .lock()
@@ -234,7 +198,12 @@ impl GoalsService {
     }
 
     /// List active goals with no activity newer than `inactive_days` ago.
-    async fn find_stale(&self, inactive_days: u32) -> zbus::fdo::Result<String> {
+    async fn find_stale(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        inactive_days: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("goals.find_stale", &header)?;
         info!(inactive_days, "D-Bus find_stale");
         let store = self
             .store
@@ -247,7 +216,12 @@ impl GoalsService {
     }
 
     /// List active goals whose deadline falls within the next `within_days`.
-    async fn find_approaching_deadline(&self, within_days: u32) -> zbus::fdo::Result<String> {
+    async fn find_approaching_deadline(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        within_days: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("goals.find_approaching_deadline", &header)?;
         info!(within_days, "D-Bus find_approaching_deadline");
         let store = self
             .store
@@ -260,20 +234,15 @@ impl GoalsService {
     }
 
     /// Request a timeline estimate for a goal.
-    ///
-    /// Pace encoding:
-    /// - If `sessions_per_week <= 0.0` or `hours_per_session <= 0.0`, the
-    ///   estimator falls back to the priority heuristic and
-    ///   `work_hours_remaining` is ignored.
-    /// - Otherwise, the estimator uses the learned pace and
-    ///   `work_hours_remaining`.
     async fn get_timeline(
         &self,
+        #[zbus(header)] header: Header<'_>,
         id: i64,
         sessions_per_week: f64,
         hours_per_session: f64,
         work_hours_remaining: f64,
     ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("goals.get_timeline", &header)?;
         let store = self
             .store
             .lock()
@@ -291,7 +260,8 @@ impl GoalsService {
     }
 
     /// Total goal count across all statuses.
-    async fn count(&self) -> zbus::fdo::Result<u32> {
+    async fn count(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<u32> {
+        self.guard.enforce("goals.count", &header)?;
         let store = self
             .store
             .lock()
@@ -304,9 +274,7 @@ impl GoalsService {
 
     // ── signals (declared only; emission handled by the orchestrator daemon) ──
 
-    /// Emitted when a new goal is created.
-    ///
-    /// `timestamp` is UTC epoch seconds.
+    /// Emitted when a new goal is created. `timestamp` is UTC epoch seconds.
     #[zbus(signal)]
     async fn goal_created(
         signal_emitter: &SignalEmitter<'_>,
@@ -314,10 +282,7 @@ impl GoalsService {
         timestamp: i64,
     ) -> zbus::Result<()>;
 
-    /// Emitted when a goal transitions to
-    /// [`GoalStatus::Completed`](die_orchestrator::goals::GoalStatus::Completed).
-    ///
-    /// `timestamp` is UTC epoch seconds.
+    /// Emitted when a goal transitions to Completed. `timestamp` is UTC epoch seconds.
     #[zbus(signal)]
     async fn goal_completed(
         signal_emitter: &SignalEmitter<'_>,
@@ -325,11 +290,7 @@ impl GoalsService {
         timestamp: i64,
     ) -> zbus::Result<()>;
 
-    /// Emitted periodically by the orchestrator daemon for each active goal
-    /// whose deadline falls within a configured window.
-    ///
-    /// `days_remaining` is the number of days until the deadline at the
-    /// time of emission. `timestamp` is UTC epoch seconds.
+    /// Emitted for each active goal whose deadline falls within a window.
     #[zbus(signal)]
     async fn goal_deadline_approaching(
         signal_emitter: &SignalEmitter<'_>,
@@ -338,12 +299,7 @@ impl GoalsService {
         timestamp: i64,
     ) -> zbus::Result<()>;
 
-    /// Emitted periodically by the orchestrator daemon for each active goal
-    /// that has had no activity in longer than a configured threshold.
-    ///
-    /// `days_inactive` is the number of days since the last activity (or
-    /// creation, if there has been no activity). `timestamp` is UTC epoch
-    /// seconds.
+    /// Emitted for each active goal with no recent activity.
     #[zbus(signal)]
     async fn goal_stale(
         signal_emitter: &SignalEmitter<'_>,
@@ -420,9 +376,37 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    use crate::auth::AuthPolicy;
+    use crate::auth_guard::completeness::{
+        assert_all_methods_classified, assert_behavioral_covers_all, header_msg as msg,
+    };
+
     fn mk_svc() -> GoalsService {
+        mk_svc_with(AuthPolicy::dev())
+    }
+
+    fn mk_svc_with(policy: AuthPolicy) -> GoalsService {
         let store = Arc::new(Mutex::new(GoalStore::in_memory().unwrap()));
-        GoalsService::new(store)
+        let guard = Arc::new(AuthGuard::new(
+            policy,
+            Arc::new(Mutex::new(fortress::audit::AuditLog::in_memory())),
+        ));
+        GoalsService::new(store, guard)
+    }
+
+    /// Create a goal under a dev guard (helper to keep tests terse).
+    async fn make_goal(svc: &GoalsService, title: &str, priority: &str, parent: i64, deadline: &str) -> i64 {
+        let m = msg(":1.5");
+        svc.create_goal(
+            m.header(),
+            title.to_string(),
+            String::new(),
+            priority.to_string(),
+            parent,
+            deadline.to_string(),
+        )
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -439,52 +423,27 @@ mod tests {
     #[tokio::test]
     async fn count_starts_at_zero() {
         let svc = mk_svc();
-        assert_eq!(svc.count().await.unwrap(), 0);
+        let m = msg(":1.5");
+        assert_eq!(svc.count(m.header()).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn create_goal_returns_positive_id() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "Ship v1".to_string(),
-                String::new(),
-                "high".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
+        let id = make_goal(&svc, "Ship v1", "high", 0, "").await;
         assert!(id > 0);
-        assert_eq!(svc.count().await.unwrap(), 1);
+        let m = msg(":1.5");
+        assert_eq!(svc.count(m.header()).await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn create_goal_with_parent_and_deadline() {
         let svc = mk_svc();
-        let parent = svc
-            .create_goal(
-                "Book".to_string(),
-                String::new(),
-                "medium".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        let child = svc
-            .create_goal(
-                "Chapter 1".to_string(),
-                "draft".to_string(),
-                "high".to_string(),
-                parent,
-                "2026-06-01T00:00:00Z".to_string(),
-            )
-            .await
-            .unwrap();
+        let parent = make_goal(&svc, "Book", "medium", 0, "").await;
+        let child = make_goal(&svc, "Chapter 1", "high", parent, "2026-06-01T00:00:00Z").await;
         assert!(child > parent);
-
-        let goal_json = svc.get_goal(child).await.unwrap();
+        let m = msg(":1.5");
+        let goal_json = svc.get_goal(m.header(), child).await.unwrap();
         assert!(goal_json.contains(r#""deadline":"2026-06-01T00:00:00+00:00""#));
         assert!(goal_json.contains(&format!(r#""parent_goal":{parent}"#)));
     }
@@ -492,31 +451,20 @@ mod tests {
     #[tokio::test]
     async fn create_goal_invalid_priority_rejected() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let err = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "ultra".to_string(),
-                0,
-                String::new(),
-            )
+            .create_goal(m.header(), "x".to_string(), String::new(), "ultra".to_string(), 0, String::new())
             .await
             .unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("priority"), "got: {msg}");
+        assert!(err.to_string().to_lowercase().contains("priority"));
     }
 
     #[tokio::test]
     async fn create_goal_invalid_deadline_rejected() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let err = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                "not-a-timestamp".to_string(),
-            )
+            .create_goal(m.header(), "x".to_string(), String::new(), "low".to_string(), 0, "not-a-timestamp".to_string())
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("deadline"));
@@ -525,24 +473,14 @@ mod tests {
     #[tokio::test]
     async fn create_goal_empty_title_rejected() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let err = svc
-            .create_goal(
-                String::new(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
+            .create_goal(m.header(), String::new(), String::new(), "low".to_string(), 0, String::new())
             .await
             .unwrap_err();
-        // SVC-9: the empty-title rejection is a domain `Validation` whose fields
-        // are `&'static str`, so the transport surfaces them as a typed
-        // `InvalidArgs` ("bad argument") rather than a content-free `Failed`.
-        // No caller content / path can ride the static field+reason.
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
         assert!(
-            err.to_string()
-                .ends_with("validation failed: title (must not be empty)"),
+            err.to_string().ends_with("validation failed: title (must not be empty)"),
             "got: {err}"
         );
     }
@@ -550,24 +488,19 @@ mod tests {
     #[tokio::test]
     async fn get_goal_returns_json_with_fields() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let id = svc
-            .create_goal(
-                "Research".to_string(),
-                "literature review".to_string(),
-                "medium".to_string(),
-                0,
-                String::new(),
-            )
+            .create_goal(m.header(), "Research".to_string(), "literature review".to_string(), "medium".to_string(), 0, String::new())
             .await
             .unwrap();
-        let json = svc.get_goal(id).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(&format!(r#""id":{id}"#)));
         assert!(json.contains(r#""title":"Research""#));
         assert!(json.contains(r#""description":"literature review""#));
         assert!(json.contains(r#""priority":"medium""#));
         assert!(json.contains(r#""status":"active""#));
         assert!(json.contains(r#""progress_estimate":0"#));
-        // No deadline on this goal.
         assert!(json.contains(r#""deadline":null"#));
         assert!(json.contains(r#""last_activity":null"#));
     }
@@ -575,32 +508,18 @@ mod tests {
     #[tokio::test]
     async fn list_active_returns_empty_array_initially() {
         let svc = mk_svc();
-        let json = svc.list_active().await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.list_active(m.header()).await.unwrap();
         assert_eq!(json, "[]");
     }
 
     #[tokio::test]
     async fn list_active_returns_created_goals() {
         let svc = mk_svc();
-        svc.create_goal(
-            "a".to_string(),
-            String::new(),
-            "low".to_string(),
-            0,
-            String::new(),
-        )
-        .await
-        .unwrap();
-        svc.create_goal(
-            "b".to_string(),
-            String::new(),
-            "low".to_string(),
-            0,
-            String::new(),
-        )
-        .await
-        .unwrap();
-        let json = svc.list_active().await.unwrap();
+        make_goal(&svc, "a", "low", 0, "").await;
+        make_goal(&svc, "b", "low", 0, "").await;
+        let m = msg(":1.5");
+        let json = svc.list_active(m.header()).await.unwrap();
         assert!(json.starts_with('['));
         assert!(json.contains(r#""title":"a""#));
         assert!(json.contains(r#""title":"b""#));
@@ -609,37 +528,11 @@ mod tests {
     #[tokio::test]
     async fn list_children_filters_by_parent() {
         let svc = mk_svc();
-        let parent = svc
-            .create_goal(
-                "parent".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        let _other = svc
-            .create_goal(
-                "other".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        svc.create_goal(
-            "child".to_string(),
-            String::new(),
-            "low".to_string(),
-            parent,
-            String::new(),
-        )
-        .await
-        .unwrap();
-
-        let json = svc.list_children(parent).await.unwrap();
+        let parent = make_goal(&svc, "parent", "low", 0, "").await;
+        let _other = make_goal(&svc, "other", "low", 0, "").await;
+        make_goal(&svc, "child", "low", parent, "").await;
+        let m = msg(":1.5");
+        let json = svc.list_children(m.header(), parent).await.unwrap();
         assert!(json.contains(r#""title":"child""#));
         assert!(!json.contains(r#""title":"other""#));
         assert!(!json.contains(r#""title":"parent""#));
@@ -648,109 +541,59 @@ mod tests {
     #[tokio::test]
     async fn update_goal_applies_title_patch() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "old".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        svc.update_goal(id, r#"{"title":"new"}"#.to_string())
-            .await
-            .unwrap();
-        let json = svc.get_goal(id).await.unwrap();
+        let id = make_goal(&svc, "old", "low", 0, "").await;
+        let m = msg(":1.5");
+        svc.update_goal(m.header(), id, r#"{"title":"new"}"#.to_string()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(r#""title":"new""#));
     }
 
     #[tokio::test]
     async fn update_goal_clear_deadline_with_null() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                "2026-05-01T00:00:00Z".to_string(),
-            )
-            .await
-            .unwrap();
-        svc.update_goal(id, r#"{"deadline":null}"#.to_string())
-            .await
-            .unwrap();
-        let json = svc.get_goal(id).await.unwrap();
+        let id = make_goal(&svc, "x", "low", 0, "2026-05-01T00:00:00Z").await;
+        let m = msg(":1.5");
+        svc.update_goal(m.header(), id, r#"{"deadline":null}"#.to_string()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(r#""deadline":null"#));
     }
 
     #[tokio::test]
     async fn update_goal_empty_patch_is_noop() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        svc.update_goal(id, "{}".to_string()).await.unwrap();
-        let json = svc.get_goal(id).await.unwrap();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        svc.update_goal(m.header(), id, "{}".to_string()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(r#""title":"x""#));
     }
 
     #[tokio::test]
     async fn update_goal_invalid_json_rejected() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        let err = svc
-            .update_goal(id, "not json".to_string())
-            .await
-            .unwrap_err();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        let err = svc.update_goal(m.header(), id, "not json".to_string()).await.unwrap_err();
         assert!(err.to_string().to_lowercase().contains("json"));
     }
 
     #[tokio::test]
     async fn update_goal_non_object_json_rejected() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        let err = svc.update_goal(id, "42".to_string()).await.unwrap_err();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        let err = svc.update_goal(m.header(), id, "42".to_string()).await.unwrap_err();
         assert!(err.to_string().to_lowercase().contains("object"));
     }
 
     #[tokio::test]
     async fn update_goal_nonexistent_id_fails() {
         let svc = mk_svc();
-        let err = svc
-            .update_goal(9999, r#"{"title":"ghost"}"#.to_string())
-            .await
-            .unwrap_err();
-        // SVC-9: a missing goal is a domain `NotFound { entity: "goal" }`. The
-        // entity label is a static string (never the caller-supplied id), so the
-        // transport surfaces it as `InvalidArgs("goal not found")` — typed, and
-        // with no id / existence-oracle leak.
+        let m = msg(":1.5");
+        let err = svc.update_goal(m.header(), 9999, r#"{"title":"ghost"}"#.to_string()).await.unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
         assert!(err.to_string().ends_with("goal not found"), "got: {err}");
     }
@@ -758,98 +601,64 @@ mod tests {
     #[tokio::test]
     async fn update_goal_sets_status_to_completed() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        svc.update_goal(id, r#"{"status":"completed"}"#.to_string())
-            .await
-            .unwrap();
-        let json = svc.get_goal(id).await.unwrap();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        svc.update_goal(m.header(), id, r#"{"status":"completed"}"#.to_string()).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(r#""status":"completed""#));
     }
 
     #[tokio::test]
     async fn update_progress_stores_value() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        svc.update_progress(id, 45).await.unwrap();
-        let json = svc.get_goal(id).await.unwrap();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        svc.update_progress(m.header(), id, 45).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(r#""progress_estimate":45"#));
     }
 
     #[tokio::test]
     async fn update_progress_rejects_out_of_range() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        // SVC-9: out-of-range progress is a typed domain `Validation`, not a
-        // silent clamp. Assert the rejection is typed and the stored value is
-        // left untouched (still the create-time default of 0).
-        let err = svc.update_progress(id, 500).await.unwrap_err();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        let err = svc.update_progress(m.header(), id, 500).await.unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
         assert!(
-            err.to_string()
-                .ends_with("validation failed: progress (must be between 0 and 100)"),
+            err.to_string().ends_with("validation failed: progress (must be between 0 and 100)"),
             "got: {err}"
         );
-        let json = svc.get_goal(id).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.get_goal(m.header(), id).await.unwrap();
         assert!(json.contains(r#""progress_estimate":0"#));
     }
 
     #[tokio::test]
     async fn find_stale_empty_initially() {
         let svc = mk_svc();
-        let json = svc.find_stale(30).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.find_stale(m.header(), 30).await.unwrap();
         assert_eq!(json, "[]");
     }
 
     #[tokio::test]
     async fn find_approaching_deadline_empty_initially() {
         let svc = mk_svc();
-        let json = svc.find_approaching_deadline(7).await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.find_approaching_deadline(m.header(), 7).await.unwrap();
         assert_eq!(json, "[]");
     }
 
     #[tokio::test]
     async fn find_approaching_deadline_picks_up_upcoming() {
         let svc = mk_svc();
-        // Create a goal with a deadline 3 days from now.
         let deadline = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
-        let id = svc
-            .create_goal(
-                "soon".to_string(),
-                String::new(),
-                "high".to_string(),
-                0,
-                deadline,
-            )
-            .await
-            .unwrap();
-        let json = svc.find_approaching_deadline(7).await.unwrap();
+        let id = make_goal(&svc, "soon", "high", 0, &deadline).await;
+        let m = msg(":1.5");
+        let json = svc.find_approaching_deadline(m.header(), 7).await.unwrap();
         assert!(json.contains(&format!(r#""id":{id}"#)));
         assert!(json.contains(r#""title":"soon""#));
     }
@@ -857,18 +666,9 @@ mod tests {
     #[tokio::test]
     async fn get_timeline_no_history_uses_priority_heuristic() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "high".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        // sessions_per_week <= 0 triggers NoHistory; High → 21 days.
-        let json = svc.get_timeline(id, 0.0, 0.0, 0.0).await.unwrap();
+        let id = make_goal(&svc, "x", "high", 0, "").await;
+        let m = msg(":1.5");
+        let json = svc.get_timeline(m.header(), id, 0.0, 0.0, 0.0).await.unwrap();
         assert!(json.contains(r#""estimated_days":21"#));
         assert!(json.contains(r#""basis":"priority_heuristic""#));
         assert!(json.contains(r#""deadline_risk":"no_deadline""#));
@@ -877,18 +677,9 @@ mod tests {
     #[tokio::test]
     async fn get_timeline_learned_uses_pace_and_hours() {
         let svc = mk_svc();
-        let id = svc
-            .create_goal(
-                "x".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new(),
-            )
-            .await
-            .unwrap();
-        // 20 hours, 2 sessions/week of 4 hours each → 18 days (per TimelineEstimator docs).
-        let json = svc.get_timeline(id, 2.0, 4.0, 20.0).await.unwrap();
+        let id = make_goal(&svc, "x", "low", 0, "").await;
+        let m = msg(":1.5");
+        let json = svc.get_timeline(m.header(), id, 2.0, 4.0, 20.0).await.unwrap();
         assert!(json.contains(r#""estimated_days":18"#));
         assert!(json.contains(r#""basis":"learned""#));
     }
@@ -896,74 +687,104 @@ mod tests {
     #[tokio::test]
     async fn get_timeline_nonexistent_goal_fails() {
         let svc = mk_svc();
-        let err = svc.get_timeline(9999, 0.0, 0.0, 0.0).await.unwrap_err();
-        // SVC-9: the timeline estimator fetches the goal first, so a missing goal
-        // is the same domain `NotFound { entity: "goal" }` surfaced as the typed
-        // `InvalidArgs("goal not found")` — no id / existence-oracle leak.
+        let m = msg(":1.5");
+        let err = svc.get_timeline(m.header(), 9999, 0.0, 0.0, 0.0).await.unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
         assert!(err.to_string().ends_with("goal not found"), "got: {err}");
     }
 
     /// SVC-6-R2-3: every D-Bus `String` parameter is capped *before* logging,
-    /// parsing, or storage. Enumerates the full surface of [`GoalsService`].
+    /// parsing, or storage (after the SVC-2 guard).
     #[tokio::test]
     async fn every_string_param_rejects_oversize() {
         let svc = mk_svc();
         let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
 
-        // create_goal(title, description, priority, parent_id, deadline_rfc3339)
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.create_goal(
-                oversize.clone(),
-                String::new(),
-                "low".to_string(),
-                0,
-                String::new()
-            )
-            .await
-            .unwrap_err(),
+            svc.create_goal(m.header(), oversize.clone(), String::new(), "low".to_string(), 0, String::new())
+                .await
+                .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.create_goal(
-                "t".to_string(),
-                oversize.clone(),
-                "low".to_string(),
-                0,
-                String::new()
-            )
-            .await
-            .unwrap_err(),
+            svc.create_goal(m.header(), "t".to_string(), oversize.clone(), "low".to_string(), 0, String::new())
+                .await
+                .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.create_goal(
-                "t".to_string(),
-                String::new(),
-                oversize.clone(),
-                0,
-                String::new()
-            )
-            .await
-            .unwrap_err(),
+            svc.create_goal(m.header(), "t".to_string(), String::new(), oversize.clone(), 0, String::new())
+                .await
+                .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.create_goal(
-                "t".to_string(),
-                String::new(),
-                "low".to_string(),
-                0,
-                oversize.clone()
-            )
-            .await
-            .unwrap_err(),
+            svc.create_goal(m.header(), "t".to_string(), String::new(), "low".to_string(), 0, oversize.clone())
+                .await
+                .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
-        // update_goal(id, patch_json)
+        let m = msg(":1.5");
         assert!(matches!(
-            svc.update_goal(1, oversize.clone()).await.unwrap_err(),
+            svc.update_goal(m.header(), 1, oversize.clone()).await.unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+    }
+
+    // ── SVC-2 completeness (Decision 3) ──
+
+    #[test]
+    fn svc2_every_method_is_classified() {
+        use zbus::object_server::Interface;
+        let svc = mk_svc();
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_all_methods_classified("goals", &xml);
+    }
+
+    #[tokio::test]
+    async fn svc2_every_method_denies_unrecognized_caller_when_deployed() {
+        let svc = mk_svc_with(AuthPolicy::deployed());
+        let mut exercised: Vec<&str> = Vec::new();
+
+        exercised.push("CreateGoal");
+        let m = msg(":1.999");
+        assert!(matches!(svc.create_goal(m.header(), "t".to_string(), String::new(), "low".to_string(), 0, String::new()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("UpdateGoal");
+        let m = msg(":1.999");
+        assert!(matches!(svc.update_goal(m.header(), 1, "{}".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("UpdateProgress");
+        let m = msg(":1.999");
+        assert!(matches!(svc.update_progress(m.header(), 1, 10).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetGoal");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_goal(m.header(), 1).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("ListActive");
+        let m = msg(":1.999");
+        assert!(matches!(svc.list_active(m.header()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("ListChildren");
+        let m = msg(":1.999");
+        assert!(matches!(svc.list_children(m.header(), 0).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("FindStale");
+        let m = msg(":1.999");
+        assert!(matches!(svc.find_stale(m.header(), 30).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("FindApproachingDeadline");
+        let m = msg(":1.999");
+        assert!(matches!(svc.find_approaching_deadline(m.header(), 7).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("GetTimeline");
+        let m = msg(":1.999");
+        assert!(matches!(svc.get_timeline(m.header(), 1, 0.0, 0.0, 0.0).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("Count");
+        let m = msg(":1.999");
+        assert!(matches!(svc.count(m.header()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+
+        use zbus::object_server::Interface;
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_behavioral_covers_all("goals", &xml, &exercised);
     }
 }

@@ -267,6 +267,34 @@ impl CallerResolver {
     }
 }
 
+/// The caller's identity from the message `header` ALONE — the unique sender
+/// name, with NO credential round-trip (SVC-2 Decision 2). General
+/// authorization is unique-name-based, so it needs only the header; this is
+/// synchronous and bus-free. The async [`CallerResolver::resolve`] (which adds
+/// uid/pid via a `DBusProxy` round-trip) is reserved for the cloud-send path,
+/// where the deployed check needs credentials.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use delphi_services::caller_resolver::identity_from_header;
+/// # use zbus::message::Header;
+/// # fn demo(header: &Header<'_>) {
+/// let caller = identity_from_header(header);
+/// # let _ = caller;
+/// # }
+/// ```
+#[must_use]
+pub fn identity_from_header(header: &Header<'_>) -> CallerIdentity {
+    match header.sender() {
+        Some(sender) => CallerIdentity::from_unique_name(sender.as_str()),
+        None => {
+            warn!("D-Bus message has no sender; treating caller as anonymous");
+            CallerIdentity::from_unique_name(String::new())
+        }
+    }
+}
+
 /// Resolve uid/pid for a unique bus name via `org.freedesktop.DBus`. A
 /// successful fetch proves the connection was live; since unique names are
 /// never reassigned, the creds are stable for the name's lifetime.

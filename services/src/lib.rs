@@ -60,6 +60,12 @@ pub mod auth;
 /// The bus-facing producer for the bus-free `auth` policy core. See SVC-2.
 pub mod caller_resolver;
 
+/// Internal: the per-method authorization guard (SVC-2 Stage 2) — `AuthGuard::enforce`
+/// is the single seam every `#[zbus::interface]` method calls on its first line
+/// (the SVC-2 analog of `limits::ensure_within`), tying the caller-identity
+/// policy, the tier catalogue, and the fortress audit log together. See SVC-2.
+pub mod auth_guard;
+
 /// D-Bus payload size caps (not an interface). Single source of truth for the
 /// per-parameter byte limits. See services-sweep finding SVC-6.
 pub mod limits;

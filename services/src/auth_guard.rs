@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: MIT
+
+//! Per-method authorization guard for the D-Bus boundary (services-sweep SVC-2,
+//! Stage 2).
+//!
+//! [`AuthGuard::enforce`] is the single seam every `#[zbus::interface]` method
+//! calls on its first line — the SVC-2 analog of SVC-6's `ensure_within`. It
+//! resolves the caller's identity from the message header (SVC-2 Decision 2:
+//! unique-name only, no credential round-trip for general methods), runs the
+//! bus-free [`authorize`] policy, records the decision to the fortress audit
+//! log, and returns:
+//!
+//! - `Ok(())` for [`AuthOutcome::Authorized`] — proceed.
+//! - `Ok(())` for [`AuthOutcome::ConfirmationRequired`] — proceed (the shell
+//!   owns the confirmation UI; see the proceed-and-audit note on
+//!   [`AuthGuard::enforce`]).
+//! - `Err(AccessDenied)` for [`AuthOutcome::AuthorizationDenied`] — the method
+//!   does NOT execute (unmapped method, or unrecognized caller under the
+//!   deployed deny policy).
+//!
+//! The cloud-send path (SVC-1-R1-1-01) gets a SEPARATE async seam in Stage 3 —
+//! it needs the credential round-trip and the same-caller-binding token check,
+//! and so will hold the [`CallerResolver`](crate::caller_resolver::CallerResolver).
+//! This general guard is the Stage-2 deliverable rolled across every method.
+
+use std::sync::{Arc, Mutex};
+
+use fortress::audit::{AuditLog, AuditResult};
+use fortress::permissions::PermissionTier;
+use zbus::message::Header;
+
+use crate::auth::{authorize, AuthOutcome, AuthPolicy, CallerIdentity, MethodPolicy};
+use crate::caller_resolver::identity_from_header;
+
+/// The shared SVC-2 authorization guard: the caller-identity policy, the tier
+/// catalogue, and the fortress audit sink. One instance is shared (`Arc`)
+/// across every D-Bus service.
+pub struct AuthGuard {
+    policy: AuthPolicy,
+    methods: MethodPolicy,
+    audit: Arc<Mutex<AuditLog>>,
+}
+
+impl AuthGuard {
+    /// Build a guard from a caller-identity [`AuthPolicy`] and a shared audit
+    /// log. The tier catalogue is the canonical [`MethodPolicy`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use delphi_services::auth::AuthPolicy;
+    /// use delphi_services::auth_guard::AuthGuard;
+    /// use fortress::audit::AuditLog;
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let guard = AuthGuard::new(
+    ///     AuthPolicy::dev(),
+    ///     Arc::new(Mutex::new(AuditLog::in_memory())),
+    /// );
+    /// let _ = guard;
+    /// ```
+    #[must_use]
+    pub fn new(policy: AuthPolicy, audit: Arc<Mutex<AuditLog>>) -> Self {
+        Self {
+            policy,
+            methods: MethodPolicy::from_table(),
+            audit,
+        }
+    }
+
+    /// Enforce SVC-2 authorization for a general (non-cloud-send) method, given
+    /// its `action` string and the message `header`. Call on the FIRST line of
+    /// every `#[zbus::interface]` method, before any domain state access
+    /// (mirrors SVC-6's `ensure_within`).
+    ///
+    /// # Proceed-and-audit, and the destructive-tier gap
+    ///
+    /// `Authorized` and `ConfirmationRequired` both PROCEED; only
+    /// `AuthorizationDenied` blocks. Per the SVC-2 design (Codex Q4) the D-Bus
+    /// check authorizes *whether* the caller may attempt the action at its tier;
+    /// the actual confirmation/biometric UI lives in the shell, which
+    /// confirms-then-calls.
+    ///
+    /// **Destructive (Biometric-tier) operations proceed on caller
+    /// authorization; human confirmation is enforced by the shell UI, not
+    /// structurally at the D-Bus boundary. Structural confirmation-token
+    /// enforcement for the destructive tier (mirroring the cloud-send
+    /// same-caller-bound token model) is a future hardening, not implemented in
+    /// v0.4. The standard session bus is not the security boundary in dev; in
+    /// deployment, caller-identity gating plus the shell's confirmation flow are
+    /// the enforcement.** (Flagged for the SVC-2 Codex review alongside the Q9
+    /// recheck skip and SVC-1-R1-1-01.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`zbus::fdo::Error::AccessDenied`] when the caller is not
+    /// authorized to attempt the action (unmapped method, or unrecognized caller
+    /// under the deployed deny policy).
+    pub fn enforce(&self, action: &'static str, header: &Header<'_>) -> zbus::fdo::Result<()> {
+        let caller = identity_from_header(header);
+        let outcome = authorize(action, &caller, &self.policy, &self.methods);
+        self.record(action, &caller, &outcome);
+        match outcome {
+            AuthOutcome::Authorized | AuthOutcome::ConfirmationRequired { .. } => Ok(()),
+            AuthOutcome::AuthorizationDenied { reason } => {
+                Err(zbus::fdo::Error::AccessDenied(reason.to_string()))
+            }
+        }
+    }
+
+    /// Record the decision to the fortress audit chain. `module` is the
+    /// authenticated caller's unique bus name; `target` is empty — the action
+    /// string already names the operation and we never log caller payloads
+    /// (SVC-4 leak discipline).
+    fn record(&self, action: &str, caller: &CallerIdentity, outcome: &AuthOutcome) {
+        let (tier, result) = match outcome {
+            AuthOutcome::Authorized => (PermissionTier::Autonomous, AuditResult::Allowed),
+            AuthOutcome::ConfirmationRequired { tier, .. } => (*tier, AuditResult::Pending),
+            AuthOutcome::AuthorizationDenied { .. } => (
+                self.methods.tier_of(action).unwrap_or(PermissionTier::Confirm),
+                AuditResult::Denied,
+            ),
+        };
+        let mut log = self.audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        log.log_action(&caller.unique_name, action, "", tier, result);
+    }
+}
+
+/// Shared completeness-test helpers (SVC-2 Decision 3). Reusable across every
+/// service's completeness test so the mechanism is identical everywhere.
+#[cfg(test)]
+pub(crate) mod completeness {
+    use crate::auth::METHOD_POLICY;
+
+    /// Extract D-Bus method names from an interface's introspection XML.
+    pub(crate) fn method_names(introspection_xml: &str) -> Vec<String> {
+        introspection_xml
+            .split("<method name=\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next().map(str::to_string))
+            .collect()
+    }
+
+    /// Convert a D-Bus PascalCase method name to its snake_case action suffix
+    /// (zbus maps the Rust `get_recent` to the D-Bus `GetRecent`).
+    pub(crate) fn pascal_to_snake(name: &str) -> String {
+        let mut out = String::new();
+        for (i, c) in name.char_indices() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// AUTO half (Decision 3a): assert every method exposed by `introspection_xml`
+    /// is classified in [`METHOD_POLICY`] under `iface` (e.g. `"timeline"`). A
+    /// new method added without a tier-table entry fails here automatically.
+    pub(crate) fn assert_all_methods_classified(iface: &str, introspection_xml: &str) {
+        let names = method_names(introspection_xml);
+        assert!(
+            !names.is_empty(),
+            "introspection produced no methods for {iface} — parser or XML format changed"
+        );
+        for name in names {
+            let action = format!("{iface}.{}", pascal_to_snake(&name));
+            assert!(
+                METHOD_POLICY.iter().any(|(a, _)| *a == action),
+                "D-Bus method {name} (action {action}) is not classified in METHOD_POLICY — \
+                 every SVC-2-guarded method must have a tier (SVC-2 completeness)"
+            );
+        }
+    }
+
+    /// CROSS-CHECK (Decision 3, completeness-of-the-completeness-test): assert the
+    /// behavioral half (b) exercised EVERY method the interface exposes.
+    /// `exercised` is the set of D-Bus method names (PascalCase, as introspected)
+    /// that the behavioral test invoked.
+    ///
+    /// Half (b) is hand-written (one denial assertion per method), so without
+    /// this its coverage depends on the author remembering each method — a
+    /// classified-but-unguarded method the author forgot to add to (b) would
+    /// slip through. This welds (b)'s coverage to (a)'s auto-enumeration: if
+    /// introspection lists a method `exercised` omits, the behavioral half is
+    /// itself incomplete → FAIL loudly. Stale entries (listed but no longer
+    /// introspected — e.g. a renamed method) also fail.
+    pub(crate) fn assert_behavioral_covers_all(
+        iface: &str,
+        introspection_xml: &str,
+        exercised: &[&str],
+    ) {
+        use std::collections::BTreeSet;
+        let introspected: BTreeSet<String> = method_names(introspection_xml).into_iter().collect();
+        let covered: BTreeSet<String> = exercised.iter().map(|s| (*s).to_string()).collect();
+
+        let missing: Vec<&String> = introspected.difference(&covered).collect();
+        assert!(
+            missing.is_empty(),
+            "behavioral completeness for {iface}: introspected methods NOT exercised by the \
+             behavioral guard test: {missing:?} — add a denial assertion for each (SVC-2)"
+        );
+        let stale: Vec<&String> = covered.difference(&introspected).collect();
+        assert!(
+            stale.is_empty(),
+            "behavioral test for {iface} lists methods not in introspection \
+             (renamed/removed?): {stale:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completeness::{method_names, pascal_to_snake};
+
+    #[test]
+    fn pascal_to_snake_maps_dbus_names() {
+        assert_eq!(pascal_to_snake("GetRecent"), "get_recent");
+        assert_eq!(pascal_to_snake("Undo"), "undo");
+        assert_eq!(pascal_to_snake("Count"), "count");
+        assert_eq!(pascal_to_snake("CreateFromTemplate"), "create_from_template");
+    }
+
+    #[test]
+    fn method_names_parses_introspection_xml() {
+        let xml = r#"<interface name="org.delphi.Timeline">
+  <method name="GetRecent"><arg type="u"/></method>
+  <method name="Undo"><arg type="s"/></method>
+</interface>"#;
+        assert_eq!(method_names(xml), vec!["GetRecent".to_string(), "Undo".to_string()]);
+    }
+}

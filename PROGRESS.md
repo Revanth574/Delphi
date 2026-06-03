@@ -1,15 +1,44 @@
 # Delphi OS — Progress State
 
 Last updated: 2026-05-30 (Phase 3B.0a — **SVC-1 COMPLETE and APPROVED** across three Codex rounds on branch `phase-3b/sweep-services`: Round 1 structural ZKQP egress `db23288`; Round 2 HMAC-bound forgery-closed ConfirmationToken `ef24983` (finding SVC-1-R1-1); Round 3 redaction-hardened ConfirmationTokenWire `78bb6a0` (finding SVC-1-R1-1-02); **Round 3 APPROVE-with-noted-dependency, 0 findings**. SVC-2 (permission-tier authorization) is next, **design-first**. Branch still **NOT merged** — SVC-2 lands with SVC-1 before any merge to main; the SVC-1-R1-1-01 consent gap closes in SVC-2 before merge. Earlier: `services/` Wave 1 (SVC-3..SVC-10) APPROVED across four rounds (`f72e7ce`/`826f51e`/`9fff872`, Round 4 APPROVE).)
-Current phase: Phase 3B.0a — SVC-1 (ZKQP structural enforcement) **COMPLETE + APPROVED**; SVC-2 (permission-tier authorization) is the next unit, **design-first**
-Current task: Phase 3B.0a SVC-2 — permission-tier authorization at the D-Bus boundary, design-specification phase (finalize the Codex design request → operator review → Codex design prescription → joint architecture review → implement). SVC-2 also carries the SVC-1-R1-1-01 consent-validation deliverable.
-Current step: SVC-1 done (3 Codex rounds, APPROVE at `78bb6a0`). PROGRESS.md updated (this chore commit). **Next: finalize the SVC-2 design-spec request** (with the consent-validation deliverable + caller-identity caching + zbus 5.x special-arg verification folded in); operator reviews it before it goes to Codex. No SVC-2 implementation yet.
-Status: in progress — SVC-1 complete + APPROVED (held unmerged with services/ Wave 1); SVC-2 design phase opening
-Tests passing: **1,730 Rust verified 2026-05-30** (`cargo test --workspace` summed across 26 binaries, 0 failed; +14 from SVC-1 rounds 2-3 token/redaction tests; `cargo clippy --workspace --all-targets -- -D warnings` clean) + 93 TypeScript (unchanged — the SVC-1 wire contract is a plain string, so the round-2 TS edits did not change the test count)
+Current phase: Phase 3B.0a — **SVC-2 COMPLETE + APPROVED** (Codex, 0 P1/P2); ready for the three-way merge to main (`services/` Wave 1 + SVC-1 + SVC-2 land together)
+Current task: Phase 3B.0a SVC-2 — DONE. Permission-tier authorization at the D-Bus boundary (61 methods guarded across 11 services with the completeness mechanism), the SVC-1-R1-1-01 cloud-send same-caller binding, and the SVC-2 destination-consent egress gate — all APPROVED by Codex. **Next: the three-way merge to main** (the operator confirms the pre-merge state first).
+Current step: SVC-2 implemented + APPROVED — Stage 1/1b (auth seam + async caller resolver), Stage 2 (AuthGuard rolled across all 11 services + the auto/behavioral/cross-check completeness mechanism), Stage 3 Piece 1 (cloud-send binding), Piece 3 (live real-bus R1-1-01 closure, RED-proven), Piece 2a (structural destination-consent egress gate), Piece 2b (guarded D-Bus + WebSocket grant methods + command-bar dialog), and the SVC2-AUDIT-01 P3 fix (`b9754cf`). PROGRESS.md is this post-APPROVE update (held out of every Codex range per the workflow lesson). **Next: full-workspace green re-verify after AUDIT-01, operator pre-merge confirmation, then `git merge --no-ff phase-3b/sweep-services`.**
+Status: **SVC-2 complete + APPROVED** — pre-merge checkpoint (operator confirms before main changes)
+Tests passing: **1,807 Rust verified 2026-06-04** (`cargo test --workspace`, 0 failed; `cargo clippy --workspace --all-targets -- -D warnings` clean; real exit codes per CLAUDE.md §13.4) + **94 TypeScript** (`pnpm test` in `shell/`, +1 from the destination-consent dialog flow test; `pnpm build` + `pnpm lint` clean)
 
 ## Merge gate (Phase 3B.0 → main)
 
 **Main must not contain a known P1.** The `services/` Wave-1 sweep is APPROVED but is held on `phase-3b/sweep-services` and is NOT merged, because Codex Round 1 surfaced two architectural P1s — SVC-1 (ZKQP structural enforcement) and SVC-2 (permission-tier authorization) — in the same inference/D-Bus boundary. These are **not** "deferred and merged with known gaps"; they are Phase 3B.0a, the engineering unit that lands on the same branch so `services/` Wave 1 + SVC-1 + SVC-2 merge to main **together** in one clean transition from Phase-3A-safe to fully-hardened. **SVC-1 is now COMPLETE + APPROVED** (3 Codex rounds, `78bb6a0`); **SVC-2 remains** (design-first), and SVC-2 must additionally close the **SVC-1-R1-1-01** consent gap (the two-call cloud-consent bypass — see the 3B.0a section's closure-check criterion) before the merge. Codex Round 3 independently confirmed this gate: merged without SVC-2, the known consent gap would become a release blocker. Rationale for front-loading 3B.0a over the `die/orchestrator/` + `fortress/` sweeps: the two P1s sit in the boundary the sweep just hardened, the context is hot, and they are the hardest remaining architectural work in Phase 3B.0.
+
+## Phase 3B.0a SVC-2 — COMPLETE + Codex APPROVE (2026-06-04)
+
+**The merge gate above is now satisfied.** SVC-2 closed the last known P1 (the SVC-1-R1-1-01 two-call cloud-consent bypass); the three-way merge (`services/` Wave 1 + SVC-1 + SVC-2) can land main from Phase-3A-safe to fully-hardened with no resident P1.
+
+**Codex verdict: APPROVE — 0 P1/P2.** Scope `git diff 953ee49..HEAD` (the full SVC-2 sweep, Stage 1 → Stage 3). All five flagged items ratified; one P3 fixed.
+
+| ID | Item | Status |
+|----|------|--------|
+| SVC2-F1 | SVC-1-R1-1-01 closure — live real-bus test exercises the real D-Bus entry end-to-end (two distinct unique names), RED-proven against pre-SVC-2 | **RATIFIED** (real session-bus path confirmed; RED proof credible; fast-auth-error variant explicitly NOT required) |
+| SVC2-F2 | Q9 insert-recheck skip (unique-names-only invariant) | **RATIFIED** (D-Bus spec grounding confirms unique-name non-reuse) |
+| SVC2-F3 | Destructive-tier proceed-and-audit (Biometric/Hardware: no structural confirmation-token enforcement in v0.4) | **ACCEPTED for v0.4** — tracked future hardening (same-caller confirmation tokens for the destructive tier), post-v0.4 |
+| SVC2-F4 | Destination-consent egress gate — structural refusal, typed-apart in all consumers | **RATIFIED** (structural at the gateway door; typed-apart across all four consumers: services, shell-bridge, die-orchestrator brain, client) |
+| SVC2-F5 | Orchestrator-brain third cloud-send entry path threat model | **RATIFIED** (brain unwired — no external caller; forward requirement documented on `Brain::query`) |
+| SVC2-AUDIT-01 | (P3) `AuthGuard::record` logged Authorized outcomes at hardcoded Autonomous, mis-labeling a Confirm-tier cloud-send in the audit trail | **FIXED** `b9754cf` — audit at the action's policy tier; RED-then-green test `enforce_cloud_send_audits_at_its_policy_tier` |
+
+**SVC-1-R1-1-01: OPEN → CLOSED.** The two-call cloud-consent bypass — the dependency tracked since SVC-1, the merge-gate blocker — is **discharged**. The live closure test `services/tests/cloud_send_closure_live.rs::cloud_confirmation_token_echo_from_non_caller_is_rejected_live` proves it on the real D-Bus entry path (caller A obtains a confirmation token; caller B, a distinct daemon-assigned unique name, echoes it; the actual cloud send is rejected with `AccessDenied` before egress), RED-proven against pre-SVC-2 (reverting `enforce_cloud_send` makes B reach the egress send). Ratified SVC2-F1.
+
+**Method-count reconciliation (62 vs 61):** 61 D-Bus methods carry an `enforce` guard across the 11 services; `inference.grant_cloud_egress_consent` is the +1 over the Stage-2 count of 60 (the real Confirm-tier grant method added in Piece 2b-i). `inference.cloud_send` is a METHOD_POLICY entry for the cloud-send *subaction* (used by `enforce_cloud_send`'s audit), not an introspected D-Bus method — classified but not method-counted. Codex confirmed.
+
+### SVC-2 commit ledger (`953ee49..HEAD`, branch `phase-3b/sweep-services`, unmerged)
+
+`08c746b` Stage 1 (auth seam) · `ef93cd2` Stage 1b (async caller resolver) · `138d322` Stage 2 (AuthGuard + completeness, timeline) · `268f859`/`7e4e0b9`/`3d6fca7`/`406888a` Stage 2 batches (all 11 services) · `19dead9` file_search clippy fix · `2e161df` CLAUDE.md real-exit-code rule · `af13d65` batch 3b (knowledge) · `81557a4` Piece 1 (cloud-send binding) · `f4bd13d` Piece 3 (live closure) · `0cfd6c5` Piece 2a (egress gate) · `3971928` brain threat-model · `30fafee` Piece 2b-i (D-Bus grant) · `90e1307` Piece 2b-ii (WebSocket grant) · `7430b20` Piece 2b-iii (dialog) · `b9754cf` SVC2-AUDIT-01 fix.
+
+### Tracked follow-ups (separate tasks, post-SVC-2-merge)
+
+- **SVC2-F3 destructive-tier hardening** (post-v0.4): same-caller confirmation-token enforcement for the Biometric/Hardware tiers, mirroring the cloud-send token model. Codex-accepted as the v0.4 posture; not a merge blocker.
+- **WebSocket cloud-send binding (Piece 1b)**: the shell-bridge `handle_inference_query` calls the shared Router directly with no per-connection caller identity; thread a per-connection identity so the same-caller binding applies on that transport too. (Spawned task during Stage 3.)
+- **Repo-wide CRLF→LF normalization**: the worktree is CRLF, HEAD is LF (no `.gitattributes`), so `git status` shows ~every file churned. Handle as a deliberate one-shot `.gitattributes` + renormalize task AFTER the 3B.0a merge (touches every file; would collide with in-flight branch work). Each SVC-2 commit was kept clean by per-file LF normalization before staging.
 
 ## Completed phases
 

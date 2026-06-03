@@ -190,9 +190,11 @@ mod tests {
     async fn svc2_every_method_denies_unrecognized_caller_when_deployed() {
         let svc = mk_svc(AuthPolicy::deployed());
         let m = msg(":1.999");
-        let mut exercised: Vec<&str> = Vec::new();
+        // FileSearchService exposes a single guarded method, so the exercised
+        // set is a one-element literal (clippy::vec_init_then_push rejects the
+        // Vec::new()+push form for a single immediate push).
+        let exercised: Vec<&str> = vec!["Search"];
 
-        exercised.push("Search");
         assert!(
             matches!(
                 svc.search(m.header(), "q".to_string(), 10).await.unwrap_err(),

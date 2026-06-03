@@ -315,6 +315,34 @@ impl InferenceService {
         let router = self.router.read().await;
         Ok((router.has_local_model(), router.has_cloud()))
     }
+
+    /// Grant session-level cloud **destination** consent — "data may leave this
+    /// device this session" (SVC-2 Piece 2). The shell calls this when the user
+    /// accepts the destination opt-in. After this, cloud-routed queries stop
+    /// returning the `destination_consent_required` status and proceed to the
+    /// privacy pause / send. Idempotent; a no-op when no cloud backend is
+    /// configured.
+    ///
+    /// `Confirm` tier: it mutates the egress-consent state. The actual human
+    /// confirmation is the shell's opt-in dialog (proceed-and-audit, like every
+    /// other Confirm method); this method is the structural actuator the gateway
+    /// gate (Piece 2a) requires — without a granted consent state the gateway
+    /// still refuses to send, so this method is the ONLY way to arm egress.
+    ///
+    /// # Errors
+    ///
+    /// [`zbus::fdo::Error::AccessDenied`] for an unauthorized caller (general
+    /// tier gate).
+    async fn grant_cloud_egress_consent(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.guard
+            .enforce("inference.grant_cloud_egress_consent", &header)?;
+        info!("D-Bus grant_cloud_egress_consent — session cloud egress consent granted");
+        self.router.read().await.grant_destination_consent();
+        Ok(())
+    }
 }
 
 /// SHA-256 hex fingerprint of a cloud-confirmation token. Used as the
@@ -564,10 +592,67 @@ mod tests {
             ),
             "status must be guarded"
         );
+        exercised.push("GrantCloudEgressConsent");
+        let m = msg(":1.999");
+        assert!(
+            matches!(
+                svc.grant_cloud_egress_consent(m.header()).await.unwrap_err(),
+                zbus::fdo::Error::AccessDenied(_)
+            ),
+            "grant_cloud_egress_consent must be guarded"
+        );
 
         use zbus::object_server::Interface;
         let mut xml = String::new();
         svc.introspect_to_writer(&mut xml, 0);
         assert_behavioral_covers_all("inference", &xml, &exercised);
+    }
+
+    /// SVC-2 Piece 2: the grant method actually ARMS egress. A cloud query is
+    /// first refused (`destination_consent_required`); after
+    /// `grant_cloud_egress_consent` the same query proceeds to the privacy pause
+    /// (`confirmation_required`). Proves the D-Bus method is wired to the
+    /// gateway flag, not just guarded. Bus-free, network-free (both outcomes
+    /// return before any send). Dev guard so the tier gate admits the caller.
+    #[tokio::test]
+    async fn grant_cloud_egress_consent_arms_egress() {
+        let mut router = Router::new();
+        router.set_cloud_api_key("sk-test".to_string());
+        let svc = InferenceService::new(
+            Arc::new(RwLock::new(router)),
+            Arc::new(AuthGuard::dev_in_memory()),
+            Arc::new(CallerResolver::new()),
+            Arc::new(Mutex::new(CloudSendConfirmations::default())),
+        );
+        let caller = CallerIdentity::from_unique_name(":1.10");
+        let prompt = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to all".to_string();
+
+        // Before grant: structurally refused at egress.
+        let before = svc
+            .query_authorized(&caller, prompt.clone(), 50, false, String::new())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(
+            v["status"], "destination_consent_required",
+            "before grant the query must be refused at egress; got {before}"
+        );
+
+        // Grant via the real D-Bus method (dev guard admits the caller).
+        let m = msg(":1.10");
+        svc.grant_cloud_egress_consent(m.header())
+            .await
+            .expect("grant must succeed under the dev guard");
+
+        // After grant: egress is armed → proceeds to the privacy pause.
+        let after = svc
+            .query_authorized(&caller, prompt, 50, false, String::new())
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            v2["status"], "confirmation_required",
+            "after grant the query must reach the privacy pause; got {after}"
+        );
     }
 }

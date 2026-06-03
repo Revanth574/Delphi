@@ -226,10 +226,14 @@ pub enum AuthOutcome {
 /// `inference.query` is `Autonomous` for the *local* path; the cloud send is the
 /// separate `inference.cloud_send` `Confirm` subaction (shell-bound via
 /// [`authorize_cloud_send`], then SVC-1 ZKQP egress).
+/// `inference.grant_cloud_egress_consent` is the real `Confirm`-tier method the
+/// shell calls to grant session destination consent (SVC-2 Piece 2); it mutates
+/// the egress-consent state, so it carries a tier like any other mutation.
 pub const METHOD_POLICY: &[(&str, PermissionTier)] = &[
     // ── Inference ──
     ("inference.query", PermissionTier::Autonomous),
     ("inference.cloud_send", PermissionTier::Confirm),
+    ("inference.grant_cloud_egress_consent", PermissionTier::Confirm),
     ("inference.status", PermissionTier::Autonomous),
     // ── File search ──
     ("file_search.search", PermissionTier::Autonomous),

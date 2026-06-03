@@ -29,7 +29,10 @@ use crate::egress::{CloudEgressGateway, EgressOutcome};
 use crate::error::InferenceError;
 use crate::hardware::{self, HardwareProfile, ModelRecommendation};
 use crate::model::{self, GenerationResult, LocalModel};
-use crate::{CloudConfirmation, InferenceRequest, InferenceResponse, InferenceTier, RouteOutcome};
+use crate::{
+    CloudConfirmation, CloudDestinationConsent, InferenceRequest, InferenceResponse, InferenceTier,
+    RouteOutcome,
+};
 
 /// The inference router that selects the appropriate tier for each request.
 ///
@@ -404,6 +407,31 @@ impl Router {
                 sanitized_preview,
                 token: token_wire,
             })),
+            EgressOutcome::DestinationConsentRequired {
+                privacy_score,
+                sanitized_preview,
+                token_wire,
+            } => Ok(RouteOutcome::DestinationConsentRequired(
+                CloudDestinationConsent {
+                    privacy_score,
+                    sanitized_preview,
+                    token: token_wire,
+                },
+            )),
+        }
+    }
+
+    /// Grant session-level cloud **destination** consent — "data may leave this
+    /// device this session" (SVC-2 Piece 2). Delegates to the egress gateway's
+    /// structural flag; after this, a cloud-routed query stops returning
+    /// [`RouteOutcome::DestinationConsentRequired`] and proceeds to the
+    /// privacy-score pause / send. No-op when no cloud gateway is configured.
+    ///
+    /// Takes `&self` (the gateway flag is an atomic) so the daemon can grant
+    /// through a shared `RwLock` read guard.
+    pub fn grant_destination_consent(&self) {
+        if let Some(gateway) = &self.cloud_gateway {
+            gateway.grant_destination_consent();
         }
     }
 }
@@ -519,6 +547,49 @@ mod tests {
         // Local fails (no model) → cloud fails (empty key) → NoBackend.
         let err = router.route(req).await.unwrap_err();
         assert!(matches!(err, InferenceError::NoBackend));
+    }
+
+    /// SVC-2 Piece 2: a non-sensitive cloud-routed query is structurally refused
+    /// at the egress gateway until the session grants destination consent. The
+    /// router maps the gateway's refusal to
+    /// [`RouteOutcome::DestinationConsentRequired`]; after
+    /// `grant_destination_consent` the same query proceeds to the privacy pause.
+    /// Verifies the Router mapping AND the grant pass-through.
+    #[tokio::test]
+    async fn destination_consent_gate_at_router_level() {
+        let mut router = Router::new();
+        router.set_cloud_api_key("sk-test".to_string());
+        let risky = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to all";
+
+        // No consent → refused at egress (no local model → cloud → Step-2 gate).
+        let req = InferenceRequest {
+            input: risky.to_string(),
+            max_tokens: 50,
+            sensitive: false,
+            cloud_confirmation_token: None,
+        };
+        match router.route(req).await.expect("a refusal is a typed Ok outcome") {
+            RouteOutcome::DestinationConsentRequired(c) => {
+                assert!(
+                    !c.token.as_str().is_empty(),
+                    "refusal carries a token for the granted retry"
+                );
+            }
+            other => panic!("expected DestinationConsentRequired without consent; got {other:?}"),
+        }
+
+        // Grant → the same query now reaches the privacy pause (high score).
+        router.grant_destination_consent();
+        let req2 = InferenceRequest {
+            input: risky.to_string(),
+            max_tokens: 50,
+            sensitive: false,
+            cloud_confirmation_token: None,
+        };
+        match router.route(req2).await.expect("the pause is a typed Ok outcome") {
+            RouteOutcome::CloudConfirmationRequired(_) => {}
+            other => panic!("after grant, expected CloudConfirmationRequired; got {other:?}"),
+        }
     }
 
     #[test]

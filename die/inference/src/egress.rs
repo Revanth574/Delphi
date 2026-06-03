@@ -41,6 +41,8 @@
 //! the response immediately, and drops it — the mapping never lands on a
 //! long-lived struct, never logs, and cannot outlive the single request.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use fortress::zkqp::QuerySanitizer;
 use hmac::Mac;
 use rand::RngCore;
@@ -91,6 +93,17 @@ pub struct CloudEgressGateway {
     /// mint or verify a token, so a caller cannot forge consent. Rotating it
     /// (gateway reconstruction) simply invalidates any outstanding token.
     token_key: [u8; 32],
+    /// SVC-2 Piece 2: session-level "data may leave this device" consent,
+    /// enforced STRUCTURALLY here — [`complete`](Self::complete) refuses to send
+    /// while this is `false`, returning [`EgressOutcome::DestinationConsentRequired`]
+    /// instead. Independent of the privacy score (it covers low-score sends the
+    /// privacy pause does not gate) and of the same-caller token binding
+    /// (SVC-1-R1-1-01, which gates *which caller* may redeem a token). Default
+    /// `false`: a fresh gateway (a new session) refuses cloud egress until the
+    /// user grants it via [`grant_destination_consent`](Self::grant_destination_consent).
+    /// A gateway is the only thing that can flip it, so a caller skipping the
+    /// shell dialog still cannot reach the send.
+    destination_consent: AtomicBool,
 }
 
 /// The result of an egress attempt.
@@ -114,6 +127,26 @@ pub enum EgressOutcome {
         /// sanitized prompt / model / max_tokens and expires shortly.
         token_wire: ConfirmationTokenWire,
     },
+    /// SVC-2 Piece 2: the session has not granted destination consent ("data may
+    /// leave this device"), so the gateway STRUCTURALLY refused to send —
+    /// nothing was transmitted, regardless of the privacy score. Distinct from
+    /// [`ConfirmationRequired`](Self::ConfirmationRequired) (which is about
+    /// *content* sensitivity once egress is already permitted). Carries the
+    /// sanitized preview and a fresh token so the shell can present a single
+    /// "allow cloud + here's what would be sent" dialog; on grant the caller
+    /// re-issues with [`grant_destination_consent`](CloudEgressGateway::grant_destination_consent)
+    /// set and the same token (which also satisfies the privacy pause if the
+    /// score is high). The token's `Debug` is redacted exactly as above.
+    DestinationConsentRequired {
+        /// The ZKQP privacy score (0-100) of the would-be send, for the dialog.
+        privacy_score: u32,
+        /// The sanitized query the user is being shown (PII already replaced).
+        sanitized_preview: String,
+        /// Opaque token (SVC-1-R1-1) bound to this sanitized prompt; reused on
+        /// the granted retry so one user acceptance both grants destination
+        /// consent and (for a high-score query) clears the privacy pause.
+        token_wire: ConfirmationTokenWire,
+    },
 }
 
 impl CloudEgressGateway {
@@ -127,7 +160,27 @@ impl CloudEgressGateway {
             client: CloudClient::new(api_key),
             sanitizer: QuerySanitizer::new(),
             token_key,
+            // Closed by default: a new session refuses cloud egress until the
+            // user explicitly grants destination consent (SVC-2 Piece 2).
+            destination_consent: AtomicBool::new(false),
         }
+    }
+
+    /// Grant session-level destination consent — "data may leave this device
+    /// this session" (SVC-2 Piece 2). After this, [`complete`](Self::complete)
+    /// stops short-circuiting with [`EgressOutcome::DestinationConsentRequired`]
+    /// and proceeds to the privacy-score pause / send. Idempotent. The grant is
+    /// per-gateway, so it lasts the gateway's (session's) lifetime and resets
+    /// when the gateway is reconstructed.
+    pub fn grant_destination_consent(&self) {
+        self.destination_consent.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether session destination consent has been granted. For diagnostics
+    /// and tests; the enforcement is in [`complete`](Self::complete), not here.
+    #[must_use]
+    pub fn is_destination_consented(&self) -> bool {
+        self.destination_consent.load(Ordering::SeqCst)
     }
 
     /// Whether the underlying cloud client has an API key configured.
@@ -170,7 +223,31 @@ impl CloudEgressGateway {
         // held across the `.await` below, restored immediately, then dropped.
         let result = self.sanitizer.sanitize(raw_prompt);
 
-        // Step 2: privacy-score pause. If too risky, require a VALID token
+        // Step 2 (SVC-2 Piece 2): structural destination-consent gate. The
+        // gateway refuses to send until the session has granted "data may leave
+        // this device" — enforced HERE, at the single egress door, not in a
+        // shell dialog a caller could skip. It is independent of the privacy
+        // score (covers low-score sends the pause below does not gate) and of
+        // the same-caller token binding (SVC-1-R1-1-01). We mint a token bound
+        // to this sanitized prompt and carry it (plus the preview) so the shell
+        // can show one "allow cloud + here's what would be sent" dialog; on the
+        // granted retry the same token also clears the Step-3 pause for a
+        // high-score query. `result` (and its PII mapping) drops here on this
+        // path — it never spans the user round trip.
+        if !self.destination_consent.load(Ordering::SeqCst) {
+            let fresh = self.issue_token(result.sanitized_text(), model, max_tokens);
+            warn!(
+                score = result.score().total,
+                "cloud egress refused: session destination consent not granted"
+            );
+            return Ok(EgressOutcome::DestinationConsentRequired {
+                privacy_score: result.score().total,
+                sanitized_preview: result.sanitized_text().to_string(),
+                token_wire: ConfirmationTokenWire::new(fresh.to_wire()),
+            });
+        }
+
+        // Step 3: privacy-score pause. If too risky, require a VALID token
         // bound to THIS sanitized prompt. A bool can be forged by any caller
         // (Codex SVC-1-R1-1); an HMAC token cannot. Verify against the freshly
         // re-sanitized text — an edited prompt, a forged token, or an expired
@@ -196,7 +273,7 @@ impl CloudEgressGateway {
             }
         }
 
-        // Step 3: mint the capability from the sanitized text and send. This
+        // Step 4: mint the capability from the sanitized text and send. This
         // is the ONLY construction of a SanitizedPrompt in the codebase.
         let sanitized = SanitizedPrompt::from_sanitized(result.sanitized_text().to_string());
         if result.pii_count() > 0 {
@@ -208,7 +285,7 @@ impl CloudEgressGateway {
         }
         let cloud_resp = self.client.complete(&sanitized, max_tokens, model).await?;
 
-        // Step 4: restore placeholders -> PII in the response. `restore`
+        // Step 5: restore placeholders -> PII in the response. `restore`
         // consumes `result`, so the mapping is gone the instant this returns.
         let restored = result.restore(&cloud_resp.text);
         Ok(EgressOutcome::Completed(CloudResponse {
@@ -294,6 +371,10 @@ mod tests {
     #[tokio::test]
     async fn high_score_query_pauses_before_send() {
         let gw = CloudEgressGateway::new(String::new());
+        // SVC-2 Piece 2: grant destination consent so this exercises the
+        // privacy pause (Step 3), not the destination gate (Step 2) that now
+        // precedes it.
+        gw.grant_destination_consent();
         // Email weight is 20 and the confirmation threshold is STRICTLY > 80
         // (4 emails = 80 is still "safe"), so 5 distinct emails = 100 > 80
         // deterministically triggers the pause without relying on the weights
@@ -319,6 +400,9 @@ mod tests {
             EgressOutcome::Completed(_) => {
                 panic!("a high-score query must pause, not send")
             }
+            EgressOutcome::DestinationConsentRequired { .. } => {
+                panic!("destination consent was granted — the gate must not fire")
+            }
         }
     }
 
@@ -333,6 +417,9 @@ mod tests {
     #[tokio::test]
     async fn confirmation_requires_a_valid_gateway_issued_token() {
         let gw = CloudEgressGateway::new(String::new());
+        // SVC-2 Piece 2: this test isolates the SVC-1 token capability (Step 3),
+        // so grant destination consent up front to pass the Step-2 gate.
+        gw.grant_destination_consent();
         let prompt_a = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com for the rollout";
 
         // First call, no token -> pause, carrying a token bound to prompt A.
@@ -343,6 +430,9 @@ mod tests {
         {
             EgressOutcome::ConfirmationRequired { token_wire, .. } => token_wire,
             EgressOutcome::Completed(_) => panic!("first call must pause"),
+            EgressOutcome::DestinationConsentRequired { .. } => {
+                panic!("destination consent granted — Step-2 gate must not fire")
+            }
         };
 
         // A FORGED token (valid shape, wrong MAC) must NOT authorize: re-pause.
@@ -354,6 +444,9 @@ mod tests {
         {
             EgressOutcome::ConfirmationRequired { .. } => {}
             EgressOutcome::Completed(_) => panic!("a forged token must not authorize send"),
+            EgressOutcome::DestinationConsentRequired { .. } => {
+                panic!("destination consent granted — Step-2 gate must not fire")
+            }
         }
 
         // The GENUINE token for prompt A authorizes the send (errors only on
@@ -381,6 +474,9 @@ mod tests {
             EgressOutcome::ConfirmationRequired { .. } => {}
             EgressOutcome::Completed(_) => {
                 panic!("a token bound to prompt A's sanitized text must not authorize a differently-sanitized prompt")
+            }
+            EgressOutcome::DestinationConsentRequired { .. } => {
+                panic!("destination consent granted — Step-2 gate must not fire")
             }
         }
     }
@@ -423,6 +519,9 @@ mod tests {
     #[tokio::test]
     async fn clean_query_without_key_errors_on_send() {
         let gw = CloudEgressGateway::new(String::new());
+        // SVC-2 Piece 2: grant destination consent so a clean (low-score) query
+        // reaches the send rather than the Step-2 destination gate.
+        gw.grant_destination_consent();
         let outcome = gw
             .complete("What is 2 + 2?", 64, CloudModel::ClaudeSonnet, None)
             .await;
@@ -453,5 +552,72 @@ mod tests {
             prompt.as_str().contains("[EMAIL_"),
             "the capability must carry the placeholder, not the original"
         );
+    }
+
+    /// SVC-2 Piece 2: the structural destination-consent gate. A fresh gateway
+    /// REFUSES egress — even a clean, low-score query that would otherwise send
+    /// straight out — returning `DestinationConsentRequired` and reaching no
+    /// client. With an empty key, a send attempt would surface "no API key", so
+    /// the ABSENCE of that error proves nothing was transmitted. After grant,
+    /// the same clean query proceeds to the capability-gated send (surfacing
+    /// "no API key"). This is the egress refusal mirroring how the SVC-1 pause
+    /// and the SVC-1-R1-1-01 binding short-circuit before the send.
+    #[tokio::test]
+    async fn destination_consent_gate_refuses_send_until_granted() {
+        let gw = CloudEgressGateway::new(String::new());
+        assert!(!gw.is_destination_consented(), "closed by default");
+        // Closed by default: even a clean, low-score query is refused at egress.
+        match gw
+            .complete("What is 2 + 2?", 64, CloudModel::ClaudeSonnet, None)
+            .await
+            .expect("a refusal is an Ok outcome, not an error — nothing was sent")
+        {
+            EgressOutcome::DestinationConsentRequired { token_wire, .. } => {
+                assert!(
+                    !token_wire.as_str().is_empty(),
+                    "carries a token bound to the content for the granted retry"
+                );
+            }
+            other => panic!("a fresh gateway must refuse cloud egress; got {other:?}"),
+        }
+
+        // After grant, the clean query reaches the capability-gated send.
+        gw.grant_destination_consent();
+        assert!(gw.is_destination_consented());
+        let err = gw
+            .complete("What is 2 + 2?", 64, CloudModel::ClaudeSonnet, None)
+            .await
+            .expect_err("granted + empty key must attempt the send and error");
+        assert!(err.to_string().contains("no API key"), "got: {err}");
+    }
+
+    /// SVC-2 Piece 2: the destination gate (Step 2) precedes the privacy pause
+    /// (Step 3). A high-PII query on a fresh gateway yields
+    /// `DestinationConsentRequired`, NOT `ConfirmationRequired` — "may data
+    /// leave at all" is asked before "is this content sensitive". The refusal
+    /// still carries the sanitized preview (no raw PII) so the shell can combine
+    /// both consents into one dialog.
+    #[tokio::test]
+    async fn destination_gate_precedes_privacy_pause() {
+        let gw = CloudEgressGateway::new(String::new());
+        let risky = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com for the rollout";
+        match gw
+            .complete(risky, 64, CloudModel::ClaudeSonnet, None)
+            .await
+            .expect("refusal is an Ok outcome")
+        {
+            EgressOutcome::DestinationConsentRequired {
+                privacy_score,
+                sanitized_preview,
+                ..
+            } => {
+                assert!(privacy_score > 80, "carries the would-be score {privacy_score}");
+                assert!(!sanitized_preview.contains("a@a.com"), "preview is sanitized");
+            }
+            EgressOutcome::ConfirmationRequired { .. } => {
+                panic!("the destination gate must precede the privacy pause")
+            }
+            EgressOutcome::Completed(_) => panic!("nothing must be sent without consent"),
+        }
     }
 }

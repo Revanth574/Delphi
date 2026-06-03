@@ -95,6 +95,16 @@ pub enum RouteOutcome {
     /// [`InferenceRequest::cloud_confirmation_token`] set to the carried
     /// [`CloudConfirmation::token`] wire string (SVC-1-R1-1).
     CloudConfirmationRequired(CloudConfirmation),
+    /// SVC-2 Piece 2: the cloud path was reached but the session has not granted
+    /// destination consent ("data may leave this device"), so the egress
+    /// gateway STRUCTURALLY refused to send — regardless of the privacy score.
+    /// Nothing was sent. Distinct from [`CloudConfirmationRequired`](Self::CloudConfirmationRequired)
+    /// (content sensitivity once egress is permitted); this is the prior gate of
+    /// whether off-device egress is permitted AT ALL. The caller shows a "use
+    /// cloud AI?" dialog (combinable with the carried privacy preview) and, on
+    /// grant, calls the grant path and re-issues the query with the carried
+    /// token.
+    DestinationConsentRequired(CloudDestinationConsent),
 }
 
 /// Details of a paused cloud query awaiting user confirmation (SVC-1).
@@ -117,6 +127,26 @@ pub struct CloudConfirmation {
     /// It is HMAC-bound to this exact sanitized prompt / model / max_tokens and
     /// expires shortly, so it cannot be reused for a different query or
     /// replayed later.
+    pub token: ConfirmationTokenWire,
+}
+
+/// Details of a cloud query the egress gateway refused for lack of session
+/// destination consent (SVC-2 Piece 2). Same non-sensitive decision data as
+/// [`CloudConfirmation`] — score, sanitized preview, and a token bound to the
+/// content — but a distinct type so the destination gate and the privacy pause
+/// stay typed-apart end to end. Nothing was sent. On grant, the caller re-issues
+/// the query with the carried [`token`](Self::token); the same token clears the
+/// privacy pause if the score is high, so one acceptance both permits egress and
+/// confirms the content.
+#[derive(Debug, Clone)]
+pub struct CloudDestinationConsent {
+    /// The ZKQP privacy score (0-100) of the would-be send, for the dialog.
+    pub privacy_score: u32,
+    /// The sanitized query the user is being shown. Safe to display: PII is
+    /// already replaced with placeholders.
+    pub sanitized_preview: String,
+    /// Opaque token (SVC-1-R1-1) bound to this sanitized prompt, carried with
+    /// redacted `Debug` (SVC-1-R1-1-02). Reused on the granted retry.
     pub token: ConfirmationTokenWire,
 }
 
@@ -208,6 +238,29 @@ mod tests {
         );
         // Non-secret decision data is still visible for diagnostics.
         assert!(debug.contains("90"));
+        assert!(debug.contains("[EMAIL_001]"));
+    }
+
+    #[test]
+    fn cloud_destination_consent_debug_redacts_token() {
+        // SVC-1-R1-1-02 + SVC-2 Piece 2: the destination-consent boundary type
+        // carries a token too, so its derived Debug must redact it identically.
+        let mac = "ef".repeat(32);
+        let consent = CloudDestinationConsent {
+            privacy_score: 65,
+            sanitized_preview: "[EMAIL_001]".to_string(),
+            token: ConfirmationTokenWire::new(format!("1700000000:{mac}")),
+        };
+        let debug = format!("{consent:?}");
+        assert!(
+            !debug.contains(&mac),
+            "CloudDestinationConsent Debug leaked the token MAC: {debug}"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "token should render redacted inside CloudDestinationConsent Debug: {debug}"
+        );
+        assert!(debug.contains("65"));
         assert!(debug.contains("[EMAIL_001]"));
     }
 }

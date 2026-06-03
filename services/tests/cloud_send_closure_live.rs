@@ -60,6 +60,13 @@ const HIGH_PII_PROMPT: &str = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to a
 fn build_service() -> InferenceService {
     let mut router = Router::new();
     router.set_cloud_api_key("sk-test".to_string());
+    // SVC-2 Piece 2: grant session destination consent up front. This test
+    // isolates the SVC-1-R1-1-01 same-caller binding, which is INDEPENDENT of
+    // the (new) destination-consent egress gate — without this grant, caller A's
+    // query would now be refused at egress (DestinationConsentRequired) before
+    // ever minting a token to bind. Granting it lets A reach the privacy pause
+    // and proves the binding still denies caller B unchanged after Piece 2.
+    router.grant_destination_consent();
     InferenceService::new(
         Arc::new(RwLock::new(router)),
         Arc::new(AuthGuard::new(

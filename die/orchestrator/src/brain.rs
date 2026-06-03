@@ -27,7 +27,10 @@ use tracing::{info, warn};
 
 use die_browser::engine::{BrowserConfig, BrowserEngine};
 use die_inference::router::Router;
-use die_inference::{CloudConfirmation, ConfirmationTokenWire, InferenceRequest, RouteOutcome};
+use die_inference::{
+    CloudConfirmation, CloudDestinationConsent, ConfirmationTokenWire, InferenceRequest,
+    RouteOutcome,
+};
 
 use crate::OrchestratorError;
 
@@ -71,6 +74,7 @@ const WEB_AUGMENT_MARKER: &str = "[web-augmented]";
 ///     web_augmented: false,
 ///     web_url: None,
 ///     cloud_confirmation: None,
+///     destination_consent: None,
 /// };
 /// assert!(!resp.web_augmented);
 /// ```
@@ -96,6 +100,14 @@ pub struct BrainResponse {
     /// wire string. `None` for completed (local or sent-and-restored)
     /// responses.
     pub cloud_confirmation: Option<CloudConfirmation>,
+    /// `Some` when the cloud query was refused at egress because the session
+    /// has not granted destination consent ("data may leave this device" —
+    /// SVC-2 Piece 2). DISTINCT from [`cloud_confirmation`](Self::cloud_confirmation):
+    /// this is the prior gate of whether off-device egress is permitted at all,
+    /// so a consumer must not confuse the two (a destination refusal must show
+    /// the "allow cloud?" opt-in, not the content-privacy dialog). `tier` is
+    /// `"DestinationConsentRequired"`. Nothing was sent. `None` otherwise.
+    pub destination_consent: Option<CloudDestinationConsent>,
 }
 
 /// The orchestrator brain — coordinates LLM + web for queries.
@@ -297,6 +309,7 @@ impl Brain {
                 web_augmented: web_context.is_some(),
                 web_url,
                 cloud_confirmation: None,
+                destination_consent: None,
             }),
             RouteOutcome::CloudConfirmationRequired(c) => Ok(BrainResponse {
                 output: String::new(),
@@ -305,6 +318,20 @@ impl Brain {
                 web_augmented: web_context.is_some(),
                 web_url,
                 cloud_confirmation: Some(c),
+                destination_consent: None,
+            }),
+            // SVC-2 Piece 2: the cloud query was refused at egress for lack of
+            // session destination consent. Surface it as a DISTINCT typed
+            // response (its own field + tier), never as a privacy confirmation,
+            // so the orchestrator/shell shows the "allow cloud?" opt-in.
+            RouteOutcome::DestinationConsentRequired(c) => Ok(BrainResponse {
+                output: String::new(),
+                tier: "DestinationConsentRequired".to_string(),
+                model_id: String::new(),
+                web_augmented: web_context.is_some(),
+                web_url,
+                cloud_confirmation: None,
+                destination_consent: Some(c),
             }),
         }
     }
@@ -516,10 +543,12 @@ mod tests {
             web_augmented: true,
             web_url: Some("https://example.com".to_string()),
             cloud_confirmation: None,
+            destination_consent: None,
         };
         assert!(resp.web_augmented);
         assert_eq!(resp.web_url.as_deref(), Some("https://example.com"));
         assert!(resp.cloud_confirmation.is_none());
+        assert!(resp.destination_consent.is_none());
     }
 
     #[test]

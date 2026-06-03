@@ -224,6 +224,28 @@ impl InferenceService {
                     "token": c.token.as_str(),
                 })
             }
+            RouteOutcome::DestinationConsentRequired(c) => {
+                // SVC-2 Piece 2: the egress gateway refused for lack of session
+                // destination consent. Bind the carried token to this caller
+                // (SVC-1-R1-1-01) exactly as the privacy pause does — the binding
+                // is independent of the destination decision — and surface a
+                // DISTINCT status so the shell shows the "allow cloud?" opt-in
+                // (combinable with the sanitized preview when the score is high).
+                let fingerprint = token_fingerprint(c.token.as_str());
+                {
+                    let mut confirmations = self
+                        .cloud_confirmations
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    confirmations.issue(fingerprint, caller);
+                }
+                serde_json::json!({
+                    "status": "destination_consent_required",
+                    "privacy_score": c.privacy_score,
+                    "sanitized_preview": c.sanitized_preview,
+                    "token": c.token.as_str(),
+                })
+            }
         };
         serde_json::to_string(&json)
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
@@ -462,6 +484,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::AccessDenied(_)));
+    }
+
+    /// SVC-2 Piece 2: a cloud-routed query whose session has NOT granted
+    /// destination consent surfaces the `destination_consent_required` status —
+    /// the egress gateway structurally refused (bus-free, network-free: the
+    /// refusal returns before any send). The carried token is bound to the
+    /// caller, so the granted retry stays same-caller (R1-1-01 unaffected).
+    #[tokio::test]
+    async fn destination_consent_required_surfaces_when_not_granted() {
+        let mut router = Router::new();
+        // Cloud key configured, but destination consent deliberately NOT granted.
+        router.set_cloud_api_key("sk-test".to_string());
+        let svc = InferenceService::new(
+            Arc::new(RwLock::new(router)),
+            Arc::new(AuthGuard::new(
+                AuthPolicy::dev(),
+                Arc::new(Mutex::new(AuditLog::in_memory())),
+            )),
+            Arc::new(CallerResolver::new()),
+            Arc::new(Mutex::new(CloudSendConfirmations::default())),
+        );
+        let caller = CallerIdentity::from_unique_name(":1.10");
+        let json = svc
+            .query_authorized(
+                &caller,
+                "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to all".to_string(),
+                50,
+                false,
+                String::new(),
+            )
+            .await
+            .expect("a refusal is a successful typed response, not an error");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["status"], "destination_consent_required",
+            "an un-granted session must be refused at egress; got {json}"
+        );
+        assert!(
+            v["token"].as_str().is_some_and(|t| !t.is_empty()),
+            "the refusal carries a token for the granted retry"
+        );
     }
 
     // ── SVC-2 completeness (Decision 3) ──

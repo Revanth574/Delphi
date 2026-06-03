@@ -244,6 +244,19 @@ impl Handler {
                     "token": c.token.as_str(),
                 }),
             ),
+            // SVC-2 Piece 2: the egress gateway refused for lack of session
+            // destination consent — surfaced as a distinct status so the shell
+            // shows the "allow cloud?" opt-in (combinable with the preview).
+            // (Granting the consent + the dialog wiring is the next sub-step.)
+            Ok(RouteOutcome::DestinationConsentRequired(c)) => Response::ok(
+                id,
+                serde_json::json!({
+                    "status": "destination_consent_required",
+                    "privacy_score": c.privacy_score,
+                    "sanitized_preview": c.sanitized_preview,
+                    "token": c.token.as_str(),
+                }),
+            ),
             Err(e) => Response::err(id, -1, &e.to_string()),
         }
     }

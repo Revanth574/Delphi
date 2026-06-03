@@ -147,6 +147,9 @@ impl Handler {
             // ── Inference ──────────────────────────────────
             "inference.query" => self.handle_inference_query(req.id, &req.params).await,
             "inference.status" => self.handle_inference_status(req.id).await,
+            "inference.grant_cloud_egress_consent" => {
+                self.handle_inference_grant_consent(req.id).await
+            }
 
             // ── File Search ────────────────────────────────
             "file_search.search" => self.handle_file_search(req.id, &req.params).await,
@@ -271,6 +274,22 @@ impl Handler {
                 "has_cloud": router.has_cloud(),
             }),
         )
+    }
+
+    /// Handle `inference.grant_cloud_egress_consent` — grant session cloud
+    /// destination consent (SVC-2 Piece 2). The shell calls this when the user
+    /// accepts the destination opt-in dialog; it arms the egress gateway so
+    /// subsequent cloud-routed queries proceed past the
+    /// `destination_consent_required` refusal to the privacy pause / send.
+    ///
+    /// The WebSocket is the shell's own trusted channel, so — like the other
+    /// inference handlers — this calls the shared Router directly. The SVC-2
+    /// AuthGuard governs the D-Bus boundary (`InferenceService`), not this one;
+    /// the WebSocket caller-identity model is the deferred Piece-1b concern.
+    async fn handle_inference_grant_consent(&self, id: u64) -> Response {
+        self.router.read().await.grant_destination_consent();
+        info!("WebSocket grant_cloud_egress_consent — session cloud egress consent granted");
+        Response::ok(id, serde_json::json!({ "granted": true }))
     }
 }
 
@@ -586,6 +605,24 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["has_local"], false);
         assert_eq!(result["has_cloud"], false);
+    }
+
+    /// SVC-2 Piece 2b: the WebSocket grant method dispatches and returns
+    /// `granted: true`. With no cloud backend configured it is a harmless no-op
+    /// on the gateway flag; the dispatch + response contract is what this
+    /// verifies (the gateway-arming behavior is covered in die-inference and the
+    /// services layer).
+    #[tokio::test]
+    async fn inference_grant_cloud_egress_consent_works() {
+        let handler = test_handler();
+        let req = Request {
+            id: 7,
+            method: "inference.grant_cloud_egress_consent".to_string(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handler.dispatch(req).await;
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["granted"], true);
     }
 
     #[tokio::test]

@@ -24,6 +24,20 @@ interface ResponseState {
     sanitizedPreview: string;
     token: string;
   } | null;
+  /**
+   * SVC-2 Piece 2: set when the cloud egress gateway REFUSED to send because
+   * the session has not granted destination consent ("data may leave this
+   * device"). DISTINCT from `confirmation` (content sensitivity) — this is the
+   * prior gate of whether off-device egress is permitted at all, so it gets its
+   * own state and dialog and is never conflated. Carries the sanitized preview
+   * (so one dialog can combine the opt-in with the privacy preview) and the
+   * content-bound token reused on the granted retry. `null` otherwise.
+   */
+  destinationConsent: {
+    privacyScore: number;
+    sanitizedPreview: string;
+    token: string;
+  } | null;
 }
 
 const INITIAL_RESPONSE: ResponseState = {
@@ -32,6 +46,7 @@ const INITIAL_RESPONSE: ResponseState = {
   tier: null,
   error: null,
   confirmation: null,
+  destinationConsent: null,
 };
 
 /**
@@ -62,13 +77,14 @@ export const CommandBar = memo(function CommandBar() {
     setOpen((prev) => !prev);
   }, [mode]);
 
-  // SVC-1: a single runner for both the initial submit (no token) and the
-  // post-confirmation retry (echoing the gateway-issued token). A cloud query
-  // whose privacy score is too high comes back as `confirmation_required`
-  // instead of a completed response; we surface the sanitized preview and the
-  // opaque token, then let the user approve sending it. The token (SVC-1-R1-1)
-  // is HMAC-bound to the exact sanitized prompt, so it cannot be forged or
-  // reused for a different query.
+  // A single runner for the initial submit and every retry. A cloud query can
+  // come back paused instead of completed, in two distinct ways:
+  //   - `destination_consent_required` (SVC-2): the session has not allowed
+  //     cloud egress at all. The gateway refused; nothing was sent.
+  //   - `confirmation_required` (SVC-1): egress is allowed but this content's
+  //     privacy score is high enough to require reviewing the sanitized text.
+  // Each carries an opaque, HMAC-bound token (SVC-1-R1-1) echoed back on the
+  // approved retry; the token cannot be forged or reused for a different query.
   const runQuery = useCallback(
     async (confirmationToken?: string) => {
       const trimmed = query.trim();
@@ -80,11 +96,25 @@ export const CommandBar = memo(function CommandBar() {
         tier: null,
         error: null,
         confirmation: null,
+        destinationConsent: null,
       });
 
       try {
         const result = await delphi.query(trimmed, 256, false, confirmationToken);
-        if (result.status === "confirmation_required") {
+        if (result.status === "destination_consent_required") {
+          setResponse({
+            loading: false,
+            text: null,
+            tier: null,
+            error: null,
+            confirmation: null,
+            destinationConsent: {
+              privacyScore: result.privacy_score,
+              sanitizedPreview: result.sanitized_preview,
+              token: result.token,
+            },
+          });
+        } else if (result.status === "confirmation_required") {
           setResponse({
             loading: false,
             text: null,
@@ -95,6 +125,7 @@ export const CommandBar = memo(function CommandBar() {
               sanitizedPreview: result.sanitized_preview,
               token: result.token,
             },
+            destinationConsent: null,
           });
         } else {
           setResponse({
@@ -103,6 +134,7 @@ export const CommandBar = memo(function CommandBar() {
             tier: result.tier,
             error: null,
             confirmation: null,
+            destinationConsent: null,
           });
         }
       } catch (err: unknown) {
@@ -114,6 +146,7 @@ export const CommandBar = memo(function CommandBar() {
           tier: null,
           error: message,
           confirmation: null,
+          destinationConsent: null,
         });
       }
     },
@@ -129,19 +162,44 @@ export const CommandBar = memo(function CommandBar() {
     () => runQuery(response.confirmation?.token),
     [runQuery, response.confirmation],
   );
+  // SVC-2 Piece 2: grant session destination consent, THEN retry with the
+  // carried token. The grant arms the egress gateway; the same token clears
+  // the SVC-1 privacy pause if the score is high, so one acceptance both
+  // permits egress and confirms the content (no second dialog).
+  const handleGrantAndSend = useCallback(async () => {
+    const token = response.destinationConsent?.token;
+    try {
+      await delphi.grantCloudEgressConsent();
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : t("commandBar.error");
+      setResponse({
+        loading: false,
+        text: null,
+        tier: null,
+        error: message,
+        confirmation: null,
+        destinationConsent: null,
+      });
+      return;
+    }
+    await runQuery(token);
+  }, [runQuery, response.destinationConsent, t]);
   const handleCancelConfirm = useCallback(
     () => setResponse(INITIAL_RESPONSE),
     [],
   );
 
-  // SVC-1-R1-1: a pending confirmation token is bound to the exact prompt that
-  // produced it. Editing the input makes that token stale (the gateway would
-  // re-pause anyway), so drop the confirmation panel rather than leave a
-  // preview on screen that no longer matches what would be sent.
+  // SVC-1-R1-1: a pending token is bound to the exact prompt that produced it.
+  // Editing the input makes that token stale (the gateway would re-pause /
+  // re-refuse anyway), so drop any pending prompt rather than leave a preview
+  // on screen that no longer matches what would be sent.
   const handleQueryChange = useCallback((value: string) => {
     setQuery(value);
     setResponse((prev) =>
-      prev.confirmation ? { ...prev, confirmation: null } : prev,
+      prev.confirmation || prev.destinationConsent
+        ? { ...prev, confirmation: null, destinationConsent: null }
+        : prev,
     );
   }, []);
 
@@ -172,14 +230,14 @@ export const CommandBar = memo(function CommandBar() {
     }
   }, [open]);
 
-  // SVC-1 a11y: when the confirmation prompt appears, move focus to the
-  // primary action so a keyboard/screen-reader user lands on it (CLAUDE.md
-  // focus-management rule).
+  // a11y: when either pending prompt appears, move focus to its primary action
+  // so a keyboard/screen-reader user lands on it (CLAUDE.md focus-management
+  // rule). Only one of the two can be set at a time.
   useEffect(() => {
-    if (response.confirmation) {
+    if (response.confirmation || response.destinationConsent) {
       confirmButtonRef.current?.focus();
     }
-  }, [response.confirmation]);
+  }, [response.confirmation, response.destinationConsent]);
 
   if (!open) return null;
 
@@ -233,6 +291,56 @@ export const CommandBar = memo(function CommandBar() {
                 {response.tier}
               </p>
             )}
+          </div>
+        )}
+
+        {/* SVC-2 Piece 2: destination-consent opt-in. The cloud egress gateway
+            refused because the session has not allowed off-device egress. The
+            carried sanitized preview lets this single dialog combine the
+            "use cloud?" opt-in with what the cloud would receive, so one
+            acceptance both grants egress and (for a high-score query) confirms
+            the content. */}
+        {response.destinationConsent && (
+          <div
+            className="border-t border-sky-500/30 px-4 py-3"
+            role="group"
+            aria-live="assertive"
+            aria-label={t("commandBar.destTitle")}
+          >
+            <p className="text-sm font-medium text-text-primary">
+              {t("commandBar.destTitle")}
+            </p>
+            <p className="mt-1 text-xs text-text-secondary">
+              {t("commandBar.destBody")}
+            </p>
+            <p className="mt-2 text-xs text-text-muted">
+              {t("commandBar.confirmPreview")}
+            </p>
+            <p className="mt-1 whitespace-pre-wrap rounded-lg bg-black/20 px-3 py-2 text-sm text-text-primary">
+              {response.destinationConsent.sanitizedPreview}
+            </p>
+            <p className="mt-1 text-xs text-sky-300">
+              {t("commandBar.destScore", {
+                score: response.destinationConsent.privacyScore,
+              })}
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                ref={confirmButtonRef}
+                type="button"
+                onClick={() => void handleGrantAndSend()}
+                className="rounded-lg bg-sky-600 px-3 py-1.5 text-sm text-white hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-400"
+              >
+                {t("commandBar.destAllow")}
+              </button>
+              <button
+                type="button"
+                onClick={handleCancelConfirm}
+                className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-text-primary hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/40"
+              >
+                {t("commandBar.destKeepLocal")}
+              </button>
+            </div>
           </div>
         )}
 

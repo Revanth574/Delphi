@@ -26,6 +26,14 @@ const en = {
       confirmPreview: "Delphi will send this sanitized version to the cloud:",
       confirmSend: "Send sanitized version",
       confirmCancel: "Cancel",
+      // SVC-2 Piece 2: destination-consent opt-in (egress permission, asked
+      // before the content-privacy confirmation).
+      destTitle: "Use cloud AI for this?",
+      destBody:
+        "This can’t run on your device. With your OK, its sanitized version is sent to the cloud for the rest of this session.",
+      destScore: "Privacy score: {{score}}/100",
+      destAllow: "Allow cloud",
+      destKeepLocal: "Keep local",
     },
 
     // ── Dock ────────────────────────────────────

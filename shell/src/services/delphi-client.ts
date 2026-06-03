@@ -56,6 +56,29 @@ export type InferenceResult =
        * shortly; the shell treats it as an opaque blob.
        */
       token: string;
+    }
+  | {
+      /**
+       * SVC-2 Piece 2: the cloud egress gateway REFUSED to send because the
+       * session has not granted destination consent ("data may leave this
+       * device"). DISTINCT from `confirmation_required` (content sensitivity);
+       * this is the prior gate of whether off-device egress is permitted at
+       * all, and covers low-score sends the privacy pause never gates. Nothing
+       * was sent.
+       *
+       * Flow: show the "use cloud AI?" opt-in (the carried `sanitized_preview`
+       * lets one dialog combine it with the privacy preview). On grant, call
+       * `grantCloudEgressConsent()` then re-issue `query()` with the carried
+       * `token` — the same token also clears the privacy pause when the score
+       * is high, so one acceptance both permits egress and confirms the content.
+       */
+      status: "destination_consent_required";
+      /** ZKQP privacy score (0-100) of the would-be send, for the dialog. */
+      privacy_score: number;
+      /** The sanitized query the cloud would receive (PII already replaced). */
+      sanitized_preview: string;
+      /** Opaque token (SVC-1-R1-1) bound to this content; echo on the retry. */
+      token: string;
     };
 
 /** Backend availability status. */
@@ -218,6 +241,17 @@ class DelphiClient {
   /** Check which inference backends are available. */
   async status(): Promise<InferenceStatus> {
     return this.call("inference.status", {}) as Promise<InferenceStatus>;
+  }
+
+  /**
+   * Grant session-level cloud **destination** consent — "data may leave this
+   * device this session" (SVC-2 Piece 2). Call this when the user accepts the
+   * destination opt-in dialog (after a `destination_consent_required` result).
+   * It arms the egress gateway so a re-issued {@link query} proceeds past the
+   * refusal. Idempotent; lasts the session (a daemon restart re-asks).
+   */
+  async grantCloudEgressConsent(): Promise<void> {
+    await this.call("inference.grant_cloud_egress_consent", {});
   }
 
   // ── File Search ────────────────────────────────────────────

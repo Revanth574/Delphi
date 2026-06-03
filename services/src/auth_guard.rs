@@ -181,7 +181,15 @@ impl AuthGuard {
     /// (SVC-4 leak discipline).
     fn record(&self, action: &str, caller: &CallerIdentity, outcome: &AuthOutcome) {
         let (tier, result) = match outcome {
-            AuthOutcome::Authorized => (PermissionTier::Autonomous, AuditResult::Allowed),
+            // SVC2-AUDIT-01: audit at the action's POLICY tier, not a hardcoded
+            // Autonomous — a successful Confirm-tier action (e.g. the cloud-send
+            // subaction) must be recorded as Confirm so the audit trail is
+            // truthful. (`tier_of` is `Some` for every real action; the fallback
+            // is defensive only.)
+            AuthOutcome::Authorized => (
+                self.methods.tier_of(action).unwrap_or(PermissionTier::Autonomous),
+                AuditResult::Allowed,
+            ),
             AuthOutcome::ConfirmationRequired { tier, .. } => (*tier, AuditResult::Pending),
             AuthOutcome::AuthorizationDenied { .. } => (
                 self.methods.tier_of(action).unwrap_or(PermissionTier::Confirm),
@@ -351,5 +359,43 @@ mod tests {
                 .unwrap_err(),
             zbus::fdo::Error::AccessDenied(_)
         ));
+    }
+
+    /// SVC2-AUDIT-01: a successful (Authorized) cloud-send is recorded at its
+    /// POLICY tier (`inference.cloud_send` = Confirm), not hardcoded Autonomous.
+    /// Enforcement was always correct; this guards the audit-trail TRUTH — a
+    /// Confirm-tier action must not be logged as if it were autonomous. RED
+    /// against the pre-fix `record` (which hardcoded Autonomous for the
+    /// Authorized branch).
+    #[test]
+    fn enforce_cloud_send_audits_at_its_policy_tier() {
+        use super::AuthGuard;
+        use crate::auth::{AuthPolicy, CallerIdentity, CloudSendConfirmations};
+        use fortress::audit::AuditLog;
+        use fortress::permissions::PermissionTier;
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        let audit = Arc::new(Mutex::new(AuditLog::in_memory()));
+        let guard = AuthGuard::new(AuthPolicy::dev(), audit.clone());
+        let mut reg = CloudSendConfirmations::default();
+        let a = CallerIdentity::from_unique_name(":1.10");
+        reg.issue("fp", &a);
+
+        // A successful (Authorized) cloud-send completion by the issuing caller.
+        guard
+            .enforce_cloud_send(&a, "fp", Instant::now(), &reg)
+            .expect("the issuing caller is authorized");
+
+        // It must be audited at the cloud-send action's policy tier (Confirm),
+        // NOT hardcoded Autonomous.
+        let log = audit.lock().unwrap_or_else(|p| p.into_inner());
+        let entries = log.query(None, None, Some("inference.cloud_send"));
+        assert_eq!(entries.len(), 1, "exactly one cloud-send audit entry");
+        assert_eq!(
+            entries[0].permission_tier,
+            PermissionTier::Confirm,
+            "an Authorized cloud-send must audit at its Confirm policy tier, not Autonomous"
+        );
     }
 }

@@ -10,6 +10,13 @@
 //!
 //! Interface: `org.delphi.Knowledge`
 //!
+//! SVC-2: every method enforces authorization via the shared [`AuthGuard`]
+//! on its first line. `ingest_file`/`ingest_text` are Confirm (they mutate
+//! the graph); `search`, `related_to`, `find_path`, `list_sources`, and
+//! `detect_contradictions` are Autonomous (read-only); `forget_source` is
+//! Biometric (destructive — orphans and removes nodes). The three
+//! `#[zbus(signal)]` declarations carry no guard (signals have no caller).
+//!
 //! # Privacy guarantees
 //!
 //! - Document content **never** transits the cloud unless the user has
@@ -38,12 +45,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 
 use die_orchestrator::knowledge::{
     EdgeRelation, IngestionAccessController, IngestionError, IngestionResult, KnowledgeNode,
     KnowledgeStore, NodeWithSources, RelatedNode, Source, SourceType,
 };
+
+use crate::auth_guard::AuthGuard;
 
 // SVC-8 (services-sweep): the held-handle `AllowlistRoot`, the
 // `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` `open_dir_no_follow`, the
@@ -97,15 +107,20 @@ pub const PATH: &str = "/org/delphi/Knowledge";
 ///
 /// ```
 /// use delphi_services::knowledge::KnowledgeService;
+/// use delphi_services::auth_guard::AuthGuard;
 /// use die_orchestrator::knowledge::{KnowledgeStore, MockEmbedder};
 /// use std::sync::{Arc, Mutex};
 ///
 /// let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-/// let svc = KnowledgeService::new(Arc::new(Mutex::new(store)));
+/// let svc = KnowledgeService::new(
+///     Arc::new(Mutex::new(store)),
+///     Arc::new(AuthGuard::dev_in_memory()),
+/// );
 /// // svc.allowlist_snapshot() is empty — shell must add roots before ingestion.
 /// ```
 pub struct KnowledgeService {
     store: Arc<Mutex<KnowledgeStore>>,
+    guard: Arc<AuthGuard>,
     /// The domain ingestion access-control gate (SVC-8). Owns the
     /// closed-by-default allowlist of held directory handles and the
     /// sensitive-content denylist; the only minter of
@@ -123,10 +138,14 @@ impl KnowledgeService {
     /// The intended flow: the user clicks a folder-picker in the shell, the
     /// shell sends the picked path over D-Bus, the daemon registers it, and
     /// only THEN can a path under it be ingested.
+    ///
+    /// `guard` is the shared [`AuthGuard`] (SVC-2): every D-Bus method
+    /// enforces authorization through it before touching the store.
     #[must_use]
-    pub fn new(store: Arc<Mutex<KnowledgeStore>>) -> Self {
+    pub fn new(store: Arc<Mutex<KnowledgeStore>>, guard: Arc<AuthGuard>) -> Self {
         Self {
             store,
+            guard,
             access: IngestionAccessController::new(),
         }
     }
@@ -138,9 +157,14 @@ impl KnowledgeService {
     /// up empty). Useful for tests and for daemon code that pre-registers
     /// roots from saved settings.
     #[must_use]
-    pub fn with_allowlist(store: Arc<Mutex<KnowledgeStore>>, roots: Vec<PathBuf>) -> Self {
+    pub fn with_allowlist(
+        store: Arc<Mutex<KnowledgeStore>>,
+        roots: Vec<PathBuf>,
+        guard: Arc<AuthGuard>,
+    ) -> Self {
         Self {
             store,
+            guard,
             access: IngestionAccessController::with_roots(roots),
         }
     }
@@ -240,7 +264,12 @@ impl KnowledgeService {
     /// platform-appropriate API is available) and pass the bytes
     /// through `ingest_text`, accepting that the safe-open boundary
     /// is the shell's responsibility on those platforms.
-    async fn ingest_file(&self, path: String) -> zbus::fdo::Result<String> {
+    async fn ingest_file(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        path: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.ingest_file", &header)?;
         // SVC-6-R2-3: cap BEFORE info!()/validation/store.
         crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
         info!(path = %path, "D-Bus ingest_file");
@@ -271,10 +300,12 @@ impl KnowledgeService {
     /// produce no nodes.
     async fn ingest_text(
         &self,
+        #[zbus(header)] header: Header<'_>,
         text: String,
         source_uri: String,
         format: String,
     ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.ingest_text", &header)?;
         // SVC-6-R2-3: cap every String param BEFORE info!()/parse/store.
         crate::limits::ensure_within(&text, crate::limits::MAX_INGEST_TEXT_BYTES, "text")?;
         crate::limits::ensure_within(&source_uri, crate::limits::MAX_STRING_BYTES, "source_uri")?;
@@ -292,7 +323,13 @@ impl KnowledgeService {
 
     /// Search the graph semantically. Returns a JSON array of
     /// [`NodeWithSources`].
-    async fn search(&self, query: String, max_results: u32) -> zbus::fdo::Result<String> {
+    async fn search(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        query: String,
+        max_results: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.search", &header)?;
         crate::limits::ensure_within(&query, crate::limits::MAX_STRING_BYTES, "query")?;
         let store = self
             .store
@@ -308,7 +345,13 @@ impl KnowledgeService {
 
     /// Walk outward from `node_id` along edges up to `max_depth`.
     /// Returns a JSON array of [`RelatedNode`].
-    async fn related_to(&self, node_id: i64, max_depth: u32) -> zbus::fdo::Result<String> {
+    async fn related_to(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        node_id: i64,
+        max_depth: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.related_to", &header)?;
         let store = self
             .store
             .lock()
@@ -323,7 +366,13 @@ impl KnowledgeService {
 
     /// Find the shortest edge path between two nodes. Returns a JSON
     /// array of edge ids, or the literal string `"null"` when unreachable.
-    async fn find_path(&self, from_id: i64, to_id: i64) -> zbus::fdo::Result<String> {
+    async fn find_path(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        from_id: i64,
+        to_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.find_path", &header)?;
         let store = self
             .store
             .lock()
@@ -339,7 +388,12 @@ impl KnowledgeService {
     }
 
     /// List sources for a node. Returns a JSON array of [`Source`].
-    async fn list_sources(&self, node_id: i64) -> zbus::fdo::Result<String> {
+    async fn list_sources(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        node_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.list_sources", &header)?;
         let store = self
             .store
             .lock()
@@ -354,7 +408,11 @@ impl KnowledgeService {
 
     /// Find all `(node_a, node_b)` pairs connected by a Contradicts edge.
     /// Returns a JSON array of two-element arrays.
-    async fn detect_contradictions(&self) -> zbus::fdo::Result<String> {
+    async fn detect_contradictions(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.detect_contradictions", &header)?;
         let store = self
             .store
             .lock()
@@ -369,7 +427,12 @@ impl KnowledgeService {
 
     /// Forget a source. Returns the number of nodes that became
     /// orphaned (no remaining sources) and were removed.
-    async fn forget_source(&self, source_id: i64) -> zbus::fdo::Result<u32> {
+    async fn forget_source(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        source_id: i64,
+    ) -> zbus::fdo::Result<u32> {
+        self.guard.enforce("knowledge.forget_source", &header)?;
         info!(source_id, "D-Bus forget_source");
         let store = self
             .store
@@ -494,9 +557,25 @@ mod tests {
     use super::*;
     use die_orchestrator::knowledge::{KnowledgeStore, MockEmbedder, NodeType};
 
+    use crate::auth::AuthPolicy;
+    use crate::auth_guard::completeness::{
+        assert_all_methods_classified, assert_behavioral_covers_all, header_msg as msg,
+    };
+
     fn mk_svc() -> KnowledgeService {
+        mk_svc_with(AuthPolicy::dev())
+    }
+
+    /// Build a service with an empty allowlist under a chosen auth policy.
+    /// The behavioral completeness test uses `AuthPolicy::deployed()` to
+    /// prove every method denies an unrecognized caller at the guard.
+    fn mk_svc_with(policy: AuthPolicy) -> KnowledgeService {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        KnowledgeService::new(Arc::new(Mutex::new(store)))
+        let guard = Arc::new(AuthGuard::new(
+            policy,
+            Arc::new(Mutex::new(fortress::audit::AuditLog::in_memory())),
+        ));
+        KnowledgeService::new(Arc::new(Mutex::new(store)), guard)
     }
 
     /// Build a service whose only ingestion root is `root`. Used by
@@ -522,9 +601,17 @@ mod tests {
     /// `ingest_file` result, as that would panic for the wrong
     /// reason (empty allowlist instead of the platform limitation
     /// the test should be probing).
+    ///
+    /// The guard is a dev (log-and-allow) guard so these tests exercise
+    /// the allowlist / safe-open behavior, not the auth boundary (which
+    /// has its own dedicated completeness tests).
     fn mk_svc_with_root(root: PathBuf) -> KnowledgeService {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![root])
+        KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![root],
+            Arc::new(AuthGuard::dev_in_memory()),
+        )
     }
 
     #[test]
@@ -554,9 +641,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_rejects_oversize_text() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let oversize = "x".repeat(crate::limits::MAX_INGEST_TEXT_BYTES + 1);
         let err = svc
-            .ingest_text(oversize, "mem://t".to_string(), "text".to_string())
+            .ingest_text(m.header(), oversize, "mem://t".to_string(), "text".to_string())
             .await
             .unwrap_err();
         assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
@@ -581,10 +669,11 @@ mod tests {
     async fn ingest_file_accepts_path_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let file = tmp.path().join("note.md");
         std::fs::write(&file, "# T\n\nP.\n").unwrap();
         let json = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .unwrap();
         // Successful round-trip — JSON shape, not contents
@@ -615,10 +704,11 @@ mod tests {
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let m = msg(":1.5");
         let outside = other.path().join("evil.md");
         std::fs::write(&outside, "should not be ingested").unwrap();
         let err = svc
-            .ingest_file(outside.to_string_lossy().into_owned())
+            .ingest_file(m.header(), outside.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         // Codex re-review FIX 7 P1: discriminant + uniform message.
@@ -639,9 +729,10 @@ mod tests {
     async fn ingest_file_rejects_nonexistent_path() {
         let allowed = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let m = msg(":1.5");
         let ghost = allowed.path().join("does-not-exist.md");
         let err = svc
-            .ingest_file(ghost.to_string_lossy().into_owned())
+            .ingest_file(m.header(), ghost.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -655,6 +746,7 @@ mod tests {
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let m = msg(":1.5");
         let outside = other.path().join("secret.md");
         std::fs::write(&outside, "secret").unwrap();
         // Construct a traversal path through the allowed root.
@@ -667,7 +759,7 @@ mod tests {
         // safe-by-default semantic: anything we can't prove is inside is
         // outside).
         let err = svc
-            .ingest_file(traversal.to_string_lossy().into_owned())
+            .ingest_file(m.header(), traversal.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -676,12 +768,17 @@ mod tests {
     #[tokio::test]
     async fn ingest_file_rejects_when_allowlist_empty() {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let svc = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
+        let m = msg(":1.5");
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("any.md");
         std::fs::write(&file, "x").unwrap();
         let err = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -692,7 +789,11 @@ mod tests {
     fn add_ingestion_root_canonicalizes_and_dedupes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let svc = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
         assert!(svc.allowlist_snapshot().is_empty());
         // First add succeeds.
         assert!(svc.add_ingestion_root(tmp.path()));
@@ -723,11 +824,12 @@ mod tests {
         // Even an ordinary markdown file inside the user's home is
         // rejected unless the user explicitly registers that location.
         let svc = mk_svc();
+        let m = msg(":1.5");
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("note.md");
         std::fs::write(&file, "# T\n\nP.\n").unwrap();
         let err = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -749,10 +851,11 @@ mod tests {
         // the denylist runs after the allowlist and cannot be overridden.
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let key_file = tmp.path().join("id_rsa");
         std::fs::write(&key_file, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
         let err = svc
-            .ingest_file(key_file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), key_file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         // FIX 7 P1: must be the uniform "AccessDenied + REJECTION_MESSAGE",
@@ -765,10 +868,11 @@ mod tests {
     async fn ingest_file_rejects_pem_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let pem = tmp.path().join("cert.pem");
         std::fs::write(&pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
         let err = svc
-            .ingest_file(pem.to_string_lossy().into_owned())
+            .ingest_file(m.header(), pem.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -779,10 +883,11 @@ mod tests {
     async fn ingest_file_rejects_env_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let env = tmp.path().join(".env");
         std::fs::write(&env, "API_KEY=secret\n").unwrap();
         let err = svc
-            .ingest_file(env.to_string_lossy().into_owned())
+            .ingest_file(m.header(), env.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -805,15 +910,19 @@ mod tests {
         // would pass for the wrong reason.
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
+        let m = msg(":1.5");
 
         // Path 1: allowlist-empty (closed-by-default)
         let store1 = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc_empty =
-            KnowledgeService::with_allowlist(Arc::new(Mutex::new(store1)), vec![]);
+        let svc_empty = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store1)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
         let any_path = allowed.path().join("any.md");
         std::fs::write(&any_path, "x").unwrap();
         let err_empty = svc_empty
-            .ingest_file(any_path.to_string_lossy().into_owned())
+            .ingest_file(m.header(), any_path.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -821,7 +930,7 @@ mod tests {
         let svc_with = mk_svc_with_root(allowed.path().to_path_buf());
         let ghost = allowed.path().join("nonexistent.md");
         let err_ghost = svc_with
-            .ingest_file(ghost.to_string_lossy().into_owned())
+            .ingest_file(m.header(), ghost.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -829,7 +938,7 @@ mod tests {
         let outside = other.path().join("evil.md");
         std::fs::write(&outside, "x").unwrap();
         let err_outside = svc_with
-            .ingest_file(outside.to_string_lossy().into_owned())
+            .ingest_file(m.header(), outside.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -837,7 +946,7 @@ mod tests {
         let key = allowed.path().join("id_rsa");
         std::fs::write(&key, "-----BEGIN-----\n").unwrap();
         let err_sensitive = svc_with
-            .ingest_file(key.to_string_lossy().into_owned())
+            .ingest_file(m.header(), key.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -863,20 +972,26 @@ mod tests {
         // resolvable path and an unresolvable path produce IDENTICAL
         // rejections — caller cannot probe whether a path exists.
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let svc = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
+        let m = msg(":1.5");
 
         // A path that DOES exist.
         let tmp = tempfile::TempDir::new().unwrap();
         let real = tmp.path().join("real.md");
         std::fs::write(&real, "x").unwrap();
         let err_real = svc
-            .ingest_file(real.to_string_lossy().into_owned())
+            .ingest_file(m.header(), real.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
         // A path that does NOT exist (deliberately silly).
         let err_ghost = svc
             .ingest_file(
+                m.header(),
                 "/this/path/cannot/possibly/exist/should-be-rejected.md".to_string(),
             )
             .await
@@ -981,8 +1096,9 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let json = svc
-            .ingest_file(link.to_string_lossy().into_owned())
+            .ingest_file(m.header(), link.to_string_lossy().into_owned())
             .await
             .expect("symlink → real-target inside allowlist must succeed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -995,8 +1111,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_returns_json_with_counts() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let json = svc
             .ingest_text(
+                m.header(),
                 "# Topic\n\nA fact.\n".to_string(),
                 "user://note".to_string(),
                 "markdown".to_string(),
@@ -1013,8 +1131,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_idempotent_returns_zero_new_nodes() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let _ = svc
             .ingest_text(
+                m.header(),
                 "# T\n\nP.\n".to_string(),
                 "u".to_string(),
                 "markdown".to_string(),
@@ -1023,6 +1143,7 @@ mod tests {
             .unwrap();
         let json = svc
             .ingest_text(
+                m.header(),
                 "# T\n\nP.\n".to_string(),
                 "u".to_string(),
                 "markdown".to_string(),
@@ -1036,8 +1157,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_unsupported_format_returns_unavailable() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let json = svc
             .ingest_text(
+                m.header(),
                 "binary or whatever".to_string(),
                 "/x.pdf".to_string(),
                 "pdf".to_string(),
@@ -1052,7 +1175,9 @@ mod tests {
     #[tokio::test]
     async fn search_returns_json_array_with_sources() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# Topic\n\napple banana cherry.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
@@ -1060,7 +1185,7 @@ mod tests {
         .await
         .unwrap();
         let json = svc
-            .search("apple banana cherry".to_string(), 5)
+            .search(m.header(), "apple banana cherry".to_string(), 5)
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1078,14 +1203,16 @@ mod tests {
     #[tokio::test]
     async fn search_zero_max_results_clamped_to_one() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# T\n\nA.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
         )
         .await
         .unwrap();
-        let json = svc.search("A".to_string(), 0).await.unwrap();
+        let json = svc.search(m.header(), "A".to_string(), 0).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // Clamped to 1 → at most 1 result returned (or 0 if no embeddings).
         assert!(v.as_array().unwrap().len() <= 1);
@@ -1094,7 +1221,9 @@ mod tests {
     #[tokio::test]
     async fn related_to_returns_json_array() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# Parent\n\nChild fact.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
@@ -1102,16 +1231,17 @@ mod tests {
         .await
         .unwrap();
         // Find one node id to walk from
-        let json = svc.search("Parent".to_string(), 1).await.unwrap();
+        let json = svc.search(m.header(), "Parent".to_string(), 1).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let id = v[0]["node"]["id"].as_i64().unwrap();
-        let rel_json = svc.related_to(id, 2).await.unwrap();
+        let rel_json = svc.related_to(m.header(), id, 2).await.unwrap();
         let _: serde_json::Value = serde_json::from_str(&rel_json).unwrap();
     }
 
     #[tokio::test]
     async fn find_path_returns_null_for_unreachable() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         // Create two nodes with no edges between them.
         {
             let store = svc.store.lock().unwrap();
@@ -1127,24 +1257,26 @@ mod tests {
             store.create_node("a", NodeType::Concept, &[s]).unwrap();
             store.create_node("b", NodeType::Concept, &[s]).unwrap();
         }
-        let json = svc.find_path(1, 2).await.unwrap();
+        let json = svc.find_path(m.header(), 1, 2).await.unwrap();
         assert_eq!(json, "null");
     }
 
     #[tokio::test]
     async fn list_sources_returns_json_array() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# T\n\nP.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
         )
         .await
         .unwrap();
-        let search_json = svc.search("T".to_string(), 1).await.unwrap();
+        let search_json = svc.search(m.header(), "T".to_string(), 1).await.unwrap();
         let sv: serde_json::Value = serde_json::from_str(&search_json).unwrap();
         let id = sv[0]["node"]["id"].as_i64().unwrap();
-        let json = svc.list_sources(id).await.unwrap();
+        let json = svc.list_sources(m.header(), id).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.is_array());
         assert_eq!(v.as_array().unwrap().len(), 1);
@@ -1154,13 +1286,15 @@ mod tests {
     #[tokio::test]
     async fn detect_contradictions_returns_empty_initially() {
         let svc = mk_svc();
-        let json = svc.detect_contradictions().await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.detect_contradictions(m.header()).await.unwrap();
         assert_eq!(json, "[]");
     }
 
     #[tokio::test]
     async fn detect_contradictions_returns_pairs() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let (a_id, b_id, src);
         {
             let store = svc.store.lock().unwrap();
@@ -1179,7 +1313,7 @@ mod tests {
                 .create_edge(a_id, b_id, EdgeRelation::Contradicts, 0.9, src)
                 .unwrap();
         }
-        let json = svc.detect_contradictions().await.unwrap();
+        let json = svc.detect_contradictions(m.header()).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1190,8 +1324,10 @@ mod tests {
     #[tokio::test]
     async fn forget_source_orphans_nodes_and_returns_count() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let r = svc
             .ingest_text(
+                m.header(),
                 "# T\n\nP.\n".to_string(),
                 "u".to_string(),
                 "markdown".to_string(),
@@ -1200,14 +1336,15 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         let src_id = v["source_id"].as_i64().unwrap();
-        let count = svc.forget_source(src_id).await.unwrap();
+        let count = svc.forget_source(m.header(), src_id).await.unwrap();
         assert!(count >= 1);
     }
 
     #[tokio::test]
     async fn forget_source_returns_zero_for_unknown_id() {
         let svc = mk_svc();
-        assert_eq!(svc.forget_source(99_999).await.unwrap(), 0);
+        let m = msg(":1.5");
+        assert_eq!(svc.forget_source(m.header(), 99_999).await.unwrap(), 0);
     }
 
     // Privacy / error-redaction tests
@@ -1217,11 +1354,12 @@ mod tests {
         // Force an error path by sending a deliberately broken arrangement.
         // We mostly want to verify the redact_to_kind helper is wired in.
         let svc = mk_svc();
+        let m = msg(":1.5");
         // search itself doesn't error on empty result; just confirm that
         // any potential failure in this layer would be redacted at the
         // boundary. Direct unit test of the helper above already covers
         // the redaction logic.
-        let _ = svc.search("anything".to_string(), 1).await;
+        let _ = svc.search(m.header(), "anything".to_string(), 1).await;
     }
 
     // ── FIX 15 (P1-high): held-directory-handle allowlist roots ──
@@ -1283,14 +1421,15 @@ mod tests {
         let file = tmp.path().join("any.md");
         std::fs::write(&file, "# placeholder\n").unwrap();
         let svc = mk_svc();
+        let m = msg(":1.5");
         let err = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .expect_err("ingest_file must fail on non-Linux");
-        let msg = err.to_string();
+        let msg_str = err.to_string();
         assert!(
-            msg.contains("path not permitted"),
-            "must use uniform rejection message; got: {msg}"
+            msg_str.contains("path not permitted"),
+            "must use uniform rejection message; got: {msg_str}"
         );
     }
 
@@ -1302,8 +1441,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_remains_supported_on_all_platforms() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let json = svc
             .ingest_text(
+                m.header(),
                 "# Title\n\nA paragraph.\n".into(),
                 "user://platform-test".into(),
                 "markdown".into(),
@@ -1380,6 +1521,7 @@ mod tests {
         std::fs::write(&file, "# hello\n\nworld\n").unwrap();
 
         let svc = mk_svc_with_root(original.clone());
+        let m = msg(":1.5");
 
         // Rename the registered directory.
         let renamed = tmp.path().join("renamed");
@@ -1392,7 +1534,7 @@ mod tests {
         // current canonical name).
         let renamed_file = renamed.join("note.md");
         let json = svc
-            .ingest_file(renamed_file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), renamed_file.to_string_lossy().into_owned())
             .await;
         // The ingestion call may either succeed (handle survived
         // rename) or fail with a deny message. What MUST NOT happen
@@ -1409,16 +1551,16 @@ mod tests {
                 // /tmp/X/original but the new canonical is
                 // /tmp/X/renamed). What's important is that we get
                 // the uniform AccessDenied message, NOT a leak.
-                let msg = e.to_string();
+                let msg_str = e.to_string();
                 assert!(
-                    msg.contains("path not permitted"),
-                    "must use uniform rejection message; got: {msg}"
+                    msg_str.contains("path not permitted"),
+                    "must use uniform rejection message; got: {msg_str}"
                 );
                 // Confirm the error doesn't leak the path or which
                 // rejection reason fired (FIX 7).
                 assert!(
-                    !msg.contains("renamed") && !msg.contains("original"),
-                    "wire error must not echo the path; got: {msg}"
+                    !msg_str.contains("renamed") && !msg_str.contains("original"),
+                    "wire error must not echo the path; got: {msg_str}"
                 );
             }
         }
@@ -1431,31 +1573,79 @@ mod tests {
     #[tokio::test]
     async fn every_string_param_rejects_oversize() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
 
         // ingest_file(path)
         assert!(matches!(
-            svc.ingest_file(oversize.clone()).await.unwrap_err(),
+            svc.ingest_file(m.header(), oversize.clone()).await.unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
         // ingest_text(text, source_uri, format) — source_uri and format
         // (the `text` cap is at MAX_INGEST_TEXT_BYTES, exercised separately).
         assert!(matches!(
-            svc.ingest_text("hello".to_string(), oversize.clone(), "markdown".to_string())
+            svc.ingest_text(m.header(), "hello".to_string(), oversize.clone(), "markdown".to_string())
                 .await
                 .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
         assert!(matches!(
-            svc.ingest_text("hello".to_string(), "u".to_string(), oversize.clone())
+            svc.ingest_text(m.header(), "hello".to_string(), "u".to_string(), oversize.clone())
                 .await
                 .unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
         // search(query)
         assert!(matches!(
-            svc.search(oversize.clone(), 5).await.unwrap_err(),
+            svc.search(m.header(), oversize.clone(), 5).await.unwrap_err(),
             zbus::fdo::Error::InvalidArgs(_)
         ));
+    }
+
+    // ── SVC-2 completeness (Decision 3) ──
+
+    #[test]
+    fn svc2_every_method_is_classified() {
+        use zbus::object_server::Interface;
+        let svc = mk_svc();
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_all_methods_classified("knowledge", &xml);
+    }
+
+    #[tokio::test]
+    async fn svc2_every_method_denies_unrecognized_caller_when_deployed() {
+        let svc = mk_svc_with(AuthPolicy::deployed());
+        let mut exercised: Vec<&str> = Vec::new();
+
+        exercised.push("IngestFile");
+        let m = msg(":1.999");
+        assert!(matches!(svc.ingest_file(m.header(), "x".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("IngestText");
+        let m = msg(":1.999");
+        assert!(matches!(svc.ingest_text(m.header(), "t".to_string(), "u".to_string(), "text".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("Search");
+        let m = msg(":1.999");
+        assert!(matches!(svc.search(m.header(), "q".to_string(), 5).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("RelatedTo");
+        let m = msg(":1.999");
+        assert!(matches!(svc.related_to(m.header(), 1, 2).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("FindPath");
+        let m = msg(":1.999");
+        assert!(matches!(svc.find_path(m.header(), 1, 2).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("ListSources");
+        let m = msg(":1.999");
+        assert!(matches!(svc.list_sources(m.header(), 1).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("DetectContradictions");
+        let m = msg(":1.999");
+        assert!(matches!(svc.detect_contradictions(m.header()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("ForgetSource");
+        let m = msg(":1.999");
+        assert!(matches!(svc.forget_source(m.header(), 1).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+
+        use zbus::object_server::Interface;
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_behavioral_covers_all("knowledge", &xml, &exercised);
     }
 }

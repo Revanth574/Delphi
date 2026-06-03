@@ -18,6 +18,12 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 zbus = { workspace = true }
 chrono = { workspace = true }
+# SVC-2 Stage 3: fingerprint the cloud-confirmation token (SHA-256) so the
+# CloudSendConfirmations registry binds the operation to its issuing caller
+# WITHOUT storing the raw token as a map key (which would leak it via the
+# registry's derived Debug — SVC-1-R1-1-02). Already in the workspace via
+# fortress's audit chain, so no new compile cost.
+sha2 = { workspace = true }
 # SVC-2 Stage 1b: the caller resolver consumes the org.freedesktop.DBus
 # NameOwnerChanged signal stream to invalidate its credential cache; StreamExt
 # provides `.next()` on the zbus signal stream (zbus re-exports only

@@ -24,12 +24,16 @@
 //! This general guard is the Stage-2 deliverable rolled across every method.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use fortress::audit::{AuditLog, AuditResult};
 use fortress::permissions::PermissionTier;
 use zbus::message::Header;
 
-use crate::auth::{authorize, AuthOutcome, AuthPolicy, CallerIdentity, MethodPolicy};
+use crate::auth::{
+    authorize, authorize_cloud_send, AuthOutcome, AuthPolicy, CallerIdentity, CloudSendConfirmations,
+    MethodPolicy,
+};
 use crate::caller_resolver::identity_from_header;
 
 /// The shared SVC-2 authorization guard: the caller-identity policy, the tier
@@ -118,6 +122,51 @@ impl AuthGuard {
         let caller = identity_from_header(header);
         let outcome = authorize(action, &caller, &self.policy, &self.methods);
         self.record(action, &caller, &outcome);
+        match outcome {
+            AuthOutcome::Authorized | AuthOutcome::ConfirmationRequired { .. } => Ok(()),
+            AuthOutcome::AuthorizationDenied { reason } => {
+                Err(zbus::fdo::Error::AccessDenied(reason.to_string()))
+            }
+        }
+    }
+
+    /// Enforce SVC-1-R1-1-01 **same-caller binding** for *completing* a cloud
+    /// send — the separate async-resolved seam this module's header promised,
+    /// distinct from [`enforce`](Self::enforce)'s general tier gate. The caller
+    /// must already be resolved (the cloud-send path does the credential
+    /// round-trip via [`CallerResolver`](crate::caller_resolver::CallerResolver)
+    /// before calling this); this method is the sync policy + audit step.
+    ///
+    /// `fingerprint` identifies the pending confirmation (a hash of the
+    /// confirmation token — never the raw token). `confirmations` is the
+    /// registry the issuing call populated via
+    /// [`CloudSendConfirmations::issue`]. `now` is injected for deterministic
+    /// TTL testing (live callers pass [`Instant::now`]).
+    ///
+    /// Delegates the decision to [`authorize_cloud_send`] (same-caller binding
+    /// enforced in dev AND deployed; deployed additionally requires the
+    /// authenticated shell and degrades-to-deny on missing creds), records it to
+    /// the fortress audit chain, and maps:
+    ///
+    /// - `Authorized` → `Ok(())` (proceed to the actual send).
+    /// - `AuthorizationDenied` → `Err(AccessDenied)` (the send does NOT happen —
+    ///   a different caller echoing another's confirmation, an expired binding,
+    ///   or deployed creds unavailable).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`zbus::fdo::Error::AccessDenied`] when the completer is not the
+    /// caller the confirmation was bound to (or the binding expired, or — under
+    /// the deployed policy — the caller is not the authenticated shell).
+    pub fn enforce_cloud_send(
+        &self,
+        caller: &CallerIdentity,
+        fingerprint: &str,
+        now: Instant,
+        confirmations: &CloudSendConfirmations,
+    ) -> zbus::fdo::Result<()> {
+        let outcome = authorize_cloud_send(caller, fingerprint, now, confirmations, &self.policy);
+        self.record("inference.cloud_send", caller, &outcome);
         match outcome {
             AuthOutcome::Authorized | AuthOutcome::ConfirmationRequired { .. } => Ok(()),
             AuthOutcome::AuthorizationDenied { reason } => {
@@ -265,5 +314,42 @@ mod tests {
   <method name="Undo"><arg type="s"/></method>
 </interface>"#;
         assert_eq!(method_names(xml), vec!["GetRecent".to_string(), "Undo".to_string()]);
+    }
+
+    /// SVC-1-R1-1-01: the guard wrapper maps the same-caller-binding decision to
+    /// the wire result. The deep policy matrix (TTL, deployed shell, degrade-to-
+    /// deny) lives in `auth.rs`'s `authorize_cloud_send` tests; this asserts the
+    /// `enforce_cloud_send` wrapper authorizes the issuing caller and returns
+    /// `AccessDenied` for a different caller echoing the binding. Bus-free.
+    #[test]
+    fn enforce_cloud_send_binds_to_issuing_caller() {
+        use super::AuthGuard;
+        use crate::auth::{CallerIdentity, CloudSendConfirmations};
+        use std::time::Instant;
+
+        let guard = AuthGuard::dev_in_memory();
+        let mut reg = CloudSendConfirmations::default();
+        let a = CallerIdentity::from_unique_name(":1.10");
+        let b = CallerIdentity::from_unique_name(":1.11");
+        reg.issue("fp-token-hash", &a);
+
+        // The issuing caller completes → authorized.
+        assert!(guard
+            .enforce_cloud_send(&a, "fp-token-hash", Instant::now(), &reg)
+            .is_ok());
+        // A different caller echoing A's confirmation → AccessDenied (the closure).
+        assert!(matches!(
+            guard
+                .enforce_cloud_send(&b, "fp-token-hash", Instant::now(), &reg)
+                .unwrap_err(),
+            zbus::fdo::Error::AccessDenied(_)
+        ));
+        // An unbound fingerprint → AccessDenied (nothing was issued for it).
+        assert!(matches!(
+            guard
+                .enforce_cloud_send(&a, "never-issued", Instant::now(), &reg)
+                .unwrap_err(),
+            zbus::fdo::Error::AccessDenied(_)
+        ));
     }
 }

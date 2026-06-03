@@ -223,6 +223,32 @@ impl Brain {
     /// 4. Route through inference engine
     /// 5. Return combined result
     ///
+    /// # SVC-1-R1-1-01 (same-caller binding) — threat-model status
+    ///
+    /// This is a THIRD cloud-send entry path (alongside the D-Bus
+    /// `InferenceService::query` and the shell-bridge WebSocket handler), and it
+    /// forwards `cloud_confirmation_token` to the router exactly like they do.
+    /// The same-caller binding that closes SVC-1-R1-1-01 lives at the D-Bus
+    /// service boundary (`enforce_cloud_send`), NOT here. It is correctly OUT of
+    /// this path's current threat model for one concrete reason: **`Brain` is not
+    /// wired to any external entry point** — nothing in the repository constructs
+    /// a `Brain` or calls `query` outside this module's own tests, so no external
+    /// caller can obtain a confirmation token through the brain and no *different*
+    /// caller can replay it. The two-call bypass is unreachable because the path
+    /// itself is unreachable — not because "an internal caller is trusted".
+    ///
+    /// The SVC-2 Piece-2 destination-consent gate DOES cover this path: it is
+    /// enforced at the egress gateway, the single door all three paths funnel
+    /// through, so a brain cloud send is also refused until consent is granted.
+    ///
+    /// **Forward requirement (enforced by review today, not by code):** when the
+    /// brain is wired into an external entry point, the same-caller binding — or
+    /// an equivalent caller-context establishment, as `InferenceService::query`
+    /// does — MUST be applied at that wiring point, because `query` forwards a
+    /// `cloud_confirmation_token` to `route()` and would otherwise let a
+    /// different caller replay a valid token. Recorded as the fifth item of the
+    /// SVC-2 Codex review.
+    ///
     /// # Errors
     ///
     /// Returns an error if inference fails entirely (no backends

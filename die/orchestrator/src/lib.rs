@@ -35,6 +35,7 @@ pub mod error;
 pub mod goals;
 pub mod health;
 pub mod knowledge;
+pub mod learning;
 pub mod planner;
 pub mod reference;
 pub mod risk;
@@ -43,6 +44,7 @@ pub mod timeline;
 pub mod workspace;
 
 pub use error::OrchestratorError;
+pub use learning::LearningFacade;
 
 #[cfg(test)]
 mod tests {

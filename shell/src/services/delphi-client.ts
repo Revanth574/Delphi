@@ -29,12 +29,57 @@ interface BridgeResponse {
   error?: { code: number; message: string };
 }
 
-/** Result from an inference query. */
-export interface InferenceResult {
-  output: string;
-  tier: string;
-  model_id: string;
-}
+/**
+ * Result from an inference query (SVC-1: discriminated by `status`).
+ *
+ * A cloud query whose ZKQP privacy score is too high pauses for explicit
+ * user confirmation instead of sending — so the result is either a completed
+ * response or a confirmation request carrying the sanitized preview.
+ */
+export type InferenceResult =
+  | {
+      status: "completed";
+      output: string;
+      tier: string;
+      model_id: string;
+    }
+  | {
+      status: "confirmation_required";
+      /** ZKQP privacy score (0-100) that triggered the pause. */
+      privacy_score: number;
+      /** The sanitized query awaiting approval (PII already replaced). */
+      sanitized_preview: string;
+      /**
+       * Opaque, HMAC-bound confirmation token (SVC-1-R1-1). Echo this back
+       * verbatim as `cloudConfirmationToken` on the approved retry. It is
+       * bound to this exact sanitized prompt / model / max_tokens and expires
+       * shortly; the shell treats it as an opaque blob.
+       */
+      token: string;
+    }
+  | {
+      /**
+       * SVC-2 Piece 2: the cloud egress gateway REFUSED to send because the
+       * session has not granted destination consent ("data may leave this
+       * device"). DISTINCT from `confirmation_required` (content sensitivity);
+       * this is the prior gate of whether off-device egress is permitted at
+       * all, and covers low-score sends the privacy pause never gates. Nothing
+       * was sent.
+       *
+       * Flow: show the "use cloud AI?" opt-in (the carried `sanitized_preview`
+       * lets one dialog combine it with the privacy preview). On grant, call
+       * `grantCloudEgressConsent()` then re-issue `query()` with the carried
+       * `token` — the same token also clears the privacy pause when the score
+       * is high, so one acceptance both permits egress and confirms the content.
+       */
+      status: "destination_consent_required";
+      /** ZKQP privacy score (0-100) of the would-be send, for the dialog. */
+      privacy_score: number;
+      /** The sanitized query the cloud would receive (PII already replaced). */
+      sanitized_preview: string;
+      /** Opaque token (SVC-1-R1-1) bound to this content; echo on the retry. */
+      token: string;
+    };
 
 /** Backend availability status. */
 export interface InferenceStatus {
@@ -165,22 +210,48 @@ class DelphiClient {
 
   // ── Inference ──────────────────────────────────────────────
 
-  /** Send a natural language query through the inference engine. */
+  /**
+   * Send a natural language query through the inference engine.
+   *
+   * `cloudConfirmationToken` (SVC-1-R1-1) carries the user's explicit consent
+   * to send a high-privacy-score query's sanitized version past the ZKQP
+   * confirmation pause. Omit it on the first call; if the result is
+   * `status: "confirmation_required"`, show the `sanitized_preview` and, on
+   * the user's approval, re-call passing back the result's `token` verbatim.
+   * The token is opaque, HMAC-bound to this exact sanitized prompt, and
+   * short-lived: a forged, stale, or edited-prompt token simply re-pauses —
+   * it never sends unsanitized text, because ZKQP applies regardless.
+   */
   async query(
     prompt: string,
     maxTokens = 256,
     sensitive = false,
+    cloudConfirmationToken?: string,
   ): Promise<InferenceResult> {
     return this.call("inference.query", {
       prompt,
       max_tokens: maxTokens,
       sensitive,
+      // Empty string means "no token presented" (bridge treats absent and
+      // empty identically); a genuine token overrides only the pause.
+      cloud_confirmation_token: cloudConfirmationToken ?? "",
     }) as Promise<InferenceResult>;
   }
 
   /** Check which inference backends are available. */
   async status(): Promise<InferenceStatus> {
     return this.call("inference.status", {}) as Promise<InferenceStatus>;
+  }
+
+  /**
+   * Grant session-level cloud **destination** consent — "data may leave this
+   * device this session" (SVC-2 Piece 2). Call this when the user accepts the
+   * destination opt-in dialog (after a `destination_consent_required` result).
+   * It arms the egress gateway so a re-issued {@link query} proceeds past the
+   * refusal. Idempotent; lasts the session (a daemon restart re-asks).
+   */
+  async grantCloudEgressConsent(): Promise<void> {
+    await this.call("inference.grant_cloud_egress_consent", {});
   }
 
   // ── File Search ────────────────────────────────────────────

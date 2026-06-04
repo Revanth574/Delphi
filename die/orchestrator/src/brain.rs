@@ -27,7 +27,10 @@ use tracing::{info, warn};
 
 use die_browser::engine::{BrowserConfig, BrowserEngine};
 use die_inference::router::Router;
-use die_inference::InferenceRequest;
+use die_inference::{
+    CloudConfirmation, CloudDestinationConsent, ConfirmationTokenWire, InferenceRequest,
+    RouteOutcome,
+};
 
 use crate::OrchestratorError;
 
@@ -70,21 +73,41 @@ const WEB_AUGMENT_MARKER: &str = "[web-augmented]";
 ///     model_id: "qwen3-7b".to_string(),
 ///     web_augmented: false,
 ///     web_url: None,
+///     cloud_confirmation: None,
+///     destination_consent: None,
 /// };
 /// assert!(!resp.web_augmented);
 /// ```
 #[derive(Debug, Clone)]
 pub struct BrainResponse {
-    /// The LLM's response text.
+    /// The LLM's response text. Empty when `cloud_confirmation` is `Some`
+    /// (the query paused before producing a response).
     pub output: String,
-    /// Which inference tier was used.
+    /// Which inference tier was used. `"ConfirmationRequired"` when the
+    /// cloud query paused for user confirmation (SVC-1).
     pub tier: String,
-    /// Which model produced the response.
+    /// Which model produced the response. Empty when paused.
     pub model_id: String,
     /// Whether web data was included in the context.
     pub web_augmented: bool,
     /// The URL fetched for augmentation, if any.
     pub web_url: Option<String>,
+    /// `Some` when the cloud query's ZKQP privacy score required user
+    /// confirmation before sending (SVC-1). Carries the score, the sanitized
+    /// preview, and an opaque confirmation token (SVC-1-R1-1); nothing was
+    /// sent. The caller shows the preview and, on acceptance, re-issues `query`
+    /// with `cloud_confirmation_token` set to the `CloudConfirmation`'s `token`
+    /// wire string. `None` for completed (local or sent-and-restored)
+    /// responses.
+    pub cloud_confirmation: Option<CloudConfirmation>,
+    /// `Some` when the cloud query was refused at egress because the session
+    /// has not granted destination consent ("data may leave this device" —
+    /// SVC-2 Piece 2). DISTINCT from [`cloud_confirmation`](Self::cloud_confirmation):
+    /// this is the prior gate of whether off-device egress is permitted at all,
+    /// so a consumer must not confuse the two (a destination refusal must show
+    /// the "allow cloud?" opt-in, not the content-privacy dialog). `tier` is
+    /// `"DestinationConsentRequired"`. Nothing was sent. `None` otherwise.
+    pub destination_consent: Option<CloudDestinationConsent>,
 }
 
 /// The orchestrator brain — coordinates LLM + web for queries.
@@ -200,6 +223,32 @@ impl Brain {
     /// 4. Route through inference engine
     /// 5. Return combined result
     ///
+    /// # SVC-1-R1-1-01 (same-caller binding) — threat-model status
+    ///
+    /// This is a THIRD cloud-send entry path (alongside the D-Bus
+    /// `InferenceService::query` and the shell-bridge WebSocket handler), and it
+    /// forwards `cloud_confirmation_token` to the router exactly like they do.
+    /// The same-caller binding that closes SVC-1-R1-1-01 lives at the D-Bus
+    /// service boundary (`enforce_cloud_send`), NOT here. It is correctly OUT of
+    /// this path's current threat model for one concrete reason: **`Brain` is not
+    /// wired to any external entry point** — nothing in the repository constructs
+    /// a `Brain` or calls `query` outside this module's own tests, so no external
+    /// caller can obtain a confirmation token through the brain and no *different*
+    /// caller can replay it. The two-call bypass is unreachable because the path
+    /// itself is unreachable — not because "an internal caller is trusted".
+    ///
+    /// The SVC-2 Piece-2 destination-consent gate DOES cover this path: it is
+    /// enforced at the egress gateway, the single door all three paths funnel
+    /// through, so a brain cloud send is also refused until consent is granted.
+    ///
+    /// **Forward requirement (enforced by review today, not by code):** when the
+    /// brain is wired into an external entry point, the same-caller binding — or
+    /// an equivalent caller-context establishment, as `InferenceService::query`
+    /// does — MUST be applied at that wiring point, because `query` forwards a
+    /// `cloud_confirmation_token` to `route()` and would otherwise let a
+    /// different caller replay a valid token. Recorded as the fifth item of the
+    /// SVC-2 Codex review.
+    ///
     /// # Errors
     ///
     /// Returns an error if inference fails entirely (no backends
@@ -215,7 +264,7 @@ impl Brain {
     /// # use tokio::sync::RwLock;
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let brain = Brain::new(Arc::new(RwLock::new(Router::new())));
-    /// let response = brain.query("What is Rust?", 256, false).await;
+    /// let response = brain.query("What is Rust?", 256, false, None).await;
     /// # });
     /// ```
     pub async fn query(
@@ -223,6 +272,7 @@ impl Brain {
         input: &str,
         max_tokens: u32,
         sensitive: bool,
+        cloud_confirmation_token: Option<String>,
     ) -> Result<BrainResponse, OrchestratorError> {
         let needs_web = self.needs_web_access(input);
         let mut web_context: Option<String> = None;
@@ -258,21 +308,58 @@ impl Brain {
 
         // Route through inference
         let router = self.router.read().await;
+        // SVC-1-R1-1: the confirmation token must be bound to the FULL prompt
+        // that is actually routed (including any web-augmentation context). If
+        // the brain re-augments with different context on a retry, the token
+        // issued for the previous augmented prompt will not verify against the
+        // new sanitized text — the gateway re-pauses with a fresh token. The
+        // brain therefore simply forwards the caller's token; it never caches
+        // or rebinds one across differing augmented prompts.
         let req = InferenceRequest {
             input: prompt,
             max_tokens,
             sensitive,
+            // Wrap the raw wire string into the redacted-Debug newtype
+            // (SVC-1-R1-1-02) as it enters the boundary type.
+            cloud_confirmation_token: cloud_confirmation_token.map(ConfirmationTokenWire::new),
         };
 
-        let resp = router.route(req).await?;
-
-        Ok(BrainResponse {
-            output: resp.output,
-            tier: format!("{:?}", resp.tier),
-            model_id: resp.model_id,
-            web_augmented: web_context.is_some(),
-            web_url,
-        })
+        // SVC-1: a cloud query may pause for ZKQP confirmation. Surface that
+        // as a typed BrainResponse (output empty, cloud_confirmation set)
+        // rather than swallowing it as a completed response or an error.
+        match router.route(req).await? {
+            RouteOutcome::Completed(resp) => Ok(BrainResponse {
+                output: resp.output,
+                tier: format!("{:?}", resp.tier),
+                model_id: resp.model_id,
+                web_augmented: web_context.is_some(),
+                web_url,
+                cloud_confirmation: None,
+                destination_consent: None,
+            }),
+            RouteOutcome::CloudConfirmationRequired(c) => Ok(BrainResponse {
+                output: String::new(),
+                tier: "ConfirmationRequired".to_string(),
+                model_id: String::new(),
+                web_augmented: web_context.is_some(),
+                web_url,
+                cloud_confirmation: Some(c),
+                destination_consent: None,
+            }),
+            // SVC-2 Piece 2: the cloud query was refused at egress for lack of
+            // session destination consent. Surface it as a DISTINCT typed
+            // response (its own field + tier), never as a privacy confirmation,
+            // so the orchestrator/shell shows the "allow cloud?" opt-in.
+            RouteOutcome::DestinationConsentRequired(c) => Ok(BrainResponse {
+                output: String::new(),
+                tier: "DestinationConsentRequired".to_string(),
+                model_id: String::new(),
+                web_augmented: web_context.is_some(),
+                web_url,
+                cloud_confirmation: None,
+                destination_consent: Some(c),
+            }),
+        }
     }
 
     /// Fetch web context for a query using the browser engine.
@@ -468,7 +555,7 @@ mod tests {
     async fn brain_query_no_backends() {
         let router = Arc::new(RwLock::new(Router::new()));
         let brain = Brain::new(router);
-        let result = brain.query("hello", 256, false).await;
+        let result = brain.query("hello", 256, false, None).await;
         // Should fail because no inference backends
         assert!(result.is_err());
     }
@@ -481,9 +568,13 @@ mod tests {
             model_id: "test-model".to_string(),
             web_augmented: true,
             web_url: Some("https://example.com".to_string()),
+            cloud_confirmation: None,
+            destination_consent: None,
         };
         assert!(resp.web_augmented);
         assert_eq!(resp.web_url.as_deref(), Some("https://example.com"));
+        assert!(resp.cloud_confirmation.is_none());
+        assert!(resp.destination_consent.is_none());
     }
 
     #[test]

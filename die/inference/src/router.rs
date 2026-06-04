@@ -24,11 +24,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::cloud::{CloudClient, CloudModel, CloudResponse};
+use crate::cloud::CloudModel;
+use crate::egress::{CloudEgressGateway, EgressOutcome};
 use crate::error::InferenceError;
 use crate::hardware::{self, HardwareProfile, ModelRecommendation};
 use crate::model::{self, GenerationResult, LocalModel};
-use crate::{InferenceRequest, InferenceResponse, InferenceTier};
+use crate::{
+    CloudConfirmation, CloudDestinationConsent, InferenceRequest, InferenceResponse, InferenceTier,
+    RouteOutcome,
+};
 
 /// The inference router that selects the appropriate tier for each request.
 ///
@@ -49,8 +53,10 @@ pub struct Router {
     /// Local model (Tier 1). Protected by RwLock for concurrent reads.
     local_model: Arc<RwLock<Option<LocalModel>>>,
 
-    /// Cloud client (Tier 2/3).
-    cloud_client: Option<CloudClient>,
+    /// Cloud egress gateway (Tier 2/3) — the ZKQP-enforcing door to the
+    /// cloud (SVC-1). The router never holds a bare `CloudClient`; all cloud
+    /// traffic is sanitized by the gateway, structurally.
+    cloud_gateway: Option<CloudEgressGateway>,
 
     /// Detected hardware profile.
     hardware: HardwareProfile,
@@ -82,7 +88,7 @@ impl Router {
 
         Self {
             local_model: Arc::new(RwLock::new(None)),
-            cloud_client: None,
+            cloud_gateway: None,
             hardware,
             recommendation,
         }
@@ -119,9 +125,9 @@ impl Router {
     /// ```
     #[must_use]
     pub fn has_cloud(&self) -> bool {
-        self.cloud_client
+        self.cloud_gateway
             .as_ref()
-            .is_some_and(CloudClient::is_available)
+            .is_some_and(CloudEgressGateway::is_available)
     }
 
     /// Get the hardware profile.
@@ -247,8 +253,8 @@ impl Router {
     /// assert!(router.has_cloud());
     /// ```
     pub fn set_cloud_api_key(&mut self, api_key: String) {
-        info!("cloud client configured");
-        self.cloud_client = Some(CloudClient::new(api_key));
+        info!("cloud egress gateway configured (ZKQP-enforced)");
+        self.cloud_gateway = Some(CloudEgressGateway::new(api_key));
     }
 
     /// Route an inference request to the appropriate tier.
@@ -256,8 +262,13 @@ impl Router {
     /// Implements the cascading logic:
     /// 1. Sensitive → local only
     /// 2. Local available → use local
-    /// 3. Cloud available → use cloud
+    /// 3. Cloud available → use cloud (ZKQP-sanitized via the egress gateway)
     /// 4. Nothing → NoBackend error
+    ///
+    /// Returns a [`RouteOutcome`]: either a completed response, or — for a
+    /// cloud query whose privacy score is too high and that the caller has
+    /// not yet confirmed — [`RouteOutcome::CloudConfirmationRequired`]
+    /// (SVC-1). Nothing is sent to the cloud without ZKQP sanitization.
     ///
     /// # Errors
     ///
@@ -274,11 +285,12 @@ impl Router {
     ///     input: "Hello".to_string(),
     ///     max_tokens: 100,
     ///     sensitive: false,
+    ///     cloud_confirmation_token: None,
     /// };
     /// let result = router.route(req).await;
     /// # }
     /// ```
-    pub async fn route(&self, req: InferenceRequest) -> Result<InferenceResponse, InferenceError> {
+    pub async fn route(&self, req: InferenceRequest) -> Result<RouteOutcome, InferenceError> {
         debug!(
             input_len = req.input.len(),
             max_tokens = req.max_tokens,
@@ -288,7 +300,7 @@ impl Router {
 
         // Step 1: Try local model.
         match self.try_local(&req).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => return Ok(RouteOutcome::Completed(response)),
             Err(e) => {
                 if req.sensitive {
                     // Sensitive data must stay local — do not cascade to cloud.
@@ -299,9 +311,11 @@ impl Router {
             }
         }
 
-        // Step 2: Try cloud.
+        // Step 2: Try cloud (sanitized by the egress gateway). A pause for
+        // user confirmation is a successful, typed outcome — propagate it
+        // rather than treating it as a failure.
         match self.try_cloud(&req).await {
-            Ok(response) => return Ok(response),
+            Ok(outcome) => return Ok(outcome),
             Err(e) => {
                 debug!("cloud inference unavailable: {e}");
             }
@@ -335,18 +349,22 @@ impl Router {
         })
     }
 
-    /// Attempt cloud inference.
-    async fn try_cloud(&self, req: &InferenceRequest) -> Result<InferenceResponse, InferenceError> {
-        let client = self
-            .cloud_client
+    /// Attempt cloud inference through the ZKQP egress gateway (SVC-1).
+    ///
+    /// Returns a [`RouteOutcome`]: `Completed` with the de-sanitized response,
+    /// or `CloudConfirmationRequired` when the privacy score is too high and
+    /// the caller has not supplied a valid `cloud_confirmation_token`.
+    async fn try_cloud(&self, req: &InferenceRequest) -> Result<RouteOutcome, InferenceError> {
+        let gateway = self
+            .cloud_gateway
             .as_ref()
             .ok_or(InferenceError::CloudApi(
-                "no cloud client configured".to_string(),
+                "no cloud gateway configured".to_string(),
             ))?;
 
-        if !client.is_available() {
+        if !gateway.is_available() {
             return Err(InferenceError::CloudApi(
-                "cloud client has no API key".to_string(),
+                "cloud gateway has no API key".to_string(),
             ));
         }
 
@@ -360,18 +378,61 @@ impl Router {
         info!(
             model = model.display_name(),
             tier = ?tier,
-            "routing to cloud"
+            "routing to cloud (ZKQP-sanitized)"
         );
 
-        let response: CloudResponse = client
-            .complete(&req.input, req.max_tokens, model)
-            .await?;
+        // SVC-1: the gateway sanitizes, optionally pauses (requiring a valid
+        // HMAC confirmation token, SVC-1-R1-1), sends, and restores. The
+        // router never sees raw cloud transmission.
+        match gateway
+            .complete(
+                &req.input,
+                req.max_tokens,
+                model,
+                req.cloud_confirmation_token.as_ref().map(|t| t.as_str()),
+            )
+            .await?
+        {
+            EgressOutcome::Completed(response) => Ok(RouteOutcome::Completed(InferenceResponse {
+                output: response.text,
+                tier,
+                model_id: response.model,
+            })),
+            EgressOutcome::ConfirmationRequired {
+                privacy_score,
+                sanitized_preview,
+                token_wire,
+            } => Ok(RouteOutcome::CloudConfirmationRequired(CloudConfirmation {
+                privacy_score,
+                sanitized_preview,
+                token: token_wire,
+            })),
+            EgressOutcome::DestinationConsentRequired {
+                privacy_score,
+                sanitized_preview,
+                token_wire,
+            } => Ok(RouteOutcome::DestinationConsentRequired(
+                CloudDestinationConsent {
+                    privacy_score,
+                    sanitized_preview,
+                    token: token_wire,
+                },
+            )),
+        }
+    }
 
-        Ok(InferenceResponse {
-            output: response.text,
-            tier,
-            model_id: response.model,
-        })
+    /// Grant session-level cloud **destination** consent — "data may leave this
+    /// device this session" (SVC-2 Piece 2). Delegates to the egress gateway's
+    /// structural flag; after this, a cloud-routed query stops returning
+    /// [`RouteOutcome::DestinationConsentRequired`] and proceeds to the
+    /// privacy-score pause / send. No-op when no cloud gateway is configured.
+    ///
+    /// Takes `&self` (the gateway flag is an atomic) so the daemon can grant
+    /// through a shared `RwLock` read guard.
+    pub fn grant_destination_consent(&self) {
+        if let Some(gateway) = &self.cloud_gateway {
+            gateway.grant_destination_consent();
+        }
     }
 }
 
@@ -397,6 +458,7 @@ impl Default for Router {
 ///     input: "Hello".to_string(),
 ///     max_tokens: 100,
 ///     sensitive: false,
+///     cloud_confirmation_token: None,
 /// };
 /// assert_eq!(select_cloud_model(&short), CloudModel::ClaudeSonnet);
 /// ```
@@ -420,6 +482,7 @@ mod tests {
             input: "test".to_string(),
             max_tokens: 50,
             sensitive: false,
+            cloud_confirmation_token: None,
         };
         let err = router.route(req).await.unwrap_err();
         assert!(matches!(err, InferenceError::NoBackend));
@@ -434,6 +497,7 @@ mod tests {
             input: "secret data".to_string(),
             max_tokens: 50,
             sensitive: true,
+            cloud_confirmation_token: None,
         };
 
         // Should fail with ModelLoad (no local model), NOT try cloud.
@@ -441,6 +505,30 @@ mod tests {
         assert!(
             matches!(err, InferenceError::ModelLoad(_)),
             "expected ModelLoad, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_high_pii_never_routes_to_cloud() {
+        // SVC-1 (b): the ZKQP detection floor must NEVER override explicit
+        // `sensitive = true` routing (Iron Law #1). Even with a configured
+        // cloud key AND a high-PII prompt that would otherwise pause/send,
+        // a sensitive request stays local-only: it fails with ModelLoad (no
+        // local model) and is NEVER routed to the cloud (no
+        // CloudConfirmationRequired, no send). Detection raises the floor; it
+        // never lowers caller intent.
+        let mut router = Router::new();
+        router.set_cloud_api_key("sk-test".to_string());
+        let req = InferenceRequest {
+            input: "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to all".to_string(),
+            max_tokens: 50,
+            sensitive: true,
+            cloud_confirmation_token: None,
+        };
+        let err = router.route(req).await.unwrap_err();
+        assert!(
+            matches!(err, InferenceError::ModelLoad(_)),
+            "sensitive high-PII request must stay local (ModelLoad), never cloud; got: {err:?}"
         );
     }
 
@@ -453,11 +541,55 @@ mod tests {
             input: "test".to_string(),
             max_tokens: 50,
             sensitive: false,
+            cloud_confirmation_token: None,
         };
 
         // Local fails (no model) → cloud fails (empty key) → NoBackend.
         let err = router.route(req).await.unwrap_err();
         assert!(matches!(err, InferenceError::NoBackend));
+    }
+
+    /// SVC-2 Piece 2: a non-sensitive cloud-routed query is structurally refused
+    /// at the egress gateway until the session grants destination consent. The
+    /// router maps the gateway's refusal to
+    /// [`RouteOutcome::DestinationConsentRequired`]; after
+    /// `grant_destination_consent` the same query proceeds to the privacy pause.
+    /// Verifies the Router mapping AND the grant pass-through.
+    #[tokio::test]
+    async fn destination_consent_gate_at_router_level() {
+        let mut router = Router::new();
+        router.set_cloud_api_key("sk-test".to_string());
+        let risky = "Mail a@a.com b@b.com c@c.com d@d.com e@e.com to all";
+
+        // No consent → refused at egress (no local model → cloud → Step-2 gate).
+        let req = InferenceRequest {
+            input: risky.to_string(),
+            max_tokens: 50,
+            sensitive: false,
+            cloud_confirmation_token: None,
+        };
+        match router.route(req).await.expect("a refusal is a typed Ok outcome") {
+            RouteOutcome::DestinationConsentRequired(c) => {
+                assert!(
+                    !c.token.as_str().is_empty(),
+                    "refusal carries a token for the granted retry"
+                );
+            }
+            other => panic!("expected DestinationConsentRequired without consent; got {other:?}"),
+        }
+
+        // Grant → the same query now reaches the privacy pause (high score).
+        router.grant_destination_consent();
+        let req2 = InferenceRequest {
+            input: risky.to_string(),
+            max_tokens: 50,
+            sensitive: false,
+            cloud_confirmation_token: None,
+        };
+        match router.route(req2).await.expect("the pause is a typed Ok outcome") {
+            RouteOutcome::CloudConfirmationRequired(_) => {}
+            other => panic!("after grant, expected CloudConfirmationRequired; got {other:?}"),
+        }
     }
 
     #[test]
@@ -494,6 +626,7 @@ mod tests {
             input: "Hi".to_string(),
             max_tokens: 100,
             sensitive: false,
+            cloud_confirmation_token: None,
         };
         assert_eq!(select_cloud_model(&req), CloudModel::ClaudeSonnet);
     }
@@ -504,6 +637,7 @@ mod tests {
             input: "x".repeat(600),
             max_tokens: 100,
             sensitive: false,
+            cloud_confirmation_token: None,
         };
         assert_eq!(select_cloud_model(&req), CloudModel::ClaudeOpus);
     }
@@ -514,6 +648,7 @@ mod tests {
             input: "short".to_string(),
             max_tokens: 2000,
             sensitive: false,
+            cloud_confirmation_token: None,
         };
         assert_eq!(select_cloud_model(&req), CloudModel::ClaudeOpus);
     }

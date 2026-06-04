@@ -10,6 +10,13 @@
 //!
 //! Interface: `org.delphi.Knowledge`
 //!
+//! SVC-2: every method enforces authorization via the shared [`AuthGuard`]
+//! on its first line. `ingest_file`/`ingest_text` are Confirm (they mutate
+//! the graph); `search`, `related_to`, `find_path`, `list_sources`, and
+//! `detect_contradictions` are Autonomous (read-only); `forget_source` is
+//! Biometric (destructive — orphans and removes nodes). The three
+//! `#[zbus(signal)]` declarations carry no guard (signals have no caller).
+//!
 //! # Privacy guarantees
 //!
 //! - Document content **never** transits the cloud unless the user has
@@ -38,167 +45,29 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing::info;
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 
 use die_orchestrator::knowledge::{
-    EdgeRelation, IngestionResult, KnowledgeNode, KnowledgeStore, NodeWithSources, RelatedNode,
-    Source, SourceType,
+    EdgeRelation, IngestionAccessController, IngestionError, IngestionResult, KnowledgeNode,
+    KnowledgeStore, NodeWithSources, RelatedNode, Source, SourceType,
 };
 
-/// **Codex re-review FIX 15 (P1-high):** an allowlisted ingestion
-/// root, anchored to a held directory handle rather than a
-/// re-resolvable path string.
-///
-/// Round-3 stored allowlist roots as `Vec<PathBuf>`. At ingest time
-/// the orchestrator's `safe_open_under_root` re-opened that path via
-/// `std::fs::File::open(trusted_root)`, which follows symlinks and
-/// re-resolves the path string. An attacker who controlled the
-/// parent of an allowlist entry could therefore swap the entry for
-/// a symlink AFTER `add_ingestion_root` canonicalized it, but
-/// BEFORE the next `safe_open_under_root` call. `openat2` would
-/// then anchor `RESOLVE_BENEATH` to the symlink target, defeating
-/// the allowlist.
-///
-/// FIX 15: open the directory ONCE at registration time with
-/// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and hold the resulting
-/// `File` handle for the service's lifetime. The handle's identity
-/// (kernel inode behind the fd) is the trust anchor — it survives
-/// renames, resists symlink swaps, and is what the orchestrator
-/// passes to `openat2`'s `dirfd` parameter.
-///
-/// `Arc<File>` lets us hand out cheap clones without cloning the
-/// underlying fd; `Drop` closes the fd when the last clone is
-/// released (typically when the service shuts down).
-#[derive(Debug, Clone)]
-pub struct AllowlistRoot {
-    /// Canonical path captured at registration time. Used for the
-    /// `starts_with` allowlist check during `check_path_allowed_with_root`.
-    pub canonical_path: PathBuf,
-    /// Held directory handle. Opened on Linux with `O_DIRECTORY |
-    /// O_NOFOLLOW | O_CLOEXEC`; on non-Linux platforms registration
-    /// itself fails (FIX 16) so this field is never constructed there.
-    pub dir_handle: Arc<std::fs::File>,
-}
+use crate::auth_guard::AuthGuard;
 
-/// Open a directory at `path` with no-follow + close-on-exec
-/// semantics, producing the held handle that anchors an
-/// `AllowlistRoot`.
-///
-/// **Linux**: `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. The
-/// `O_NOFOLLOW` rejects a final-component symlink (so the
-/// registered path itself cannot be a symlink); `O_DIRECTORY`
-/// rejects regular files at the registered path; `O_CLOEXEC`
-/// makes the fd not survive a `fork+exec` (defense in depth
-/// against accidental fd leakage to subprocess managers).
-///
-/// **Non-Linux**: returns `ErrorKind::Unsupported`. See FIX 16
-/// rationale: Windows' kernel-level path-anchored opens require
-/// undocumented NT APIs we don't depend on at this build stage,
-/// and macOS support via repeated `openat` walks is deferred.
-fn open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "knowledge ingestion requires Linux (O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC). \
-             Windows and other Unix variants are not supported in this build — see \
-             FIX 16 rationale. Use ingest_text instead.",
-        ))
-    }
-}
+// SVC-8 (services-sweep): the held-handle `AllowlistRoot`, the
+// `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` `open_dir_no_follow`, the
+// sensitive-content denylist (`is_sensitive_path` + its const tables),
+// and the closed-by-default allowlist + validation logic
+// (`check_path_allowed_with_root`) all moved into the domain as
+// `die_orchestrator::knowledge::IngestionAccessController`. The security
+// boundary is now enforced at the type level: ingestion requires a
+// `ValidatedIngestionPath` token that only the controller's `validate`
+// can mint. This module keeps only the D-Bus wrapper, the uniform wire
+// rejection message, and the domain-error → `zbus` mapping.
 
 /// D-Bus object path for the Knowledge interface.
 pub const PATH: &str = "/org/delphi/Knowledge";
-
-/// Directory names that must never be ingested, regardless of allowlist.
-/// Compared component-wise (case-insensitive ASCII) against the
-/// canonicalized path. A path containing any of these as a component is
-/// rejected even if the user explicitly added a parent dir to the
-/// allowlist.
-///
-/// Codex review (FIX 4 round) flagged the original allowlist as
-/// insufficient: even an opt-in allowlist that includes the user's home
-/// can pull keys/credentials/tokens. This denylist provides a safety
-/// net the allowlist cannot override.
-const SENSITIVE_DIR_NAMES: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".gpg",
-    ".aws",
-    ".kube",
-    ".docker",
-    ".azure",
-];
-
-/// File-name stems that always indicate sensitive material. Compared
-/// case-insensitively against the canonicalized path's `file_name`.
-const SENSITIVE_FILE_NAMES: &[&str] = &[
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    "id_dsa",
-    "credentials",
-    "authorized_keys",
-    "known_hosts",
-];
-
-/// File extensions that always indicate sensitive material. Compared
-/// case-insensitively (so `.PEM` is rejected the same as `.pem`).
-const SENSITIVE_EXTENSIONS: &[&str] = &[
-    "pem", "key", "p12", "pfx", "kdbx", "keystore", "jks",
-];
-
-/// Pure function: returns `true` if the canonicalized path matches the
-/// sensitive-content denylist and must be rejected.
-///
-/// Checks (in order, return `true` on first hit):
-/// 1. Each path component against [`SENSITIVE_DIR_NAMES`]
-/// 2. The file-name stem against [`SENSITIVE_FILE_NAMES`]
-/// 3. The file name's `.env*` prefix (catches `.env`, `.env.production`, etc.)
-/// 4. The file extension against [`SENSITIVE_EXTENSIONS`]
-///
-/// The function takes only `&Path` and performs no I/O — it's a pure
-/// classifier suitable for unit testing without temp dirs or fixtures.
-pub(crate) fn is_sensitive_path(path: &Path) -> bool {
-    // Component-wise dir-name check.
-    for comp in path.components() {
-        if let std::path::Component::Normal(os) = comp
-            && let Some(name) = os.to_str()
-            && SENSITIVE_DIR_NAMES
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(name))
-        {
-            return true;
-        }
-    }
-    // File name + extension checks.
-    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let lower = file_name.to_ascii_lowercase();
-    if SENSITIVE_FILE_NAMES.iter().any(|n| lower == *n) {
-        return true;
-    }
-    if lower.starts_with(".env") {
-        return true;
-    }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_ascii_lowercase();
-        if SENSITIVE_EXTENSIONS.iter().any(|e| ext_lower == *e) {
-            return true;
-        }
-    }
-    false
-}
 
 /// Knowledge D-Bus service.
 ///
@@ -206,7 +75,7 @@ pub(crate) fn is_sensitive_path(path: &Path) -> bool {
 /// can lock briefly to read state or mutate the graph. The Mutex is the
 /// standard `std::sync::Mutex`.
 ///
-/// # Path access control — closed-by-default (Codex review FIX 4, P1)
+/// # Path access control — closed-by-default, enforced in the domain (SVC-8)
 ///
 /// [`ingest_file`](Self::ingest_file) takes a caller-supplied path. The
 /// initial 3A.5 design auto-registered the user's home directory as an
@@ -215,258 +84,138 @@ pub(crate) fn is_sensitive_path(path: &Path) -> bool {
 /// dotfile-stored API tokens, or browser cookie databases, and pull
 /// parsed content back through `search`.
 ///
-/// **The default allowlist is now empty.** The shell explicitly
-/// registers each ingestion root via
+/// **The gate now lives in the domain.** This service holds a
+/// [`die_orchestrator::knowledge::IngestionAccessController`] — the single
+/// owner of the closed-by-default allowlist, canonicalization, prefix
+/// match, and sensitive-content denylist (the 9-round-hardened
+/// F4 / F7 / F15 logic). The shell registers each ingestion root via
 /// [`add_ingestion_root`](Self::add_ingestion_root) only after the user
-/// picks a directory in a folder-picker dialog. Without that explicit
-/// opt-in, every `ingest_file` call returns `AccessDenied`.
+/// picks a directory; without that explicit opt-in, every `ingest_file`
+/// call is denied.
 ///
-/// Path validation runs in this order, returning `AccessDenied` on the
-/// first failure (without echoing the rejected path back to the wire):
-///
-/// 1. Canonicalize the input via `std::fs::canonicalize` (resolves
-///    symlinks AND `..` components; non-existent paths fail early).
-/// 2. Verify the canonical path lies under at least one allowlist entry
-///    (component-wise prefix match — `/home/user2` does NOT match
-///    `/home/user`).
-/// 3. Verify the canonical path does not match the sensitive-content
-///    denylist ([`is_sensitive_path`]). The denylist runs **after** the
-///    allowlist so a denylisted file inside an allowed directory still
-///    rejects — even an explicit allowlist cannot override the denylist.
+/// The service no longer performs path validation itself: it asks the
+/// controller to [`validate`](die_orchestrator::knowledge::IngestionAccessController::validate)
+/// the path, which on success mints a
+/// [`ValidatedIngestionPath`](die_orchestrator::knowledge::ValidatedIngestionPath)
+/// capability token, and hands that token to
+/// [`KnowledgeStore::ingest_validated_file`]. Possession of the token is
+/// the only way to reach the store's file-ingest path, so the allowlist
+/// cannot be bypassed. Every denial is mapped to one uniform
+/// [`REJECTION_MESSAGE`] (FIX 7 — no filesystem-existence oracle).
 ///
 /// # Examples
 ///
 /// ```
 /// use delphi_services::knowledge::KnowledgeService;
+/// use delphi_services::auth_guard::AuthGuard;
 /// use die_orchestrator::knowledge::{KnowledgeStore, MockEmbedder};
 /// use std::sync::{Arc, Mutex};
 ///
 /// let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-/// let svc = KnowledgeService::new(Arc::new(Mutex::new(store)));
+/// let svc = KnowledgeService::new(
+///     Arc::new(Mutex::new(store)),
+///     Arc::new(AuthGuard::dev_in_memory()),
+/// );
 /// // svc.allowlist_snapshot() is empty — shell must add roots before ingestion.
 /// ```
 pub struct KnowledgeService {
     store: Arc<Mutex<KnowledgeStore>>,
-    /// **Codex re-review FIX 15 (P1-high):** allowlisted base
-    /// directories, anchored to held directory handles rather than
-    /// re-resolvable path strings. See [`AllowlistRoot`] for the
-    /// architectural rationale. Empty allowlist → no path is
-    /// permitted (closed by default, Codex review FIX 4 P1).
-    allowlist: Arc<Mutex<Vec<AllowlistRoot>>>,
+    guard: Arc<AuthGuard>,
+    /// The domain ingestion access-control gate (SVC-8). Owns the
+    /// closed-by-default allowlist of held directory handles and the
+    /// sensitive-content denylist; the only minter of
+    /// [`ValidatedIngestionPath`](die_orchestrator::knowledge::ValidatedIngestionPath)
+    /// tokens. Empty allowlist → no path is permitted.
+    access: IngestionAccessController,
 }
 
 impl KnowledgeService {
-    /// Build a service with an **empty** ingestion allowlist. This is
-    /// the closed-by-default posture per Codex review FIX 4 (P1):
-    /// every `ingest_file` call returns `AccessDenied` until the shell
+    /// Build a service with an **empty** ingestion allowlist (closed by
+    /// default, FIX 4): every `ingest_file` call is denied until the shell
     /// registers explicit roots via
     /// [`add_ingestion_root`](Self::add_ingestion_root).
     ///
-    /// The intended flow is: the user clicks a folder-picker in the
-    /// shell, the shell sends the picked path over D-Bus to a future
-    /// `AddIngestionRoot` method (or the daemon registers it directly
-    /// at construction), and only THEN can the path be ingested.
+    /// The intended flow: the user clicks a folder-picker in the shell, the
+    /// shell sends the picked path over D-Bus, the daemon registers it, and
+    /// only THEN can a path under it be ingested.
+    ///
+    /// `guard` is the shared [`AuthGuard`] (SVC-2): every D-Bus method
+    /// enforces authorization through it before touching the store.
     #[must_use]
-    pub fn new(store: Arc<Mutex<KnowledgeStore>>) -> Self {
+    pub fn new(store: Arc<Mutex<KnowledgeStore>>, guard: Arc<AuthGuard>) -> Self {
         Self {
             store,
-            allowlist: Arc::new(Mutex::new(Vec::new())),
+            guard,
+            access: IngestionAccessController::new(),
         }
     }
 
     /// Build a service with an explicit allowlist of base directories.
-    /// Each entry is canonicalized AND opened as a held directory
-    /// handle (FIX 15). Entries that fail either step are silently
-    /// dropped. Useful for tests that need to inject a tempdir-rooted
-    /// allowlist and for daemon code that pre-registers roots from
-    /// saved settings.
+    /// Delegates to [`IngestionAccessController::with_roots`]: each entry is
+    /// canonicalized AND opened as a held directory handle (FIX 15); entries
+    /// that fail either step are dropped (so on non-Linux the allowlist ends
+    /// up empty). Useful for tests and for daemon code that pre-registers
+    /// roots from saved settings.
     #[must_use]
     pub fn with_allowlist(
         store: Arc<Mutex<KnowledgeStore>>,
         roots: Vec<PathBuf>,
+        guard: Arc<AuthGuard>,
     ) -> Self {
-        let entries: Vec<AllowlistRoot> = roots
-            .into_iter()
-            .filter_map(|p| {
-                let canon = std::fs::canonicalize(&p).ok()?;
-                let handle = open_dir_no_follow(&canon).ok()?;
-                Some(AllowlistRoot {
-                    canonical_path: canon,
-                    dir_handle: Arc::new(handle),
-                })
-            })
-            .collect();
         Self {
             store,
-            allowlist: Arc::new(Mutex::new(entries)),
+            guard,
+            access: IngestionAccessController::with_roots(roots),
         }
     }
 
-    /// Add a base directory to the allowlist. Returns `true` if the path
-    /// was added (canonicalization AND directory-handle open both
-    /// succeeded and it wasn't already present); `false` otherwise.
-    ///
-    /// **Codex re-review FIX 15 (P1-high):** the directory is opened
-    /// with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` ONCE at
-    /// registration time, and the resulting `File` handle is retained
-    /// for the service's lifetime. The handle anchors trust to a
-    /// kernel inode rather than a re-resolvable path string —
-    /// resisting post-registration symlink swaps of the registered
-    /// path's parent directory.
-    ///
-    /// `O_NOFOLLOW` here means the registered path itself cannot be a
-    /// symlink (the open returns `ELOOP` if it is), so callers like
-    /// the shell folder-picker must hand us the resolved directory.
-    /// Combined with `add_ingestion_root`'s `canonicalize` call, this
-    /// gives us "canonical path AND no-follow open" at registration —
-    /// belt-and-braces against any creative resolution semantics.
+    /// Add a base directory to the allowlist. Returns `true` if it was
+    /// added. Delegates to [`IngestionAccessController::add_root`], which
+    /// opens the directory with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` once
+    /// at registration and holds the handle for the gate's lifetime (FIX
+    /// 15) — anchoring trust to a kernel inode, not a path string.
     pub fn add_ingestion_root(&self, root: &Path) -> bool {
-        let Ok(canon) = std::fs::canonicalize(root) else {
-            return false;
-        };
-        let Ok(handle) = open_dir_no_follow(&canon) else {
-            // open_dir_no_follow rejects symlinks at the registered
-            // path AND non-Linux platforms (FIX 16). Both surface as
-            // a single "could not register" boolean to the caller.
-            return false;
-        };
-        let Ok(mut allow) = self.allowlist.lock() else {
-            return false;
-        };
-        if allow.iter().any(|entry| entry.canonical_path == canon) {
-            return false;
-        }
-        allow.push(AllowlistRoot {
-            canonical_path: canon,
-            dir_handle: Arc::new(handle),
-        });
-        true
+        self.access.add_root(root)
     }
 
-    /// Snapshot of currently-allowed canonical root paths — for
-    /// diagnostics and tests. Returns paths only; the held handles
-    /// are intentionally not exposed (they're an internal trust
-    /// anchor, not a stable public API).
+    /// Snapshot of currently-allowed canonical root paths — for diagnostics
+    /// and tests. Delegates to [`IngestionAccessController::snapshot`];
+    /// returns paths only (the held handles stay an internal trust anchor).
+    #[must_use]
     pub fn allowlist_snapshot(&self) -> Vec<PathBuf> {
-        self.allowlist
-            .lock()
-            .map(|a| a.iter().map(|e| e.canonical_path.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Validate a caller-supplied path against the allowlist + denylist
-    /// AND return the matching allowlist root's held directory handle
-    /// in a single lock acquisition.
-    ///
-    /// **Codex re-review FIX 7 (P1-high) — retained:** every rejection
-    /// returns the uniform [`REJECTION_MESSAGE`] via [`reject`]. The
-    /// detailed reason goes to the tracing log only.
-    ///
-    /// **Codex re-review FIX 15 (P1-high):** the function now returns
-    /// `(canonical_path, Arc<File>)` so the caller can hand the held
-    /// handle straight to the orchestrator's
-    /// `ingest_file_with_root_handle`. Round-3 released the allowlist
-    /// lock between validation and root-handle lookup, opening a
-    /// (small) race window where the matching root could disappear or
-    /// be reordered. FIX 15 holds the lock once for the whole
-    /// validate-and-look-up step, so the returned `Arc<File>` is
-    /// guaranteed to be the handle that gated the request.
-    ///
-    /// **Order matters (FIX 7):** the empty-allowlist check runs
-    /// before canonicalization. Closed-by-default → no probe oracle.
-    fn check_path_allowed_with_root(
-        &self,
-        raw: &str,
-    ) -> zbus::fdo::Result<(PathBuf, Arc<std::fs::File>)> {
-        // Hold the lock through validation AND root-handle pickup so
-        // a concurrent add_ingestion_root cannot reshape the allowlist
-        // between the prefix match and the handle clone.
-        let allow = self
-            .allowlist
-            .lock()
-            .map_err(|e| zbus::fdo::Error::Failed(format!("allowlist lock poisoned: {e}")))?;
-
-        // FIX 7 part A: short-circuit on empty allowlist BEFORE any
-        // filesystem syscall. Closed-by-default → no probe oracle.
-        if allow.is_empty() {
-            return Err(reject(RejectionReason::AllowlistEmpty, raw));
-        }
-
-        // Allowlist is non-empty; canonicalization is justified.
-        // The lock is held during this syscall — the lock window
-        // grows by one canonicalize() syscall, but that's preferable
-        // to round-3's race where the lock dropped between the prefix
-        // match and the handle clone.
-        let canon = std::fs::canonicalize(raw)
-            .map_err(|_| reject(RejectionReason::Unresolvable, raw))?;
-
-        // Find the matching root and clone its Arc<File>. Both the
-        // canonical_path (for the prefix match) and the dir_handle
-        // (for the orchestrator) come from the same AllowlistRoot
-        // entry, eliminating any chance of a path/handle mismatch.
-        let matched = allow
-            .iter()
-            .find(|entry| canon.starts_with(&entry.canonical_path))
-            .ok_or_else(|| reject(RejectionReason::OutsideAllowlist, raw))?;
-        let dir_handle = Arc::clone(&matched.dir_handle);
-
-        // FIX 4 retained: denylist runs AFTER allowlist so we never
-        // signal "this file exists but is denylisted" with a different
-        // rejection reason than "this file isn't in your allowlist."
-        if is_sensitive_path(&canon) {
-            return Err(reject(RejectionReason::SensitivePath, raw));
-        }
-
-        Ok((canon, dir_handle))
+        self.access.snapshot()
     }
 }
 
 // ────────────────────────────────────────────────────────────────────
-// FIX 7 (P1-high): uniform public rejection + local-only audit log
+// FIX 7 (P1-high): uniform public rejection + domain-error → wire mapping
 // ────────────────────────────────────────────────────────────────────
 
-/// Single public rejection message. The detailed reason is logged
-/// locally via `tracing` for operator diagnostics, never returned to
-/// the D-Bus caller — that would re-introduce the filesystem-existence
-/// oracle Codex flagged in re-review finding F7.
+/// Single public rejection message. The detailed reason is logged locally
+/// (by the domain's `IngestionAccessController::validate`) for operator
+/// diagnostics, never returned to the D-Bus caller — that would
+/// re-introduce the filesystem-existence oracle Codex flagged in re-review
+/// finding F7.
 pub(crate) const REJECTION_MESSAGE: &str = "path not permitted";
 
-/// Reasons we reject a path. Used only for local tracing; never crosses
-/// the D-Bus boundary.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RejectionReason {
-    /// Allowlist is empty — ingestion closed by default.
-    AllowlistEmpty,
-    /// `canonicalize()` failed — path doesn't exist or can't be resolved.
-    Unresolvable,
-    /// Canonical path doesn't start with any allowlist root.
-    OutsideAllowlist,
-    /// Path matches the sensitive-content denylist.
-    SensitivePath,
-}
-
-impl RejectionReason {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            RejectionReason::AllowlistEmpty => "allowlist empty",
-            RejectionReason::Unresolvable => "unresolvable or does not exist",
-            RejectionReason::OutsideAllowlist => "outside allowlist",
-            RejectionReason::SensitivePath => "matches sensitive-content denylist",
+/// Map a domain [`IngestionError`] to a `zbus::fdo::Error` at the trust
+/// boundary.
+///
+/// **FIX 7 (P1-high):** every access *denial* — whatever its specific
+/// reason — collapses to one uniform [`REJECTION_MESSAGE`] under
+/// `AccessDenied`, so the wire carries no information about *why* a path
+/// was refused (no allowlist-vs-denylist-vs-nonexistent oracle). The
+/// specific reason and the raw path were already logged locally by the
+/// domain's `validate`. An [`IngestionError::Internal`] (e.g. a poisoned
+/// allowlist lock) is a bug, not an access decision, so it surfaces as a
+/// generic `Failed` rather than `AccessDenied`.
+fn map_ingestion_error(err: IngestionError) -> zbus::fdo::Error {
+    match err {
+        IngestionError::Denied(_) => zbus::fdo::Error::AccessDenied(REJECTION_MESSAGE.to_string()),
+        IngestionError::Internal(_) => {
+            zbus::fdo::Error::Failed("ingestion access check failed".to_string())
         }
     }
-}
-
-/// Construct an `AccessDenied` error with the uniform public message,
-/// emitting the detailed reason + raw caller path to the local tracing
-/// log. The wire response carries no information about why the path
-/// was rejected.
-pub(crate) fn reject(reason: RejectionReason, raw: &str) -> zbus::fdo::Error {
-    tracing::warn!(
-        reason = reason.as_str(),
-        raw_path = %raw,
-        "knowledge ingestion path rejected"
-    );
-    zbus::fdo::Error::AccessDenied(REJECTION_MESSAGE.to_string())
 }
 
 #[zbus::interface(name = "org.delphi.Knowledge")]
@@ -515,23 +264,31 @@ impl KnowledgeService {
     /// platform-appropriate API is available) and pass the bytes
     /// through `ingest_text`, accepting that the safe-open boundary
     /// is the shell's responsibility on those platforms.
-    async fn ingest_file(&self, path: String) -> zbus::fdo::Result<String> {
+    async fn ingest_file(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        path: String,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.ingest_file", &header)?;
+        // SVC-6-R2-3: cap BEFORE info!()/validation/store.
+        crate::limits::ensure_within(&path, crate::limits::MAX_STRING_BYTES, "path")?;
         info!(path = %path, "D-Bus ingest_file");
 
-        // FIX 15: single-lock check + root-handle pickup. The held
-        // directory handle anchors trust to a kernel inode rather
-        // than a re-resolvable path string; the orchestrator's
-        // `ingest_file_with_root_handle` consumes it directly. Round-3
-        // released the lock between validation and handle lookup,
-        // opening a small race window — closed here.
-        let (canonical, trusted_root_handle) = self.check_path_allowed_with_root(&path)?;
+        // SVC-8: the domain gate validates the path and, on success, mints
+        // a capability token bundling the canonical path with the held root
+        // handle (FIX 15 — single-lock validate-and-pickup, now inside the
+        // controller). The store's only public file-ingest entry consumes
+        // that token, so the allowlist cannot be bypassed here. Denials map
+        // to one uniform AccessDenied (FIX 7); the specific reason and raw
+        // path were already logged in the domain.
+        let validated = self.access.validate(&path).map_err(map_ingestion_error)?;
 
         let store = self
             .store
             .lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
         let result = store
-            .ingest_file_with_root_handle(&trusted_root_handle, &canonical)
+            .ingest_validated_file(&validated)
             .map_err(|e| zbus::fdo::Error::Failed(redact_to_kind(&e.to_string())))?;
         ingestion_to_json_string(&result)
     }
@@ -543,10 +300,16 @@ impl KnowledgeService {
     /// produce no nodes.
     async fn ingest_text(
         &self,
+        #[zbus(header)] header: Header<'_>,
         text: String,
         source_uri: String,
         format: String,
     ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.ingest_text", &header)?;
+        // SVC-6-R2-3: cap every String param BEFORE info!()/parse/store.
+        crate::limits::ensure_within(&text, crate::limits::MAX_INGEST_TEXT_BYTES, "text")?;
+        crate::limits::ensure_within(&source_uri, crate::limits::MAX_STRING_BYTES, "source_uri")?;
+        crate::limits::ensure_within(&format, crate::limits::MAX_STRING_BYTES, "format")?;
         info!(uri = %source_uri, fmt = %format, "D-Bus ingest_text");
         let store = self
             .store
@@ -560,7 +323,14 @@ impl KnowledgeService {
 
     /// Search the graph semantically. Returns a JSON array of
     /// [`NodeWithSources`].
-    async fn search(&self, query: String, max_results: u32) -> zbus::fdo::Result<String> {
+    async fn search(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        query: String,
+        max_results: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.search", &header)?;
+        crate::limits::ensure_within(&query, crate::limits::MAX_STRING_BYTES, "query")?;
         let store = self
             .store
             .lock()
@@ -575,7 +345,13 @@ impl KnowledgeService {
 
     /// Walk outward from `node_id` along edges up to `max_depth`.
     /// Returns a JSON array of [`RelatedNode`].
-    async fn related_to(&self, node_id: i64, max_depth: u32) -> zbus::fdo::Result<String> {
+    async fn related_to(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        node_id: i64,
+        max_depth: u32,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.related_to", &header)?;
         let store = self
             .store
             .lock()
@@ -590,7 +366,13 @@ impl KnowledgeService {
 
     /// Find the shortest edge path between two nodes. Returns a JSON
     /// array of edge ids, or the literal string `"null"` when unreachable.
-    async fn find_path(&self, from_id: i64, to_id: i64) -> zbus::fdo::Result<String> {
+    async fn find_path(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        from_id: i64,
+        to_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.find_path", &header)?;
         let store = self
             .store
             .lock()
@@ -606,7 +388,12 @@ impl KnowledgeService {
     }
 
     /// List sources for a node. Returns a JSON array of [`Source`].
-    async fn list_sources(&self, node_id: i64) -> zbus::fdo::Result<String> {
+    async fn list_sources(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        node_id: i64,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.list_sources", &header)?;
         let store = self
             .store
             .lock()
@@ -621,7 +408,11 @@ impl KnowledgeService {
 
     /// Find all `(node_a, node_b)` pairs connected by a Contradicts edge.
     /// Returns a JSON array of two-element arrays.
-    async fn detect_contradictions(&self) -> zbus::fdo::Result<String> {
+    async fn detect_contradictions(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.guard.enforce("knowledge.detect_contradictions", &header)?;
         let store = self
             .store
             .lock()
@@ -636,7 +427,12 @@ impl KnowledgeService {
 
     /// Forget a source. Returns the number of nodes that became
     /// orphaned (no remaining sources) and were removed.
-    async fn forget_source(&self, source_id: i64) -> zbus::fdo::Result<u32> {
+    async fn forget_source(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        source_id: i64,
+    ) -> zbus::fdo::Result<u32> {
+        self.guard.enforce("knowledge.forget_source", &header)?;
         info!(source_id, "D-Bus forget_source");
         let store = self
             .store
@@ -761,9 +557,25 @@ mod tests {
     use super::*;
     use die_orchestrator::knowledge::{KnowledgeStore, MockEmbedder, NodeType};
 
+    use crate::auth::AuthPolicy;
+    use crate::auth_guard::completeness::{
+        assert_all_methods_classified, assert_behavioral_covers_all, header_msg as msg,
+    };
+
     fn mk_svc() -> KnowledgeService {
+        mk_svc_with(AuthPolicy::dev())
+    }
+
+    /// Build a service with an empty allowlist under a chosen auth policy.
+    /// The behavioral completeness test uses `AuthPolicy::deployed()` to
+    /// prove every method denies an unrecognized caller at the guard.
+    fn mk_svc_with(policy: AuthPolicy) -> KnowledgeService {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        KnowledgeService::new(Arc::new(Mutex::new(store)))
+        let guard = Arc::new(AuthGuard::new(
+            policy,
+            Arc::new(Mutex::new(fortress::audit::AuditLog::in_memory())),
+        ));
+        KnowledgeService::new(Arc::new(Mutex::new(store)), guard)
     }
 
     /// Build a service whose only ingestion root is `root`. Used by
@@ -789,9 +601,17 @@ mod tests {
     /// `ingest_file` result, as that would panic for the wrong
     /// reason (empty allowlist instead of the platform limitation
     /// the test should be probing).
+    ///
+    /// The guard is a dev (log-and-allow) guard so these tests exercise
+    /// the allowlist / safe-open behavior, not the auth boundary (which
+    /// has its own dedicated completeness tests).
     fn mk_svc_with_root(root: PathBuf) -> KnowledgeService {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![root])
+        KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![root],
+            Arc::new(AuthGuard::dev_in_memory()),
+        )
     }
 
     #[test]
@@ -814,6 +634,23 @@ mod tests {
         assert_eq!(redact_to_kind("standalone"), "standalone");
     }
 
+    /// SVC-6: `ingest_text` accepts a larger payload than other params
+    /// (8 MiB), but text beyond that cap must be rejected before processing.
+    /// RED pre-fix (the oversize text is ingested successfully), GREEN once
+    /// the cap is enforced at the method boundary.
+    #[tokio::test]
+    async fn ingest_text_rejects_oversize_text() {
+        let svc = mk_svc();
+        let m = msg(":1.5");
+        let oversize = "x".repeat(crate::limits::MAX_INGEST_TEXT_BYTES + 1);
+        let err = svc
+            .ingest_text(m.header(), oversize, "mem://t".to_string(), "text".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+        assert!(err.to_string().contains("limit"));
+    }
+
     // ── FIX 1: ingest_file allowlist enforcement ─────────────────────
     //
     // **FIX 18 gating note:** every test below that calls
@@ -832,10 +669,11 @@ mod tests {
     async fn ingest_file_accepts_path_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let file = tmp.path().join("note.md");
         std::fs::write(&file, "# T\n\nP.\n").unwrap();
         let json = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .unwrap();
         // Successful round-trip — JSON shape, not contents
@@ -866,10 +704,11 @@ mod tests {
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let m = msg(":1.5");
         let outside = other.path().join("evil.md");
         std::fs::write(&outside, "should not be ingested").unwrap();
         let err = svc
-            .ingest_file(outside.to_string_lossy().into_owned())
+            .ingest_file(m.header(), outside.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         // Codex re-review FIX 7 P1: discriminant + uniform message.
@@ -890,9 +729,10 @@ mod tests {
     async fn ingest_file_rejects_nonexistent_path() {
         let allowed = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let m = msg(":1.5");
         let ghost = allowed.path().join("does-not-exist.md");
         let err = svc
-            .ingest_file(ghost.to_string_lossy().into_owned())
+            .ingest_file(m.header(), ghost.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -906,6 +746,7 @@ mod tests {
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(allowed.path().to_path_buf());
+        let m = msg(":1.5");
         let outside = other.path().join("secret.md");
         std::fs::write(&outside, "secret").unwrap();
         // Construct a traversal path through the allowed root.
@@ -918,7 +759,7 @@ mod tests {
         // safe-by-default semantic: anything we can't prove is inside is
         // outside).
         let err = svc
-            .ingest_file(traversal.to_string_lossy().into_owned())
+            .ingest_file(m.header(), traversal.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -927,12 +768,17 @@ mod tests {
     #[tokio::test]
     async fn ingest_file_rejects_when_allowlist_empty() {
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let svc = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
+        let m = msg(":1.5");
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("any.md");
         std::fs::write(&file, "x").unwrap();
         let err = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -943,7 +789,11 @@ mod tests {
     fn add_ingestion_root_canonicalizes_and_dedupes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let svc = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
         assert!(svc.allowlist_snapshot().is_empty());
         // First add succeeds.
         assert!(svc.add_ingestion_root(tmp.path()));
@@ -974,74 +824,22 @@ mod tests {
         // Even an ordinary markdown file inside the user's home is
         // rejected unless the user explicitly registers that location.
         let svc = mk_svc();
+        let m = msg(":1.5");
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("note.md");
         std::fs::write(&file, "# T\n\nP.\n").unwrap();
         let err = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
     }
 
-    // -- Pure is_sensitive_path tests (no async, no I/O) --
-
-    #[test]
-    fn sensitive_path_rejects_ssh_private_key() {
-        assert!(is_sensitive_path(Path::new("/home/u/.ssh/id_rsa")));
-    }
-
-    #[test]
-    fn sensitive_path_rejects_ed25519() {
-        assert!(is_sensitive_path(Path::new("/home/u/.ssh/id_ed25519")));
-    }
-
-    #[test]
-    fn sensitive_path_rejects_pem_extension() {
-        assert!(is_sensitive_path(Path::new("/tmp/cert.pem")));
-    }
-
-    #[test]
-    fn sensitive_path_rejects_env_file() {
-        assert!(is_sensitive_path(Path::new("/proj/.env.production")));
-    }
-
-    #[test]
-    fn sensitive_path_rejects_credentials_filename() {
-        // /home/u/.aws/credentials — caught by either the .aws dir name
-        // OR the "credentials" file-stem rule. Either is fine.
-        assert!(is_sensitive_path(Path::new("/home/u/.aws/credentials")));
-    }
-
-    #[test]
-    fn sensitive_path_rejects_kdbx() {
-        assert!(is_sensitive_path(Path::new("/home/u/passwords.kdbx")));
-    }
-
-    #[test]
-    fn sensitive_path_rejects_gnupg_dir_midpath() {
-        // .gnupg as an intermediate path component triggers the dir rule
-        // even though the leaf file looks innocuous.
-        assert!(is_sensitive_path(Path::new("/home/u/.gnupg/random.txt")));
-    }
-
-    #[test]
-    fn sensitive_path_accepts_ordinary_markdown() {
-        assert!(!is_sensitive_path(Path::new("/home/u/notes/foo.md")));
-    }
-
-    #[test]
-    fn sensitive_path_accepts_dotfile_that_is_not_sensitive() {
-        // .bashrc is a dotfile but neither a sensitive-named file nor
-        // does it match the .env* prefix nor a sensitive extension.
-        assert!(!is_sensitive_path(Path::new("/home/u/.bashrc")));
-    }
-
-    #[test]
-    fn sensitive_path_extension_check_is_case_insensitive() {
-        assert!(is_sensitive_path(Path::new("/tmp/cert.PEM")));
-        assert!(is_sensitive_path(Path::new("/tmp/cert.Pem")));
-    }
+    // -- Pure is_sensitive_path tests moved to the domain (SVC-8):
+    //    `die_orchestrator::knowledge::tests::sensitive_path_*`. The
+    //    denylist classifier now lives in the domain, so its unit tests
+    //    live alongside it. The integration tests below still prove the
+    //    denylist is enforced end-to-end through the wired D-Bus service.
 
     // -- Integration tests: denylist defeats allowlist --
 
@@ -1053,10 +851,11 @@ mod tests {
         // the denylist runs after the allowlist and cannot be overridden.
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let key_file = tmp.path().join("id_rsa");
         std::fs::write(&key_file, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
         let err = svc
-            .ingest_file(key_file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), key_file.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         // FIX 7 P1: must be the uniform "AccessDenied + REJECTION_MESSAGE",
@@ -1069,10 +868,11 @@ mod tests {
     async fn ingest_file_rejects_pem_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let pem = tmp.path().join("cert.pem");
         std::fs::write(&pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
         let err = svc
-            .ingest_file(pem.to_string_lossy().into_owned())
+            .ingest_file(m.header(), pem.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -1083,10 +883,11 @@ mod tests {
     async fn ingest_file_rejects_env_inside_allowlist() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let env = tmp.path().join(".env");
         std::fs::write(&env, "API_KEY=secret\n").unwrap();
         let err = svc
-            .ingest_file(env.to_string_lossy().into_owned())
+            .ingest_file(m.header(), env.to_string_lossy().into_owned())
             .await
             .unwrap_err();
         assert_uniform_rejection(&err);
@@ -1109,15 +910,19 @@ mod tests {
         // would pass for the wrong reason.
         let allowed = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
+        let m = msg(":1.5");
 
         // Path 1: allowlist-empty (closed-by-default)
         let store1 = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc_empty =
-            KnowledgeService::with_allowlist(Arc::new(Mutex::new(store1)), vec![]);
+        let svc_empty = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store1)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
         let any_path = allowed.path().join("any.md");
         std::fs::write(&any_path, "x").unwrap();
         let err_empty = svc_empty
-            .ingest_file(any_path.to_string_lossy().into_owned())
+            .ingest_file(m.header(), any_path.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -1125,7 +930,7 @@ mod tests {
         let svc_with = mk_svc_with_root(allowed.path().to_path_buf());
         let ghost = allowed.path().join("nonexistent.md");
         let err_ghost = svc_with
-            .ingest_file(ghost.to_string_lossy().into_owned())
+            .ingest_file(m.header(), ghost.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -1133,7 +938,7 @@ mod tests {
         let outside = other.path().join("evil.md");
         std::fs::write(&outside, "x").unwrap();
         let err_outside = svc_with
-            .ingest_file(outside.to_string_lossy().into_owned())
+            .ingest_file(m.header(), outside.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -1141,7 +946,7 @@ mod tests {
         let key = allowed.path().join("id_rsa");
         std::fs::write(&key, "-----BEGIN-----\n").unwrap();
         let err_sensitive = svc_with
-            .ingest_file(key.to_string_lossy().into_owned())
+            .ingest_file(m.header(), key.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
@@ -1167,20 +972,26 @@ mod tests {
         // resolvable path and an unresolvable path produce IDENTICAL
         // rejections — caller cannot probe whether a path exists.
         let store = KnowledgeStore::in_memory(Box::new(MockEmbedder::new())).unwrap();
-        let svc = KnowledgeService::with_allowlist(Arc::new(Mutex::new(store)), vec![]);
+        let svc = KnowledgeService::with_allowlist(
+            Arc::new(Mutex::new(store)),
+            vec![],
+            Arc::new(AuthGuard::dev_in_memory()),
+        );
+        let m = msg(":1.5");
 
         // A path that DOES exist.
         let tmp = tempfile::TempDir::new().unwrap();
         let real = tmp.path().join("real.md");
         std::fs::write(&real, "x").unwrap();
         let err_real = svc
-            .ingest_file(real.to_string_lossy().into_owned())
+            .ingest_file(m.header(), real.to_string_lossy().into_owned())
             .await
             .unwrap_err();
 
         // A path that does NOT exist (deliberately silly).
         let err_ghost = svc
             .ingest_file(
+                m.header(),
                 "/this/path/cannot/possibly/exist/should-be-rejected.md".to_string(),
             )
             .await
@@ -1194,73 +1005,43 @@ mod tests {
     }
 
     #[test]
-    fn tracing_log_records_specific_reason_but_wire_does_not() {
-        // Asymmetry verification: the operator's tracing log gets the
-        // detailed reason; the D-Bus caller gets only the uniform message.
-        //
-        // Tested directly against `reject()` — the SOLE constructor of
-        // path-validation `AccessDenied` errors. Testing the full async
-        // ingest_file path here would mean fighting tokio + thread-local
-        // tracing scoping under parallel `cargo test` execution; calling
-        // `reject()` directly is equivalent because `check_path_allowed`
-        // routes every rejection through it.
-        use std::io::Write;
-        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    fn map_ingestion_error_collapses_denials_to_uniform_message() {
+        // SVC-8 / FIX 7 — the boundary half of the asymmetry. The domain's
+        // `validate` logs the specific reason AND the raw path (covered by
+        // `die_orchestrator::knowledge::tests::deny_logs_*`). At THIS trust
+        // boundary, every denial — whatever its reason — must collapse to
+        // one uniform `AccessDenied(REJECTION_MESSAGE)` with no reason or
+        // path leak. An `Internal` error (e.g. a poisoned lock) is a bug,
+        // not an access decision, so it maps to `Failed`, not `AccessDenied`.
+        use die_orchestrator::knowledge::IngestionDenied;
 
-        #[derive(Clone)]
-        struct CaptureWriter(StdArc<StdMutex<Vec<u8>>>);
-        impl Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
+        for reason in [
+            IngestionDenied::AllowlistEmpty,
+            IngestionDenied::Unresolvable,
+            IngestionDenied::OutsideAllowlist,
+            IngestionDenied::SensitivePath,
+        ] {
+            let wire = map_ingestion_error(IngestionError::Denied(reason));
+            match wire {
+                zbus::fdo::Error::AccessDenied(m) => {
+                    assert_eq!(m, REJECTION_MESSAGE, "denial must use the uniform message");
+                    assert!(
+                        !m.contains("denylist")
+                            && !m.contains("sensitive")
+                            && !m.contains("allowlist")
+                            && !m.contains("resolve"),
+                        "wire leaked the specific reason: {m}"
+                    );
+                }
+                other => panic!("a denial must map to AccessDenied, got {other:?}"),
             }
         }
 
-        let buf: StdArc<StdMutex<Vec<u8>>> = StdArc::new(StdMutex::new(Vec::new()));
-        let buf_for_writer = buf.clone();
-        let make_writer = move || CaptureWriter(buf_for_writer.clone());
-
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(make_writer)
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .finish();
-
-        let err = tracing::subscriber::with_default(subscriber, || {
-            reject(
-                RejectionReason::SensitivePath,
-                "/secret/path/that/should/not/leak",
-            )
-        });
-
-        // Local tracing log MUST contain the specific reason AND the path.
-        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // Internal errors are not access decisions.
+        let internal = map_ingestion_error(IngestionError::Internal("allowlist lock poisoned"));
         assert!(
-            captured.contains("matches sensitive-content denylist"),
-            "expected detailed reason in local log; got: {captured:?}"
-        );
-        assert!(
-            captured.contains("/secret/path/that/should/not/leak"),
-            "expected raw path in local log; got: {captured:?}"
-        );
-
-        // Wire error MUST NOT contain the reason or the path — only the
-        // uniform public message.
-        let wire = match &err {
-            zbus::fdo::Error::AccessDenied(m) => m.clone(),
-            other => panic!("expected AccessDenied, got {other:?}"),
-        };
-        assert_eq!(wire, REJECTION_MESSAGE);
-        assert!(
-            !wire.contains("denylist") && !wire.contains("sensitive"),
-            "wire response leaked specific reason: {wire}"
-        );
-        assert!(
-            !wire.contains("/secret"),
-            "wire response leaked the path: {wire}"
+            matches!(internal, zbus::fdo::Error::Failed(_)),
+            "internal error must map to Failed, not AccessDenied"
         );
     }
 
@@ -1315,8 +1096,9 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let svc = mk_svc_with_root(tmp.path().to_path_buf());
+        let m = msg(":1.5");
         let json = svc
-            .ingest_file(link.to_string_lossy().into_owned())
+            .ingest_file(m.header(), link.to_string_lossy().into_owned())
             .await
             .expect("symlink → real-target inside allowlist must succeed");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1329,8 +1111,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_returns_json_with_counts() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let json = svc
             .ingest_text(
+                m.header(),
                 "# Topic\n\nA fact.\n".to_string(),
                 "user://note".to_string(),
                 "markdown".to_string(),
@@ -1347,8 +1131,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_idempotent_returns_zero_new_nodes() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let _ = svc
             .ingest_text(
+                m.header(),
                 "# T\n\nP.\n".to_string(),
                 "u".to_string(),
                 "markdown".to_string(),
@@ -1357,6 +1143,7 @@ mod tests {
             .unwrap();
         let json = svc
             .ingest_text(
+                m.header(),
                 "# T\n\nP.\n".to_string(),
                 "u".to_string(),
                 "markdown".to_string(),
@@ -1370,8 +1157,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_unsupported_format_returns_unavailable() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let json = svc
             .ingest_text(
+                m.header(),
                 "binary or whatever".to_string(),
                 "/x.pdf".to_string(),
                 "pdf".to_string(),
@@ -1386,7 +1175,9 @@ mod tests {
     #[tokio::test]
     async fn search_returns_json_array_with_sources() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# Topic\n\napple banana cherry.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
@@ -1394,7 +1185,7 @@ mod tests {
         .await
         .unwrap();
         let json = svc
-            .search("apple banana cherry".to_string(), 5)
+            .search(m.header(), "apple banana cherry".to_string(), 5)
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1412,14 +1203,16 @@ mod tests {
     #[tokio::test]
     async fn search_zero_max_results_clamped_to_one() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# T\n\nA.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
         )
         .await
         .unwrap();
-        let json = svc.search("A".to_string(), 0).await.unwrap();
+        let json = svc.search(m.header(), "A".to_string(), 0).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // Clamped to 1 → at most 1 result returned (or 0 if no embeddings).
         assert!(v.as_array().unwrap().len() <= 1);
@@ -1428,7 +1221,9 @@ mod tests {
     #[tokio::test]
     async fn related_to_returns_json_array() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# Parent\n\nChild fact.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
@@ -1436,16 +1231,17 @@ mod tests {
         .await
         .unwrap();
         // Find one node id to walk from
-        let json = svc.search("Parent".to_string(), 1).await.unwrap();
+        let json = svc.search(m.header(), "Parent".to_string(), 1).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let id = v[0]["node"]["id"].as_i64().unwrap();
-        let rel_json = svc.related_to(id, 2).await.unwrap();
+        let rel_json = svc.related_to(m.header(), id, 2).await.unwrap();
         let _: serde_json::Value = serde_json::from_str(&rel_json).unwrap();
     }
 
     #[tokio::test]
     async fn find_path_returns_null_for_unreachable() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         // Create two nodes with no edges between them.
         {
             let store = svc.store.lock().unwrap();
@@ -1461,24 +1257,26 @@ mod tests {
             store.create_node("a", NodeType::Concept, &[s]).unwrap();
             store.create_node("b", NodeType::Concept, &[s]).unwrap();
         }
-        let json = svc.find_path(1, 2).await.unwrap();
+        let json = svc.find_path(m.header(), 1, 2).await.unwrap();
         assert_eq!(json, "null");
     }
 
     #[tokio::test]
     async fn list_sources_returns_json_array() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         svc.ingest_text(
+            m.header(),
             "# T\n\nP.\n".to_string(),
             "u".to_string(),
             "markdown".to_string(),
         )
         .await
         .unwrap();
-        let search_json = svc.search("T".to_string(), 1).await.unwrap();
+        let search_json = svc.search(m.header(), "T".to_string(), 1).await.unwrap();
         let sv: serde_json::Value = serde_json::from_str(&search_json).unwrap();
         let id = sv[0]["node"]["id"].as_i64().unwrap();
-        let json = svc.list_sources(id).await.unwrap();
+        let json = svc.list_sources(m.header(), id).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.is_array());
         assert_eq!(v.as_array().unwrap().len(), 1);
@@ -1488,13 +1286,15 @@ mod tests {
     #[tokio::test]
     async fn detect_contradictions_returns_empty_initially() {
         let svc = mk_svc();
-        let json = svc.detect_contradictions().await.unwrap();
+        let m = msg(":1.5");
+        let json = svc.detect_contradictions(m.header()).await.unwrap();
         assert_eq!(json, "[]");
     }
 
     #[tokio::test]
     async fn detect_contradictions_returns_pairs() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let (a_id, b_id, src);
         {
             let store = svc.store.lock().unwrap();
@@ -1513,7 +1313,7 @@ mod tests {
                 .create_edge(a_id, b_id, EdgeRelation::Contradicts, 0.9, src)
                 .unwrap();
         }
-        let json = svc.detect_contradictions().await.unwrap();
+        let json = svc.detect_contradictions(m.header()).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1524,8 +1324,10 @@ mod tests {
     #[tokio::test]
     async fn forget_source_orphans_nodes_and_returns_count() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let r = svc
             .ingest_text(
+                m.header(),
                 "# T\n\nP.\n".to_string(),
                 "u".to_string(),
                 "markdown".to_string(),
@@ -1534,14 +1336,15 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         let src_id = v["source_id"].as_i64().unwrap();
-        let count = svc.forget_source(src_id).await.unwrap();
+        let count = svc.forget_source(m.header(), src_id).await.unwrap();
         assert!(count >= 1);
     }
 
     #[tokio::test]
     async fn forget_source_returns_zero_for_unknown_id() {
         let svc = mk_svc();
-        assert_eq!(svc.forget_source(99_999).await.unwrap(), 0);
+        let m = msg(":1.5");
+        assert_eq!(svc.forget_source(m.header(), 99_999).await.unwrap(), 0);
     }
 
     // Privacy / error-redaction tests
@@ -1551,102 +1354,25 @@ mod tests {
         // Force an error path by sending a deliberately broken arrangement.
         // We mostly want to verify the redact_to_kind helper is wired in.
         let svc = mk_svc();
+        let m = msg(":1.5");
         // search itself doesn't error on empty result; just confirm that
         // any potential failure in this layer would be redacted at the
         // boundary. Direct unit test of the helper above already covers
         // the redaction logic.
-        let _ = svc.search("anything".to_string(), 1).await;
+        let _ = svc.search(m.header(), "anything".to_string(), 1).await;
     }
 
-    // ── FIX 15 (P1-high): AllowlistRoot with held directory handle ──
+    // ── FIX 15 (P1-high): held-directory-handle allowlist roots ──
     //
-    // Round-3 stored allowlist roots as Vec<PathBuf>. At ingest time
-    // the orchestrator's safe_open_under_root re-opened that path
-    // string via std::fs::File::open, so an attacker who controlled
-    // the parent of an allowlist entry could swap the entry for a
-    // symlink between registration and use, defeating openat2's
-    // RESOLVE_BENEATH. Round-4 holds the directory open with
-    // O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC at registration time and
-    // anchors trust to the held inode, immune to post-registration
-    // path swaps.
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn add_ingestion_root_holds_directory_handle() {
-        // Register a tempdir as an ingestion root; verify the
-        // held handle is a directory by reading its metadata.
-        // Round-3 only stored a PathBuf; round-4 stores
-        // (canonical_path, Arc<File>) where the File is
-        // O_DIRECTORY-opened.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let svc = mk_svc();
-        assert!(svc.add_ingestion_root(tmp.path()));
-
-        // Inspect the internal handle by acquiring the lock and
-        // checking the Arc<File>'s metadata. We can't expose the
-        // handle through the public API (it's a trust anchor) but
-        // we CAN verify it from inside the same crate via the
-        // private allowlist field.
-        let allow = svc.allowlist.lock().unwrap();
-        assert_eq!(allow.len(), 1, "exactly one root registered");
-        let entry = &allow[0];
-        let meta = entry
-            .dir_handle
-            .metadata()
-            .expect("held handle must be queryable");
-        assert!(
-            meta.is_dir(),
-            "held handle must be a directory (O_DIRECTORY enforced at open)"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn add_ingestion_root_rejects_symlink_root() {
-        // O_NOFOLLOW on the registered path: a symlink at the
-        // root path itself must be refused at registration time.
-        // Round-3 silently accepted symlinks (canonicalize would
-        // resolve them) — F15's open_dir_no_follow rejects them
-        // outright.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let real_dir = tmp.path().join("real_dir");
-        std::fs::create_dir(&real_dir).unwrap();
-        let symlink_dir = tmp.path().join("symlink_to_real");
-        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
-
-        let svc = mk_svc();
-        // Round-3 would have canonicalized the symlink and accepted
-        // the resolved real_dir (effectively allowing the user to
-        // register a symlink path that could be swapped later).
-        // Round-4 must NOT silently dereference; the registration
-        // must succeed but the held handle is the inode of real_dir
-        // (because canonicalize resolves first), and the SECOND
-        // attempt to register the same canonical path is a no-op.
-        // The architectural assertion: the registered path stored
-        // in canonical_path is the resolved one, and the handle is
-        // bound to that inode — not to the symlink string.
-        let ok_canonical = svc.add_ingestion_root(&symlink_dir);
-        // canonicalize() in add_ingestion_root has already resolved
-        // the symlink to real_dir. The open_dir_no_follow call uses
-        // the canonical path, so the O_NOFOLLOW only triggers if
-        // the canonical path itself is a symlink — which it is not.
-        // This is the correct behavior: symlink paths are
-        // canonicalized to their target, and the handle anchors to
-        // the target inode.
-        assert!(
-            ok_canonical,
-            "registering a symlink should canonicalize to the target and succeed"
-        );
-
-        // Verify the stored canonical_path is real_dir, not the
-        // symlink path. The handle is bound to real_dir's inode, so
-        // even if the attacker later replaces symlink_dir with a
-        // pointer to a malicious target, the held inode is still
-        // real_dir.
-        let real_canon = std::fs::canonicalize(&real_dir).unwrap();
-        let allow = svc.allowlist.lock().unwrap();
-        assert_eq!(allow[0].canonical_path, real_canon);
-    }
+    // The held-handle internals — that registration opens the directory
+    // with O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC and anchors trust to the inode,
+    // and that a symlinked root canonicalizes to its target — are now domain
+    // properties, tested against the private allowlist field where it lives:
+    // `die_orchestrator::knowledge::tests::add_root_holds_directory_handle`
+    // and `..::add_root_resolves_symlink_root_to_target_inode` (SVC-8). The
+    // service-level F15 behavior (ingest survives a root rename via the held
+    // handle) is still exercised end-to-end below by
+    // `ingest_file_uses_held_handle_after_root_rename`.
 
     // ── FIX 16 (P1-high): explicit Windows feature-gate ──
     //
@@ -1695,14 +1421,15 @@ mod tests {
         let file = tmp.path().join("any.md");
         std::fs::write(&file, "# placeholder\n").unwrap();
         let svc = mk_svc();
+        let m = msg(":1.5");
         let err = svc
-            .ingest_file(file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), file.to_string_lossy().into_owned())
             .await
             .expect_err("ingest_file must fail on non-Linux");
-        let msg = err.to_string();
+        let msg_str = err.to_string();
         assert!(
-            msg.contains("path not permitted"),
-            "must use uniform rejection message; got: {msg}"
+            msg_str.contains("path not permitted"),
+            "must use uniform rejection message; got: {msg_str}"
         );
     }
 
@@ -1714,8 +1441,10 @@ mod tests {
     #[tokio::test]
     async fn ingest_text_remains_supported_on_all_platforms() {
         let svc = mk_svc();
+        let m = msg(":1.5");
         let json = svc
             .ingest_text(
+                m.header(),
                 "# Title\n\nA paragraph.\n".into(),
                 "user://platform-test".into(),
                 "markdown".into(),
@@ -1792,6 +1521,7 @@ mod tests {
         std::fs::write(&file, "# hello\n\nworld\n").unwrap();
 
         let svc = mk_svc_with_root(original.clone());
+        let m = msg(":1.5");
 
         // Rename the registered directory.
         let renamed = tmp.path().join("renamed");
@@ -1804,7 +1534,7 @@ mod tests {
         // current canonical name).
         let renamed_file = renamed.join("note.md");
         let json = svc
-            .ingest_file(renamed_file.to_string_lossy().into_owned())
+            .ingest_file(m.header(), renamed_file.to_string_lossy().into_owned())
             .await;
         // The ingestion call may either succeed (handle survived
         // rename) or fail with a deny message. What MUST NOT happen
@@ -1821,18 +1551,101 @@ mod tests {
                 // /tmp/X/original but the new canonical is
                 // /tmp/X/renamed). What's important is that we get
                 // the uniform AccessDenied message, NOT a leak.
-                let msg = e.to_string();
+                let msg_str = e.to_string();
                 assert!(
-                    msg.contains("path not permitted"),
-                    "must use uniform rejection message; got: {msg}"
+                    msg_str.contains("path not permitted"),
+                    "must use uniform rejection message; got: {msg_str}"
                 );
                 // Confirm the error doesn't leak the path or which
                 // rejection reason fired (FIX 7).
                 assert!(
-                    !msg.contains("renamed") && !msg.contains("original"),
-                    "wire error must not echo the path; got: {msg}"
+                    !msg_str.contains("renamed") && !msg_str.contains("original"),
+                    "wire error must not echo the path; got: {msg_str}"
                 );
             }
         }
+    }
+
+    /// SVC-6-R2-3: every D-Bus `String` parameter is capped at the boundary.
+    /// `ingest_text(text)` has its own dedicated test
+    /// (`ingest_text_rejects_oversize_text`) at `MAX_INGEST_TEXT_BYTES`; this
+    /// covers the remaining `MAX_STRING_BYTES` fields across the surface.
+    #[tokio::test]
+    async fn every_string_param_rejects_oversize() {
+        let svc = mk_svc();
+        let m = msg(":1.5");
+        let oversize = "x".repeat(crate::limits::MAX_STRING_BYTES + 1);
+
+        // ingest_file(path)
+        assert!(matches!(
+            svc.ingest_file(m.header(), oversize.clone()).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // ingest_text(text, source_uri, format) — source_uri and format
+        // (the `text` cap is at MAX_INGEST_TEXT_BYTES, exercised separately).
+        assert!(matches!(
+            svc.ingest_text(m.header(), "hello".to_string(), oversize.clone(), "markdown".to_string())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            svc.ingest_text(m.header(), "hello".to_string(), "u".to_string(), oversize.clone())
+                .await
+                .unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+        // search(query)
+        assert!(matches!(
+            svc.search(m.header(), oversize.clone(), 5).await.unwrap_err(),
+            zbus::fdo::Error::InvalidArgs(_)
+        ));
+    }
+
+    // ── SVC-2 completeness (Decision 3) ──
+
+    #[test]
+    fn svc2_every_method_is_classified() {
+        use zbus::object_server::Interface;
+        let svc = mk_svc();
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_all_methods_classified("knowledge", &xml);
+    }
+
+    #[tokio::test]
+    async fn svc2_every_method_denies_unrecognized_caller_when_deployed() {
+        let svc = mk_svc_with(AuthPolicy::deployed());
+        let mut exercised: Vec<&str> = Vec::new();
+
+        exercised.push("IngestFile");
+        let m = msg(":1.999");
+        assert!(matches!(svc.ingest_file(m.header(), "x".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("IngestText");
+        let m = msg(":1.999");
+        assert!(matches!(svc.ingest_text(m.header(), "t".to_string(), "u".to_string(), "text".to_string()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("Search");
+        let m = msg(":1.999");
+        assert!(matches!(svc.search(m.header(), "q".to_string(), 5).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("RelatedTo");
+        let m = msg(":1.999");
+        assert!(matches!(svc.related_to(m.header(), 1, 2).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("FindPath");
+        let m = msg(":1.999");
+        assert!(matches!(svc.find_path(m.header(), 1, 2).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("ListSources");
+        let m = msg(":1.999");
+        assert!(matches!(svc.list_sources(m.header(), 1).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("DetectContradictions");
+        let m = msg(":1.999");
+        assert!(matches!(svc.detect_contradictions(m.header()).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+        exercised.push("ForgetSource");
+        let m = msg(":1.999");
+        assert!(matches!(svc.forget_source(m.header(), 1).await.unwrap_err(), zbus::fdo::Error::AccessDenied(_)));
+
+        use zbus::object_server::Interface;
+        let mut xml = String::new();
+        svc.introspect_to_writer(&mut xml, 0);
+        assert_behavioral_covers_all("knowledge", &xml, &exercised);
     }
 }

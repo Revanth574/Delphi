@@ -20,6 +20,20 @@ const en = {
       loading: "Thinking\u2026",
       error: "Something went wrong. Try again.",
       noBackend: "No AI backend available. Check connection.",
+      // SVC-1: ZKQP privacy-score confirmation (CLAUDE.md ZKQP rule 4).
+      confirmTitle: "This query may contain sensitive information",
+      confirmScore: "Privacy score: {{score}}/100",
+      confirmPreview: "Delphi will send this sanitized version to the cloud:",
+      confirmSend: "Send sanitized version",
+      confirmCancel: "Cancel",
+      // SVC-2 Piece 2: destination-consent opt-in (egress permission, asked
+      // before the content-privacy confirmation).
+      destTitle: "Use cloud AI for this?",
+      destBody:
+        "This can’t run on your device. With your OK, its sanitized version is sent to the cloud for the rest of this session.",
+      destScore: "Privacy score: {{score}}/100",
+      destAllow: "Allow cloud",
+      destKeepLocal: "Keep local",
     },
 
     // ── Dock ────────────────────────────────────

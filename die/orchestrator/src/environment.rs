@@ -799,6 +799,78 @@ pub struct LocationMap {
     pub labels: HashMap<String, String>,
 }
 
+/// Maximum length (in Unicode scalar values) of a location label (SVC-7).
+const MAX_LOCATION_LABEL_CHARS: usize = 256;
+/// Maximum length (in **bytes**) of an SSID in a location key, matching the
+/// IEEE 802.11 / DOT11 SSID octet-string bound (SVC-7-R2-4). The Round 1 fix
+/// used `chars().count()`, which lets a multibyte SSID whose scalar count is
+/// under the cap exceed the wire's actual 32-byte limit.
+const MAX_LOCATION_SSID_BYTES: usize = 32;
+
+/// Validate a [`LocationMap`] key against the SVC-7 grammar: the literal
+/// `"wired:true"`, or `"ssid:<name>"` with `<name>` 1–32 **bytes** (the IEEE
+/// 802.11 SSID octet limit, not a scalar count — SVC-7-R2-4) and no
+/// disallowed Unicode characters.
+///
+/// Disallowed characters (SVC-7-R2-4 + SVC-7-R3-1):
+/// - Unicode **Control** category (`Cc`): C0 `U+0000`–`U+001F`, `U+007F`,
+///   and C1 — caught via [`char::is_control`].
+/// - Unicode **Format** category (`Cf`): bidi overrides/isolates
+///   (`U+202A`–`U+202E`, `U+2066`–`U+2069` — the right-to-left-override
+///   visual-spoofing vector), zero-width joiner/non-joiner/space
+///   (`U+200B`–`U+200D`), and the rest of the `Cf` block. Caught via the
+///   `unicode_general_category` property table.
+/// - **Variation selectors** (`U+FE00`–`U+FE0F`, `U+180B`–`U+180D`,
+///   `U+180F`, `U+E0100`–`U+E01EF`): these are General_Category = `Mn`
+///   (Nonspacing_Mark), **not** `Cf`, so the `Cf` check alone misses them
+///   (SVC-7-R3-1). Rejected explicitly via the shared
+///   [`crate::workspace::validator::is_variation_selector`] helper so this
+///   validator and the workspace path validator stay in sync by construction.
+///
+/// Non-ASCII *printable* SSIDs remain accepted (non-English network names
+/// are legitimate); only the dangerous Cc / Cf / variation-selector
+/// characters are rejected.
+fn is_valid_location_key(key: &str) -> bool {
+    if key == "wired:true" {
+        return true;
+    }
+    if let Some(name) = key.strip_prefix("ssid:") {
+        // SVC-7-R2-4 (a): IEEE 802.11 SSID is a 32-byte octet string. Round
+        // 1 used `chars().count()`, which under-counted multibyte SSIDs.
+        if !(1..=MAX_LOCATION_SSID_BYTES).contains(&name.len()) {
+            return false;
+        }
+        // SVC-7-R2-4 (b) + SVC-7-R3-1: reject Cc (control), Cf (format,
+        // incl. bidi overrides like U+202E), AND variation selectors
+        // (category Mn, missed by the Cf check). Round 1 checked only
+        // `char::is_control`.
+        return !name.chars().any(is_disallowed_ssid_char);
+    }
+    false
+}
+
+/// Reject control, format, or variation-selector characters in an SSID
+/// character (SVC-7-R2-4 + SVC-7-R3-1):
+/// - `Cc` (control) via [`char::is_control`];
+/// - `Cf` (format) — bidi overrides (`U+202E` "RLO" and family), zero-width
+///   marks, etc. — via the `unicode_general_category` property table;
+/// - variation selectors (category `Mn`, so the `Cf` check misses them) via
+///   the shared [`crate::workspace::validator::is_variation_selector`] helper.
+fn is_disallowed_ssid_char(ch: char) -> bool {
+    if ch.is_control() {
+        return true;
+    }
+    if matches!(
+        unicode_general_category::get_general_category(ch),
+        unicode_general_category::GeneralCategory::Format
+    ) {
+        return true;
+    }
+    // SVC-7-R3-1: variation selectors are Mn, not Cf — reject via the same
+    // helper the workspace validator uses so the ranges never drift apart.
+    crate::workspace::validator::is_variation_selector(ch as u32)
+}
+
 impl LocationMap {
     /// Resolve the label for the current network situation. SSID
     /// precedence over wired fallback (an SSID is more specific).
@@ -815,8 +887,21 @@ impl LocationMap {
         None
     }
 
-    pub fn set_label(&mut self, key: &str, label: &str) {
+    /// Set a label, enforcing the key/label grammar (SVC-7 + SVC-7-R2-4).
+    /// Returns `true` if the entry was valid and stored, `false` if rejected.
+    /// The grammar is authoritative here in the domain, not transport-only:
+    /// the key must be the literal `"wired:true"` or `"ssid:<name>"` (name
+    /// 1–32 **bytes** per IEEE 802.11, with no Unicode Control (`Cc`) or
+    /// Format (`Cf`) characters — `Cf` rejection closes the U+202E
+    /// right-to-left-override visual-spoofing vector named in
+    /// SVC-7-R2-4), and the label at most [`MAX_LOCATION_LABEL_CHARS`]
+    /// characters.
+    pub fn set_label(&mut self, key: &str, label: &str) -> bool {
+        if !is_valid_location_key(key) || label.chars().count() > MAX_LOCATION_LABEL_CHARS {
+            return false;
+        }
         self.labels.insert(key.to_string(), label.to_string());
+        true
     }
 
     pub fn remove_label(&mut self, key: &str) -> bool {
@@ -1724,6 +1809,82 @@ mod tests {
         map.set_label("wired:true", "office");
         // SSID match wins over wired fallback
         assert_eq!(map.label_for(Some("home-net"), true), Some("home"));
+    }
+
+    /// SVC-7: `set_label` enforces the key/label grammar in the domain so the
+    /// invariant is authoritative (not transport-only). Invalid keys and
+    /// oversized labels must be rejected and NOT stored. RED pre-fix (the
+    /// unvalidated `insert` stored anything), GREEN once validation lands.
+    #[test]
+    fn set_label_rejects_invalid_grammar() {
+        let mut map = LocationMap::default();
+        // Invalid: arbitrary scheme, non-literal wired, empty SSID, control
+        // character in SSID, oversized SSID (65 > 64), oversized label (257 > 256).
+        map.set_label("evil:key", "x");
+        map.set_label("wired:false", "x");
+        map.set_label("ssid:", "x");
+        map.set_label("ssid:has\u{0007}bell", "x");
+        map.set_label(&format!("ssid:{}", "s".repeat(65)), "x");
+        map.set_label("ssid:longlabel", &"a".repeat(257));
+        assert!(
+            map.labels.is_empty(),
+            "invalid keys/labels were stored: {:?}",
+            map.labels
+        );
+        // Valid keys accepted, including a non-ASCII (printable) SSID.
+        map.set_label("wired:true", "office");
+        map.set_label("ssid:café-net", "home");
+        assert_eq!(map.labels.len(), 2);
+    }
+
+    /// SVC-7-R2-4: SSID validation must use **byte** length (IEEE 802.11
+    /// octet-string bound), not Unicode scalar count, AND reject Cf
+    /// (Format) category characters such as the U+202E right-to-left
+    /// override that enables visual spoofing. RED against Round 1 (the
+    /// multibyte case below sneaks past `chars().count() <= 64` and the
+    /// U+202E case sneaks past `char::is_control`), GREEN after the
+    /// byte-length + General_Category fix.
+    #[test]
+    fn set_label_svc7_r2_4_byte_length_and_format_chars() {
+        let mut map = LocationMap::default();
+
+        // (1) 33-byte ASCII SSID rejected (33 > 32 bytes).
+        map.set_label(&format!("ssid:{}", "a".repeat(33)), "x");
+
+        // (2) Multibyte SSID under 32 *chars* but over 32 *bytes* rejected.
+        //     11 × U+3042 ("あ", 3 bytes UTF-8 each) = 33 bytes / 11 chars.
+        //     Round 1's scalar check (`chars().count() <= 64`) accepted
+        //     this — that's the precise bug Codex flagged.
+        map.set_label(&format!("ssid:{}", "\u{3042}".repeat(11)), "x");
+
+        // (3) bidi-override visual-spoofing vector rejected. U+202E (RLO)
+        //     is category Cf (Format), not Cc (Control), so
+        //     `char::is_control` (Round 1) missed it.
+        map.set_label("ssid:evil\u{202E}txt", "x");
+
+        // (4) SVC-7-R3-1: variation selectors are General_Category = Mn
+        //     (Nonspacing_Mark), NOT Cf, so the Cf-only check (Round 2)
+        //     missed them. All three variation-selector blocks must reject:
+        //       U+FE0F  — VS16 (emoji variation selector)
+        //       U+180B  — Mongolian FVS1
+        //       U+E0100 — VS17 (supplementary-plane)
+        //     These store successfully against Round-2 code (the gap) and
+        //     must be rejected after the shared is_variation_selector check.
+        map.set_label("ssid:evil\u{FE0F}txt", "x");
+        map.set_label("ssid:evil\u{180B}txt", "x");
+        map.set_label("ssid:evil\u{E0100}txt", "x");
+
+        assert!(
+            map.labels.is_empty(),
+            "byte-length / Cf / variation-selector rejection failed; stored: {:?}",
+            map.labels
+        );
+
+        // Sanity: a 32-byte ASCII SSID at the boundary IS accepted.
+        map.set_label(&format!("ssid:{}", "b".repeat(32)), "edge-32");
+        // And a 30-byte multibyte SSID (10 × "\u{3042}") under the limit is accepted.
+        map.set_label(&format!("ssid:{}", "\u{3042}".repeat(10)), "ten-jp");
+        assert_eq!(map.labels.len(), 2);
     }
 
     #[test]

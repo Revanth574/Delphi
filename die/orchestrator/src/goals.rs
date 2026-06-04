@@ -109,9 +109,11 @@ impl FromStr for GoalStatus {
             "paused" => Ok(Self::Paused),
             "completed" => Ok(Self::Completed),
             "archived" => Ok(Self::Archived),
-            other => Err(OrchestratorError::Planning(format!(
-                "invalid goal status: {other}"
-            ))),
+            _ => Err(OrchestratorError::Validation {
+                domain: "goal",
+                field: "status",
+                reason: "must be active, paused, completed, or archived",
+            }),
         }
     }
 }
@@ -178,9 +180,11 @@ impl FromStr for Priority {
             "medium" | "med" | "2" => Ok(Self::Medium),
             "high" | "3" => Ok(Self::High),
             "critical" | "crit" | "4" => Ok(Self::Critical),
-            other => Err(OrchestratorError::Planning(format!(
-                "invalid priority: {other}"
-            ))),
+            _ => Err(OrchestratorError::Validation {
+                domain: "goal",
+                field: "priority",
+                reason: "must be low, medium, high, or critical (or 1-4)",
+            }),
         }
     }
 }
@@ -292,6 +296,102 @@ pub struct GoalPatch {
     pub priority: Option<Priority>,
     pub parent_goal: Option<Option<GoalId>>,
     pub status: Option<GoalStatus>,
+}
+
+impl GoalPatch {
+    /// Parse a goal patch from a JSON object string. Only keys *present* are
+    /// interpreted; absent keys leave the corresponding field `None`
+    /// (unchanged). Moved from the transport layer (SVC-9) so parsing +
+    /// validation is domain-authoritative and returns typed
+    /// [`OrchestratorError::Validation`] rather than transport errors.
+    ///
+    /// `deadline` and `parent` are tri-state: a JSON `null` clears the field
+    /// (`Some(None)`), a value sets it (`Some(Some(..))`), absence leaves it.
+    ///
+    /// # Errors
+    ///
+    /// [`OrchestratorError::Validation`] if the JSON is malformed, not an
+    /// object, or any present field has the wrong type / an invalid value.
+    pub fn from_json(json: &str) -> Result<Self, OrchestratorError> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
+            OrchestratorError::Validation {
+                domain: "goal",
+                field: "patch",
+                reason: "must be valid JSON",
+            }
+        })?;
+        let obj = value.as_object().ok_or(OrchestratorError::Validation {
+            domain: "goal",
+            field: "patch",
+            reason: "must be a JSON object",
+        })?;
+
+        let mut patch = GoalPatch::default();
+
+        if let Some(val) = obj.get("title") {
+            patch.title = Some(
+                val.as_str()
+                    .ok_or(OrchestratorError::Validation {
+                        domain: "goal",
+                        field: "title",
+                        reason: "must be a string",
+                    })?
+                    .to_string(),
+            );
+        }
+        if let Some(val) = obj.get("description") {
+            patch.description = Some(
+                val.as_str()
+                    .ok_or(OrchestratorError::Validation {
+                        domain: "goal",
+                        field: "description",
+                        reason: "must be a string",
+                    })?
+                    .to_string(),
+            );
+        }
+        if let Some(val) = obj.get("priority") {
+            let s = val.as_str().ok_or(OrchestratorError::Validation {
+                domain: "goal",
+                field: "priority",
+                reason: "must be a string",
+            })?;
+            patch.priority = Some(Priority::from_str(s)?);
+        }
+        if let Some(val) = obj.get("status") {
+            let s = val.as_str().ok_or(OrchestratorError::Validation {
+                domain: "goal",
+                field: "status",
+                reason: "must be a string",
+            })?;
+            patch.status = Some(GoalStatus::from_str(s)?);
+        }
+        if let Some(val) = obj.get("deadline") {
+            patch.deadline = Some(if val.is_null() {
+                None
+            } else {
+                let s = val.as_str().ok_or(OrchestratorError::Validation {
+                    domain: "goal",
+                    field: "deadline",
+                    reason: "must be an RFC 3339 string or null",
+                })?;
+                Some(parse_rfc3339_deadline(s)?)
+            });
+        }
+        if let Some(val) = obj.get("parent") {
+            patch.parent_goal = Some(if val.is_null() {
+                None
+            } else {
+                Some(val.as_i64().ok_or(OrchestratorError::Validation {
+                    domain: "goal",
+                    field: "parent",
+                    reason: "must be an integer or null",
+                })?)
+            });
+        }
+
+        Ok(patch)
+    }
 }
 
 /// Result of [`GoalStore::estimate_timeline`].
@@ -530,16 +630,25 @@ impl GoalStore {
         parent: Option<GoalId>,
     ) -> Result<GoalId, OrchestratorError> {
         if title.trim().is_empty() {
-            return Err(OrchestratorError::Planning(
-                "goal title must not be empty".to_string(),
-            ));
+            return Err(OrchestratorError::Validation {
+                domain: "goal",
+                field: "title",
+                reason: "must not be empty",
+            });
         }
-        if let Some(parent_id) = parent
-            && !self.goal_exists(parent_id)?
-        {
-            return Err(OrchestratorError::Planning(format!(
-                "parent goal {parent_id} does not exist"
-            )));
+        if let Some(parent_id) = parent {
+            if parent_id <= 0 {
+                return Err(OrchestratorError::Validation {
+                    domain: "goal",
+                    field: "parent",
+                    reason: "must be a positive goal id",
+                });
+            }
+            if !self.goal_exists(parent_id)? {
+                return Err(OrchestratorError::NotFound {
+                    entity: "parent goal",
+                });
+            }
         }
         let now = current_timestamp();
         self.conn
@@ -569,8 +678,11 @@ impl GoalStore {
     ///
     /// # Errors
     ///
-    /// Returns [`OrchestratorError::Planning`] if the goal is not found
-    /// or the row cannot be parsed.
+    /// - [`OrchestratorError::NotFound`] if the goal does not exist.
+    /// - [`OrchestratorError::Validation`] if a stored row is out of range
+    ///   (data corruption).
+    /// - [`OrchestratorError::Planning`] / [`OrchestratorError::TransientLock`]
+    ///   on SQLite failure.
     ///
     /// # Examples
     ///
@@ -591,7 +703,12 @@ impl GoalStore {
                 params![id],
                 row_to_goal,
             )
-            .map_err(|e| map_sqlite_err(e, &format!("goal {id} not found")))?
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    OrchestratorError::NotFound { entity: "goal" }
+                }
+                other => map_sqlite_err(other, "goal lookup failed"),
+            })?
     }
 
     /// Update any subset of a goal's fields.
@@ -601,10 +718,14 @@ impl GoalStore {
     ///
     /// # Errors
     ///
-    /// - [`OrchestratorError::Planning`] if the goal does not exist.
-    /// - [`OrchestratorError::Planning`] if the new parent would create a cycle.
-    /// - [`OrchestratorError::Planning`] if the new parent does not exist.
-    /// - [`OrchestratorError::Planning`] on any SQLite failure.
+    /// - [`OrchestratorError::NotFound`] if the goal (or the new parent) does
+    ///   not exist.
+    /// - [`OrchestratorError::Validation`] if the resulting title is empty or
+    ///   the new parent id is not positive.
+    /// - [`OrchestratorError::Conflict`] if the new parent is the goal itself
+    ///   or would create a goal-graph cycle.
+    /// - [`OrchestratorError::Planning`] / [`OrchestratorError::TransientLock`]
+    ///   on any SQLite failure.
     ///
     /// # Examples
     ///
@@ -623,24 +744,40 @@ impl GoalStore {
         // Validate new parent, if any, before writing. `Some(Some(id))` sets
         // a new parent; `Some(None)` clears it; outer `None` leaves it as-is.
         if let Some(Some(parent_id)) = patch.parent_goal {
+            if parent_id <= 0 {
+                return Err(OrchestratorError::Validation {
+                    domain: "goal",
+                    field: "parent",
+                    reason: "must be a positive goal id",
+                });
+            }
             if parent_id == id {
-                return Err(OrchestratorError::Planning(
-                    "a goal cannot be its own parent".to_string(),
-                ));
+                return Err(OrchestratorError::Conflict {
+                    domain: "goal",
+                    reason: "a goal cannot be its own parent",
+                });
             }
             if !self.goal_exists(parent_id)? {
-                return Err(OrchestratorError::Planning(format!(
-                    "parent goal {parent_id} does not exist"
-                )));
+                return Err(OrchestratorError::NotFound {
+                    entity: "parent goal",
+                });
             }
             if self.is_cycle_if_parented(id, parent_id)? {
-                return Err(OrchestratorError::Planning(format!(
-                    "setting parent of {id} to {parent_id} would create a cycle"
-                )));
+                return Err(OrchestratorError::Conflict {
+                    domain: "goal",
+                    reason: "setting this parent would create a goal-graph cycle",
+                });
             }
         }
 
         let title = patch.title.unwrap_or(existing.title);
+        if title.trim().is_empty() {
+            return Err(OrchestratorError::Validation {
+                domain: "goal",
+                field: "title",
+                reason: "must not be empty",
+            });
+        }
         let description = patch.description.unwrap_or(existing.description);
         let deadline = match patch.deadline {
             Some(v) => v,
@@ -679,12 +816,12 @@ impl GoalStore {
 
     /// Record progress on a goal: set `progress_estimate` and stamp `last_activity`.
     ///
-    /// `progress` is clamped to `0..=100`.
+    /// `progress` must be in `0..=100`.
     ///
     /// # Errors
     ///
-    /// Returns [`OrchestratorError::Planning`] if `progress > 100` or the
-    /// goal does not exist.
+    /// - [`OrchestratorError::Validation`] if `progress > 100`.
+    /// - [`OrchestratorError::NotFound`] if the goal does not exist.
     ///
     /// # Examples
     ///
@@ -698,17 +835,17 @@ impl GoalStore {
     pub fn update_progress(
         &self,
         id: GoalId,
-        progress: u8,
+        progress: u32,
     ) -> Result<(), OrchestratorError> {
         if progress > 100 {
-            return Err(OrchestratorError::Planning(format!(
-                "progress must be 0..=100 (got {progress})"
-            )));
+            return Err(OrchestratorError::Validation {
+                domain: "goal",
+                field: "progress",
+                reason: "must be between 0 and 100",
+            });
         }
         if !self.goal_exists(id)? {
-            return Err(OrchestratorError::Planning(format!(
-                "goal {id} does not exist"
-            )));
+            return Err(OrchestratorError::NotFound { entity: "goal" });
         }
         let now = current_timestamp();
         self.conn
@@ -1125,6 +1262,49 @@ impl GoalStore {
         })
     }
 
+    /// Estimate a goal's timeline from raw pace floats (the transport's wire
+    /// shape). Rejects any non-finite float (NaN / ±∞) with a typed
+    /// [`OrchestratorError::Validation`] *before* estimating (SVC-9 — the
+    /// float-sanity check used to live in the transport), then builds
+    /// [`UserPace`] (falling back to `NoHistory` when sessions/hours are
+    /// non-positive) and delegates to [`estimate_timeline`](Self::estimate_timeline).
+    ///
+    /// # Errors
+    ///
+    /// - [`OrchestratorError::Validation`] if any pace float is non-finite.
+    /// - Propagates [`estimate_timeline`](Self::estimate_timeline) errors
+    ///   (e.g. [`OrchestratorError::NotFound`] for a missing goal).
+    pub fn estimate_timeline_from_raw_pace(
+        &self,
+        id: GoalId,
+        sessions_per_week: f64,
+        hours_per_session: f64,
+        work_hours_remaining: f64,
+    ) -> Result<GoalTimeline, OrchestratorError> {
+        for (field, value) in [
+            ("sessions_per_week", sessions_per_week),
+            ("hours_per_session", hours_per_session),
+            ("work_hours_remaining", work_hours_remaining),
+        ] {
+            if !value.is_finite() {
+                return Err(OrchestratorError::Validation {
+                    domain: "goal",
+                    field,
+                    reason: "must be a finite number",
+                });
+            }
+        }
+        let pace = if sessions_per_week <= 0.0 || hours_per_session <= 0.0 {
+            UserPace::NoHistory
+        } else {
+            UserPace::Learned {
+                sessions_per_week,
+                hours_per_session,
+            }
+        };
+        self.estimate_timeline(id, pace, work_hours_remaining)
+    }
+
     /// Total goal count across all statuses.
     ///
     /// # Errors
@@ -1244,10 +1424,49 @@ fn row_to_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Goal, Orchest
             created_at,
             updated_at,
             last_activity,
-            // SQLite CHECK constraint guarantees 0..=100, but clamp defensively.
-            progress_estimate: progress_estimate.clamp(0, 100) as u8,
+            // SQLite CHECK constraint guarantees 0..=100; surface any
+            // out-of-range stored value as typed corruption rather than
+            // silently clamping (SVC-9).
+            progress_estimate: if (0..=100).contains(&progress_estimate) {
+                progress_estimate as u8
+            } else {
+                return Err(OrchestratorError::Validation {
+                    domain: "goal",
+                    field: "stored progress_estimate",
+                    reason: "out of range (data corruption)",
+                });
+            },
         })
     })())
+}
+
+/// Parse an RFC 3339 timestamp into UTC. Moved from the transport (SVC-9);
+/// returns a typed [`OrchestratorError::Validation`] on malformed input
+/// (the raw chrono parse error goes nowhere near the bus).
+fn parse_rfc3339_deadline(s: &str) -> Result<DateTime<Utc>, OrchestratorError> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| OrchestratorError::Validation {
+            domain: "goal",
+            field: "deadline",
+            reason: "must be an RFC 3339 timestamp",
+        })
+}
+
+/// Parse an optional RFC 3339 deadline: the empty string means "no deadline"
+/// (`None`); any other value must parse. Moved from the transport (SVC-9).
+///
+/// # Errors
+///
+/// [`OrchestratorError::Validation`] if a non-empty value fails to parse.
+pub fn parse_optional_deadline_rfc3339(
+    s: &str,
+) -> Result<Option<DateTime<Utc>>, OrchestratorError> {
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parse_rfc3339_deadline(s)?))
+    }
 }
 
 fn sql_err(e: rusqlite::Error) -> OrchestratorError {
@@ -1370,9 +1589,13 @@ mod tests {
     #[test]
     fn create_rejects_empty_title() {
         let store = mk();
-        assert!(store
+        let err = store
             .create_goal("   ", "", Priority::Low, None)
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OrchestratorError::Validation { field: "title", .. }
+        ));
     }
 
     #[test]
@@ -1381,7 +1604,11 @@ mod tests {
         let err = store
             .create_goal("child", "", Priority::Low, Some(999))
             .unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
+        // SVC-9: a positive-but-missing parent is a typed NotFound (no id leak).
+        assert!(matches!(
+            err,
+            OrchestratorError::NotFound { entity: "parent goal" }
+        ));
     }
 
     #[test]
@@ -1399,7 +1626,12 @@ mod tests {
     fn update_progress_rejects_over_100() {
         let store = mk();
         let id = store.create_goal("x", "", Priority::Low, None).unwrap();
-        assert!(store.update_progress(id, 101).is_err());
+        let err = store.update_progress(id, 101).unwrap_err();
+        // SVC-9: rejected (not clamped), as a typed Validation.
+        assert!(matches!(
+            err,
+            OrchestratorError::Validation { field: "progress", .. }
+        ));
     }
 
     #[test]
@@ -1559,7 +1791,7 @@ mod tests {
             ..Default::default()
         };
         let err = store.update_goal(a, patch).unwrap_err();
-        assert!(err.to_string().contains("cycle"));
+        assert!(matches!(err, OrchestratorError::Conflict { domain: "goal", .. }));
     }
 
     #[test]
@@ -1571,7 +1803,104 @@ mod tests {
             ..Default::default()
         };
         let err = store.update_goal(a, patch).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("own parent"));
+        assert!(matches!(err, OrchestratorError::Conflict { domain: "goal", .. }));
+    }
+
+    #[test]
+    fn update_goal_empty_title_is_validation() {
+        let store = mk();
+        let id = store.create_goal("ok", "", Priority::Low, None).unwrap();
+        let patch = GoalPatch {
+            title: Some(String::new()),
+            ..Default::default()
+        };
+        let err = store.update_goal(id, patch).unwrap_err();
+        assert!(matches!(
+            err,
+            OrchestratorError::Validation { field: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn estimate_timeline_rejects_non_finite_pace() {
+        let store = mk();
+        let id = store.create_goal("t", "", Priority::High, None).unwrap();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                store.estimate_timeline_from_raw_pace(id, bad, 2.0, 10.0),
+                Err(OrchestratorError::Validation { field: "sessions_per_week", .. })
+            ));
+            assert!(matches!(
+                store.estimate_timeline_from_raw_pace(id, 2.0, bad, 10.0),
+                Err(OrchestratorError::Validation { field: "hours_per_session", .. })
+            ));
+            assert!(matches!(
+                store.estimate_timeline_from_raw_pace(id, 2.0, 2.0, bad),
+                Err(OrchestratorError::Validation { field: "work_hours_remaining", .. })
+            ));
+        }
+        // A finite pace still estimates.
+        assert!(store
+            .estimate_timeline_from_raw_pace(id, 2.0, 4.0, 20.0)
+            .is_ok());
+    }
+
+    #[test]
+    fn stored_progress_out_of_range_is_corruption_not_clamped() {
+        // The production schema's CHECK constraint prevents storing an
+        // out-of-range progress, so simulate corruption with a constraint-free
+        // table and decode it through `row_to_goal` directly. Old behavior
+        // silently clamped to 100; SVC-9 surfaces it as typed corruption.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE goals (
+                id INTEGER PRIMARY KEY, title TEXT, description TEXT,
+                deadline_unix INTEGER, priority INTEGER, parent_goal_id INTEGER,
+                status TEXT, created_at_unix INTEGER, updated_at_unix INTEGER,
+                last_activity_unix INTEGER, progress_estimate INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goals VALUES (1,'t','',NULL,1,NULL,'active',0,0,NULL,150)",
+            [],
+        )
+        .unwrap();
+        let decoded: Result<Goal, OrchestratorError> = conn
+            .query_row(
+                "SELECT id, title, description, deadline_unix, priority,
+                        parent_goal_id, status, created_at_unix, updated_at_unix,
+                        last_activity_unix, progress_estimate
+                 FROM goals WHERE id = 1",
+                [],
+                row_to_goal,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                decoded,
+                Err(OrchestratorError::Validation {
+                    field: "stored progress_estimate",
+                    ..
+                })
+            ),
+            "corrupt stored progress must surface as typed Validation, got {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn goal_patch_from_json_typed_errors() {
+        assert!(matches!(
+            GoalPatch::from_json("not json"),
+            Err(OrchestratorError::Validation { field: "patch", .. })
+        ));
+        assert!(matches!(
+            GoalPatch::from_json(r#"{"priority":"bogus"}"#),
+            Err(OrchestratorError::Validation { field: "priority", .. })
+        ));
+        // A valid patch parses; `deadline: null` is the tri-state "clear".
+        let p = GoalPatch::from_json(r#"{"title":"x","deadline":null}"#).unwrap();
+        assert_eq!(p.title.as_deref(), Some("x"));
+        assert_eq!(p.deadline, Some(None));
     }
 
     // ---- stale + deadline ---------------------------------------

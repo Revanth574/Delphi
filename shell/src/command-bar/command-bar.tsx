@@ -13,6 +13,31 @@ interface ResponseState {
   text: string | null;
   tier: string | null;
   error: string | null;
+  /**
+   * SVC-1: set when a cloud query's ZKQP privacy score requires explicit
+   * user confirmation before sending. Carries the score, the sanitized
+   * preview, and the opaque confirmation token (SVC-1-R1-1) echoed back on
+   * approval; nothing has been sent. `null` otherwise.
+   */
+  confirmation: {
+    privacyScore: number;
+    sanitizedPreview: string;
+    token: string;
+  } | null;
+  /**
+   * SVC-2 Piece 2: set when the cloud egress gateway REFUSED to send because
+   * the session has not granted destination consent ("data may leave this
+   * device"). DISTINCT from `confirmation` (content sensitivity) — this is the
+   * prior gate of whether off-device egress is permitted at all, so it gets its
+   * own state and dialog and is never conflated. Carries the sanitized preview
+   * (so one dialog can combine the opt-in with the privacy preview) and the
+   * content-bound token reused on the granted retry. `null` otherwise.
+   */
+  destinationConsent: {
+    privacyScore: number;
+    sanitizedPreview: string;
+    token: string;
+  } | null;
 }
 
 const INITIAL_RESPONSE: ResponseState = {
@@ -20,6 +45,8 @@ const INITIAL_RESPONSE: ResponseState = {
   text: null,
   tier: null,
   error: null,
+  confirmation: null,
+  destinationConsent: null,
 };
 
 /**
@@ -37,6 +64,7 @@ export const CommandBar = memo(function CommandBar() {
   const [query, setQuery] = useState("");
   const [response, setResponse] = useState<ResponseState>(INITIAL_RESPONSE);
   const inputRef = useRef<HTMLInputElement>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement>(null);
 
   // Connect to bridge on mount
   useEffect(() => {
@@ -49,26 +77,131 @@ export const CommandBar = memo(function CommandBar() {
     setOpen((prev) => !prev);
   }, [mode]);
 
-  const handleSubmit = useCallback(async () => {
-    const trimmed = query.trim();
-    if (trimmed.length === 0) return;
+  // A single runner for the initial submit and every retry. A cloud query can
+  // come back paused instead of completed, in two distinct ways:
+  //   - `destination_consent_required` (SVC-2): the session has not allowed
+  //     cloud egress at all. The gateway refused; nothing was sent.
+  //   - `confirmation_required` (SVC-1): egress is allowed but this content's
+  //     privacy score is high enough to require reviewing the sanitized text.
+  // Each carries an opaque, HMAC-bound token (SVC-1-R1-1) echoed back on the
+  // approved retry; the token cannot be forged or reused for a different query.
+  const runQuery = useCallback(
+    async (confirmationToken?: string) => {
+      const trimmed = query.trim();
+      if (trimmed.length === 0) return;
 
-    setResponse({ loading: true, text: null, tier: null, error: null });
-
-    try {
-      const result = await delphi.query(trimmed);
       setResponse({
-        loading: false,
-        text: result.output,
-        tier: result.tier,
+        loading: true,
+        text: null,
+        tier: null,
         error: null,
+        confirmation: null,
+        destinationConsent: null,
       });
+
+      try {
+        const result = await delphi.query(trimmed, 256, false, confirmationToken);
+        if (result.status === "destination_consent_required") {
+          setResponse({
+            loading: false,
+            text: null,
+            tier: null,
+            error: null,
+            confirmation: null,
+            destinationConsent: {
+              privacyScore: result.privacy_score,
+              sanitizedPreview: result.sanitized_preview,
+              token: result.token,
+            },
+          });
+        } else if (result.status === "confirmation_required") {
+          setResponse({
+            loading: false,
+            text: null,
+            tier: null,
+            error: null,
+            confirmation: {
+              privacyScore: result.privacy_score,
+              sanitizedPreview: result.sanitized_preview,
+              token: result.token,
+            },
+            destinationConsent: null,
+          });
+        } else {
+          setResponse({
+            loading: false,
+            text: result.output,
+            tier: result.tier,
+            error: null,
+            confirmation: null,
+            destinationConsent: null,
+          });
+        }
+      } catch (err: unknown) {
+        const message =
+          err instanceof Error ? err.message : t("commandBar.error");
+        setResponse({
+          loading: false,
+          text: null,
+          tier: null,
+          error: message,
+          confirmation: null,
+          destinationConsent: null,
+        });
+      }
+    },
+    [query, t],
+  );
+
+  const handleSubmit = useCallback(() => runQuery(), [runQuery]);
+  // Echo the gateway-issued token from the pending confirmation back on the
+  // approved retry (SVC-1-R1-1). If there is somehow no token, this is a
+  // no-token call that simply re-pauses — it can never force an unsanitized
+  // send.
+  const handleConfirmSend = useCallback(
+    () => runQuery(response.confirmation?.token),
+    [runQuery, response.confirmation],
+  );
+  // SVC-2 Piece 2: grant session destination consent, THEN retry with the
+  // carried token. The grant arms the egress gateway; the same token clears
+  // the SVC-1 privacy pause if the score is high, so one acceptance both
+  // permits egress and confirms the content (no second dialog).
+  const handleGrantAndSend = useCallback(async () => {
+    const token = response.destinationConsent?.token;
+    try {
+      await delphi.grantCloudEgressConsent();
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : t("commandBar.error");
-      setResponse({ loading: false, text: null, tier: null, error: message });
+      setResponse({
+        loading: false,
+        text: null,
+        tier: null,
+        error: message,
+        confirmation: null,
+        destinationConsent: null,
+      });
+      return;
     }
-  }, [query, t]);
+    await runQuery(token);
+  }, [runQuery, response.destinationConsent, t]);
+  const handleCancelConfirm = useCallback(
+    () => setResponse(INITIAL_RESPONSE),
+    [],
+  );
+
+  // SVC-1-R1-1: a pending token is bound to the exact prompt that produced it.
+  // Editing the input makes that token stale (the gateway would re-pause /
+  // re-refuse anyway), so drop any pending prompt rather than leave a preview
+  // on screen that no longer matches what would be sent.
+  const handleQueryChange = useCallback((value: string) => {
+    setQuery(value);
+    setResponse((prev) =>
+      prev.confirmation || prev.destinationConsent
+        ? { ...prev, confirmation: null, destinationConsent: null }
+        : prev,
+    );
+  }, []);
 
   // Alt+Space global shortcut
   useEffect(() => {
@@ -97,6 +230,15 @@ export const CommandBar = memo(function CommandBar() {
     }
   }, [open]);
 
+  // a11y: when either pending prompt appears, move focus to its primary action
+  // so a keyboard/screen-reader user lands on it (CLAUDE.md focus-management
+  // rule). Only one of the two can be set at a time.
+  useEffect(() => {
+    if (response.confirmation || response.destinationConsent) {
+      confirmButtonRef.current?.focus();
+    }
+  }, [response.confirmation, response.destinationConsent]);
+
   if (!open) return null;
 
   return (
@@ -121,7 +263,7 @@ export const CommandBar = memo(function CommandBar() {
             ref={inputRef}
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => handleQueryChange(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !response.loading) {
                 e.preventDefault();
@@ -149,6 +291,100 @@ export const CommandBar = memo(function CommandBar() {
                 {response.tier}
               </p>
             )}
+          </div>
+        )}
+
+        {/* SVC-2 Piece 2: destination-consent opt-in. The cloud egress gateway
+            refused because the session has not allowed off-device egress. The
+            carried sanitized preview lets this single dialog combine the
+            "use cloud?" opt-in with what the cloud would receive, so one
+            acceptance both grants egress and (for a high-score query) confirms
+            the content. */}
+        {response.destinationConsent && (
+          <div
+            className="border-t border-sky-500/30 px-4 py-3"
+            role="group"
+            aria-live="assertive"
+            aria-label={t("commandBar.destTitle")}
+          >
+            <p className="text-sm font-medium text-text-primary">
+              {t("commandBar.destTitle")}
+            </p>
+            <p className="mt-1 text-xs text-text-secondary">
+              {t("commandBar.destBody")}
+            </p>
+            <p className="mt-2 text-xs text-text-muted">
+              {t("commandBar.confirmPreview")}
+            </p>
+            <p className="mt-1 whitespace-pre-wrap rounded-lg bg-black/20 px-3 py-2 text-sm text-text-primary">
+              {response.destinationConsent.sanitizedPreview}
+            </p>
+            <p className="mt-1 text-xs text-sky-300">
+              {t("commandBar.destScore", {
+                score: response.destinationConsent.privacyScore,
+              })}
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                ref={confirmButtonRef}
+                type="button"
+                onClick={() => void handleGrantAndSend()}
+                className="rounded-lg bg-sky-600 px-3 py-1.5 text-sm text-white hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-400"
+              >
+                {t("commandBar.destAllow")}
+              </button>
+              <button
+                type="button"
+                onClick={handleCancelConfirm}
+                className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-text-primary hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/40"
+              >
+                {t("commandBar.destKeepLocal")}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* SVC-1: ZKQP privacy-score confirmation prompt. A high-score cloud
+            query pauses here; the user reviews the already-sanitized preview
+            and explicitly approves sending it (or cancels). */}
+        {response.confirmation && (
+          <div
+            className="border-t border-amber-500/30 px-4 py-3"
+            role="group"
+            aria-live="assertive"
+            aria-label={t("commandBar.confirmTitle")}
+          >
+            <p className="text-sm font-medium text-text-primary">
+              {t("commandBar.confirmTitle")}
+            </p>
+            <p className="mt-1 text-xs text-amber-300">
+              {t("commandBar.confirmScore", {
+                score: response.confirmation.privacyScore,
+              })}
+            </p>
+            <p className="mt-2 text-xs text-text-muted">
+              {t("commandBar.confirmPreview")}
+            </p>
+            <p className="mt-1 whitespace-pre-wrap rounded-lg bg-black/20 px-3 py-2 text-sm text-text-primary">
+              {response.confirmation.sanitizedPreview}
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                ref={confirmButtonRef}
+                type="button"
+                onClick={() => void handleConfirmSend()}
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              >
+                {t("commandBar.confirmSend")}
+              </button>
+              <button
+                type="button"
+                onClick={handleCancelConfirm}
+                className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-text-primary hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/40"
+              >
+                {t("commandBar.confirmCancel")}
+              </button>
+            </div>
           </div>
         )}
 

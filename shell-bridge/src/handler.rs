@@ -23,9 +23,9 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use die_inference::router::Router;
-use die_inference::InferenceRequest;
+use die_inference::{ConfirmationTokenWire, InferenceRequest, RouteOutcome};
 use die_orchestrator::timeline::Timeline;
-use delphi_services::learning::Suggestion;
+use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
 use semantic_fs::indexer::Indexer;
 
 use crate::protocol::{Request, Response};
@@ -52,7 +52,7 @@ use crate::protocol::{Request, Response};
 ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
 ///     Arc::new(RwLock::new(HashMap::new())),
 ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-///     Arc::new(RwLock::new(Vec::new())),
+///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
 /// );
 /// ```
 pub struct Handler {
@@ -64,8 +64,10 @@ pub struct Handler {
     modes: Arc<RwLock<HashMap<String, String>>>,
     /// Action timeline (shared with D-Bus TimelineService).
     timeline: Arc<Mutex<Timeline>>,
-    /// Learning suggestions (shared with D-Bus LearningService).
-    suggestions: Arc<RwLock<Vec<Suggestion>>>,
+    /// Shared learning facade (shared with the D-Bus LearningService) — one
+    /// authoritative accept/dismiss implementation across both transports
+    /// instead of duplicated, independently-buggy `Vec<Suggestion>` copies (SVC-5).
+    learning: Arc<Mutex<LearningFacade>>,
 }
 
 impl Handler {
@@ -87,7 +89,7 @@ impl Handler {
     ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     ///     Arc::new(RwLock::new(HashMap::new())),
     ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    ///     Arc::new(RwLock::new(Vec::new())),
+    ///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// );
     /// ```
     #[must_use]
@@ -96,14 +98,14 @@ impl Handler {
         indexer: Arc<Mutex<Indexer>>,
         modes: Arc<RwLock<HashMap<String, String>>>,
         timeline: Arc<Mutex<Timeline>>,
-        suggestions: Arc<RwLock<Vec<Suggestion>>>,
+        learning: Arc<Mutex<LearningFacade>>,
     ) -> Self {
         Self {
             router,
             indexer,
             modes,
             timeline,
-            suggestions,
+            learning,
         }
     }
 
@@ -130,7 +132,7 @@ impl Handler {
     ///     Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
     ///     Arc::new(RwLock::new(HashMap::new())),
     ///     Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-    ///     Arc::new(RwLock::new(Vec::new())),
+    ///     Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
     /// );
     ///
     /// let req = Request { id: 1, method: "inference.status".to_string(), params: serde_json::Value::Null };
@@ -145,6 +147,9 @@ impl Handler {
             // ── Inference ──────────────────────────────────
             "inference.query" => self.handle_inference_query(req.id, &req.params).await,
             "inference.status" => self.handle_inference_status(req.id).await,
+            "inference.grant_cloud_egress_consent" => {
+                self.handle_inference_grant_consent(req.id).await
+            }
 
             // ── File Search ────────────────────────────────
             "file_search.search" => self.handle_file_search(req.id, &req.params).await,
@@ -197,20 +202,62 @@ impl Handler {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // SVC-1-R1-1: explicit consent token to send a high-privacy-score
+        // query (the sanitized version) past the ZKQP confirmation pause. The
+        // opaque, HMAC-bound token comes from a prior `confirmation_required`
+        // response; absent on the first call. A forged/stale token simply
+        // re-pauses — it can't force an unsanitized send (replaces the old
+        // caller-forgeable `cloud_confirmed` bool).
+        let cloud_confirmation_token = params
+            .get("cloud_confirmation_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            // Wrap into the redacted-Debug newtype (SVC-1-R1-1-02) at the
+            // boundary, so the live token never sits in a bare String field.
+            .map(|s| ConfirmationTokenWire::new(s.to_string()));
+
         let router = self.router.read().await;
         let req = InferenceRequest {
             input: prompt,
             max_tokens,
             sensitive,
+            cloud_confirmation_token,
         };
 
         match router.route(req).await {
-            Ok(resp) => Response::ok(
+            // SVC-1: a cloud query may pause for confirmation. Surface the
+            // typed outcome to the shell discriminated by `status` rather than
+            // swallowing the pause or pretending it completed.
+            Ok(RouteOutcome::Completed(resp)) => Response::ok(
                 id,
                 serde_json::json!({
+                    "status": "completed",
                     "output": resp.output,
                     "tier": format!("{:?}", resp.tier),
                     "model_id": resp.model_id,
+                }),
+            ),
+            Ok(RouteOutcome::CloudConfirmationRequired(c)) => Response::ok(
+                id,
+                serde_json::json!({
+                    "status": "confirmation_required",
+                    "privacy_score": c.privacy_score,
+                    "sanitized_preview": c.sanitized_preview,
+                    // Explicit transport read of the redacted-Debug newtype.
+                    "token": c.token.as_str(),
+                }),
+            ),
+            // SVC-2 Piece 2: the egress gateway refused for lack of session
+            // destination consent — surfaced as a distinct status so the shell
+            // shows the "allow cloud?" opt-in (combinable with the preview).
+            // (Granting the consent + the dialog wiring is the next sub-step.)
+            Ok(RouteOutcome::DestinationConsentRequired(c)) => Response::ok(
+                id,
+                serde_json::json!({
+                    "status": "destination_consent_required",
+                    "privacy_score": c.privacy_score,
+                    "sanitized_preview": c.sanitized_preview,
+                    "token": c.token.as_str(),
                 }),
             ),
             Err(e) => Response::err(id, -1, &e.to_string()),
@@ -227,6 +274,22 @@ impl Handler {
                 "has_cloud": router.has_cloud(),
             }),
         )
+    }
+
+    /// Handle `inference.grant_cloud_egress_consent` — grant session cloud
+    /// destination consent (SVC-2 Piece 2). The shell calls this when the user
+    /// accepts the destination opt-in dialog; it arms the egress gateway so
+    /// subsequent cloud-routed queries proceed past the
+    /// `destination_consent_required` refusal to the privacy pause / send.
+    ///
+    /// The WebSocket is the shell's own trusted channel, so — like the other
+    /// inference handlers — this calls the shared Router directly. The SVC-2
+    /// AuthGuard governs the D-Bus boundary (`InferenceService`), not this one;
+    /// the WebSocket caller-identity model is the deferred Piece-1b concern.
+    async fn handle_inference_grant_consent(&self, id: u64) -> Response {
+        self.router.read().await.grant_destination_consent();
+        info!("WebSocket grant_cloud_egress_consent — session cloud egress consent granted");
+        Response::ok(id, serde_json::json!({ "granted": true }))
     }
 }
 
@@ -322,6 +385,14 @@ impl Handler {
 
         let mut modes = self.modes.write().await;
         modes.insert(window_id, mode.clone());
+        // SVC-5-R2-1: arm the learning facade inside the same mode-lock
+        // critical section that updated the mode map. The shell-bridge and
+        // the D-Bus ModeService both route mode changes through the shared
+        // helper so a Focus transition arrives at the facade no matter which
+        // transport carried the request.
+        if let Err(msg) = delphi_services::mode::apply_focus_from_modes(&modes, &self.learning) {
+            return Response::err(id, -32603, &format!("internal: {msg}"));
+        }
 
         Response::ok(id, serde_json::json!({ "mode": mode }))
     }
@@ -411,21 +482,16 @@ impl Handler {
 // ── Learning handlers ──────────────────────────────────────────
 
 impl Handler {
-    /// Handle `learning.suggestions` — get all active suggestions.
+    /// Handle `learning.suggestions` — pending suggestions via the facade.
     async fn handle_learning_suggestions(&self, id: u64) -> Response {
-        let suggestions = self.suggestions.read().await;
-        let json: Vec<serde_json::Value> = suggestions
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "description": s.description,
-                    "confidence": s.confidence,
-                    "observed_count": s.observed_count,
-                })
-            })
-            .collect();
-        Response::ok(id, serde_json::json!(json))
+        let suggestions = match self.learning.lock() {
+            Ok(facade) => facade.list_suggestions(),
+            Err(_) => return Response::err(id, -1, "learning state unavailable"),
+        };
+        match serde_json::to_value(&suggestions) {
+            Ok(v) => Response::ok(id, v),
+            Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+        }
     }
 
     /// Handle `learning.accept` — accept a suggestion.
@@ -439,19 +505,24 @@ impl Handler {
             None => return Response::err(id, -32602, "missing required param: suggestion_id"),
         };
 
-        let mut suggestions = self.suggestions.write().await;
-        let before = suggestions.len();
-        suggestions.retain(|s| s.id != suggestion_id);
-
-        if suggestions.len() == before {
-            return Response::err(
-                id,
-                -1,
-                &format!("suggestion not found: {suggestion_id}"),
-            );
+        let result = {
+            let mut facade = match self.learning.lock() {
+                Ok(f) => f,
+                Err(_) => return Response::err(id, -1, "learning state unavailable"),
+            };
+            facade.accept(&suggestion_id)
+        };
+        match result {
+            Ok(r) => match serde_json::to_value(&r) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(LearningFacadeError::NotFound) => Response::err(id, -1, "suggestion not found"),
+            Err(LearningFacadeError::FocusMode) => {
+                Response::err(id, -1, "cannot accept suggestions while in Focus mode")
+            }
+            Err(_) => Response::err(id, -1, "learning operation failed"),
         }
-
-        Response::ok(id, serde_json::json!({ "accepted": suggestion_id }))
     }
 
     /// Handle `learning.dismiss` — dismiss a suggestion.
@@ -465,28 +536,30 @@ impl Handler {
             None => return Response::err(id, -32602, "missing required param: suggestion_id"),
         };
 
-        let mut suggestions = self.suggestions.write().await;
-        let before = suggestions.len();
-        suggestions.retain(|s| s.id != suggestion_id);
-
-        if suggestions.len() == before {
-            return Response::err(
-                id,
-                -1,
-                &format!("suggestion not found: {suggestion_id}"),
-            );
+        let result = {
+            let mut facade = match self.learning.lock() {
+                Ok(f) => f,
+                Err(_) => return Response::err(id, -1, "learning state unavailable"),
+            };
+            facade.dismiss(&suggestion_id)
+        };
+        match result {
+            Ok(r) => match serde_json::to_value(&r) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(LearningFacadeError::NotFound) => Response::err(id, -1, "suggestion not found"),
+            Err(_) => Response::err(id, -1, "learning operation failed"),
         }
-
-        Response::ok(id, serde_json::json!({ "dismissed": suggestion_id }))
     }
 
-    /// Handle `learning.count` — get active suggestion count.
+    /// Handle `learning.count` — count of pending suggestions via the facade.
     async fn handle_learning_count(&self, id: u64) -> Response {
-        let suggestions = self.suggestions.read().await;
-        Response::ok(
-            id,
-            serde_json::json!({ "count": suggestions.len() }),
-        )
+        let count = match self.learning.lock() {
+            Ok(facade) => facade.list_suggestions().len(),
+            Err(_) => return Response::err(id, -1, "learning state unavailable"),
+        };
+        Response::ok(id, serde_json::json!({ "count": count }))
     }
 }
 
@@ -501,7 +574,7 @@ mod tests {
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
         )
     }
 
@@ -532,6 +605,24 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["has_local"], false);
         assert_eq!(result["has_cloud"], false);
+    }
+
+    /// SVC-2 Piece 2b: the WebSocket grant method dispatches and returns
+    /// `granted: true`. With no cloud backend configured it is a harmless no-op
+    /// on the gateway flag; the dispatch + response contract is what this
+    /// verifies (the gateway-arming behavior is covered in die-inference and the
+    /// services layer).
+    #[tokio::test]
+    async fn inference_grant_cloud_egress_consent_works() {
+        let handler = test_handler();
+        let req = Request {
+            id: 7,
+            method: "inference.grant_cloud_egress_consent".to_string(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handler.dispatch(req).await;
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["granted"], true);
     }
 
     #[tokio::test]
@@ -715,48 +806,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learning_accept_existing() {
-        let suggestions = vec![Suggestion {
-            id: "sug-001".to_string(),
-            description: "Auto-archive reports".to_string(),
-            confidence: 0.9,
-            observed_count: 5,
-        }];
+    async fn learning_accept_transitions_to_practicing() {
+        use die_learning::{EventCategory, LearningEvent};
+
+        // Seed a Proposed suggestion in a shared facade (deterministic
+        // firefox→code recipe; see die_orchestrator::learning tests).
+        let mut facade = LearningFacade::in_memory().unwrap();
+        for i in 0..10 {
+            let _ = facade.observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "firefox",
+                None,
+                i * 100,
+            ));
+            let _ = facade.observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "code",
+                None,
+                i * 100 + 10,
+            ));
+        }
+        let _ = facade.run_detection();
+        let suggestion_id = facade
+            .list_suggestions()
+            .first()
+            .expect("seed must produce a pending suggestion")
+            .id
+            .clone();
+
         let handler = Handler::new(
             Arc::new(RwLock::new(Router::new())),
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(RwLock::new(suggestions)),
+            Arc::new(Mutex::new(facade)),
         );
 
-        // Verify suggestion exists
-        let count_req = Request {
-            id: 17,
-            method: "learning.count".to_string(),
-            params: serde_json::Value::Null,
-        };
-        let resp = handler.dispatch(count_req).await;
-        assert_eq!(resp.result.unwrap()["count"], 1);
-
-        // Accept it
         let accept_req = Request {
             id: 18,
             method: "learning.accept".to_string(),
-            params: serde_json::json!({ "suggestion_id": "sug-001" }),
+            params: serde_json::json!({ "suggestion_id": suggestion_id }),
         };
         let resp = handler.dispatch(accept_req).await;
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap()["accepted"], "sug-001");
+        assert!(resp.error.is_none(), "accept failed: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        // Strengthened (SVC-5): accept TRANSITIONS to Practicing and records a
+        // reversible timeline action — it no longer silently deletes the
+        // suggestion (the old broken accept ≡ dismiss behavior).
+        assert_eq!(result["new_stage"], "practicing");
+        assert!(
+            result["action_timeline_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("tl-")
+        );
+    }
 
-        // Verify removed
-        let count_req = Request {
-            id: 19,
-            method: "learning.count".to_string(),
-            params: serde_json::Value::Null,
+    /// SVC-5-R2-1 cross-transport integration: a Focus mode-change must arm
+    /// the [`LearningFacade`] regardless of *which* transport carried the
+    /// request. This drives Focus via the shell-bridge `handle_mode_set`
+    /// path and clears it via the D-Bus `ModeService::set_mode` path against
+    /// the SAME shared facade and modes Arcs.
+    ///
+    /// **This is the RED→GREEN proof** for SVC-5-R2-1. Pre-round-2, the
+    /// transports only called `modes.insert(...)` and the facade stayed
+    /// disarmed; the `focus_active() / list_suggestions().is_empty() /
+    /// accept → FocusMode` assertions all failed because the gate, though
+    /// implemented, was never wired up. Post-round-2 both transports route
+    /// the mode change through `apply_focus_from_modes` and the facade
+    /// arms/disarms in lock-step with the mode map.
+    #[tokio::test]
+    async fn focus_arms_facade_through_both_transports() {
+        use delphi_services::mode::ModeService;
+        use die_learning::{EventCategory, LearningEvent};
+        use die_orchestrator::learning::LearningFacadeError;
+
+        // Seed a Proposed suggestion (firefox→code recipe).
+        let mut facade = LearningFacade::in_memory().unwrap();
+        for i in 0..10 {
+            let _ = facade.observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "firefox",
+                None,
+                i * 100,
+            ));
+            let _ = facade.observe(LearningEvent::at_time(
+                EventCategory::AppLaunch,
+                "code",
+                None,
+                i * 100 + 10,
+            ));
+        }
+        let _ = facade.run_detection();
+        let suggestion_id = facade
+            .list_suggestions()
+            .first()
+            .expect("seed must produce a pending suggestion")
+            .id
+            .clone();
+
+        // Shared state for both transports.
+        let modes = Arc::new(RwLock::new(HashMap::<String, String>::new()));
+        let facade_arc = Arc::new(Mutex::new(facade));
+
+        let handler = Handler::new(
+            Arc::new(RwLock::new(Router::new())),
+            Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
+            modes.clone(),
+            Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
+            facade_arc.clone(),
+        );
+        let mode_svc = ModeService::new(
+            modes.clone(),
+            facade_arc.clone(),
+            Arc::new(delphi_services::auth_guard::AuthGuard::dev_in_memory()),
+        );
+
+        // Sanity: facade starts disarmed and the seeded suggestion is listed.
+        assert!(!facade_arc.lock().unwrap().focus_active());
+        assert!(!facade_arc.lock().unwrap().list_suggestions().is_empty());
+
+        // ── Path 1: arm Focus via the shell-bridge (WebSocket) handler ──
+        let focus_req = Request {
+            id: 100,
+            method: "mode.set".to_string(),
+            params: serde_json::json!({ "window_id": "win-1", "mode": "Focus" }),
         };
-        let resp = handler.dispatch(count_req).await;
-        assert_eq!(resp.result.unwrap()["count"], 0);
+        let focus_resp = handler.dispatch(focus_req).await;
+        assert!(
+            focus_resp.error.is_none(),
+            "handler mode.set failed: {:?}",
+            focus_resp.error
+        );
+
+        assert!(
+            facade_arc.lock().unwrap().focus_active(),
+            "shell-bridge mode.set(\"Focus\") must arm the facade (SVC-5-R2-1)"
+        );
+        assert!(
+            facade_arc.lock().unwrap().list_suggestions().is_empty(),
+            "armed facade must filter all suggestions"
+        );
+        let accept_err = facade_arc.lock().unwrap().accept(&suggestion_id);
+        assert!(
+            matches!(accept_err, Err(LearningFacadeError::FocusMode)),
+            "armed facade must reject accept with FocusMode; got: {accept_err:?}"
+        );
+
+        // ── Path 2: clear Focus via the D-Bus ModeService ──────────────
+        // Build a message Header carrying a sender so the SVC-2 guard can read
+        // the caller identity (dev policy → proceed-and-audit, so set_mode runs).
+        let setmode_msg = zbus::message::Message::method_call("/org/delphi/Mode", "SetMode")
+            .unwrap()
+            .sender(":1.5")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        mode_svc
+            .set_mode(setmode_msg.header(), "win-1".to_string(), "Direct".to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            !facade_arc.lock().unwrap().focus_active(),
+            "ModeService::set_mode(\"Direct\") must disarm the facade (SVC-5-R2-1)"
+        );
+        assert!(
+            facade_arc
+                .lock()
+                .unwrap()
+                .list_suggestions()
+                .iter()
+                .any(|s| s.id == suggestion_id),
+            "disarmed facade must surface the seeded suggestion again"
+        );
     }
 
     #[tokio::test]

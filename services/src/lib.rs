@@ -41,6 +41,35 @@ pub mod mode;
 pub mod timeline;
 pub mod workspace;
 
+/// Internal: D-Bus error sanitization at the trust boundary (not an
+/// interface). See `error::opaque` and services-sweep finding SVC-4.
+pub(crate) mod error;
+
+/// Internal: caller-identity + permission-tier authorization at the D-Bus
+/// boundary (not an interface). The SVC-2 auth seam — typed outcomes, the tier
+/// catalogue, and the synchronous decision functions including the
+/// SVC-1-R1-1-01 same-caller-binding cloud-send closure. The async caller
+/// resolver (zbus header + fdo credentials + NameOwnerChanged cache) and the
+/// per-method guard rollout build on this foundation. See services-sweep
+/// finding SVC-2.
+pub mod auth;
+
+/// Internal: async caller-identity resolver (SVC-2 Stage 1b) — resolves a
+/// [`auth::CallerIdentity`] from a live D-Bus message header + connection
+/// (`fdo::DBusProxy` credentials) with a `NameOwnerChanged`-invalidated cache.
+/// The bus-facing producer for the bus-free `auth` policy core. See SVC-2.
+pub mod caller_resolver;
+
+/// Internal: the per-method authorization guard (SVC-2 Stage 2) — `AuthGuard::enforce`
+/// is the single seam every `#[zbus::interface]` method calls on its first line
+/// (the SVC-2 analog of `limits::ensure_within`), tying the caller-identity
+/// policy, the tier catalogue, and the fortress audit log together. See SVC-2.
+pub mod auth_guard;
+
+/// D-Bus payload size caps (not an interface). Single source of truth for the
+/// per-parameter byte limits. See services-sweep finding SVC-6.
+pub mod limits;
+
 /// D-Bus well-known name for the Delphi services.
 pub const DBUS_NAME: &str = "org.delphi.Services";
 

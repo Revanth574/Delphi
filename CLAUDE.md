@@ -1543,6 +1543,8 @@ These patterns indicate hallucination and are strictly prohibited:
 Before declaring any task, subtask, or phase complete, run this audit:
 
 ```bash
+set -o pipefail   # a piped cargo's failure must not be masked by tee/tail — see the exit-code note below
+
 # Compile check
 cargo check --workspace
 
@@ -1563,6 +1565,8 @@ for dir in */; do
   fi
 done
 ```
+
+**Exit-code capture (build discipline — never trust an exit code through a pipe).** `cmd | tee log` and `cmd | tail` report the *last* pipeline stage's status (`tee`/`tail`, almost always `0`), silently masking a failed `cmd`. A verification that can pass for the wrong reason is worse than none — it is false confidence, the same failure shape as a security gate tested only in isolation. To gate on success, capture the command's OWN status: either `set -o pipefail` before any pipeline (as in the block above), or redirect with `cmd &> log; rc=$?` and check `$rc` explicitly. This applies to **every** cargo invocation (`check` / `clippy` / `test`) — local self-audits and CI alike. (Discovered in the SVC-2 services sweep: a `cargo clippy … | tee log` reported `tee`'s exit `0` and masked a real `-D warnings` lint that had shipped several batches earlier. The lesson generalizes to the orchestrator and fortress sweeps that follow.)
 
 **Report the OUTPUT of these commands, not a summary. If you claim "950 tests pass," include the literal test result line showing that count. Any discrepancy between claimed and actual is a hallucination that must be corrected immediately.**
 

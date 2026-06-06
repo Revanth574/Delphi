@@ -1378,8 +1378,14 @@ fn current_timestamp() -> i64 {
 
 /// Convert an epoch seconds value to a [`DateTime<Utc>`].
 fn ts_to_dt(ts: i64) -> Result<DateTime<Utc>, OrchestratorError> {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .ok_or_else(|| OrchestratorError::Planning(format!("invalid timestamp: {ts}")))
+    DateTime::<Utc>::from_timestamp(ts, 0).ok_or_else(|| {
+        tracing::warn!(timestamp = ts, "stored goal timestamp out of representable range");
+        OrchestratorError::Validation {
+            domain: "goal",
+            field: "timestamp",
+            reason: "out of valid range",
+        }
+    })
 }
 
 /// Parse a row into a [`Goal`].
@@ -1507,6 +1513,23 @@ fn compute_deadline_risk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ORCH-R1-07: stored-timestamp value leak → typed Validation (no value in Display) ──
+    #[test]
+    fn ts_to_dt_out_of_range_is_validation_no_value_leak_orch_r1_07() {
+        let err = ts_to_dt(i64::MAX).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "goal", field: "timestamp", .. }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(&i64::MAX.to_string()),
+            "timestamp value leaked into error Display: {err}"
+        );
+    }
 
     fn mk() -> GoalStore {
         GoalStore::in_memory().expect("in-memory store")

@@ -2144,10 +2144,8 @@ impl KnowledgeStore {
         use std::io::Read;
         let file = safe_open_under_root_handle(trusted_root_handle, target)
             .map_err(|e| {
-                OrchestratorError::Planning(format!(
-                    "could not safely open {} for ingestion: {e}",
-                    target.display()
-                ))
+                warn!(path = %target.display(), "could not safely open file for ingestion");
+                OrchestratorError::Planning(format!("could not safely open file for ingestion: {e}"))
             })?;
         // ORCH-R1-04: bound the read. metadata() on the held fd is an early-out
         // for honestly-sized regular files; the take()-bounded read below is the
@@ -2173,10 +2171,8 @@ impl KnowledgeStore {
         file.take(MAX_INGEST_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| {
-                OrchestratorError::Planning(format!(
-                    "could not read {} for ingestion: {e}",
-                    target.display()
-                ))
+                warn!(path = %target.display(), "could not read file for ingestion");
+                OrchestratorError::Planning(format!("could not read file for ingestion: {e}"))
             })?;
         if bytes.len() > MAX_INGEST_BYTES {
             warn!(
@@ -3679,6 +3675,24 @@ impl IngestionAccessController {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── ORCH-R1-07: ingest open/read failures must not leak the file path ──
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ingest_missing_file_does_not_leak_path_orch_r1_07() {
+        let tmp = TempDir::new().unwrap();
+        let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
+        let target = trusted_root.join("nonexistent-secret-file.md");
+        let s = store();
+        let err = s
+            .ingest_file_with_root_handle(&trusted_root_handle, &target)
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("nonexistent-secret-file"),
+            "ingest path leaked into error Display: {err}"
+        );
+    }
     use tempfile::TempDir;
 
     // ── SVC-8: ingestion access control (relocated from the transport) ──

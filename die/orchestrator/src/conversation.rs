@@ -421,7 +421,7 @@ impl ConversationStore {
             )
             .optional()
             .map_err(|e| map_sqlite_err(e, "get_conversation lookup"))?
-            .ok_or_else(|| OrchestratorError::Planning(format!("conversation not found: {id}")))
+            .ok_or(OrchestratorError::NotFound { entity: "conversation" })
     }
 
     /// Fetch the most recent messages from a conversation (newest first).
@@ -689,9 +689,7 @@ impl ConversationStore {
             )
             .map_err(|e| map_sqlite_err(e, "existence check failed"))?;
         if n == 0 {
-            return Err(OrchestratorError::Planning(format!(
-                "conversation not found: {id}"
-            )));
+            return Err(OrchestratorError::NotFound { entity: "conversation" });
         }
         Ok(())
     }
@@ -853,6 +851,37 @@ fn rand_suffix() -> u32 {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    // ── ORCH-R1-07: public-boundary id leaks → typed NotFound (no id in Display) ──
+    #[test]
+    fn get_conversation_missing_is_notfound_no_id_leak_orch_r1_07() {
+        let store = ConversationStore::in_memory().unwrap();
+        let err = store.get_conversation("conv-secret-12345").unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "conversation" }),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("conv-secret-12345"),
+            "caller id leaked into error Display: {err}"
+        );
+    }
+
+    #[test]
+    fn add_message_to_missing_conversation_is_notfound_no_id_leak_orch_r1_07() {
+        let store = ConversationStore::in_memory().unwrap();
+        let err = store
+            .add_message("conv-secret-67890", MessageRole::User, "hi", None)
+            .unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "conversation" }),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("conv-secret-67890"),
+            "caller id leaked into error Display: {err}"
+        );
+    }
 
     /// Mock summarizer for testing tier 2 prompt building.
     struct MockSummary;
@@ -1286,39 +1315,28 @@ mod tests {
     // ── Codex re-review FIX 25 (round 9): query_row error preservation ──
 
     #[test]
-    fn get_conversation_missing_id_returns_planning_with_id() {
-        // **F25 regression — Part 1 of 2.** See timeline.rs's
-        // `undo_action_missing_row_returns_planning_with_action_id`
-        // for the full rationale. Pre-F25, `get_conversation`'s
-        // bare `.map_err(|_| Planning("conversation not found: {id}"))`
-        // produced this error for EVERY rusqlite failure, including
-        // SQLITE_BUSY. Post-F25, `.optional() + ok_or_else` confines
-        // this message to the actual `QueryReturnedNoRows` case.
-        // This test pins the variant + message format; the companion
+    fn get_conversation_missing_id_returns_notfound_not_transient_lock() {
+        // **F25 regression — Part 1 of 2.** Pre-F25, `get_conversation`'s bare
+        // `.map_err(|_| Planning("conversation not found: {id}"))` produced the
+        // not-found error for EVERY rusqlite failure, including SQLITE_BUSY.
+        // Post-F25, `.optional() + ok_or_else` confines the missing-row branch
+        // to the genuine `QueryReturnedNoRows` case; the companion
         // `_routes_database_busy_*` test covers the lock-error half.
         //
-        // Tightens the existing `get_conversation_not_found` test
-        // (line 911), which only asserts `.is_err()` without
-        // pinning the variant or message format — a regression that
-        // turned the error type into a `TransientLock` (or anything
-        // else) would not have tripped that loose assertion.
+        // ORCH-R1-07 then replaced the free-string Planning (which leaked the
+        // id) with the typed, leak-free `NotFound { entity: "conversation" }`;
+        // the no-leak property is pinned by the `..._no_id_leak_orch_r1_07`
+        // test. This test pins the surviving F25 invariant: the missing-row
+        // branch stays NotFound and is never conflated with the transient-lock
+        // branch (which the loose `.is_err()` in `get_conversation_not_found`
+        // would not have caught).
         let store = ConversationStore::in_memory().unwrap();
         let err = store.get_conversation("conv-nonexistent-id").unwrap_err();
-        match err {
-            OrchestratorError::Planning(msg) => {
-                assert!(
-                    msg.contains("conversation not found")
-                        && msg.contains("conv-nonexistent-id"),
-                    "missing-row error must be Planning containing 'conversation not found' \
-                     and the id, got: {msg}"
-                );
-            }
-            other => panic!(
-                "missing conversation must produce Planning, not {other:?} \
-                 (F25 regression: post-fix ok_or_else path must stay semantically \
-                 equivalent on the missing-row branch)"
-            ),
-        }
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "conversation" }),
+            "missing-row must be NotFound(conversation), not {err:?} \
+             (F25: distinct from TransientLock)"
+        );
     }
 
     #[test]

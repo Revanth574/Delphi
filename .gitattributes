@@ -1,0 +1,43 @@
+# Delphi OS — line-ending and binary-attribute policy.
+# SPDX-License-Identifier: MIT
+#
+# Canonical line ending is LF everywhere. Delphi is built on Linux (WSL2) with
+# the Windows working tree at C:\dev\Delphi. Forcing LF in the working tree
+# (eol=lf, not merely text=auto) keeps both trees byte-identical and prevents
+# the CRLF/LF churn that otherwise dirties `git status` on the Windows side.
+#
+# Binary inventory (verified 2026-06-06): the repository currently tracks ZERO
+# binary blobs — every file is text (.rs .ts .tsx .toml .md .proto .json .yaml
+# .sh .lock .js .html .css .gitkeep .gitignore). The `binary` rules below are
+# therefore forward-looking guards, grounded in Delphi's own architecture:
+# shell UI assets (icons/fonts) and local model files (GGUF/ONNX per the
+# three-tier inference stack). They ensure such files, when added later, are
+# never line-ending-converted or rendered as text diffs. SVG is intentionally
+# omitted — it is XML text and is correctly handled by the default rule below.
+
+# ── Default ──────────────────────────────────────────────────────────────
+# Auto-detect text; store in the repo and check out in the working tree as LF.
+* text=auto eol=lf
+
+# ── Forward-looking binary guards (none tracked today; see header) ───────
+# Shell UI raster assets
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.bmp   binary
+# Fonts
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+# Local model / inference artifacts (three-tier inference stack)
+*.gguf  binary
+*.onnx  binary
+*.wasm  binary
+# Misc binary containers
+*.pdf   binary
+*.zip   binary
+*.gz    binary

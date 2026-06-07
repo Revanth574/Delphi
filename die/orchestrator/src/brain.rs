@@ -249,6 +249,29 @@ impl Brain {
     /// different caller replay a valid token. Recorded as the fifth item of the
     /// SVC-2 Codex review.
     ///
+    /// # Prompt-injection forward requirement (ORCH-R1-01)
+    ///
+    /// When `web_context` is present it is **untrusted, attacker-controlled
+    /// data**: any page the search surfaces can contain text crafted to read as
+    /// instructions to the model ("ignore previous instructions and ..."), and
+    /// today it is concatenated into the prompt with only a `---` fence and the
+    /// `[web-augmented]` marker, after a plain character truncate — which is NOT
+    /// sufficient injection defense. This is LATENT, not live: `Brain` is
+    /// unwired (see the SVC-1-R1-1-01 note above), so no external caller can
+    /// reach this path. Before the brain is wired to an external entry point,
+    /// web content MUST be treated as data, not instructions:
+    ///
+    /// 1. Fence it with explicit non-instruction framing the model is told to
+    ///    treat as quoted, untrusted data (not a bare `---`), and/or isolate it
+    ///    in a separate low-trust message role.
+    /// 2. Strip or score instruction-like / override phrasing before inclusion.
+    /// 3. Ship hostile-injection test fixtures (pages attempting prompt override
+    ///    or data exfiltration) proving web content cannot steer the model.
+    ///
+    /// Recorded as ORCH-R1-01 (orchestrator-sweep round 1); like the
+    /// SVC-1-R1-1-01 binding, the safe state is the current unwired one and this
+    /// requirement becomes mandatory at the wiring point.
+    ///
     /// # Errors
     ///
     /// Returns an error if inference fails entirely (no backends
@@ -293,7 +316,12 @@ impl Brain {
             }
         }
 
-        // Build the prompt — augmented or plain
+        // Build the prompt — augmented or plain. ORCH-R1-01: `context` is
+        // untrusted web data; the `---` fence + marker below is NOT sufficient
+        // prompt-injection defense. See the "Prompt-injection forward
+        // requirement" on `query` — it MUST be hardened (fence-as-data, strip
+        // instruction-like content, hostile fixtures) before the brain is wired
+        // to an external entry point. Latent today: the path is unreachable.
         let prompt = match &web_context {
             Some(context) => format!(
                 "{WEB_AUGMENT_MARKER}\n\
@@ -378,9 +406,8 @@ impl Brain {
             browser.start().await?;
         }
 
-        // Build a search URL (DuckDuckGo — privacy-respecting)
-        let encoded_query = query.replace(' ', "+");
-        let url = format!("https://lite.duckduckgo.com/lite/?q={encoded_query}");
+        // Build a search URL (DuckDuckGo — privacy-respecting).
+        let url = search_url(query);
 
         // Navigate
         browser.navigate(&url).await?;
@@ -435,22 +462,96 @@ pub fn truncate_context(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
 
-    // If the character at the cut point is a space (or we're at end),
-    // the cut is already at a word boundary — keep the full slice.
-    if text.as_bytes().get(max_chars).is_none_or(|&b| b == b' ') {
-        return text[..max_chars].to_string();
+    // ORCH-R1-02: `max_chars` is a BYTE budget; slicing at it directly panics
+    // when it lands inside a multi-byte UTF-8 sequence. Floor to the nearest
+    // char boundary at or below the budget before any slice.
+    let cut = floor_char_boundary(text, max_chars);
+
+    // If the byte at the cut is a space (or the cut is at the end), the cut is
+    // already at a word boundary — keep the floored slice.
+    if text.as_bytes().get(cut).is_none_or(|&b| b == b' ') {
+        return text[..cut].to_string();
     }
 
-    // Otherwise, find the last space before the limit to avoid mid-word cuts.
-    match text[..max_chars].rfind(' ') {
+    // Otherwise, back up to the last space before the cut to avoid mid-word cuts.
+    match text[..cut].rfind(' ') {
         Some(pos) => text[..pos].to_string(),
-        None => text[..max_chars].to_string(),
+        None => text[..cut].to_string(),
     }
+}
+
+/// Largest char-boundary byte index `<= index` in `s` — a stable-toolchain
+/// equivalent of the still-unstable `str::floor_char_boundary` (ORCH-R1-02).
+/// Relies only on the stable [`str::is_char_boundary`].
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Build the DuckDuckGo search URL for `query` (ORCH-R1-03). The query is
+/// percent-encoded as a URL query-component value so reserved characters
+/// (& # = ? + space and control bytes) cannot alter the URL's structure.
+pub fn search_url(query: &str) -> String {
+    format!(
+        "https://lite.duckduckgo.com/lite/?q={}",
+        percent_encode_query(query)
+    )
+}
+
+/// Percent-encode `s` for use as a URL query-component value (RFC 3986): only
+/// the unreserved set (ALPHA / DIGIT / `-` `_` `.` `~`) passes through; every
+/// other byte becomes `%XX`. Minimal and dependency-free (ORCH-R1-03).
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_context_handles_utf8_boundary_orch_r1_02() {
+        // max_chars is a BYTE budget; a budget landing inside a multi-byte char
+        // must not panic (RED pre-fix: `text[..max_chars]` panics on the 'é' byte).
+        let text = "héllo wörld";
+        for budget in 0..=text.len() {
+            let out = truncate_context(text, budget);
+            assert!(out.len() <= budget, "result must fit the byte budget");
+            assert!(text.starts_with(&out), "result must be a valid prefix: {out:?}");
+        }
+    }
+
+    #[test]
+    fn search_url_percent_encodes_reserved_chars_orch_r1_03() {
+        // RED pre-fix: only spaces were encoded, so reserved chars passed
+        // through raw and could alter the URL's query/fragment structure.
+        let url = search_url("a & b=c #d");
+        let q = url
+            .strip_prefix("https://lite.duckduckgo.com/lite/?q=")
+            .expect("search_url must target the DuckDuckGo lite endpoint");
+        assert!(!q.contains('&'), "raw & must be encoded: {q}");
+        assert!(!q.contains('#'), "raw # must be encoded: {q}");
+        assert!(!q.contains('='), "raw = must be encoded: {q}");
+        assert!(!q.contains(' '), "raw space must be encoded: {q}");
+    }
 
     #[test]
     fn needs_web_detects_weather() {

@@ -820,12 +820,14 @@ impl AppController {
     /// ```
     #[must_use]
     pub fn needs_confirmation(&self, confidence: f64) -> bool {
-        // ORCH-R1-05 round-2: FAIL-CLOSED. The old `confidence < min` let NaN
-        // through (`NaN < x` is false) — a fail-OPEN where a NaN/garbage
-        // confidence executed unflagged. Explicitly gate NaN, then the normal
-        // low-confidence comparison (equivalent to `!(confidence >= min)` but
-        // without the negated-PartialOrd-comparison footgun).
-        confidence.is_nan() || confidence < self.min_confidence
+        // ORCH-R1-05 round-2 / ORCH-R2-01: FAIL-CLOSED over the whole invalid
+        // CLASS. Auto-execution requires a finite confidence in [min, 1.0];
+        // confirmation is required for ANYTHING else — NaN, ±inf, and
+        // out-of-range (e.g. 2.0). The old `confidence < min` let NaN AND
+        // +inf/>1.0 through (those comparisons are false), a fail-OPEN; gating
+        // the whole class (not just the NaN that surfaced) is the airtight
+        // boundary.
+        !(confidence.is_finite() && (self.min_confidence..=1.0).contains(&confidence))
     }
 
     /// Execute a validated workflow step (simulated — real execution
@@ -1280,6 +1282,29 @@ mod tests {
             matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
             "a NaN-confidence step must be gated (fail-closed), got {err:?}"
         );
+    }
+
+    #[test]
+    fn gate_rejects_non_finite_and_out_of_range_confidence_orch_r2_01() {
+        // ORCH-R2-01: the gate must reject the whole INVALID CLASS (non-finite
+        // OR outside [min, 1.0]), not just the NaN value that surfaced. RED
+        // pre-fix: +inf and 2.0 passed (inf<0.7 and 2.0<0.7 are false, neither is
+        // NaN). confidence is set via the direct field — the with_confidence /
+        // serde bypass path the gate must catch as the airtight boundary.
+        let ctrl = AppController::new();
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, 2.0_f64, -0.1_f64, f64::NAN] {
+            let mut step = WorkflowStep::new("s", "app", "do");
+            step.confidence = bad;
+            let err = ctrl.execute_step(&step, &HashMap::new()).unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+                "invalid confidence {bad} must be gated, got {err:?}"
+            );
+        }
+        // A valid high confidence still auto-executes.
+        let mut ok = WorkflowStep::new("s", "app", "do");
+        ok.confidence = 0.95;
+        assert!(ctrl.execute_step(&ok, &HashMap::new()).is_ok());
     }
 
     #[test]

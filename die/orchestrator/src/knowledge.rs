@@ -1529,12 +1529,17 @@ impl KnowledgeStore {
             )));
         }
         if relation.is_acyclic() && self.would_create_cycle(from_id, to_id, relation)? {
-            return Err(OrchestratorError::Planning(format!(
-                "{} edge {} -> {} would create a cycle",
-                relation.as_str(),
-                from_id,
-                to_id
-            )));
+            // ORCH-R2-03: typed, leak-free — caller-held node ids go to tracing.
+            warn!(
+                relation = relation.as_str(),
+                from = %from_id,
+                to = %to_id,
+                "create_edge: edge would create a cycle"
+            );
+            return Err(OrchestratorError::Conflict {
+                domain: "knowledge",
+                reason: "edge would create a cycle",
+            });
         }
         let now = Utc::now().timestamp();
         let conn = self.conn.lock().map_err(map_lock_err)?;
@@ -4531,6 +4536,31 @@ mod tests {
         s.create_edge(a, b, EdgeRelation::RelatesTo, 0.5, src).unwrap();
         // Reverse direction should succeed for non-acyclic relations.
         s.create_edge(b, a, EdgeRelation::RelatesTo, 0.5, src).unwrap();
+    }
+
+    #[test]
+    fn create_edge_cycle_is_conflict_no_node_id_leak_orch_r2_03() {
+        // ORCH-R2-03: the cycle error formatted caller node ids (positional {}).
+        // Now typed Conflict; ids to tracing.
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("alpha", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("beta", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::PartOf, 0.9, src).unwrap();
+        let err = s
+            .create_edge(b, a, EdgeRelation::PartOf, 0.9, src)
+            .unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "knowledge", .. }),
+            "a cycle-forming edge must be a knowledge Conflict, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(&a.to_string())
+                && !err.to_string().contains(&b.to_string()),
+            "node id leaked into Display: {err}"
+        );
     }
 
     // ── Semantic search ───────────────────────────────────────────────

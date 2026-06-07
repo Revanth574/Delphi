@@ -157,13 +157,28 @@ impl WorkflowStep {
     /// ```
     /// use die_orchestrator::apps::WorkflowStep;
     ///
-    /// let step = WorkflowStep::new("s1", "org.app", "risky").with_confidence(0.4);
+    /// let step = WorkflowStep::new("s1", "org.app", "risky").with_confidence(0.4).unwrap();
     /// assert!((step.confidence - 0.4).abs() < f64::EPSILON);
     /// ```
-    #[must_use]
-    pub fn with_confidence(mut self, confidence: f64) -> Self {
-        self.confidence = confidence;
-        self
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchestratorError::Validation`] if `confidence` is NaN or
+    /// outside `[0.0, 1.0]` (ORCH-R1-05 round-2 depth). A caller passing such a
+    /// value has a bug; rejecting surfaces it rather than silently clamping and
+    /// hiding it. The `execute_step` gate is independently fail-closed, so this
+    /// is defense in depth, not the security boundary — the pub `confidence`
+    /// field can still be written directly.
+    pub fn with_confidence(self, confidence: f64) -> Result<Self, OrchestratorError> {
+        if !(0.0..=1.0).contains(&confidence) {
+            // NaN and ±inf both fail the range check (NaN compares false).
+            return Err(OrchestratorError::Validation {
+                domain: "workflow",
+                field: "confidence",
+                reason: "must be a finite value in [0.0, 1.0]",
+            });
+        }
+        Ok(Self { confidence, ..self })
     }
 }
 
@@ -796,7 +811,12 @@ impl AppController {
     /// ```
     #[must_use]
     pub fn needs_confirmation(&self, confidence: f64) -> bool {
-        confidence < self.min_confidence
+        // ORCH-R1-05 round-2: FAIL-CLOSED. The old `confidence < min` let NaN
+        // through (`NaN < x` is false) — a fail-OPEN where a NaN/garbage
+        // confidence executed unflagged. Explicitly gate NaN, then the normal
+        // low-confidence comparison (equivalent to `!(confidence >= min)` but
+        // without the negated-PartialOrd-comparison footgun).
+        confidence.is_nan() || confidence < self.min_confidence
     }
 
     /// Execute a validated workflow step (simulated — real execution
@@ -1218,7 +1238,9 @@ mod tests {
     #[test]
     fn execute_step_refuses_low_confidence_orch_r1_05() {
         let ctrl = AppController::new();
-        let step = WorkflowStep::new("s1", "org.app", "risky").with_confidence(0.4);
+        let step = WorkflowStep::new("s1", "org.app", "risky")
+            .with_confidence(0.4)
+            .unwrap();
         let err = ctrl.execute_step(&step, &HashMap::new()).unwrap_err();
         assert!(
             matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
@@ -1229,8 +1251,41 @@ mod tests {
     #[test]
     fn execute_step_allows_high_confidence_orch_r1_05() {
         let ctrl = AppController::new();
-        let step = WorkflowStep::new("s1", "org.app", "safe").with_confidence(0.95);
+        let step = WorkflowStep::new("s1", "org.app", "safe")
+            .with_confidence(0.95)
+            .unwrap();
         assert!(ctrl.execute_step(&step, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn execute_step_gates_nan_confidence_orch_r1_05() {
+        // ORCH-R1-05 round-2 (gate fail-closed): a NaN confidence must be GATED,
+        // not executed. RED pre-fix: `NaN < 0.7` is false, so the `<` gate let it
+        // through — a fail-OPEN. confidence is set via the direct pub field
+        // because with_confidence now rejects NaN.
+        let ctrl = AppController::new();
+        let mut step = WorkflowStep::new("s1", "org.app", "do");
+        step.confidence = f64::NAN;
+        let err = ctrl.execute_step(&step, &HashMap::new()).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+            "a NaN-confidence step must be gated (fail-closed), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn with_confidence_rejects_nan_and_out_of_range_orch_r1_05() {
+        // Defense in depth: with_confidence REJECTS (does not silently clamp)
+        // NaN / non-finite / out-of-[0,1], surfacing a caller's bug at
+        // construction rather than hiding it as a plausible value.
+        let base = || WorkflowStep::new("s1", "org.app", "do");
+        assert!(base().with_confidence(f64::NAN).is_err());
+        assert!(base().with_confidence(f64::INFINITY).is_err());
+        assert!(base().with_confidence(2.0).is_err());
+        assert!(base().with_confidence(-0.1).is_err());
+        assert!(base().with_confidence(0.0).is_ok());
+        assert!(base().with_confidence(1.0).is_ok());
+        assert!(base().with_confidence(0.5).is_ok());
     }
 
     #[test]
@@ -1272,8 +1327,11 @@ mod tests {
         // hashed identically, the execution door passed, and the now-high-
         // confidence step executed.
         let ctrl = AppController::new();
-        let wf = Workflow::new("t")
-            .with_step(WorkflowStep::new("s1", "org.app", "do").with_confidence(0.5));
+        let wf = Workflow::new("t").with_step(
+            WorkflowStep::new("s1", "org.app", "do")
+                .with_confidence(0.5)
+                .unwrap(),
+        );
         let token = ConsentToken::issue(&wf);
         let mut consented_wf = wf.with_consent(token);
         // Raise the step's confidence AFTER consent was minted.

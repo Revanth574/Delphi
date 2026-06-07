@@ -278,7 +278,9 @@ impl Workflow {
 
     /// Stable fingerprint of the workflow's identity (name + ordered steps and
     /// their actions), used to bind a [`ConsentToken`] to this exact workflow
-    /// (ORCH-R1-05). Deterministic: map params are hashed in sorted-key order.
+    /// (ORCH-R1-05). Canonical and collision-resistant: every field is
+    /// LENGTH-PREFIXED and every collection count-prefixed (ORCH-R2-02), so no
+    /// two distinct workflows hash alike; map params are in sorted-key order.
     /// Excludes the `consent` field itself (so attaching a token does not change
     /// the hash it is bound to). INCLUDES per-step `confidence`: it is read by
     /// the `execute_step` confidence gate, so it is execution-affecting and must
@@ -291,42 +293,49 @@ impl Workflow {
     pub fn fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(self.name.as_bytes());
-        h.update(b"\0WF\0");
+        // ORCH-R2-02: canonical LENGTH-PREFIXED encoding. Every variable-length
+        // field is emitted via `fp_field` (u64-LE byte length ++ bytes) and every
+        // collection is count-prefixed, so the byte stream is unambiguous — no
+        // two distinct workflows can produce the same bytes. The delimiter
+        // joining this replaced let ("a\0b","c") vs ("a","b\0c") and {"a":"b=c"}
+        // vs {"a=b":"c"} collide (the git `blob <len>\0<content>` lesson).
+        fp_field(&mut h, self.name.as_bytes());
+        h.update((self.steps.len() as u64).to_le_bytes());
         for step in &self.steps {
-            h.update(step.step_id.as_bytes());
-            h.update(b"\0");
-            h.update(step.app_id.as_bytes());
-            h.update(b"\0");
-            h.update(step.capability.as_bytes());
-            // ORCH-R1-05 round-2: per-step confidence is read by the
-            // execute_step gate (execution-affecting), so it MUST be bound —
-            // raising it post-consent must invalidate the token.
-            h.update(b"\0C\0");
+            fp_field(&mut h, step.step_id.as_bytes());
+            fp_field(&mut h, step.app_id.as_bytes());
+            fp_field(&mut h, step.capability.as_bytes());
+            // Per-step confidence is execution-affecting (the execute_step gate
+            // reads it) so it MUST be bound (ORCH-R1-05 round-2). Fixed 8 bytes.
             h.update(step.confidence.to_bits().to_le_bytes());
-            h.update(b"\0P\0");
             let mut keys: Vec<&String> = step.params.keys().collect();
             keys.sort();
+            h.update((keys.len() as u64).to_le_bytes());
             for k in keys {
-                h.update(k.as_bytes());
-                h.update(b"=");
-                h.update(step.params[k].as_bytes());
-                h.update(b"\0");
+                fp_field(&mut h, k.as_bytes());
+                fp_field(&mut h, step.params[k].as_bytes());
             }
-            h.update(b"\0D\0");
+            h.update((step.depends_on.len() as u64).to_le_bytes());
             for d in &step.depends_on {
-                h.update(d.as_bytes());
-                h.update(b",");
+                fp_field(&mut h, d.as_bytes());
             }
-            h.update(b"\0O\0");
+            h.update((step.produces.len() as u64).to_le_bytes());
             for p in &step.produces {
-                h.update(p.as_bytes());
-                h.update(b",");
+                fp_field(&mut h, p.as_bytes());
             }
-            h.update(b"\0STEP\0");
         }
         h.finalize().into()
     }
+}
+
+/// Length-prefix a variable-length field into the workflow-fingerprint hasher
+/// (ORCH-R2-02): a u64-LE byte length followed by the bytes, so a field's
+/// CONTENT can never be confused with a delimiter and no two distinct workflows
+/// can produce the same byte stream (the git `blob <len>\0<content>` lesson).
+fn fp_field(h: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+    h.update((bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
 }
 
 /// Unforgeable proof that the user consented to a specific [`Workflow`]
@@ -1298,6 +1307,46 @@ mod tests {
         assert!(
             !mutated.consent.as_ref().unwrap().authorizes(&mutated),
             "a token issued for the pre-mutation workflow must not authorize the mutated one"
+        );
+    }
+
+    #[test]
+    fn fingerprint_no_collision_on_delimiter_shifted_fields_orch_r2_02() {
+        // ORCH-R2-02: delimiter joining made ("a\0b","c") and ("a","b\0c") hash
+        // identically (both -> a\0b\0c). Length-prefixing distinguishes them, so
+        // a token for one cannot authorize the behaviorally-different other.
+        // RED pre-fix: the fingerprints collide and the token authorizes.
+        let wf1 = Workflow::new("w").with_step(WorkflowStep::new("a\0b", "c", "cap"));
+        let wf2 = Workflow::new("w").with_step(WorkflowStep::new("a", "b\0c", "cap"));
+        assert_ne!(
+            wf1.fingerprint(),
+            wf2.fingerprint(),
+            "delimiter-shifted step_id/app_id must not collide"
+        );
+        let token = ConsentToken::issue(&wf1);
+        assert!(
+            !token.authorizes(&wf2),
+            "consent for wf1 must not authorize the colliding wf2"
+        );
+    }
+
+    #[test]
+    fn fingerprint_no_collision_on_param_delimiter_orch_r2_02() {
+        // ORCH-R2-02: {"a":"b=c"} and {"a=b":"c"} both joined to a=b=c\0 under
+        // delimiter hashing. Length-prefixing distinguishes them.
+        let wf1 = Workflow::new("w")
+            .with_step(WorkflowStep::new("s", "app", "cap").with_param("a", "b=c"));
+        let wf2 = Workflow::new("w")
+            .with_step(WorkflowStep::new("s", "app", "cap").with_param("a=b", "c"));
+        assert_ne!(
+            wf1.fingerprint(),
+            wf2.fingerprint(),
+            "param key/value delimiter collision must not occur"
+        );
+        let token = ConsentToken::issue(&wf1);
+        assert!(
+            !token.authorizes(&wf2),
+            "consent for one param map must not authorize the colliding other"
         );
     }
 

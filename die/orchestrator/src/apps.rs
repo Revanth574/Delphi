@@ -265,8 +265,13 @@ impl Workflow {
     /// their actions), used to bind a [`ConsentToken`] to this exact workflow
     /// (ORCH-R1-05). Deterministic: map params are hashed in sorted-key order.
     /// Excludes the `consent` field itself (so attaching a token does not change
-    /// the hash it is bound to) and per-step `confidence` metadata (consent is
-    /// about the *actions*, not the SSI score).
+    /// the hash it is bound to). INCLUDES per-step `confidence`: it is read by
+    /// the `execute_step` confidence gate, so it is execution-affecting and must
+    /// be bound — otherwise raising a step's confidence after consent would
+    /// bypass the gate without invalidating the token (ORCH-R1-05 round-2). The
+    /// name, step Vec order, and dependency/produces order are over-included
+    /// (a reorder forces a conservative re-consent) — safe, since the binding
+    /// must never be LESS sensitive than execution behavior, only more.
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
@@ -279,6 +284,11 @@ impl Workflow {
             h.update(step.app_id.as_bytes());
             h.update(b"\0");
             h.update(step.capability.as_bytes());
+            // ORCH-R1-05 round-2: per-step confidence is read by the
+            // execute_step gate (execution-affecting), so it MUST be bound —
+            // raising it post-consent must invalidate the token.
+            h.update(b"\0C\0");
+            h.update(step.confidence.to_bits().to_le_bytes());
             h.update(b"\0P\0");
             let mut keys: Vec<&String> = step.params.keys().collect();
             keys.sort();
@@ -1250,6 +1260,28 @@ mod tests {
         assert!(
             matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
             "execute must reject consent bound to a different (pre-mutation) workflow, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn execute_rejects_confidence_raised_after_consent_orch_r1_05() {
+        // ORCH-R1-05 round-2 (fingerprint behavioral coverage): per-step
+        // confidence is execution-affecting (the execute_step gate reads it), so
+        // RAISING it after consent must invalidate the binding. RED pre-fix:
+        // confidence was excluded from the fingerprint, so the mutated workflow
+        // hashed identically, the execution door passed, and the now-high-
+        // confidence step executed.
+        let ctrl = AppController::new();
+        let wf = Workflow::new("t")
+            .with_step(WorkflowStep::new("s1", "org.app", "do").with_confidence(0.5));
+        let token = ConsentToken::issue(&wf);
+        let mut consented_wf = wf.with_consent(token);
+        // Raise the step's confidence AFTER consent was minted.
+        consented_wf.steps[0].confidence = 0.95;
+        let err = ctrl.execute(&consented_wf).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+            "raising a step's confidence post-consent must invalidate the token, got {err:?}"
         );
     }
 

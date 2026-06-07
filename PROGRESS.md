@@ -1,11 +1,53 @@
 # Delphi OS — Progress State
 
-Last updated: 2026-06-04 (Phase 3B.0a — **COMPLETE + MERGED TO MAIN**. SVC-2 Codex APPROVE (0 P1/P2); the three-way merge `services/` Wave 1 + SVC-1 + SVC-2 landed at merge commit **`0efe67c`**, tagged **`v0.4.0`** on origin, feature branch `phase-3b/sweep-services` deleted (safe `-d`, fully merged). The D-Bus boundary is fully hardened: 61 methods guarded across 11 services with the completeness mechanism, the cloud-send same-caller binding, and the structural destination-consent egress gate. **SVC-1-R1-1-01 is CLOSED** — the two-call cloud-consent bypass tracked since SVC-1 as the merge-gate blocker, discharged by the live real-bus closure test (RED-proven). main went from Phase-3A-safe to fully-hardened in one transition with no resident P1. Prior: SVC-1 3 rounds APPROVE (`78bb6a0`); services/ Wave 1 4 rounds APPROVE.)
-Current phase: Phase 3B.0 — 3B.0a **COMPLETE + MERGED** (`0efe67c`, tag `v0.4.0`). Next unit: resume the crate sweeps — `die/orchestrator/` then `fortress/`.
-Current task: Phase 3B.0 — resume the retroactive Codex crate sweeps after the 3B.0a hardening landed. **Next unit: the `die/orchestrator/` sweep** (then `fortress/`), applying Task 3A.6's threat model on a fresh `phase-3b/sweep-orchestrator` branch (per the Codex Adversarial Review Process, retroactive-sweep mode, 3-round budget unless extended). No in-progress implementation — 3B.0a is closed and on main.
-Current step: Phase 3B.0a fully landed — merge `0efe67c` (parents `0442555` main + `23b198b` branch) on main; tag `v0.4.0` on origin pointing at the merge commit; the intermediate `v0.4.0-phase3b0a` tag cleaned up from local + origin; feature branch deleted. `main == origin/main`, working tree clean. **Next: open the `die/orchestrator/` sweep.**
-Status: **Phase 3B.0a COMPLETE + MERGED + TAGGED `v0.4.0`** — main fully-hardened and clean; ready to open the next sweep
-Tests passing: **1,808 Rust verified 2026-06-04 ON MERGED MAIN** (`cargo test --workspace`, 0 failed; `cargo clippy --workspace --all-targets -- -D warnings` clean; real exit codes per CLAUDE.md §13.4) + **94 TypeScript** (`pnpm test` / `pnpm build` / `pnpm lint` in `shell/`, 0 failed)
+Last updated: 2026-06-07 (Phase 3B.0 — **`die/orchestrator/` sweep COMPLETE + Codex APPROVE; PRE-MERGE**. Three adversarial Codex rounds converged: **R1 REVISE (7 findings) → R2 REVISE (3 findings) → R3 APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **3 defects found in my own round-1 code and fixed before round 2** (the "fix what you find, review for what you didn't" discipline). 10 fix commits `a095222..3c7183a` on `phase-3b/sweep-orchestrator`, branched from `main@621e574` (the `.gitattributes` LF-pin chore). Full-workspace self-audit GREEN. **Main is untouched at `621e574`** — the `--no-ff` merge + credentialed push + `-d` branch delete are the operator's interactive steps. Prior milestone: 3B.0a (`services/` Wave 1 + SVC-1 + SVC-2) merged at `0efe67c`, tag `v0.4.0`.)
+Current phase: Phase 3B.0 — `die/orchestrator/` sweep **COMPLETE + APPROVED (pre-merge)**. Next unit: the `fortress/` sweep, then Phase 3B.0 close.
+Current task: orchestrator retroactive Codex sweep — done. 10 fix commits ready for `git merge --no-ff phase-3b/sweep-orchestrator` into `main`; the merge + push + `-d` branch delete are the operator's interactive (credentialed) steps. No in-progress implementation.
+Current step: R3 APPROVE (0 findings) on `3c7183a`; full-workspace self-audit green; this PROGRESS chore committed on the sweep branch (rides the merge, like 3B.0a's pre-merge `23b198b`); merge-commit message + diffstat drafted for operator review. **Next after merge: open the `fortress/` sweep.**
+Status: **`die/orchestrator/` sweep COMPLETE + Codex APPROVE** — main clean at `621e574`; ready for the operator-run `--no-ff` merge
+Tests passing: **1,838 Rust verified 2026-06-07 on `phase-3b/sweep-orchestrator`** (`cargo test --workspace`, 0 failed — every `test result:` line ok; `cargo clippy --workspace --all-targets -- -D warnings` clean; real exit codes per CLAUDE.md §13.4) + **94 TypeScript** (`pnpm test` / `pnpm build` / `pnpm lint` in `shell/`, 0 failed)
+
+## Phase 3B.0 — `die/orchestrator/` sweep — COMPLETE + Codex APPROVE (2026-06-07)
+
+**Retroactive Codex adversarial sweep of `die/orchestrator/`, converged inside the 3-round budget.** Applied Task 3A.6's threat model on `phase-3b/sweep-orchestrator` (branched from `main@621e574`). Verdict trajectory **R1 REVISE (7) → R2 REVISE (3) → R3 APPROVE (0)** — the textbook convergence signal (new-attack-surface P1 → subtler-issue-inside-the-fix P2 → clean). Every finding fixed at root with a regression test **proven RED against the pre-fix code** and green after. Full-workspace self-audit on branch tip `3c7183a`: **1,838 Rust / 0 failed**, `cargo clippy --workspace --all-targets -- -D warnings` clean, **94 TypeScript / 0 failed**. Round 2 was SOURCE-ONLY on Codex's host (llama-cpp-sys-2 bindgen could not find libclang); our WSL RED→GREEN runs are the execution proof, and the round-3 prompt pasted the **literal committed test bodies** so the logic-review and the execution-proof are the same artifact.
+
+**"Fix what you find, review for what you didn't" — 3 defects fixed in my own round-1 code *before* round 2**, so Codex's round 2 reviewed already-hardened code and its scrutiny went to the genuine unknowns:
+
+1. **Cap divergence** (`5e9b192`) — R1-04's ingestion caps were enforced at 3 per-entry call sites; centralized to one shared choke-point (`enforce_ingest_byte_cap` / `enforce_concept_caps`), applying the SVC-2 completeness lesson (one shared guard, never per-site copies that drift).
+2. **Confidence excluded from the consent fingerprint** (`b601ef3`) — `Workflow::fingerprint()` omitted `step.confidence`, an *under-coverage* gap (behavior changes at execution, hash stays the same → a mutated-confidence workflow could ride a stale consent token). Enumerated every field read during execution and bound them all.
+3. **NaN/non-finite gate fail-open** (`3b2de18`) — the confidence gate's `confidence < min` admitted `NaN`/`+inf` (both comparisons false → auto-execute without confirmation). Made it fail-closed and rejected invalid confidence at construction.
+
+### Finding ledger (per-finding disposition + fix commit)
+
+| ID | Finding | Disposition | Commit |
+|----|---------|-------------|--------|
+| ORCH-R1-01 | Prompt-injection: fetched web content folded into the LLM prompt with no isolation boundary | **DOCUMENTED** — forward-requirement on `Brain::query` + inline marker; `Brain` is **UNWIRED** (no external caller), so latent not live | `9d8d774` |
+| ORCH-R1-02 | `truncate_context` sliced at a byte index inside a UTF-8 char → panic | **FIXED** — floor to a char boundary (stable `is_char_boundary` walk) | `9d8d774` |
+| ORCH-R1-03 | `search_url` interpolated the query without percent-encoding | **FIXED** — RFC-3986 `percent_encode_query` | `9d8d774` |
+| ORCH-R1-04 | Knowledge ingestion size unbounded → live memory-exhaustion DoS | **FIXED** — `MAX_INGEST_BYTES` (10 MiB) + `MAX_CONCEPTS` / `MAX_CONCEPT_TEXT_LEN`; round-2 centralized to one shared guard | `a095222` + `5e9b192` |
+| ORCH-R1-05 | Workflow auto-executes with no consent; the only gate was a forgeable `f64` confidence | **FIXED** — compile-time-unforgeable `ConsentToken` capability (private field, sole `issue(&Workflow)` ctor, `#[serde(skip)]`) bound to a workflow fingerprint, re-verified **at the execution door** (closes the validate→mutate→execute TOCTOU); structural confidence gate; round-2 confidence-in-fingerprint + fail-closed gate | `9a844de` + `b601ef3` + `3b2de18` |
+| ORCH-R1-06 | SQLite stores are not encrypted at rest | **NOTED-AND-DEFERRED** → the `fortress/` sweep / Fortress Layer 2 (at-rest encryption is a Fortress concern, not a per-store one) — follow-up (c) | — |
+| ORCH-R1-07 | Public-boundary errors leaked caller-supplied ids / filesystem paths into `Display` | **FIXED** — typed `NotFound{entity}` / `Conflict{domain,reason}` / `Validation{domain,field,reason}`; ids/paths to `tracing` only | `553f2c9` |
+| ORCH-R2-01 | The fail-closed gate rejected `NaN` + below-min but still admitted `+inf` / `>1.0` | **FIXED** — gate the whole invalid class: `confidence.is_finite() && (min_confidence..=1.0).contains(&confidence)` | `79097d9` |
+| ORCH-R2-02 | Delimiter-joined fingerprint collided (`("a\0b","c")` ≡ `("a","b\0c")`) → a token for one authorizes a behaviorally-different other | **FIXED** — canonical **length-prefixed** encoding (u64-LE length ++ bytes; count-prefixed collections) → injective | `b5f8ef4` |
+| ORCH-R2-03 | `goals::is_cycle_if_parented` + `knowledge::create_edge` cycle errors leaked caller ids (an R1-07 completeness miss) | **FIXED** — typed `NotFound`/`Conflict`; ids to `tracing`; **exhaustive** read of every store's public-boundary `format!` (not a placeholder-shape grep) | `3c7183a` |
+
+### Accepted residuals (deliberate, recorded — NOT missed)
+
+Re-confirmed during the R2-03 exhaustive store enumeration; intentionally **not** gated because none leaks a cross-tenant resource id, path, or secret:
+
+- **R1-07** — raw `{e}` from a downstream error at non-id/path sites (the typed variant carries static context; the dynamic detail goes to `tracing`, never `Display`).
+- **R2-03** — value-echoes at `TryFrom`/validation (priority / role / enum-discriminant, edge-confidence **value**); the store's own internal data-dir paths; internal schema diagnostics (schema version / SQL-preview / FK-violation counts). These echo caller-supplied **values** or internal config, not resource identity.
+
+### Orchestrator-sweep follow-ups (tracked)
+
+- **(a) Cross-crate egress verification** (new — promoted from this sweep + SVC2-F5). Confirm the destination-consent gate covers **all three** cloud-egress paths — D-Bus inference (`services`), WebSocket (`shell-bridge`), and the orchestrator `Brain` — as one picture. No single crate-scoped sweep sees the whole egress surface, so this is a dedicated cross-crate check (it subsumes verifying the `Brain` forward-requirement once `Brain` is wired, and dovetails with Piece-1b).
+- **(b) Post-v0.4.0 items ride along unchanged** — **SVC2-F3** (destructive-tier confirmation-token hardening) and **Piece-1b** (WebSocket cloud-send caller binding), both in the "Active tracked follow-ups" list below. Unaffected by this sweep.
+- **(c) ORCH-R1-06 → `fortress/` sweep** — at-rest encryption of the orchestrator's SQLite stores belongs to Fortress Layer 2, not a per-store change; carry it into the upcoming `fortress/` sweep / Fortress tracker.
+
+### Orchestrator-sweep commit ledger (`a095222..3c7183a`, branch `phase-3b/sweep-orchestrator`, pre-merge)
+
+`a095222` R1-04 (ingestion DoS) · `553f2c9` R1-07 (id/path leaks) · `9a844de` R1-05 (consent capability + gate) · `9d8d774` R1-02/R1-03/R1-01 (brain hardening) · `b601ef3` R1-05 confidence-in-fingerprint (fix-before-review) · `5e9b192` R1-04 shared-cap centralization (fix-before-review) · `3b2de18` R1-05 fail-closed gate (fix-before-review) · `b5f8ef4` R2-02 (fingerprint length-prefix) · `79097d9` R2-01 (gate invalid class) · `3c7183a` R2-03 (goal/node id leaks + exhaustive enumeration). Branch root `621e574` (`.gitattributes` LF-pin, already on `main`).
 
 ## Merge gate (Phase 3B.0 → main)
 
@@ -40,7 +82,7 @@ Deferred during the SVC-2 sweep; the merge is done, so these are now actionable 
 
 1. **SVC2-F3 — destructive-tier confirmation-token hardening** (post-v0.4, future). Mirror the cloud-send same-caller token model for **Biometric/Hardware-tier** operations: a structural confirmation-token bound to the requesting caller, so a destructive action cannot be completed by a different caller. Codex-ratified as the acceptable v0.4 posture (the dev session bus is not the security boundary; deployment uses caller-identity gating + the shell's confirmation flow) — this is the deployment-grade hardening, not a blocker.
 2. **Piece-1b — WebSocket cloud-send caller binding**. `shell-bridge`'s `Handler::handle_inference_query` calls the shared `Router` directly with no per-connection caller identity, so the same-caller binding (closed on the D-Bus path) does not yet apply on that transport. Thread a **per-connection identity** through the bridge dispatch and apply `enforce_cloud_send` there, mirroring the D-Bus **Piece-1 wiring** in `services/src/inference.rs`. (A spawned-task chip was created during Stage 3.)
-3. **Repo-wide CRLF→LF normalization**. The worktree is CRLF while HEAD is LF (no `.gitattributes`), so `git status` shows nearly every file churned; each SVC-2 commit was kept clean by per-file LF normalization before staging. **Good window NOW** — the feature branch is deleted, so a one-shot `.gitattributes` + `git add --renormalize .` will not collide with in-flight branch work. Best done before opening the next sweep branch.
+3. **Repo-wide CRLF→LF normalization** — ✅ **DONE** (`621e574`, on `main`; the `phase-3b/sweep-orchestrator` branch root). Added `.gitattributes` (`* text=auto eol=lf` + binary guards grounded in the repo's actual asset types — GGUF/ONNX models, shell image assets — with SVG intentionally left as text), ran `git add --renormalize .`, and verified **only** line-ending changes (`git diff --ignore-cr-at-eol` empty) before committing. Because the orchestrator sweep branched from this commit, every sweep diff is LF-clean — no per-file pre-stage normalization was needed this time.
 
 ## Completed phases
 

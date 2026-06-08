@@ -369,15 +369,44 @@ impl AuditLog {
 }
 
 /// Compute SHA-256 hash of an audit entry (for chain linking).
+///
+/// The encoding is **canonical and injective**, applying both hash-discipline
+/// lessons the orchestrator sweep produced:
+///
+/// - **Full field coverage.** *Every* security-relevant field of [`AuditEntry`]
+///   is hashed — `action_id`, `timestamp`, `module`, `action`, `target`,
+///   `permission_tier`, `result`, and the previous-entry link `proof_hash`.
+///   Omitting any of these would let it be tampered without breaking the chain
+///   (e.g. an audit that records `Denied` must not be silently editable to
+///   `Allowed`, nor a `Biometric` tier downgraded to `Autonomous`).
+/// - **Length-prefixed (injective) encoding.** Each variable-length field is
+///   prefixed with its `u64`-LE byte length via [`hash_field`], so distinct
+///   entries can never alias by shifting a field boundary (the ORCH-R2-02
+///   delimiter-collision class). Fixed-width fields (`timestamp`, the two enum
+///   discriminants) need no prefix.
 fn hash_entry(entry: &AuditEntry) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hasher.update(entry.action_id.as_bytes());
+    hash_field(&mut hasher, entry.action_id.as_bytes());
     hasher.update(entry.timestamp.to_le_bytes());
-    hasher.update(entry.module.as_bytes());
-    hasher.update(entry.action.as_bytes());
-    hasher.update(entry.target.as_bytes());
-    hasher.update(&entry.proof_hash);
+    hash_field(&mut hasher, entry.module.as_bytes());
+    hash_field(&mut hasher, entry.action.as_bytes());
+    hash_field(&mut hasher, entry.target.as_bytes());
+    hasher.update([entry.permission_tier as u8]);
+    hasher.update([match entry.result {
+        AuditResult::Allowed => 0u8,
+        AuditResult::Denied => 1,
+        AuditResult::Pending => 2,
+    }]);
+    hash_field(&mut hasher, &entry.proof_hash);
     hasher.finalize().to_vec()
+}
+
+/// Length-prefix a variable-length field into the running hash
+/// (`u64`-LE byte length, then the bytes), making the entry encoding injective
+/// so no field-boundary shift can produce a colliding hash.
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// Serialization helpers using TOML format.
@@ -497,5 +526,89 @@ mod tests {
             assert_eq!(log.len(), 2);
             assert!(log.verify_chain().is_ok());
         }
+    }
+
+    #[test]
+    fn tampering_result_is_detected_audit_coverage() {
+        let mut log = AuditLog::in_memory();
+        // entry[0] records a DENIED action — the security-relevant fact.
+        log.log_action(
+            "ssi",
+            "install",
+            "evil-app",
+            PermissionTier::Confirm,
+            AuditResult::Denied,
+        );
+        // A subsequent entry makes entry[0] covered by entry[1].proof_hash.
+        log.log_action(
+            "die",
+            "read",
+            "/doc",
+            PermissionTier::Autonomous,
+            AuditResult::Allowed,
+        );
+        assert!(log.verify_chain().is_ok(), "untampered chain must verify");
+
+        // Tamper: rewrite the denied action to look allowed.
+        log.entries[0].result = AuditResult::Allowed;
+
+        // RED pre-fix: `result` was not in the hash, so hash_entry(entry[0]) is
+        // unchanged and the chain still verifies — the tamper survives.
+        assert!(
+            log.verify_chain().is_err(),
+            "flipping result Denied->Allowed must break the hash chain"
+        );
+    }
+
+    #[test]
+    fn tampering_tier_is_detected_audit_coverage() {
+        let mut log = AuditLog::in_memory();
+        log.log_action(
+            "die",
+            "financial_transfer",
+            "$1M",
+            PermissionTier::Biometric,
+            AuditResult::Allowed,
+        );
+        log.log_action(
+            "die",
+            "read",
+            "/doc",
+            PermissionTier::Autonomous,
+            AuditResult::Allowed,
+        );
+        assert!(log.verify_chain().is_ok());
+
+        // Tamper: downgrade the recorded tier.
+        log.entries[0].permission_tier = PermissionTier::Autonomous;
+
+        // RED pre-fix: `permission_tier` was not in the hash.
+        assert!(
+            log.verify_chain().is_err(),
+            "flipping permission_tier must break the hash chain"
+        );
+    }
+
+    #[test]
+    fn field_boundary_shift_does_not_collide_audit() {
+        // ORCH-R2-02 class: without length-prefixing, module||action||target are
+        // concatenated, so ("ab","c") and ("a","bc") hash identically and one
+        // entry could be rewritten as the other without breaking the chain.
+        let mk = |module: &str, action: &str| AuditEntry {
+            action_id: "x".to_string(),
+            timestamp: 0,
+            module: module.to_string(),
+            action: action.to_string(),
+            target: "t".to_string(),
+            permission_tier: PermissionTier::Autonomous,
+            result: AuditResult::Allowed,
+            proof_hash: vec![0u8; 32],
+        };
+        // RED pre-fix: the two encodings collide.
+        assert_ne!(
+            hash_entry(&mk("ab", "c")),
+            hash_entry(&mk("a", "bc")),
+            "field-boundary-shifted entries must not produce the same hash"
+        );
     }
 }

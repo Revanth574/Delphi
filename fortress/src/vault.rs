@@ -8,7 +8,9 @@
 //!
 //! # Security Model
 //!
-//! - Key derivation: Argon2id with 64 MB memory cost, 3 iterations
+//! - Key derivation: Argon2id — 64 MiB memory, 3 iterations, parallelism 1
+//!   (current OWASP Password Storage recommendation, aligned with RFC 9106 §4),
+//!   pinned explicitly rather than the weaker version-dependent `Params::DEFAULT`
 //! - Encryption: AES-256-GCM with random 96-bit nonces
 //! - Storage: each credential is independently encrypted (no bulk decrypt)
 //! - In-memory: keys are zeroized when the vault locks
@@ -18,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, AeadCore, Key, Nonce};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -424,13 +426,36 @@ impl Vault {
     }
 }
 
-/// Derive an AES-256 key from a passphrase using Argon2id.
+/// Argon2id memory cost in KiB (64 MiB) for the vault master-key KDF.
+///
+/// 64 MiB / 3 iterations / parallelism 1 is the current OWASP Password Storage
+/// recommendation for interactive single-password verification (~100 ms on a
+/// modern core), aligned with RFC 9106 §4's memory-constrained profile (the RFC
+/// uses p=4 for ASIC resistance; OWASP uses p=1 for interactive use — the right
+/// fit for a local vault unlock). Pinned explicitly so the KDF strength does not
+/// silently track the argon2 crate's version-dependent `Params::DEFAULT` (the
+/// weaker legacy profile) — the same "don't rely on a library default for a
+/// security parameter" discipline as the SQLite `busy_timeout` policy.
+const ARGON2_M_COST_KIB: u32 = 65_536;
+/// Argon2id iterations (time cost) for the vault master-key KDF.
+const ARGON2_T_COST: u32 = 3;
+/// Argon2id degree of parallelism for the vault master-key KDF.
+const ARGON2_P_COST: u32 = 1;
+
+/// Build the Argon2id hasher with the pinned vault KDF parameters.
+fn vault_argon2() -> Result<Argon2<'static>, FortressError> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| FortressError::Encryption(format!("invalid Argon2 params: {e}")))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+/// Derive an AES-256 key from a passphrase using Argon2id (pinned parameters).
 fn derive_key(
     passphrase: &str,
     salt: &[u8; SALT_LEN],
 ) -> Result<Key<Aes256Gcm>, FortressError> {
     let mut key_bytes = [0u8; 32];
-    Argon2::default()
+    vault_argon2()?
         .hash_password_into(passphrase.as_bytes(), salt, &mut key_bytes)
         .map_err(|e| FortressError::Encryption(format!("key derivation failed: {e}")))?;
     Ok(*Key::<Aes256Gcm>::from_slice(&key_bytes))
@@ -564,5 +589,18 @@ mod tests {
         let encoded = hex_encode(data);
         let decoded = hex_decode(&encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn vault_argon2_uses_pinned_owasp_rfc9106_profile() {
+        // Pin the currently-recommended Argon2id profile (OWASP Password Storage
+        // / RFC 9106 §4 memory-constrained: 64 MiB, t=3, p=1) explicitly, not the
+        // weaker version-dependent Params::DEFAULT. A change that weakens the KDF
+        // must fail here. Config-correctness, not a behavioral RED.
+        assert_eq!(ARGON2_M_COST_KIB, 65_536, "memory cost must be 64 MiB");
+        assert_eq!(ARGON2_T_COST, 3, "iterations must be 3");
+        assert_eq!(ARGON2_P_COST, 1, "parallelism must be 1");
+        // The pinned values must build a valid Argon2id hasher (crate constraints).
+        vault_argon2().expect("pinned params must be valid for the argon2 crate");
     }
 }

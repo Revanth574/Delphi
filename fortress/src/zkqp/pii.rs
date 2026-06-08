@@ -445,22 +445,23 @@ impl PiiDetector {
         matches
     }
 
-    /// Detect credit card numbers (16 digits, optionally grouped).
+    /// Detect credit card numbers (13-19 digits in space/dash-separated groups).
     fn detect_credit_cards(&self, text: &str) -> Vec<PiiMatch> {
         let mut matches = Vec::new();
 
-        // Look for 4 groups of 4 digits separated by spaces or dashes.
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let joined = words.join(" ");
-
-        // Simple: find sequences of 13-19 digits (possibly with separators).
-        let chars: Vec<char> = joined.chars().collect();
+        // Scan the ORIGINAL text, not a whitespace-collapsed copy: the reported
+        // value and byte offsets MUST line up with the input. The old code
+        // scanned `text.split_whitespace().join(" ")` and emitted char-indices
+        // into THAT copy as byte offsets, so the value did not substring-match
+        // the original and sanitize() could not redact the card.
+        let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
 
         while i < chars.len() {
             if chars[i].is_ascii_digit() {
                 let start = i;
                 let mut digit_count = 0;
+                let mut last_digit = i + 1; // exclusive char-end of the last digit
                 let mut j = i;
 
                 while j < chars.len()
@@ -468,17 +469,25 @@ impl PiiDetector {
                 {
                     if chars[j].is_ascii_digit() {
                         digit_count += 1;
+                        last_digit = j + 1;
                     }
                     j += 1;
                 }
 
                 if (13..=19).contains(&digit_count) {
-                    let value: String = chars[start..j].iter().collect();
+                    // Span [start, last_digit): trim trailing separators so the
+                    // value ends on a digit. Map char indices to byte offsets so
+                    // the match is correct even with a multibyte prefix.
+                    let byte_start = text.char_indices().nth(start).map_or(0, |(b, _)| b);
+                    let byte_end = text
+                        .char_indices()
+                        .nth(last_digit)
+                        .map_or(text.len(), |(b, _)| b);
                     matches.push(PiiMatch {
                         pii_type: PiiType::CreditCard,
-                        value,
-                        start,
-                        end: j,
+                        value: text[byte_start..byte_end].to_string(),
+                        start: byte_start,
+                        end: byte_end,
                     });
                     i = j;
                     continue;
@@ -687,6 +696,32 @@ mod tests {
                 .iter()
                 .any(|m| m.pii_type == PiiType::Email && m.value == "user@example.com"),
             "email after a multibyte separator must be detected without panicking"
+        );
+    }
+
+    #[test]
+    fn credit_card_value_is_a_substring_of_the_original_zkqp() {
+        let detector = PiiDetector::new();
+        // Irregular (double) spacing between groups. RED pre-fix: detection ran
+        // on a whitespace-collapsed copy (words.join(" ")), so the reported
+        // value/offsets did not line up with the original input -- the value was
+        // not a substring of `input`, so QuerySanitizer::sanitize could not
+        // redact it and the card leaked into the cloud-bound text.
+        let input = "pay 4111  1111  1111  1111 now";
+        let cc = detector
+            .detect(input)
+            .into_iter()
+            .find(|m| m.pii_type == PiiType::CreditCard)
+            .expect("a credit card must be detected");
+        assert_eq!(
+            cc.value.as_str(),
+            &input[cc.start..cc.end],
+            "value must equal the original-text slice at [start, end)"
+        );
+        assert!(
+            input.contains(cc.value.as_str()),
+            "detected value must be a substring of the original so sanitize can redact it: {:?}",
+            cc.value
         );
     }
 }

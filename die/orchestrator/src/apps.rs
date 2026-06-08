@@ -60,6 +60,19 @@ pub struct WorkflowStep {
     pub depends_on: Vec<String>,
     /// Context keys this step produces (available to later steps).
     pub produces: Vec<String>,
+    /// SSI-manifest capability confidence in `[0.0, 1.0]`. Below
+    /// [`MIN_AUTO_CONFIDENCE`] the step is refused inside
+    /// [`AppController::execute_step`] pending explicit user confirmation
+    /// (ORCH-R1-05 — the gate is structural at dispatch, not advisory).
+    /// Defaults to `1.0` (fully trusted) when absent on the wire.
+    #[serde(default = "default_step_confidence")]
+    pub confidence: f64,
+}
+
+/// Serde default for [`WorkflowStep::confidence`] — fully trusted when a step
+/// arrives without the field (forward/backward wire compatibility).
+fn default_step_confidence() -> f64 {
+    1.0
 }
 
 impl WorkflowStep {
@@ -82,6 +95,7 @@ impl WorkflowStep {
             params: HashMap::new(),
             depends_on: Vec::new(),
             produces: Vec::new(),
+            confidence: 1.0,
         }
     }
 
@@ -135,6 +149,37 @@ impl WorkflowStep {
         self.produces.push(key.to_string());
         self
     }
+
+    /// Set the SSI-manifest capability confidence for this step.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use die_orchestrator::apps::WorkflowStep;
+    ///
+    /// let step = WorkflowStep::new("s1", "org.app", "risky").with_confidence(0.4).unwrap();
+    /// assert!((step.confidence - 0.4).abs() < f64::EPSILON);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchestratorError::Validation`] if `confidence` is NaN or
+    /// outside `[0.0, 1.0]` (ORCH-R1-05 round-2 depth). A caller passing such a
+    /// value has a bug; rejecting surfaces it rather than silently clamping and
+    /// hiding it. The `execute_step` gate is independently fail-closed, so this
+    /// is defense in depth, not the security boundary — the pub `confidence`
+    /// field can still be written directly.
+    pub fn with_confidence(self, confidence: f64) -> Result<Self, OrchestratorError> {
+        if !(0.0..=1.0).contains(&confidence) {
+            // NaN and ±inf both fail the range check (NaN compares false).
+            return Err(OrchestratorError::Validation {
+                domain: "workflow",
+                field: "confidence",
+                reason: "must be a finite value in [0.0, 1.0]",
+            });
+        }
+        Ok(Self { confidence, ..self })
+    }
 }
 
 /// A multi-app workflow definition.
@@ -158,8 +203,16 @@ pub struct Workflow {
     pub name: String,
     /// Ordered list of steps.
     pub steps: Vec<WorkflowStep>,
-    /// Whether user consent has been obtained.
-    pub user_consented: bool,
+    /// Unforgeable proof that the user consented to THIS workflow
+    /// (ORCH-R1-05). `None` until a [`ConsentToken`] minted by
+    /// [`ConsentToken::issue`] for this exact workflow is attached via
+    /// [`Workflow::with_consent`]. `#[serde(skip)]` makes consent an
+    /// **in-process** capability: it never crosses the wire, so a deserialized
+    /// workflow is always unconsented and a token cannot be forged by sending
+    /// one (the confirmation *signal* crosses the bus; the capability is minted
+    /// locally — mirrors SVC-1 SanitizedPrompt / SVC-8 ValidatedIngestionPath).
+    #[serde(skip)]
+    pub consent: Option<ConsentToken>,
 }
 
 impl Workflow {
@@ -172,14 +225,14 @@ impl Workflow {
     ///
     /// let wf = Workflow::new("my-workflow");
     /// assert!(wf.steps.is_empty());
-    /// assert!(!wf.user_consented);
+    /// assert!(wf.consent.is_none());
     /// ```
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
             steps: Vec::new(),
-            user_consented: false,
+            consent: None,
         }
     }
 
@@ -200,20 +253,153 @@ impl Workflow {
         self
     }
 
-    /// Mark the workflow as user-consented.
+    /// Attach an unforgeable [`ConsentToken`] proving the user consented to
+    /// this workflow (ORCH-R1-05). The token MUST have been minted by
+    /// [`ConsentToken::issue`] for this exact workflow after a verified
+    /// confirmation; a token bound to a different (or later-mutated) workflow
+    /// is rejected at execution by the fingerprint check, so granting consent
+    /// then mutating the steps cannot smuggle unconsented actions past the gate.
     ///
     /// # Examples
     ///
     /// ```
-    /// use die_orchestrator::apps::Workflow;
+    /// use die_orchestrator::apps::{ConsentToken, Workflow, WorkflowStep};
     ///
-    /// let wf = Workflow::new("test").with_consent();
-    /// assert!(wf.user_consented);
+    /// let wf = Workflow::new("test").with_step(WorkflowStep::new("s1", "org.app", "do"));
+    /// let token = ConsentToken::issue(&wf);
+    /// let wf = wf.with_consent(token);
+    /// assert!(wf.consent.is_some());
     /// ```
     #[must_use]
-    pub fn with_consent(mut self) -> Self {
-        self.user_consented = true;
+    pub fn with_consent(mut self, token: ConsentToken) -> Self {
+        self.consent = Some(token);
         self
+    }
+
+    /// Stable fingerprint of the workflow's identity (name + ordered steps and
+    /// their actions), used to bind a [`ConsentToken`] to this exact workflow
+    /// (ORCH-R1-05). Canonical and collision-resistant: every field is
+    /// LENGTH-PREFIXED and every collection count-prefixed (ORCH-R2-02), so no
+    /// two distinct workflows hash alike; map params are in sorted-key order.
+    /// Excludes the `consent` field itself (so attaching a token does not change
+    /// the hash it is bound to). INCLUDES per-step `confidence`: it is read by
+    /// the `execute_step` confidence gate, so it is execution-affecting and must
+    /// be bound — otherwise raising a step's confidence after consent would
+    /// bypass the gate without invalidating the token (ORCH-R1-05 round-2). The
+    /// name, step Vec order, and dependency/produces order are over-included
+    /// (a reorder forces a conservative re-consent) — safe, since the binding
+    /// must never be LESS sensitive than execution behavior, only more.
+    #[must_use]
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        // ORCH-R2-02: canonical LENGTH-PREFIXED encoding. Every variable-length
+        // field is emitted via `fp_field` (u64-LE byte length ++ bytes) and every
+        // collection is count-prefixed, so the byte stream is unambiguous — no
+        // two distinct workflows can produce the same bytes. The delimiter
+        // joining this replaced let ("a\0b","c") vs ("a","b\0c") and {"a":"b=c"}
+        // vs {"a=b":"c"} collide (the git `blob <len>\0<content>` lesson).
+        fp_field(&mut h, self.name.as_bytes());
+        h.update((self.steps.len() as u64).to_le_bytes());
+        for step in &self.steps {
+            fp_field(&mut h, step.step_id.as_bytes());
+            fp_field(&mut h, step.app_id.as_bytes());
+            fp_field(&mut h, step.capability.as_bytes());
+            // Per-step confidence is execution-affecting (the execute_step gate
+            // reads it) so it MUST be bound (ORCH-R1-05 round-2). Fixed 8 bytes.
+            h.update(step.confidence.to_bits().to_le_bytes());
+            let mut keys: Vec<&String> = step.params.keys().collect();
+            keys.sort();
+            h.update((keys.len() as u64).to_le_bytes());
+            for k in keys {
+                fp_field(&mut h, k.as_bytes());
+                fp_field(&mut h, step.params[k].as_bytes());
+            }
+            h.update((step.depends_on.len() as u64).to_le_bytes());
+            for d in &step.depends_on {
+                fp_field(&mut h, d.as_bytes());
+            }
+            h.update((step.produces.len() as u64).to_le_bytes());
+            for p in &step.produces {
+                fp_field(&mut h, p.as_bytes());
+            }
+        }
+        h.finalize().into()
+    }
+}
+
+/// Length-prefix a variable-length field into the workflow-fingerprint hasher
+/// (ORCH-R2-02): a u64-LE byte length followed by the bytes, so a field's
+/// CONTENT can never be confused with a delimiter and no two distinct workflows
+/// can produce the same byte stream (the git `blob <len>\0<content>` lesson).
+fn fp_field(h: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+    h.update((bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// Unforgeable proof that the user consented to a specific [`Workflow`]
+/// (ORCH-R1-05). The only constructor is [`ConsentToken::issue`]; the single
+/// private field has no public initializer, and the type intentionally has no
+/// `Default`, `Serialize`, or `Deserialize`, so a token cannot be fabricated by
+/// a struct literal, defaulted into existence, or forged by deserializing
+/// attacker-supplied bytes. It is an **in-process** capability: the verified
+/// confirmation (Confirm/Biometric tier) happens at the shell/services
+/// boundary, and `issue` is the single local mint point invoked from that path.
+/// Possessing a token proves consent was minted through the sanctioned path,
+/// and the embedded fingerprint proves it was for THIS workflow — the same
+/// shape as SVC-1 `ConfirmationToken` (bound to the sanitized prompt) and
+/// SVC-8 `ValidatedIngestionPath`.
+///
+/// # Forward requirement (discharged by this type)
+///
+/// When cross-app dispatch is wired to real execution, `issue` MUST be called
+/// only after the user confirms the workflow in the UI. The capability is
+/// structurally in place now, so the wiring inherits an armed gate rather than
+/// a deferred to-do.
+///
+/// # Forgery is a compile error
+///
+/// ```compile_fail
+/// use die_orchestrator::apps::ConsentToken;
+/// // The single field is private and there is no public constructor besides
+/// // `issue` (and no Default/Deserialize), so a struct literal cannot compile:
+/// let _forged = ConsentToken { workflow_fingerprint: [0u8; 32] };
+/// ```
+#[derive(Debug, Clone)]
+pub struct ConsentToken {
+    /// Fingerprint of the workflow this token authorizes. Private — set only
+    /// by [`ConsentToken::issue`].
+    workflow_fingerprint: [u8; 32],
+}
+
+impl ConsentToken {
+    /// Mint a consent token bound to `workflow`. THE verified-path mint
+    /// (ORCH-R1-05): in production this is called only after the user confirms
+    /// the workflow at the shell/services confirmation boundary.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use die_orchestrator::apps::{ConsentToken, Workflow, WorkflowStep};
+    ///
+    /// let wf = Workflow::new("t").with_step(WorkflowStep::new("s1", "org.app", "do"));
+    /// let token = ConsentToken::issue(&wf);
+    /// assert!(token.authorizes(&wf));
+    /// ```
+    #[must_use]
+    pub fn issue(workflow: &Workflow) -> Self {
+        Self {
+            workflow_fingerprint: workflow.fingerprint(),
+        }
+    }
+
+    /// Whether this token authorizes `workflow` — true only if `workflow`'s
+    /// current fingerprint matches the one captured at [`issue`](Self::issue)
+    /// time. A workflow mutated after consent was granted no longer matches.
+    #[must_use]
+    pub fn authorizes(&self, workflow: &Workflow) -> bool {
+        self.workflow_fingerprint == workflow.fingerprint()
     }
 }
 
@@ -499,20 +685,26 @@ impl AppController {
     /// # Examples
     ///
     /// ```
-    /// use die_orchestrator::apps::{AppController, Workflow, WorkflowStep};
+    /// use die_orchestrator::apps::{AppController, ConsentToken, Workflow, WorkflowStep};
     ///
     /// let ctrl = AppController::new();
     /// let wf = Workflow::new("test")
-    ///     .with_step(WorkflowStep::new("s1", "org.app", "do"))
-    ///     .with_consent();
+    ///     .with_step(WorkflowStep::new("s1", "org.app", "do"));
+    /// let token = ConsentToken::issue(&wf);
+    /// let wf = wf.with_consent(token);
     /// assert!(ctrl.validate(&wf).is_ok());
     /// ```
     pub fn validate(&self, workflow: &Workflow) -> Result<(), OrchestratorError> {
-        // Must have user consent.
-        if !workflow.user_consented {
-            return Err(OrchestratorError::Planning(
-                "workflow requires user consent before execution".to_string(),
-            ));
+        // ORCH-R1-05: must carry a consent capability (presence check). The
+        // workflow-BINDING (token bound to THIS workflow's fingerprint) is
+        // enforced at the execution door in `execute` — the door that performs
+        // the action — so a validate->mutate->execute substitution cannot slip
+        // a different workflow past consent granted for the original.
+        if workflow.consent.is_none() {
+            return Err(OrchestratorError::Conflict {
+                domain: "workflow",
+                reason: "workflow requires user consent before execution",
+            });
         }
 
         if workflow.steps.is_empty() {
@@ -586,7 +778,7 @@ impl AppController {
     /// # Examples
     ///
     /// ```
-    /// use die_orchestrator::apps::{AppController, Workflow, WorkflowStep};
+    /// use die_orchestrator::apps::{AppController, ConsentToken, Workflow, WorkflowStep};
     ///
     /// let ctrl = AppController::new();
     /// let wf = Workflow::new("test")
@@ -596,8 +788,9 @@ impl AppController {
     ///         WorkflowStep::new("s3", "org.c", "merge")
     ///             .depends_on("s1")
     ///             .depends_on("s2"),
-    ///     )
-    ///     .with_consent();
+    ///     );
+    /// let token = ConsentToken::issue(&wf);
+    /// let wf = wf.with_consent(token);
     ///
     /// let levels = ctrl.resolve_order(&wf).unwrap();
     /// // Level 0: s1, s2 (parallel); Level 1: s3
@@ -627,7 +820,14 @@ impl AppController {
     /// ```
     #[must_use]
     pub fn needs_confirmation(&self, confidence: f64) -> bool {
-        confidence < self.min_confidence
+        // ORCH-R1-05 round-2 / ORCH-R2-01: FAIL-CLOSED over the whole invalid
+        // CLASS. Auto-execution requires a finite confidence in [min, 1.0];
+        // confirmation is required for ANYTHING else — NaN, ±inf, and
+        // out-of-range (e.g. 2.0). The old `confidence < min` let NaN AND
+        // +inf/>1.0 through (those comparisons are false), a fail-OPEN; gating
+        // the whole class (not just the NaN that surfaced) is the airtight
+        // boundary.
+        !(confidence.is_finite() && (self.min_confidence..=1.0).contains(&confidence))
     }
 
     /// Execute a validated workflow step (simulated — real execution
@@ -669,6 +869,24 @@ impl AppController {
             capability = %step.capability,
             "executing workflow step"
         );
+
+        // ORCH-R1-05: the confidence gate is STRUCTURAL at dispatch — a
+        // low-confidence capability is refused HERE, not merely flagged by the
+        // advisory needs_confirmation() a caller might skip (the SVC-5
+        // unarmed-gate lesson). Confirmation/escalation is the caller's job
+        // before retrying; execute_step never silently runs a low-confidence step.
+        if self.needs_confirmation(step.confidence) {
+            tracing::debug!(
+                step_id = %step.step_id,
+                confidence = step.confidence,
+                threshold = self.min_confidence,
+                "step below auto-confidence threshold; refused pending confirmation"
+            );
+            return Err(OrchestratorError::Conflict {
+                domain: "workflow",
+                reason: "step confidence below auto-execution threshold; requires confirmation",
+            });
+        }
 
         // Resolve parameter references from context.
         let resolved_params = resolve_params(&step.params, context);
@@ -713,18 +931,34 @@ impl AppController {
     /// # Examples
     ///
     /// ```
-    /// use die_orchestrator::apps::{AppController, Workflow, WorkflowStep};
+    /// use die_orchestrator::apps::{AppController, ConsentToken, Workflow, WorkflowStep};
     ///
     /// let ctrl = AppController::new();
     /// let wf = Workflow::new("simple")
-    ///     .with_step(WorkflowStep::new("s1", "org.app", "do"))
-    ///     .with_consent();
+    ///     .with_step(WorkflowStep::new("s1", "org.app", "do"));
+    /// let token = ConsentToken::issue(&wf);
+    /// let wf = wf.with_consent(token);
     ///
     /// let result = ctrl.execute(&wf).unwrap();
     /// assert!(result.all_succeeded());
     /// ```
     pub fn execute(&self, workflow: &Workflow) -> Result<WorkflowResult, OrchestratorError> {
         let levels = self.resolve_order(workflow)?;
+        // ORCH-R1-05: re-verify the consent binding AT THE EXECUTION DOOR —
+        // against the workflow actually being executed, not only in validate().
+        // This closes the validate->mutate->execute substitution: a token minted
+        // for an earlier workflow shape does not authorize a mutated one. The
+        // door that performs the action is where the check must fire (same
+        // principle as SVC-1-R1-1-01's live-path closure).
+        match &workflow.consent {
+            Some(token) if token.authorizes(workflow) => {}
+            _ => {
+                return Err(OrchestratorError::Conflict {
+                    domain: "workflow",
+                    reason: "consent does not authorize this workflow",
+                });
+            }
+        }
         let mut all_results: Vec<StepResult> = Vec::new();
         let mut context: HashMap<String, String> = HashMap::new();
 
@@ -1003,6 +1237,186 @@ pub fn compute_execution_levels(steps: &[WorkflowStep]) -> Vec<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// Test helper: mint a consent token bound to `wf` and attach it
+    /// (ORCH-R1-05). Simulates the in-process post-confirmation mint —
+    /// production calls `ConsentToken::issue` AFTER the verified UI confirmation.
+    fn consented(wf: Workflow) -> Workflow {
+        let token = ConsentToken::issue(&wf);
+        wf.with_consent(token)
+    }
+
+    // ── ORCH-R1-05: consent capability + structural confidence gate ──
+    #[test]
+    fn execute_step_refuses_low_confidence_orch_r1_05() {
+        let ctrl = AppController::new();
+        let step = WorkflowStep::new("s1", "org.app", "risky")
+            .with_confidence(0.4)
+            .unwrap();
+        let err = ctrl.execute_step(&step, &HashMap::new()).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+            "low-confidence step must be refused inside execute_step, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn execute_step_allows_high_confidence_orch_r1_05() {
+        let ctrl = AppController::new();
+        let step = WorkflowStep::new("s1", "org.app", "safe")
+            .with_confidence(0.95)
+            .unwrap();
+        assert!(ctrl.execute_step(&step, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn execute_step_gates_nan_confidence_orch_r1_05() {
+        // ORCH-R1-05 round-2 (gate fail-closed): a NaN confidence must be GATED,
+        // not executed. RED pre-fix: `NaN < 0.7` is false, so the `<` gate let it
+        // through — a fail-OPEN. confidence is set via the direct pub field
+        // because with_confidence now rejects NaN.
+        let ctrl = AppController::new();
+        let mut step = WorkflowStep::new("s1", "org.app", "do");
+        step.confidence = f64::NAN;
+        let err = ctrl.execute_step(&step, &HashMap::new()).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+            "a NaN-confidence step must be gated (fail-closed), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_non_finite_and_out_of_range_confidence_orch_r2_01() {
+        // ORCH-R2-01: the gate must reject the whole INVALID CLASS (non-finite
+        // OR outside [min, 1.0]), not just the NaN value that surfaced. RED
+        // pre-fix: +inf and 2.0 passed (inf<0.7 and 2.0<0.7 are false, neither is
+        // NaN). confidence is set via the direct field — the with_confidence /
+        // serde bypass path the gate must catch as the airtight boundary.
+        let ctrl = AppController::new();
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, 2.0_f64, -0.1_f64, f64::NAN] {
+            let mut step = WorkflowStep::new("s", "app", "do");
+            step.confidence = bad;
+            let err = ctrl.execute_step(&step, &HashMap::new()).unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+                "invalid confidence {bad} must be gated, got {err:?}"
+            );
+        }
+        // A valid high confidence still auto-executes.
+        let mut ok = WorkflowStep::new("s", "app", "do");
+        ok.confidence = 0.95;
+        assert!(ctrl.execute_step(&ok, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn with_confidence_rejects_nan_and_out_of_range_orch_r1_05() {
+        // Defense in depth: with_confidence REJECTS (does not silently clamp)
+        // NaN / non-finite / out-of-[0,1], surfacing a caller's bug at
+        // construction rather than hiding it as a plausible value.
+        let base = || WorkflowStep::new("s1", "org.app", "do");
+        assert!(base().with_confidence(f64::NAN).is_err());
+        assert!(base().with_confidence(f64::INFINITY).is_err());
+        assert!(base().with_confidence(2.0).is_err());
+        assert!(base().with_confidence(-0.1).is_err());
+        assert!(base().with_confidence(0.0).is_ok());
+        assert!(base().with_confidence(1.0).is_ok());
+        assert!(base().with_confidence(0.5).is_ok());
+    }
+
+    #[test]
+    fn consent_token_does_not_authorize_mutated_workflow_orch_r1_05() {
+        let wf = Workflow::new("t").with_step(WorkflowStep::new("s1", "org.app", "do"));
+        let token = ConsentToken::issue(&wf);
+        let mutated = wf
+            .with_consent(token)
+            .with_step(WorkflowStep::new("s2", "org.evil", "exfiltrate"));
+        assert!(
+            !mutated.consent.as_ref().unwrap().authorizes(&mutated),
+            "a token issued for the pre-mutation workflow must not authorize the mutated one"
+        );
+    }
+
+    #[test]
+    fn fingerprint_no_collision_on_delimiter_shifted_fields_orch_r2_02() {
+        // ORCH-R2-02: delimiter joining made ("a\0b","c") and ("a","b\0c") hash
+        // identically (both -> a\0b\0c). Length-prefixing distinguishes them, so
+        // a token for one cannot authorize the behaviorally-different other.
+        // RED pre-fix: the fingerprints collide and the token authorizes.
+        let wf1 = Workflow::new("w").with_step(WorkflowStep::new("a\0b", "c", "cap"));
+        let wf2 = Workflow::new("w").with_step(WorkflowStep::new("a", "b\0c", "cap"));
+        assert_ne!(
+            wf1.fingerprint(),
+            wf2.fingerprint(),
+            "delimiter-shifted step_id/app_id must not collide"
+        );
+        let token = ConsentToken::issue(&wf1);
+        assert!(
+            !token.authorizes(&wf2),
+            "consent for wf1 must not authorize the colliding wf2"
+        );
+    }
+
+    #[test]
+    fn fingerprint_no_collision_on_param_delimiter_orch_r2_02() {
+        // ORCH-R2-02: {"a":"b=c"} and {"a=b":"c"} both joined to a=b=c\0 under
+        // delimiter hashing. Length-prefixing distinguishes them.
+        let wf1 = Workflow::new("w")
+            .with_step(WorkflowStep::new("s", "app", "cap").with_param("a", "b=c"));
+        let wf2 = Workflow::new("w")
+            .with_step(WorkflowStep::new("s", "app", "cap").with_param("a=b", "c"));
+        assert_ne!(
+            wf1.fingerprint(),
+            wf2.fingerprint(),
+            "param key/value delimiter collision must not occur"
+        );
+        let token = ConsentToken::issue(&wf1);
+        assert!(
+            !token.authorizes(&wf2),
+            "consent for one param map must not authorize the colliding other"
+        );
+    }
+
+    #[test]
+    fn execute_rejects_consent_for_mutated_workflow_at_the_door_orch_r1_05() {
+        // Binding enforced AT THE EXECUTION DOOR, not only validate: issue for
+        // X, mutate to Y, execute(Y) -> rejected.
+        let ctrl = AppController::new();
+        let wf = Workflow::new("t").with_step(WorkflowStep::new("s1", "org.app", "do"));
+        let token = ConsentToken::issue(&wf);
+        let mutated = wf
+            .with_consent(token)
+            .with_step(WorkflowStep::new("s2", "org.evil", "exfiltrate"));
+        let err = ctrl.execute(&mutated).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+            "execute must reject consent bound to a different (pre-mutation) workflow, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn execute_rejects_confidence_raised_after_consent_orch_r1_05() {
+        // ORCH-R1-05 round-2 (fingerprint behavioral coverage): per-step
+        // confidence is execution-affecting (the execute_step gate reads it), so
+        // RAISING it after consent must invalidate the binding. RED pre-fix:
+        // confidence was excluded from the fingerprint, so the mutated workflow
+        // hashed identically, the execution door passed, and the now-high-
+        // confidence step executed.
+        let ctrl = AppController::new();
+        let wf = Workflow::new("t").with_step(
+            WorkflowStep::new("s1", "org.app", "do")
+                .with_confidence(0.5)
+                .unwrap(),
+        );
+        let token = ConsentToken::issue(&wf);
+        let mut consented_wf = wf.with_consent(token);
+        // Raise the step's confidence AFTER consent was minted.
+        consented_wf.steps[0].confidence = 0.95;
+        let err = ctrl.execute(&consented_wf).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "workflow", .. }),
+            "raising a step's confidence post-consent must invalidate the token, got {err:?}"
+        );
+    }
+
     #[test]
     fn workflow_step_creation() {
         let step = WorkflowStep::new("s1", "org.app", "file.open");
@@ -1042,11 +1456,11 @@ mod tests {
     #[test]
     fn workflow_creation_and_consent() {
         let wf = Workflow::new("test-workflow");
-        assert!(!wf.user_consented);
+        assert!(wf.consent.is_none());
         assert!(wf.steps.is_empty());
 
-        let wf = wf.with_consent();
-        assert!(wf.user_consented);
+        let wf = consented(wf);
+        assert!(wf.consent.is_some());
     }
 
     #[test]
@@ -1137,17 +1551,18 @@ mod tests {
     #[test]
     fn validate_rejects_empty_workflow() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("empty").with_consent();
+        let wf = consented(Workflow::new("empty"));
         assert!(ctrl.validate(&wf).is_err());
     }
 
     #[test]
     fn validate_rejects_duplicate_ids() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("test")
-            .with_step(WorkflowStep::new("s1", "org.a", "do"))
-            .with_step(WorkflowStep::new("s1", "org.b", "do"))
-            .with_consent();
+        let wf = consented(
+            Workflow::new("test")
+                .with_step(WorkflowStep::new("s1", "org.a", "do"))
+                .with_step(WorkflowStep::new("s1", "org.b", "do")),
+        );
         let err = ctrl.validate(&wf).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
     }
@@ -1155,9 +1570,10 @@ mod tests {
     #[test]
     fn validate_rejects_missing_dependency() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("test")
-            .with_step(WorkflowStep::new("s1", "org.a", "do").depends_on("nonexistent"))
-            .with_consent();
+        let wf = consented(
+            Workflow::new("test")
+                .with_step(WorkflowStep::new("s1", "org.a", "do").depends_on("nonexistent")),
+        );
         let err = ctrl.validate(&wf).unwrap_err();
         assert!(err.to_string().contains("non-existent"));
     }
@@ -1165,10 +1581,11 @@ mod tests {
     #[test]
     fn validate_accepts_valid_workflow() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("test")
-            .with_step(WorkflowStep::new("s1", "org.a", "open"))
-            .with_step(WorkflowStep::new("s2", "org.b", "process").depends_on("s1"))
-            .with_consent();
+        let wf = consented(
+            Workflow::new("test")
+                .with_step(WorkflowStep::new("s1", "org.a", "open"))
+                .with_step(WorkflowStep::new("s2", "org.b", "process").depends_on("s1")),
+        );
         assert!(ctrl.validate(&wf).is_ok());
     }
 
@@ -1300,9 +1717,9 @@ mod tests {
     #[test]
     fn execute_workflow_simple() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("simple-test")
-            .with_step(WorkflowStep::new("s1", "org.app", "action"))
-            .with_consent();
+        let wf = consented(
+            Workflow::new("simple-test").with_step(WorkflowStep::new("s1", "org.app", "action")),
+        );
         let result = ctrl.execute(&wf).unwrap();
         assert!(result.all_succeeded());
         assert_eq!(result.step_results.len(), 1);
@@ -1312,17 +1729,17 @@ mod tests {
     #[test]
     fn execute_workflow_with_dependencies() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("dep-test")
-            .with_step(
-                WorkflowStep::new("s1", "org.editor", "open")
-                    .produces_key("file_handle"),
-            )
-            .with_step(
-                WorkflowStep::new("s2", "org.export", "convert")
-                    .depends_on("s1")
-                    .with_param("input", "${file_handle}"),
-            )
-            .with_consent();
+        let wf = consented(
+            Workflow::new("dep-test")
+                .with_step(
+                    WorkflowStep::new("s1", "org.editor", "open").produces_key("file_handle"),
+                )
+                .with_step(
+                    WorkflowStep::new("s2", "org.export", "convert")
+                        .depends_on("s1")
+                        .with_param("input", "${file_handle}"),
+                ),
+        );
 
         let result = ctrl.execute(&wf).unwrap();
         assert!(result.all_succeeded());
@@ -1344,11 +1761,7 @@ mod tests {
         step_a.depends_on = vec!["b".to_string()];
         let mut step_b = WorkflowStep::new("b", "org.y", "do");
         step_b.depends_on = vec!["a".to_string()];
-        let wf = Workflow {
-            name: "cyclic".to_string(),
-            steps: vec![step_a, step_b],
-            user_consented: true,
-        };
+        let wf = consented(Workflow::new("cyclic").with_step(step_a).with_step(step_b));
         let err = ctrl.validate(&wf).unwrap_err();
         assert!(err.to_string().contains("circular"));
     }
@@ -1356,31 +1769,33 @@ mod tests {
     #[test]
     fn resolve_order_returns_levels() {
         let ctrl = AppController::new();
-        let wf = Workflow::new("test")
-            .with_step(WorkflowStep::new("s1", "org.a", "open"))
-            .with_step(WorkflowStep::new("s2", "org.b", "open"))
-            .with_step(
-                WorkflowStep::new("s3", "org.c", "merge")
-                    .depends_on("s1")
-                    .depends_on("s2"),
-            )
-            .with_consent();
+        let wf = consented(
+            Workflow::new("test")
+                .with_step(WorkflowStep::new("s1", "org.a", "open"))
+                .with_step(WorkflowStep::new("s2", "org.b", "open"))
+                .with_step(
+                    WorkflowStep::new("s3", "org.c", "merge")
+                        .depends_on("s1")
+                        .depends_on("s2"),
+                ),
+        );
         let levels = ctrl.resolve_order(&wf).unwrap();
         assert_eq!(levels.len(), 2);
     }
 
     #[test]
     fn workflow_serialization_roundtrip() {
-        let wf = Workflow::new("test")
-            .with_step(
-                WorkflowStep::new("s1", "org.app", "do")
-                    .with_param("key", "value"),
-            )
-            .with_consent();
+        let wf = consented(
+            Workflow::new("test")
+                .with_step(WorkflowStep::new("s1", "org.app", "do").with_param("key", "value")),
+        );
         let json = serde_json::to_string(&wf).unwrap();
         let deserialized: Workflow = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "test");
         assert_eq!(deserialized.steps.len(), 1);
-        assert!(deserialized.user_consented);
+        // ORCH-R1-05: consent is #[serde(skip)] — an in-process capability that
+        // never crosses the wire, so a deserialized workflow is always
+        // unconsented and a token cannot be forged by sending one.
+        assert!(deserialized.consent.is_none());
     }
 }

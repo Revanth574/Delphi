@@ -1165,14 +1165,18 @@ impl GoalStore {
         proposed_parent: GoalId,
     ) -> Result<bool, OrchestratorError> {
         if !self.goal_exists(child)? {
-            return Err(OrchestratorError::Planning(format!(
-                "child goal {child} does not exist"
-            )));
+            // ORCH-R2-03: typed, leak-free — the caller-supplied goal id goes to
+            // tracing, not the error (an R1-07 miss: that grep keyed on "{id}" /
+            // "not found"; this leaked via "{child}").
+            tracing::debug!(child_goal = child, "is_cycle_if_parented: child goal does not exist");
+            return Err(OrchestratorError::NotFound { entity: "child goal" });
         }
         if !self.goal_exists(proposed_parent)? {
-            return Err(OrchestratorError::Planning(format!(
-                "proposed parent {proposed_parent} does not exist"
-            )));
+            tracing::debug!(
+                parent_goal = proposed_parent,
+                "is_cycle_if_parented: proposed parent does not exist"
+            );
+            return Err(OrchestratorError::NotFound { entity: "parent goal" });
         }
         if child == proposed_parent {
             return Ok(true);
@@ -1378,8 +1382,14 @@ fn current_timestamp() -> i64 {
 
 /// Convert an epoch seconds value to a [`DateTime<Utc>`].
 fn ts_to_dt(ts: i64) -> Result<DateTime<Utc>, OrchestratorError> {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .ok_or_else(|| OrchestratorError::Planning(format!("invalid timestamp: {ts}")))
+    DateTime::<Utc>::from_timestamp(ts, 0).ok_or_else(|| {
+        tracing::warn!(timestamp = ts, "stored goal timestamp out of representable range");
+        OrchestratorError::Validation {
+            domain: "goal",
+            field: "timestamp",
+            reason: "out of valid range",
+        }
+    })
 }
 
 /// Parse a row into a [`Goal`].
@@ -1507,6 +1517,23 @@ fn compute_deadline_risk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ORCH-R1-07: stored-timestamp value leak → typed Validation (no value in Display) ──
+    #[test]
+    fn ts_to_dt_out_of_range_is_validation_no_value_leak_orch_r1_07() {
+        let err = ts_to_dt(i64::MAX).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "goal", field: "timestamp", .. }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(&i64::MAX.to_string()),
+            "timestamp value leaked into error Display: {err}"
+        );
+    }
 
     fn mk() -> GoalStore {
         GoalStore::in_memory().expect("in-memory store")
@@ -1731,6 +1758,26 @@ mod tests {
         let store = mk();
         let a = store.create_goal("a", "", Priority::Low, None).unwrap();
         assert!(store.is_cycle_if_parented(a, a).unwrap());
+    }
+
+    #[test]
+    fn is_cycle_if_parented_missing_goals_are_notfound_no_id_leak_orch_r2_03() {
+        // ORCH-R2-03 (an R1-07 completeness miss): is_cycle_if_parented formatted
+        // caller goal ids into the error. Now typed NotFound; ids to tracing.
+        let store = mk();
+        let real = store.create_goal("real", "", Priority::Low, None).unwrap();
+        let err = store.is_cycle_if_parented(999_999, real).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "child goal" }),
+            "missing child must be NotFound(child goal), got {err:?}"
+        );
+        assert!(!err.to_string().contains("999999"), "child goal id leaked: {err}");
+        let err = store.is_cycle_if_parented(real, 888_888).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "parent goal" }),
+            "missing parent must be NotFound(parent goal), got {err:?}"
+        );
+        assert!(!err.to_string().contains("888888"), "parent goal id leaked: {err}");
     }
 
     #[test]

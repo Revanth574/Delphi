@@ -113,7 +113,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::OrchestratorError;
 use crate::environment::Fidelity;
@@ -121,6 +121,77 @@ use crate::environment::Fidelity;
 /// Default embedding dimension for the [`MockEmbedder`] and as the canonical
 /// dimension when no other constraint exists.
 pub const DEFAULT_EMBEDDING_DIMENSION: usize = 32;
+
+/// Maximum bytes accepted for a single ingestion — file or in-memory text
+/// (ORCH-R1-04, live ingestion DoS). Enforced at every public ingest entry;
+/// the file-read path additionally bounds the read with [`std::io::Read::take`]
+/// so a hostile or streaming file (e.g. a special file that reports length 0
+/// yet streams unbounded) can never be slurped whole into memory. 10 MiB
+/// matches the workspace content cap (`workspace::validator::MAX_TOTAL_CONTENT_BYTES`).
+pub const MAX_INGEST_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum number of concepts (graph nodes) a single document may yield
+/// (ORCH-R1-04). A document that parses to more than this is rejected before
+/// any node is created, rather than flooding the graph.
+pub const MAX_CONCEPTS: usize = 50_000;
+
+/// Maximum byte length of a single concept's text — one graph node
+/// (ORCH-R1-04). A concept longer than this is rejected rather than stored as
+/// an unbounded node.
+pub const MAX_CONCEPT_TEXT_LEN: usize = 64 * 1024;
+
+/// The single sanctioned byte-cap guard for ingestion (ORCH-R1-04). EVERY
+/// ingest entry routes its size check through this one function, so the cap
+/// value and the rejection cannot drift across entries — the weakest entry is
+/// the DoS vector (the SVC-2 completeness lesson: one shared guard, not per-site
+/// copies). `len` is the in-memory byte length; detail goes to tracing and the
+/// typed error carries no caller content (SVC-9 / R1-07).
+fn enforce_ingest_byte_cap(len: usize, uri: &str) -> Result<(), OrchestratorError> {
+    if len > MAX_INGEST_BYTES {
+        warn!(len, cap = MAX_INGEST_BYTES, uri, "ingestion input exceeds byte cap; rejected");
+        return Err(OrchestratorError::Validation {
+            domain: "knowledge",
+            field: "content",
+            reason: "exceeds maximum ingestion size",
+        });
+    }
+    Ok(())
+}
+
+/// The single sanctioned concept-explosion guard for ingestion (ORCH-R1-04):
+/// bounds the concept count and any single concept's text length, so a hostile
+/// document cannot flood the graph or store an unbounded node. Called once, at
+/// the sole parse site (`ingest_text`); a helper so the caps stay greppable and
+/// testable alongside the byte-cap guard.
+fn enforce_concept_caps(concepts: &[RawConcept], uri: &str) -> Result<(), OrchestratorError> {
+    if concepts.len() > MAX_CONCEPTS {
+        warn!(
+            count = concepts.len(),
+            cap = MAX_CONCEPTS,
+            uri,
+            "ingestion produced too many concepts; rejected"
+        );
+        return Err(OrchestratorError::Validation {
+            domain: "knowledge",
+            field: "concept_count",
+            reason: "document produced too many concepts",
+        });
+    }
+    if let Some(oversize) = concepts.iter().find(|c| c.text.len() > MAX_CONCEPT_TEXT_LEN) {
+        warn!(
+            len = oversize.text.len(),
+            cap = MAX_CONCEPT_TEXT_LEN,
+            uri,
+            "ingestion concept exceeds max length; rejected"
+        );
+        return Err(OrchestratorError::Validation {
+            domain: "knowledge",
+            field: "concept_text",
+            reason: "a concept exceeds maximum length",
+        });
+    }
+    Ok(())
+}
 
 /// Schema for the knowledge SQLite database. Applied idempotently on every
 /// open via `IF NOT EXISTS`.
@@ -1458,12 +1529,17 @@ impl KnowledgeStore {
             )));
         }
         if relation.is_acyclic() && self.would_create_cycle(from_id, to_id, relation)? {
-            return Err(OrchestratorError::Planning(format!(
-                "{} edge {} -> {} would create a cycle",
-                relation.as_str(),
-                from_id,
-                to_id
-            )));
+            // ORCH-R2-03: typed, leak-free — caller-held node ids go to tracing.
+            warn!(
+                relation = relation.as_str(),
+                from = %from_id,
+                to = %to_id,
+                "create_edge: edge would create a cycle"
+            );
+            return Err(OrchestratorError::Conflict {
+                domain: "knowledge",
+                reason: "edge would create a cycle",
+            });
         }
         let now = Utc::now().timestamp();
         let conn = self.conn.lock().map_err(map_lock_err)?;
@@ -1949,10 +2025,15 @@ impl KnowledgeStore {
         source_type: SourceType,
         format: &str,
     ) -> Result<IngestionResult, OrchestratorError> {
+        // ORCH-R1-04: every ingest entry routes through the SAME shared cap
+        // guards — one choke-point, no per-entry drift (SVC-2 completeness).
+        enforce_ingest_byte_cap(text.len(), source_uri)?;
         let hash = content_hash(text.as_bytes());
         // Determine fidelity FIRST. The parser knows whether it can
         // actually extract concepts for this format; we honor its verdict.
         let (concepts, fidelity_used) = self.parse_concepts(text, format);
+        // Bound concept explosion BEFORE any node is created (shared guard).
+        enforce_concept_caps(&concepts, source_uri)?;
         let pre_count = self.count_sources()?;
         let source_id = self.create_or_get_source(
             source_type,
@@ -2078,23 +2159,27 @@ impl KnowledgeStore {
         target: &Path,
     ) -> Result<IngestionResult, OrchestratorError> {
         use std::io::Read;
-        let mut file = safe_open_under_root_handle(trusted_root_handle, target)
+        let file = safe_open_under_root_handle(trusted_root_handle, target)
             .map_err(|e| {
-                OrchestratorError::Planning(format!(
-                    "could not safely open {} for ingestion: {e}",
-                    target.display()
-                ))
+                warn!(path = %target.display(), "could not safely open file for ingestion");
+                OrchestratorError::Planning(format!("could not safely open file for ingestion: {e}"))
             })?;
+        // ORCH-R1-04: bound the read to MAX_INGEST_BYTES + 1 so a special or
+        // streaming file (which can report length 0 yet stream unbounded) is
+        // never slurped whole into memory, then route the size DECISION through
+        // the SAME shared byte-cap guard every entry uses (no per-entry drift —
+        // SVC-2 completeness: one choke-point, not per-site copies).
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|e| {
-            OrchestratorError::Planning(format!(
-                "could not read {} for ingestion: {e}",
-                target.display()
-            ))
-        })?;
+        file.take(MAX_INGEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                warn!(path = %target.display(), "could not read file for ingestion");
+                OrchestratorError::Planning(format!("could not read file for ingestion: {e}"))
+            })?;
+        let uri = target.to_string_lossy().to_string();
+        enforce_ingest_byte_cap(bytes.len(), &uri)?;
         let head = &bytes[..bytes.len().min(64)];
         let format = detect_format(target, head);
-        let uri = target.to_string_lossy().to_string();
         self.ingest_bytes(&bytes, &uri, format)
     }
 
@@ -2144,6 +2229,10 @@ impl KnowledgeStore {
         uri: &str,
         format: &str,
     ) -> Result<IngestionResult, OrchestratorError> {
+        // ORCH-R1-04: same shared byte-cap guard as every other ingest entry —
+        // covers direct callers and the unsupported-format branch below that
+        // content-hashes bytes without parsing (an unbounded hash is a CPU DoS).
+        enforce_ingest_byte_cap(bytes.len(), uri)?;
         match format {
             "markdown" | "text" | "html" => {
                 let text = std::str::from_utf8(bytes).map_err(|e| {
@@ -3565,6 +3654,24 @@ impl IngestionAccessController {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── ORCH-R1-07: ingest open/read failures must not leak the file path ──
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ingest_missing_file_does_not_leak_path_orch_r1_07() {
+        let tmp = TempDir::new().unwrap();
+        let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
+        let target = trusted_root.join("nonexistent-secret-file.md");
+        let s = store();
+        let err = s
+            .ingest_file_with_root_handle(&trusted_root_handle, &target)
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("nonexistent-secret-file"),
+            "ingest path leaked into error Display: {err}"
+        );
+    }
     use tempfile::TempDir;
 
     // ── SVC-8: ingestion access control (relocated from the transport) ──
@@ -4431,6 +4538,31 @@ mod tests {
         s.create_edge(b, a, EdgeRelation::RelatesTo, 0.5, src).unwrap();
     }
 
+    #[test]
+    fn create_edge_cycle_is_conflict_no_node_id_leak_orch_r2_03() {
+        // ORCH-R2-03: the cycle error formatted caller node ids (positional {}).
+        // Now typed Conflict; ids to tracing.
+        let s = store();
+        let src = s
+            .create_or_get_source(SourceType::UserAssertion, "u", Fidelity::Direct, "h", "t")
+            .unwrap();
+        let a = s.create_node("alpha", NodeType::Concept, &[src]).unwrap();
+        let b = s.create_node("beta", NodeType::Concept, &[src]).unwrap();
+        s.create_edge(a, b, EdgeRelation::PartOf, 0.9, src).unwrap();
+        let err = s
+            .create_edge(b, a, EdgeRelation::PartOf, 0.9, src)
+            .unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "knowledge", .. }),
+            "a cycle-forming edge must be a knowledge Conflict, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(&a.to_string())
+                && !err.to_string().contains(&b.to_string()),
+            "node id leaked into Display: {err}"
+        );
+    }
+
     // ── Semantic search ───────────────────────────────────────────────
 
     #[test]
@@ -4784,6 +4916,144 @@ mod tests {
         assert!(result.source_id > 0);
         let src = s.get_source(result.source_id).unwrap();
         assert_eq!(src.fidelity, Fidelity::Unavailable);
+    }
+
+    // ── ORCH-R1-04: ingestion resource caps (live DoS) ────────────────
+    // RED against pre-fix: without the caps each ingest path returns Ok, so
+    // `unwrap_err()` panics. The field-specific match also fails RED if pre-fix
+    // errored for an unrelated reason. Sizes go to tracing only; the typed
+    // Validation error carries no caller content (SVC-9 / aligns with R1-07).
+
+    #[test]
+    fn ingest_text_rejects_oversize_input_orch_r1_04() {
+        let s = store();
+        let huge = "a".repeat(MAX_INGEST_BYTES + 1);
+        let err = s
+            .ingest_text(&huge, "uri://oversize", SourceType::LocalFile, "markdown")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "knowledge", field: "content", .. }
+            ),
+            "oversize text must be rejected with a content Validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_text_rejects_concept_explosion_orch_r1_04() {
+        let s = store();
+        // Distinct headings → one Concept each, comfortably under the byte cap.
+        let mut doc = String::new();
+        for i in 0..=MAX_CONCEPTS {
+            doc.push_str(&format!("# h{i}\n\n"));
+        }
+        assert!(
+            doc.len() < MAX_INGEST_BYTES,
+            "concept-explosion doc must stay under the byte cap to isolate the count cap"
+        );
+        let err = s
+            .ingest_text(&doc, "uri://many", SourceType::LocalFile, "markdown")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "knowledge", field: "concept_count", .. }
+            ),
+            "a doc exceeding MAX_CONCEPTS must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_text_rejects_oversize_concept_orch_r1_04() {
+        let s = store();
+        // One paragraph longer than the per-concept cap: 1 concept, under byte cap.
+        let para = "a".repeat(MAX_CONCEPT_TEXT_LEN + 1);
+        assert!(para.len() < MAX_INGEST_BYTES);
+        let err = s
+            .ingest_text(&para, "uri://longconcept", SourceType::LocalFile, "markdown")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "knowledge", field: "concept_text", .. }
+            ),
+            "an over-long concept must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_bytes_rejects_oversize_input_orch_r1_04() {
+        let s = store();
+        let huge = vec![b'a'; MAX_INGEST_BYTES + 1];
+        let err = s.ingest_bytes(&huge, "uri://bytes", "markdown").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "knowledge", field: "content", .. }
+            ),
+            "oversize bytes must be rejected, got {err:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ingest_file_rejects_oversize_file_orch_r1_04() {
+        // The headline R1-04 vector: a file larger than the cap must be refused
+        // at the read boundary, never slurped whole into memory.
+        let tmp = TempDir::new().unwrap();
+        let trusted_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let trusted_root_handle = open_test_root_handle(&trusted_root);
+        let path = trusted_root.join("huge.md");
+        std::fs::write(&path, vec![b'a'; MAX_INGEST_BYTES + 1]).unwrap();
+        let s = store();
+        let err = s
+            .ingest_file_with_root_handle(&trusted_root_handle, &path)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Validation { domain: "knowledge", field: "content", .. }
+            ),
+            "an oversize file must be rejected at the read boundary, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn all_ingest_entries_share_the_byte_cap_orch_r1_04() {
+        // ORCH-R1-04 round-2: every ingest entry routes the byte cap through the
+        // SAME shared guard (enforce_ingest_byte_cap), so an over-cap input is
+        // rejected with the IDENTICAL typed error at every entry. This is a
+        // drift-regression guard: a future divergence (one entry's cap drifting)
+        // breaks it — the weakest entry is the DoS vector (SVC-2 completeness:
+        // one guard, not per-site copies).
+        let s = store();
+        let over = vec![b'a'; MAX_INGEST_BYTES + 1];
+        let over_text = std::str::from_utf8(&over).expect("'a' bytes are valid UTF-8");
+        let mut errs = vec![
+            s.ingest_text(over_text, "uri://t", SourceType::LocalFile, "markdown")
+                .unwrap_err(),
+            s.ingest_bytes(&over, "uri://b", "markdown").unwrap_err(),
+        ];
+        #[cfg(target_os = "linux")]
+        {
+            let tmp = TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let handle = open_test_root_handle(&root);
+            let path = root.join("over.md");
+            std::fs::write(&path, &over).unwrap();
+            errs.push(s.ingest_file_with_root_handle(&handle, &path).unwrap_err());
+        }
+        for e in &errs {
+            assert!(
+                matches!(
+                    e,
+                    OrchestratorError::Validation { domain: "knowledge", field: "content", .. }
+                ),
+                "every ingest entry must reject over-cap input with the same content Validation; \
+                 a divergence here is a cap-drift finding. got {e:?}"
+            );
+        }
     }
 
     // ── FIX 15 (P1-high): handle-anchored safe-open boundary

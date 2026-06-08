@@ -367,9 +367,11 @@ impl Timeline {
             )
             .map_err(|e| map_sqlite_err(e, "failed to finalize pending action"))?;
         if changed == 0 {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} is not pending"
-            )));
+            tracing::debug!(action_id, "complete_pending: action is not pending");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action is not pending",
+            });
         }
         Ok(())
     }
@@ -380,16 +382,19 @@ impl Timeline {
         let record = self.get_action(action_id)?;
 
         if !record.reversible || !record.status.is_reversible_terminal() {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} is not reversible"
-            )));
+            tracing::debug!(action_id, "action is not reversible");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action is not reversible",
+            });
         }
 
         if now > record.expires_at {
-            return Err(OrchestratorError::Planning(format!(
-                "undo window expired for {action_id} (expired at {})",
-                record.expires_at
-            )));
+            tracing::debug!(action_id, expires_at = record.expires_at, "undo window expired");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "undo window expired",
+            });
         }
 
         let changed = self
@@ -406,9 +411,11 @@ impl Timeline {
             )
             .map_err(|e| map_sqlite_err(e, "failed to mark undoing"))?;
         if changed == 0 {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} could not enter undoing state"
-            )));
+            tracing::debug!(action_id, "begin_undo: could not enter undoing state");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action could not enter undoing state",
+            });
         }
 
         Ok(record.undo_command)
@@ -431,9 +438,11 @@ impl Timeline {
             )
             .map_err(|e| map_sqlite_err(e, "failed to mark undone"))?;
         if changed == 0 {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} is not undoing"
-            )));
+            tracing::debug!(action_id, "action is not undoing");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action is not undoing",
+            });
         }
         info!(action_id, "action undone");
         Ok(())
@@ -464,9 +473,11 @@ impl Timeline {
             )
             .map_err(|e| map_sqlite_err(e, "failed to abort undo"))?;
         if changed == 0 {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} is not undoing"
-            )));
+            tracing::debug!(action_id, "action is not undoing");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action is not undoing",
+            });
         }
         Ok(())
     }
@@ -512,7 +523,7 @@ impl Timeline {
             )
             .optional()
             .map_err(|e| map_sqlite_err(e, "action lookup"))?
-            .ok_or_else(|| OrchestratorError::Planning(format!("action not found: {action_id}")))
+            .ok_or(OrchestratorError::NotFound { entity: "action" })
     }
 
     /// Attempt to undo an action.
@@ -577,19 +588,22 @@ impl Timeline {
             )
             .optional()
             .map_err(|e| map_sqlite_err(e, "undo_action lookup"))?
-            .ok_or_else(|| OrchestratorError::Planning(format!("action not found: {action_id}")))?;
+            .ok_or(OrchestratorError::NotFound { entity: "action" })?;
 
         if !record.reversible || !record.status.is_reversible_terminal() {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} is not reversible"
-            )));
+            tracing::debug!(action_id, "action is not reversible");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action is not reversible",
+            });
         }
 
         if now > record.expires_at {
-            return Err(OrchestratorError::Planning(format!(
-                "undo window expired for {action_id} (expired at {})",
-                record.expires_at
-            )));
+            tracing::debug!(action_id, expires_at = record.expires_at, "undo window expired");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "undo window expired",
+            });
         }
 
         // Mark as undone.
@@ -608,9 +622,11 @@ impl Timeline {
             )
             .map_err(|e| map_sqlite_err(e, "failed to mark undone"))?;
         if changed == 0 {
-            return Err(OrchestratorError::Planning(format!(
-                "action {action_id} could not be marked undone"
-            )));
+            tracing::debug!(action_id, "undo_action: action could not be marked undone");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action could not be marked undone",
+            });
         }
 
         info!(action_id, "action undone");
@@ -811,6 +827,50 @@ fn rand_suffix() -> u32 {
 mod tests {
     use super::*;
 
+    // ── ORCH-R1-07: public-boundary action_id leaks → typed NotFound/Conflict ──
+    #[test]
+    fn undo_missing_action_is_notfound_no_id_leak_orch_r1_07() {
+        let tl = Timeline::in_memory().unwrap();
+        let err = tl.undo_action("tl-secret-abc").unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "action" }),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("tl-secret-abc"),
+            "action_id leaked into error Display: {err}"
+        );
+    }
+
+    #[test]
+    fn get_action_status_missing_is_notfound_no_id_leak_orch_r1_07() {
+        let tl = Timeline::in_memory().unwrap();
+        let err = tl.get_action_status("tl-secret-def").unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "action" }),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("tl-secret-def"),
+            "action_id leaked into error Display: {err}"
+        );
+    }
+
+    #[test]
+    fn undo_irreversible_action_is_conflict_no_id_leak_orch_r1_07() {
+        let tl = Timeline::in_memory().unwrap();
+        let id = tl.record_irreversible("did a thing").unwrap();
+        let err = tl.undo_action(&id).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Conflict { domain: "timeline", .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(&id),
+            "action_id leaked into conflict Display: {err}"
+        );
+    }
+
     #[test]
     fn create_in_memory_timeline() {
         let tl = Timeline::in_memory().unwrap();
@@ -1006,38 +1066,27 @@ mod tests {
     // ── Codex re-review FIX 25 (round 9): query_row error preservation ──
 
     #[test]
-    fn undo_action_missing_row_returns_planning_with_action_id() {
-        // **F25 regression — Part 1 of 2.** Pre-F25, `undo_action`'s
-        // bare `.map_err(|_| Planning("action not found: {id}"))` chain
-        // happened to produce the right error variant for genuine
-        // missing-row cases *but for the wrong reason*: it produced
-        // that error for EVERY rusqlite error, including
-        // `SQLITE_BUSY` / `SQLITE_LOCKED`. Post-F25 the missing-row
-        // path now goes through `.optional() + ok_or_else`, which
-        // preserves the descriptive message ONLY for the genuine
-        // `QueryReturnedNoRows` case. This test pins the message
-        // format so a future regression (e.g. someone dropping the
-        // `action_id` from the message during refactoring) trips
-        // the assertion. The companion `_routes_database_busy_*`
+    fn undo_action_missing_row_returns_notfound_not_transient_lock() {
+        // **F25 regression — Part 1 of 2.** Pre-F25, `undo_action`'s bare
+        // `.map_err(|_| Planning("action not found: {id}"))` chain produced the
+        // not-found error for EVERY rusqlite error, including `SQLITE_BUSY` /
+        // `SQLITE_LOCKED`. Post-F25 the missing-row path goes through
+        // `.optional() + ok_or_else`, confining it to the genuine
+        // `QueryReturnedNoRows` case; the companion `_routes_database_busy_*`
         // test below covers the lock-error half.
+        //
+        // ORCH-R1-07 then replaced the free-string Planning (which leaked the
+        // action_id) with the typed, leak-free `NotFound { entity: "action" }`;
+        // the no-leak property is pinned by the `..._no_id_leak_orch_r1_07`
+        // test. This test pins the surviving F25 invariant: the missing-row
+        // branch stays NotFound, never conflated with the transient-lock branch.
         let tl = Timeline::in_memory().unwrap();
         let err = tl.undo_action("tl-nonexistent-id").unwrap_err();
-        match err {
-            OrchestratorError::Planning(msg) => {
-                assert!(
-                    msg.contains("action not found") && msg.contains("tl-nonexistent-id"),
-                    "missing-row error must be Planning containing 'action not found' \
-                     and the action_id, got: {msg}"
-                );
-            }
-            other => panic!(
-                "missing row must produce Planning, not {other:?} \
-                 (F25 regression: pre-fix bare map_err chain would also have produced \
-                 Planning here, but for the wrong reason — this test pins the variant + \
-                 message so the post-F25 ok_or_else path stays semantically equivalent \
-                 on the missing-row branch)"
-            ),
-        }
+        assert!(
+            matches!(err, OrchestratorError::NotFound { entity: "action" }),
+            "missing-row must be NotFound(action), not {err:?} \
+             (F25: distinct from TransientLock)"
+        );
     }
 
     #[test]

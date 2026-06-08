@@ -256,7 +256,10 @@ impl PiiDetector {
 
             let local_start = before
                 .rfind(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-')
-                .map(|p| p + 1)
+                // `rfind` returns the byte index of the matched separator char;
+                // advance past the WHOLE char (not +1) so a multibyte separator
+                // can't leave `local_start` mid-codepoint and panic the slice.
+                .map(|p| p + before[p..].chars().next().map_or(1, char::len_utf8))
                 .unwrap_or(0);
 
             let domain_end = after
@@ -670,5 +673,20 @@ mod tests {
         let mut detector = PiiDetector::new();
         detector.add_entity("Acme Corp");
         assert_eq!(detector.known_entities.len(), 1);
+    }
+
+    #[test]
+    fn detect_email_after_multibyte_separator_zkqp() {
+        let detector = PiiDetector::new();
+        // A multibyte separator ('\u{2022}' bullet, 3 bytes) immediately before
+        // the local part. RED pre-fix: rfind returns the bullet's byte index,
+        // +1 lands mid-codepoint, and slicing panics inside detect_emails.
+        let matches = detector.detect("Contact\u{2022}user@example.com now");
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.pii_type == PiiType::Email && m.value == "user@example.com"),
+            "email after a multibyte separator must be detected without panicking"
+        );
     }
 }

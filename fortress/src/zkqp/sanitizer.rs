@@ -247,8 +247,10 @@ impl QuerySanitizer {
         // Step 2: Score privacy.
         let score = self.scorer.score(&matches);
 
-        // Step 3: Build mapping (memory-only).
-        let mapping = self.detector.build_mapping(&matches);
+        // Step 3: Build mapping (memory-only). The query-bound token makes
+        // placeholders collision-resistant against look-alikes in cloud responses
+        // (FORT-R1-02), while staying deterministic for the same query.
+        let mapping = self.detector.build_mapping(&matches, &query_token(query));
 
         // Step 4: Replace PII with placeholders.
         let sanitized_text = if mapping.is_empty() {
@@ -312,6 +314,17 @@ impl Default for QuerySanitizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A short, deterministic, query-bound token mixed into every placeholder so a
+/// literal placeholder-shaped string in a cloud response cannot collide with a
+/// minted one (FORT-R1-02). Derived from `SHA-256(query)` — stateless and stable
+/// for the same query, so sanitization stays deterministic for the cloud-egress
+/// HMAC binding, and unguessable to the cloud (which never sees the query hash).
+fn query_token(query: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(query.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -499,6 +512,32 @@ mod tests {
             leaks.len(),
             cases.len(),
             leaks.join("\n")
+        );
+    }
+
+    #[test]
+    fn restore_ignores_response_lookalike_placeholders_fort_r1_02() {
+        // FORT-R1-02: placeholders were predictable ([EMAIL_001]) and restore did
+        // a global string replace, so a cloud RESPONSE containing a bare
+        // [EMAIL_001] look-alike was rewritten to the original PII (re-injection).
+        let sanitizer = QuerySanitizer::new();
+        let result = sanitizer.sanitize("Contact alice@example.com please");
+        // The cloud response echoes the (query-bound) minted placeholder AND also
+        // contains a bare predictable-format look-alike the model emitted itself.
+        let minted = result.sanitized_text().to_string();
+        let response = format!("{minted} -- see also [EMAIL_001] in the archive");
+        let restored = result.restore(&response);
+        // The minted placeholder restores to the real email...
+        assert!(
+            restored.contains("alice@example.com"),
+            "the minted placeholder must restore to the original"
+        );
+        // ...but the bare look-alike must survive untouched (no re-injection).
+        // RED pre-fix: predictable [EMAIL_001] minted == the look-alike, so it was
+        // rewritten to alice@example.com.
+        assert!(
+            restored.contains("[EMAIL_001]"),
+            "a bare look-alike placeholder must NOT be rewritten to PII"
         );
     }
 }

@@ -601,12 +601,12 @@ impl PiiDetector {
     ///
     /// let detector = PiiDetector::new();
     /// let matches = detector.detect("user@example.com");
-    /// let mapping = detector.build_mapping(&matches);
+    /// let mapping = detector.build_mapping(&matches, "q1a2b3c4");
     /// assert!(mapping.contains_key("user@example.com"));
     /// assert!(mapping["user@example.com"].starts_with("[EMAIL_"));
     /// ```
     #[must_use]
-    pub fn build_mapping(&self, matches: &[PiiMatch]) -> HashMap<String, String> {
+    pub fn build_mapping(&self, matches: &[PiiMatch], token: &str) -> HashMap<String, String> {
         let mut mapping = HashMap::new();
         let mut counters: HashMap<PiiType, u32> = HashMap::new();
 
@@ -616,7 +616,11 @@ impl PiiDetector {
             }
             let count = counters.entry(m.pii_type).or_insert(0);
             *count += 1;
-            let placeholder = format!("[{}_{:03}]", m.pii_type.placeholder_prefix(), count);
+            // The query-bound `token` makes the placeholder unguessable to the
+            // cloud (which never sees it), so a literal [EMAIL_001]-style string
+            // in a response cannot collide with a minted placeholder (FORT-R1-02).
+            let placeholder =
+                format!("[{}_{}_{:03}]", m.pii_type.placeholder_prefix(), token, count);
             mapping.insert(m.value.clone(), placeholder);
         }
 
@@ -767,7 +771,7 @@ mod tests {
     fn build_mapping_creates_placeholders() {
         let detector = PiiDetector::new();
         let matches = detector.detect("Email user@test.com about it");
-        let mapping = detector.build_mapping(&matches);
+        let mapping = detector.build_mapping(&matches, "q1a2b3c4");
         assert!(!mapping.is_empty());
         // Each placeholder should have the type prefix.
         for placeholder in mapping.values() {
@@ -780,7 +784,7 @@ mod tests {
     fn build_mapping_deduplicates() {
         let detector = PiiDetector::new();
         let matches = detector.detect("user@a.com and user@a.com again");
-        let mapping = detector.build_mapping(&matches);
+        let mapping = detector.build_mapping(&matches, "q1a2b3c4");
         // Same email appears once in the mapping.
         let email_placeholders: Vec<_> = mapping
             .values()

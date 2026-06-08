@@ -35,6 +35,8 @@ pub enum PiiType {
     NationalId,
     /// Credit card number.
     CreditCard,
+    /// A registered known entity (company / project / person name).
+    Entity,
 }
 
 impl PiiType {
@@ -57,6 +59,7 @@ impl PiiType {
             Self::Url => "URL",
             Self::NationalId => "ID",
             Self::CreditCard => "CC",
+            Self::Entity => "ENTITY",
         }
     }
 
@@ -77,6 +80,7 @@ impl PiiType {
             Self::Email => 20,
             Self::Phone => 20,
             Self::IpAddress => 15,
+            Self::Entity => 15,
             Self::Url => 10,
             Self::Date => 5,
         }
@@ -228,6 +232,7 @@ impl PiiDetector {
         matches.extend(self.detect_dates(text));
         matches.extend(self.detect_urls(text));
         matches.extend(self.detect_credit_cards(text));
+        matches.extend(self.detect_entities(text));
 
         // Sort by position for consistent replacement order.
         matches.sort_by_key(|m| m.start);
@@ -543,6 +548,35 @@ impl PiiDetector {
         matches
     }
 
+    /// Detect occurrences of registered known entities (company / project /
+    /// person names added via [`add_entity`](Self::add_entity)).
+    ///
+    /// Exact (verbatim) substring match of each registered name, so the value
+    /// equals the original slice and sanitize() can redact it. Case-insensitive
+    /// matching is a deliberate non-goal here (kept deterministic for the
+    /// cloud-egress token binding).
+    fn detect_entities(&self, text: &str) -> Vec<PiiMatch> {
+        let mut matches = Vec::new();
+        for entity in &self.known_entities {
+            if entity.is_empty() {
+                continue;
+            }
+            let mut from = 0;
+            while let Some(pos) = text[from..].find(entity.as_str()) {
+                let start = from + pos;
+                let end = start + entity.len();
+                matches.push(PiiMatch {
+                    pii_type: PiiType::Entity,
+                    value: entity.clone(),
+                    start,
+                    end,
+                });
+                from = end;
+            }
+        }
+        matches
+    }
+
     /// Build a placeholder mapping from detected PII.
     ///
     /// Returns a map from original value to placeholder. This map
@@ -782,6 +816,20 @@ mod tests {
                 .iter()
                 .any(|m| m.pii_type == PiiType::NationalId && m.value == "123-45-6789"),
             "an SSN must be detected as NationalId"
+        );
+    }
+
+    #[test]
+    fn registered_entity_is_detected_zkqp() {
+        let mut detector = PiiDetector::new();
+        detector.add_entity("Acme Corp");
+        // add_entity stored the name, but detect() never scanned known_entities,
+        // so registering an entity was a silent no-op -- the company/project
+        // name passed through to the cloud unredacted. RED pre-fix: no match.
+        let matches = detector.detect("Meeting with Acme Corp today");
+        assert!(
+            matches.iter().any(|m| m.value == "Acme Corp"),
+            "a registered known entity must be detected"
         );
     }
 }

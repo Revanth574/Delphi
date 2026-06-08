@@ -220,6 +220,9 @@ impl PiiDetector {
         let mut matches = Vec::new();
 
         matches.extend(self.detect_emails(text));
+        // National IDs before phones: an SSN's 9 digits also satisfy the phone
+        // heuristic, so detect it first to win the placeholder classification.
+        matches.extend(self.detect_national_ids(text));
         matches.extend(self.detect_phones(text));
         matches.extend(self.detect_ips(text));
         matches.extend(self.detect_dates(text));
@@ -499,6 +502,47 @@ impl PiiDetector {
         matches
     }
 
+    /// Detect US national IDs / SSNs in the form XXX-XX-XXXX.
+    fn detect_national_ids(&self, text: &str) -> Vec<PiiMatch> {
+        let mut matches = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        // SSN: 3 digits '-' 2 digits '-' 4 digits (11 chars total).
+        while i + 10 < chars.len() {
+            let shaped = chars[i].is_ascii_digit()
+                && chars[i + 1].is_ascii_digit()
+                && chars[i + 2].is_ascii_digit()
+                && chars[i + 3] == '-'
+                && chars[i + 4].is_ascii_digit()
+                && chars[i + 5].is_ascii_digit()
+                && chars[i + 6] == '-'
+                && chars[i + 7].is_ascii_digit()
+                && chars[i + 8].is_ascii_digit()
+                && chars[i + 9].is_ascii_digit()
+                && chars[i + 10].is_ascii_digit();
+            // Reject when embedded in a longer digit run (e.g. inside a card).
+            let isolated = (i == 0 || !chars[i - 1].is_ascii_digit())
+                && (i + 11 >= chars.len() || !chars[i + 11].is_ascii_digit());
+            if shaped && isolated {
+                let byte_start = text.char_indices().nth(i).map_or(0, |(b, _)| b);
+                let byte_end = text
+                    .char_indices()
+                    .nth(i + 11)
+                    .map_or(text.len(), |(b, _)| b);
+                matches.push(PiiMatch {
+                    pii_type: PiiType::NationalId,
+                    value: text[byte_start..byte_end].to_string(),
+                    start: byte_start,
+                    end: byte_end,
+                });
+                i += 11;
+                continue;
+            }
+            i += 1;
+        }
+        matches
+    }
+
     /// Build a placeholder mapping from detected PII.
     ///
     /// Returns a map from original value to placeholder. This map
@@ -722,6 +766,22 @@ mod tests {
             input.contains(cc.value.as_str()),
             "detected value must be a substring of the original so sanitize can redact it: {:?}",
             cc.value
+        );
+    }
+
+    #[test]
+    fn national_id_is_detected_zkqp() {
+        let detector = PiiDetector::new();
+        // PiiType::NationalId is defined, weighted (30), and scored -- but no
+        // detector ever produced it, so an SSN was never classified or redacted
+        // as an ID (only incidentally caught by the phone heuristic and
+        // mis-scored as 20). RED pre-fix: no NationalId match is produced.
+        let matches = detector.detect("SSN 123-45-6789 on file");
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.pii_type == PiiType::NationalId && m.value == "123-45-6789"),
+            "an SSN must be detected as NationalId"
         );
     }
 }

@@ -457,4 +457,48 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a, s1);
     }
+
+    #[test]
+    fn zkqp_detection_completeness_table_fort_r1_01() {
+        // FORT-R1-01 (P1 LIVE): a false negative in ZKQP is a SILENT PII LEAK to
+        // the cloud — the score reads clean, the send proceeds, raw PII egresses.
+        // Each row carries PII of a CLAIMED-supported class in a valid-but-unusual
+        // form; `canary` is a distinctive substring that MUST be redacted. This
+        // single test reports the WHOLE table of leaks at once (it does NOT abort
+        // on the first), so the full false-negative surface is visible in the RED
+        // run before it is closed.
+        let cases: &[(&str, &str, &str)] = &[
+            // (input, leaked canary that must be redacted, axis)
+            ("Contact johndoe+tag@example.com please", "johndoe", "email +atext (RFC 5322)"),
+            ("Mail user.name+filter@mail.example now", "user.name", "email +atext (RFC 5322)"),
+            ("See HTTPS://secret-host.example/p?k=v here", "secret-host.example", "URL scheme uppercase (RFC 3986)"),
+            ("Visit HtTp://other.example/x now", "other.example", "URL scheme mixed case (RFC 3986)"),
+            ("Host 8.8.8.8, is up", "8.8.8.8", "IPv4 trailing comma"),
+            ("End at 8.8.4.4.", "8.8.4.4", "IPv4 trailing period"),
+            ("Paren (1.2.3.4) here", "1.2.3.4", "IPv4 surrounding parens"),
+            ("Call 555\u{00A0}867\u{00A0}5309 today", "5309", "phone NBSP separators"),
+            ("Ring 555\u{202F}123\u{202F}4567 now", "4567", "phone narrow-NBSP separators"),
+            ("Card 4111\u{00A0}1111\u{00A0}1111\u{00A0}1111 ok", "4111", "card NBSP separators"),
+            ("Pay 4111\u{2011}1111\u{2011}1111\u{2011}1111 now", "4111", "card non-breaking-hyphen separators"),
+            ("SSN 123\u{2011}45\u{2011}6789 filed", "6789", "SSN non-breaking-hyphen separators"),
+        ];
+        let sanitizer = QuerySanitizer::new();
+        let mut leaks = Vec::new();
+        for &(input, canary, axis) in cases {
+            let out = sanitizer.sanitize(input);
+            if out.sanitized_text().contains(canary) {
+                leaks.push(format!(
+                    "  LEAK [{axis}]: {canary:?} survived -> {:?}",
+                    out.sanitized_text()
+                ));
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "ZKQP silent PII leaks: {} of {} variants egressed raw PII:\n{}",
+            leaks.len(),
+            cases.len(),
+            leaks.join("\n")
+        );
+    }
 }

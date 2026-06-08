@@ -263,7 +263,7 @@ impl PiiDetector {
             let after = &text[i + 1..];
 
             let local_start = before
-                .rfind(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-')
+                .rfind(|c: char| !is_email_local_char(c))
                 // `rfind` returns the byte index of the matched separator char;
                 // advance past the WHOLE char (not +1) so a multibyte separator
                 // can't leave `local_start` mid-codepoint and panic the slice.
@@ -308,9 +308,8 @@ impl PiiDetector {
 
                 while j < chars.len()
                     && (chars[j].is_ascii_digit()
-                        || chars[j] == '-'
+                        || is_pii_separator(chars[j])
                         || chars[j] == '.'
-                        || chars[j] == ' '
                         || chars[j] == '('
                         || chars[j] == ')'
                         || chars[j] == '+')
@@ -353,36 +352,43 @@ impl PiiDetector {
     /// Detect IP addresses (IPv4).
     fn detect_ips(&self, text: &str) -> Vec<PiiMatch> {
         let mut matches = Vec::new();
-        let words: Vec<&str> = text.split_whitespace().collect();
 
         let mut offset = 0;
-        for word in &words {
-            if let Some(pos) = text[offset..].find(word) {
-                let start = offset + pos;
-                let end = start + word.len();
-                offset = end;
+        for word in text.split_whitespace() {
+            let Some(pos) = text[offset..].find(word) else {
+                continue;
+            };
+            let word_start = offset + pos;
+            offset = word_start + word.len();
 
-                // Simple IPv4: four groups of 1-3 digits separated by dots.
-                let parts: Vec<&str> = word.split('.').collect();
-                if parts.len() == 4
-                    && parts.iter().all(|p| {
-                        p.len() <= 3
-                            && !p.is_empty()
-                            && p.chars().all(|c| c.is_ascii_digit())
-                    })
-                {
-                    let valid = parts.iter().all(|p| {
-                        p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
-                    });
-                    if valid {
-                        matches.push(PiiMatch {
-                            pii_type: PiiType::IpAddress,
-                            value: word.to_string(),
-                            start,
-                            end,
-                        });
-                    }
-                }
+            // Boundary-aware: trim leading/trailing non-digits so an IPv4 with
+            // surrounding punctuation ("8.8.8.8," / "8.8.4.4." / "(1.2.3.4)") is
+            // still detected. The core stays a substring of the original at the
+            // adjusted offset, so the value still redacts.
+            let core = word.trim_matches(|c: char| !c.is_ascii_digit());
+            if core.is_empty() {
+                continue;
+            }
+            let lead = word.len() - word.trim_start_matches(|c: char| !c.is_ascii_digit()).len();
+            let start = word_start + lead;
+            let end = start + core.len();
+
+            // IPv4: four groups of 1-3 digits, each 0-255, separated by dots.
+            let parts: Vec<&str> = core.split('.').collect();
+            if parts.len() == 4
+                && parts.iter().all(|p| {
+                    !p.is_empty()
+                        && p.len() <= 3
+                        && p.chars().all(|c| c.is_ascii_digit())
+                        && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+                })
+            {
+                matches.push(PiiMatch {
+                    pii_type: PiiType::IpAddress,
+                    value: core.to_string(),
+                    start,
+                    end,
+                });
             }
         }
         matches
@@ -427,11 +433,17 @@ impl PiiDetector {
     /// Detect URLs.
     fn detect_urls(&self, text: &str) -> Vec<PiiMatch> {
         let mut matches = Vec::new();
+        // URI schemes are case-insensitive (RFC 3986). Search a byte-length-
+        // preserving ASCII-lowercased copy so HTTPS:// / HtTp:// match, but take
+        // OFFSETS into the ORIGINAL text — ASCII lowercasing keeps every byte
+        // boundary identical, so offsets line up and the value stays a real
+        // substring the sanitizer can redact.
+        let lower = text.to_ascii_lowercase();
         let prefixes = ["https://", "http://"];
 
         for prefix in &prefixes {
             let mut search_from = 0;
-            while let Some(pos) = text[search_from..].find(prefix) {
+            while let Some(pos) = lower[search_from..].find(prefix) {
                 let start = search_from + pos;
                 let rest = &text[start..];
                 let end = rest
@@ -473,7 +485,7 @@ impl PiiDetector {
                 let mut j = i;
 
                 while j < chars.len()
-                    && (chars[j].is_ascii_digit() || chars[j] == '-' || chars[j] == ' ')
+                    && (chars[j].is_ascii_digit() || is_pii_separator(chars[j]))
                 {
                     if chars[j].is_ascii_digit() {
                         digit_count += 1;
@@ -517,10 +529,10 @@ impl PiiDetector {
             let shaped = chars[i].is_ascii_digit()
                 && chars[i + 1].is_ascii_digit()
                 && chars[i + 2].is_ascii_digit()
-                && chars[i + 3] == '-'
+                && is_pii_separator(chars[i + 3])
                 && chars[i + 4].is_ascii_digit()
                 && chars[i + 5].is_ascii_digit()
-                && chars[i + 6] == '-'
+                && is_pii_separator(chars[i + 6])
                 && chars[i + 7].is_ascii_digit()
                 && chars[i + 8].is_ascii_digit()
                 && chars[i + 9].is_ascii_digit()
@@ -610,6 +622,35 @@ impl PiiDetector {
 
         mapping
     }
+}
+
+/// True for characters that may separate digit groups in phone numbers, credit
+/// cards, and national IDs — ASCII space/hyphen plus their common Unicode
+/// confusables (NBSP, narrow NBSP, figure space; Unicode hyphen, non-breaking
+/// hyphen, figure dash).
+///
+/// Detectors accept these **in place on the original text**. We deliberately do
+/// NOT normalize-then-scan: that would emit matches whose value is in
+/// normalized coordinates and no longer substring-matches the input (the
+/// `c86e075` credit-card offset class), so `sanitize()` could not redact them.
+fn is_pii_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '-' | '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2010}' | '\u{2011}' | '\u{2012}'
+    )
+}
+
+/// True for characters valid in an email local part: the full RFC 5322 `atext`
+/// set plus `.` (dot-atom). The old scan allowed only alphanumerics and `._-`,
+/// so a local part like `johndoe+tag` was truncated at `+`, leaking the prefix.
+fn is_email_local_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || c == '.'
+        || matches!(
+            c,
+            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '/' | '=' | '?' | '^' | '_'
+                | '`' | '{' | '|' | '}' | '~'
+        )
 }
 
 impl Default for PiiDetector {

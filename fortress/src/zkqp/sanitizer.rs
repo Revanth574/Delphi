@@ -76,6 +76,12 @@ pub struct SanitizationResult {
     /// original query is intentionally NOT stored (SVC-1 — minimal PII
     /// footprint), so the only way the originals leave this struct is via
     /// [`restore`](Self::restore), which consumes them.
+    ///
+    /// This is the **minted** map (FORT-R3-01): only the placeholders actually
+    /// emitted into [`sanitized_text`](Self::sanitized_text). Under overlap
+    /// absorption (FORT-R2-03) a covered match's placeholder is never minted, so
+    /// it is deliberately absent here — `restore` can therefore only rewrite a
+    /// placeholder that was genuinely sent, never re-inject a never-minted one.
     mapping: HashMap<String, String>,
     /// Whether user confirmation is needed (score > threshold).
     requires_confirmation: bool,
@@ -125,6 +131,13 @@ impl SanitizationResult {
     /// values. Taking `self` by value means the mapping is dropped the
     /// moment de-sanitization completes — it is structurally impossible to
     /// reuse the mapping or let it outlive this single call.
+    ///
+    /// Operates on the **minted** map only (FORT-R3-01): the restore set IS the
+    /// set of placeholders emitted into the sanitized text, by construction. A
+    /// placeholder that was never minted (e.g. an embedded email absorbed into a
+    /// URL interval, or a model-guessed look-alike) is not a key here, so it
+    /// cannot be rewritten back to raw PII — closing the R1-02 re-injection class
+    /// for overlap cases.
     ///
     /// # Examples
     ///
@@ -265,8 +278,13 @@ impl QuerySanitizer {
         // the ORIGINAL text (FORT-R2-03). Value-based global replace let a later
         // replacement land inside an already-minted placeholder (an entity named
         // "EMAIL" rewriting [EMAIL_<ns>_001]); span replacement appends
-        // placeholders and never re-scans them.
-        let sanitized_text = replace_spans(query, &matches, &mapping);
+        // placeholders and never re-scans them. `replace_spans` returns the
+        // sanitized text AND the MINTED submap — the placeholders it actually
+        // emitted. Overlap absorption means a covered match's placeholder is
+        // never minted; `restore` must act on the minted set ONLY, or a cloud
+        // response echoing a never-sent placeholder could be rewritten back to
+        // raw PII (FORT-R3-01 re-injection under overlap).
+        let (sanitized_text, minted) = replace_spans(query, &matches, &mapping);
 
         // Step 5: Determine if confirmation needed.
         let requires_confirmation = !score.safe_to_sanitize;
@@ -276,9 +294,9 @@ impl QuerySanitizer {
                 score = score.total,
                 "ZKQP: privacy score too high — user confirmation required"
             );
-        } else if !mapping.is_empty() {
+        } else if !minted.is_empty() {
             info!(
-                pii_count = mapping.len(),
+                pii_count = minted.len(),
                 score = score.total,
                 "ZKQP: query sanitized"
             );
@@ -287,7 +305,7 @@ impl QuerySanitizer {
         SanitizationResult {
             sanitized_text,
             score,
-            mapping,
+            mapping: minted,
             requires_confirmation,
         }
     }
@@ -318,23 +336,35 @@ impl Default for QuerySanitizer {
 }
 
 /// Replace every PII match with its placeholder by BYTE SPAN, in a single pass
-/// over the ORIGINAL text (FORT-R2-03).
+/// over the ORIGINAL text (FORT-R2-03), returning the sanitized text AND the
+/// **minted** map — the `value -> placeholder` pairs actually emitted.
 ///
 /// `matches` are start-sorted (`PiiDetector::detect`). Overlapping matches — a
 /// URL containing an email, an SSN also matched as a phone — are absorbed into
 /// one maximal cover interval whose placeholder is the FIRST match's (by start;
-/// detect order breaks ties). Two properties hold by construction:
+/// detect order breaks ties). Three properties hold by construction:
 ///
 /// - **No placeholder corruption:** the output is built only from the original
 ///   text, and appended placeholders are never re-scanned, so no replacement can
 ///   land inside a minted placeholder (the value-based global-replace bug).
 /// - **Coverage by something:** every byte of every match is inside an emitted
 ///   redaction, even under overlap — no PII byte survives.
+/// - **Minted == emitted (FORT-R3-01):** the returned map contains an entry only
+///   for a placeholder that was actually pushed into `out`. An absorbed match's
+///   placeholder is never minted, so `restore` (which consumes this map) cannot
+///   rewrite a never-sent placeholder back to raw PII. The full detection
+///   `mapping` is the *lookup* source; the minted map is the *restore* source —
+///   keeping these distinct is the whole fix.
 ///
 /// All offsets are byte offsets the detectors produced via `char_indices`, so
 /// the slices are always on char boundaries.
-fn replace_spans(text: &str, matches: &[PiiMatch], mapping: &HashMap<String, String>) -> String {
+fn replace_spans(
+    text: &str,
+    matches: &[PiiMatch],
+    mapping: &HashMap<String, String>,
+) -> (String, HashMap<String, String>) {
     let mut out = String::with_capacity(text.len());
+    let mut minted: HashMap<String, String> = HashMap::new();
     let mut cursor = 0usize;
     let mut i = 0usize;
     while i < matches.len() {
@@ -357,11 +387,16 @@ fn replace_spans(text: &str, matches: &[PiiMatch], mapping: &HashMap<String, Str
         }
         out.push_str(&text[cursor..interval_start]);
         out.push_str(placeholder);
+        // Record ONLY the placeholder just emitted. The absorbed matches in
+        // i+1..j are covered by THIS placeholder and are deliberately NOT
+        // recorded, so the minted map equals the set of placeholders in `out`
+        // (FORT-R3-01: restore must never act on a never-minted placeholder).
+        minted.insert(m.value.clone(), placeholder.clone());
         cursor = interval_end;
         i = j;
     }
     out.push_str(&text[cursor..]);
-    out
+    (out, minted)
 }
 
 /// Generate a fresh random placeholder namespace (8 hex chars) for a sanitizer
@@ -714,6 +749,54 @@ mod tests {
         assert!(
             !sanitized.contains("host.example"),
             "the URL host must be covered, got: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn restore_only_acts_on_minted_placeholders_under_overlap_fort_r3_01() {
+        // FORT-R3-01 (the R2-02/R2-03 composition seam): R2-03's span-merge
+        // absorbs the embedded email into the URL interval, so ONLY the URL
+        // placeholder is minted into the prompt. Pre-fix, restore() still iterated
+        // the FULL detection mapping, which retained the absorbed email's entry
+        // (user@host.example -> [EMAIL_<ns>_001]). So a cloud response that merely
+        // CONTAINED that never-sent placeholder (a model guess / look-alike) was
+        // rewritten back to raw PII the cloud never received — R1-02 re-injection,
+        // reopened for overlap. The fix: restore operates on the MINTED set only.
+        let sanitizer = QuerySanitizer::new();
+        let result = sanitizer.sanitize("Visit https://host.example/u?cc=user@host.example now");
+        let sanitized = result.sanitized_text().to_string();
+
+        // The URL placeholder is minted; the absorbed email placeholder is NOT.
+        assert!(
+            sanitized.contains("[URL_"),
+            "the URL placeholder must be minted: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("[EMAIL_"),
+            "the absorbed email must not be separately minted: {sanitized}"
+        );
+
+        // Reconstruct the email placeholder build_mapping WOULD have assigned the
+        // absorbed email: same per-instance namespace as the minted URL
+        // placeholder (parsed out of the output), [EMAIL_<ns>_001] (first email,
+        // per-type counter). This is the never-sent placeholder.
+        let ns_start = sanitized.find("[URL_").expect("URL placeholder present") + "[URL_".len();
+        let after = &sanitized[ns_start..];
+        let ns = &after[..after.find('_').expect("namespace terminator")];
+        let never_minted = format!("[EMAIL_{ns}_001]");
+
+        // A cloud response echoing the never-minted placeholder. RED pre-fix:
+        // restore rewrites it to user@host.example. Post-fix: the minted map
+        // lacks that entry, so it passes through untouched.
+        let response = format!("See {never_minted} for the contact");
+        let restored = result.restore(&response);
+        assert!(
+            !restored.contains("host.example"),
+            "a never-minted placeholder must NOT restore to raw PII: {restored}"
+        );
+        assert!(
+            restored.contains(&never_minted),
+            "the never-minted placeholder should pass through verbatim: {restored}"
         );
     }
 }

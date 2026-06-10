@@ -923,4 +923,23 @@ mod tests {
             "a registered known entity must be detected"
         );
     }
+
+    #[test]
+    fn placeholder_is_not_a_stable_function_of_the_value_fort_r2_02() {
+        // R2-02 residual-linkability guard: a value's placeholder must depend on
+        // its POSITION (the per-query ordinal counter), not be a stable function
+        // of the value -- else the cloud could correlate two queries as
+        // containing the same hidden value. Same value at a different position
+        // gets a different placeholder, even with the namespace held fixed.
+        let detector = PiiDetector::new();
+        let ns = "fixed_ns";
+        let a = detector.detect("Email alice@example.com today");
+        let ma = detector.build_mapping(&a, ns);
+        let b = detector.detect("Email bob@x.com cc alice@example.com");
+        let mb = detector.build_mapping(&b, ns);
+        assert_ne!(
+            ma["alice@example.com"], mb["alice@example.com"],
+            "same value at a different position must get a different placeholder"
+        );
+    }
 }

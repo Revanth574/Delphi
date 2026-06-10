@@ -170,6 +170,12 @@ pub struct QuerySanitizer {
     detector: PiiDetector,
     /// Privacy scorer.
     scorer: PrivacyScorer,
+    /// Per-instance random placeholder namespace (FORT-R2-02). Generated once at
+    /// construction and STORED, so it is stable for this instance's lifetime
+    /// (per-instance determinism = the SVC-1 retry binding holds) yet RANDOM
+    /// across instances (unlinkable across sessions). It is NOT derived from any
+    /// query, so the wire-visible placeholder leaks nothing about the query.
+    namespace: String,
 }
 
 impl QuerySanitizer {
@@ -187,6 +193,7 @@ impl QuerySanitizer {
         Self {
             detector: PiiDetector::new(),
             scorer: PrivacyScorer::new(),
+            namespace: random_namespace(),
         }
     }
 
@@ -209,6 +216,7 @@ impl QuerySanitizer {
         Self {
             detector,
             scorer: PrivacyScorer::new(),
+            namespace: random_namespace(),
         }
     }
 
@@ -247,10 +255,11 @@ impl QuerySanitizer {
         // Step 2: Score privacy.
         let score = self.scorer.score(&matches);
 
-        // Step 3: Build mapping (memory-only). The query-bound token makes
+        // Step 3: Build mapping (memory-only). The per-instance namespace makes
         // placeholders collision-resistant against look-alikes in cloud responses
-        // (FORT-R1-02), while staying deterministic for the same query.
-        let mapping = self.detector.build_mapping(&matches, &query_token(query));
+        // (FORT-R1-02) WITHOUT deriving any wire-visible value from the query
+        // (FORT-R2-02); it is stable for this instance, so retry is deterministic.
+        let mapping = self.detector.build_mapping(&matches, &self.namespace);
 
         // Step 4: Replace PII with placeholders.
         let sanitized_text = if mapping.is_empty() {
@@ -316,15 +325,21 @@ impl Default for QuerySanitizer {
     }
 }
 
-/// A short, deterministic, query-bound token mixed into every placeholder so a
-/// literal placeholder-shaped string in a cloud response cannot collide with a
-/// minted one (FORT-R1-02). Derived from `SHA-256(query)` — stateless and stable
-/// for the same query, so sanitization stays deterministic for the cloud-egress
-/// HMAC binding, and unguessable to the cloud (which never sees the query hash).
-fn query_token(query: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(query.as_bytes());
-    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+/// Generate a fresh random placeholder namespace (8 hex chars) for a sanitizer
+/// instance (FORT-R2-02).
+///
+/// The namespace's only jobs are to be UNGUESSABLE to the cloud (so a literal
+/// placeholder-shaped string in a response cannot collide with a minted one —
+/// FORT-R1-02) and STABLE for the instance (so a confirmed retry on the same
+/// gateway re-sanitizes identically — the SVC-1 HMAC binding). It is
+/// query-INDEPENDENT: the earlier `SHA-256(query)` derivation was wire-visible
+/// and let the cloud link identical queries and offline-verify guessed PII; a
+/// random, query-independent namespace removes that fingerprint.
+fn random_namespace() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 4];
+    rand::rng().fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -447,28 +462,27 @@ mod tests {
         assert!(restored.contains("user@test.com"));
     }
 
-    /// SVC-1-R1-1 PRECONDITION: sanitization must be deterministic.
+    /// SVC-1-R1-1 PRECONDITION: sanitization is deterministic PER INSTANCE.
     ///
-    /// The cloud-egress `ConfirmationToken` (die-inference) binds an HMAC to
-    /// the sanitized text, so a confirmed retry re-sanitizes and re-checks the
-    /// HMAC. That only works if `sanitize` is byte-stable for the same input:
-    /// same input -> same `sanitized_text`, across repeated calls AND across
-    /// fresh sanitizer instances (no per-instance state perturbs the
-    /// placeholder assignment). If this ever fails, the token design is
-    /// unsound and the non-determinism must be fixed before relying on it.
+    /// The cloud-egress `ConfirmationToken` (die-inference) binds an HMAC to the
+    /// sanitized text, so a confirmed retry re-sanitizes and re-checks the HMAC.
+    /// The egress gateway holds ONE `QuerySanitizer` for its lifetime
+    /// (`egress.rs`), so the original send and the retry re-sanitize on the SAME
+    /// instance -> same `sanitized_text` -> the token re-verifies.
+    ///
+    /// Cross-INSTANCE determinism is deliberately NOT a property (FORT-R2-02): a
+    /// query-derived, instance-stable token was a wire-visible fingerprint that
+    /// let the cloud link identical queries / offline-verify guessed PII. The
+    /// placeholder namespace is now a per-instance secret, so two instances
+    /// differ by design. This is a CORRECTION of the contract the test encodes
+    /// (per-instance is what SVC-1 actually needs), not a weakening of it.
     #[test]
-    fn sanitize_is_deterministic() {
+    fn sanitize_is_deterministic_per_instance_fort_r2_02() {
         let input = "Email a@a.com and b@b.com from 10.0.0.1 on 2024-06-15";
-        let s1 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
-        let s2 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
-        assert_eq!(s1, s2, "sanitization must be deterministic for token HMAC binding");
-
-        // Also stable across repeated calls on the same instance.
         let sanitizer = QuerySanitizer::new();
         let a = sanitizer.sanitize(input).sanitized_text().to_string();
         let b = sanitizer.sanitize(input).sanitized_text().to_string();
-        assert_eq!(a, b);
-        assert_eq!(a, s1);
+        assert_eq!(a, b, "same instance must be byte-stable (SVC-1 retry binding)");
     }
 
     #[test]
@@ -584,6 +598,39 @@ mod tests {
         assert!(
             restored.contains("[EMAIL_001]"),
             "a bare look-alike placeholder must NOT be rewritten to PII"
+        );
+    }
+
+    #[test]
+    fn identical_queries_are_unlinkable_across_instances_fort_r2_02() {
+        // R2-02: the wire-visible placeholder token must not let the cloud
+        // correlate identical queries across sessions. Pre-fix the token was
+        // SHA-256(query)[..4], a keyless function of the query -> identical for
+        // the same query in any instance -> linkable. RED pre-fix: p1 == p2.
+        let input = "Contact alice@example.com please";
+        let p1 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        let p2 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        assert_ne!(
+            p1, p2,
+            "identical queries must not yield correlatable placeholders across instances"
+        );
+    }
+
+    #[test]
+    fn placeholder_token_is_not_a_query_hash_fort_r2_02() {
+        // R2-02: no offline verifier. Pre-fix the placeholder embedded
+        // SHA-256(query)[..4] hex, which the cloud could recompute from a GUESSED
+        // query to confirm the guess. RED pre-fix: the sanitized text contains it.
+        use sha2::{Digest, Sha256};
+        let input = "Contact alice@example.com please";
+        let sanitized = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        let leaked: String = Sha256::digest(input.as_bytes())[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            !sanitized.contains(&leaked),
+            "placeholder must not embed a query-derived hash the cloud can recompute"
         );
     }
 }

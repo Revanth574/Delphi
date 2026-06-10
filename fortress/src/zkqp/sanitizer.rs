@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use tracing::{info, warn};
 
-use crate::zkqp::pii::PiiDetector;
+use crate::zkqp::pii::{PiiDetector, PiiMatch};
 use crate::zkqp::scorer::{PrivacyScore, PrivacyScorer};
 
 /// Result of sanitizing a query.
@@ -261,20 +261,12 @@ impl QuerySanitizer {
         // (FORT-R2-02); it is stable for this instance, so retry is deterministic.
         let mapping = self.detector.build_mapping(&matches, &self.namespace);
 
-        // Step 4: Replace PII with placeholders.
-        let sanitized_text = if mapping.is_empty() {
-            query.to_string()
-        } else {
-            let mut result = query.to_string();
-            // Replace longest matches first to avoid partial replacements.
-            let mut sorted_pairs: Vec<(&String, &String)> = mapping.iter().collect();
-            sorted_pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-            for (original, placeholder) in sorted_pairs {
-                result = result.replace(original.as_str(), placeholder);
-            }
-            result
-        };
+        // Step 4: Replace PII with placeholders by BYTE SPAN, single pass over
+        // the ORIGINAL text (FORT-R2-03). Value-based global replace let a later
+        // replacement land inside an already-minted placeholder (an entity named
+        // "EMAIL" rewriting [EMAIL_<ns>_001]); span replacement appends
+        // placeholders and never re-scans them.
+        let sanitized_text = replace_spans(query, &matches, &mapping);
 
         // Step 5: Determine if confirmation needed.
         let requires_confirmation = !score.safe_to_sanitize;
@@ -323,6 +315,53 @@ impl Default for QuerySanitizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Replace every PII match with its placeholder by BYTE SPAN, in a single pass
+/// over the ORIGINAL text (FORT-R2-03).
+///
+/// `matches` are start-sorted (`PiiDetector::detect`). Overlapping matches — a
+/// URL containing an email, an SSN also matched as a phone — are absorbed into
+/// one maximal cover interval whose placeholder is the FIRST match's (by start;
+/// detect order breaks ties). Two properties hold by construction:
+///
+/// - **No placeholder corruption:** the output is built only from the original
+///   text, and appended placeholders are never re-scanned, so no replacement can
+///   land inside a minted placeholder (the value-based global-replace bug).
+/// - **Coverage by something:** every byte of every match is inside an emitted
+///   redaction, even under overlap — no PII byte survives.
+///
+/// All offsets are byte offsets the detectors produced via `char_indices`, so
+/// the slices are always on char boundaries.
+fn replace_spans(text: &str, matches: &[PiiMatch], mapping: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < matches.len() {
+        let m = &matches[i];
+        if m.end <= cursor {
+            i += 1;
+            continue;
+        }
+        let Some(placeholder) = mapping.get(&m.value) else {
+            i += 1;
+            continue;
+        };
+        let interval_start = m.start.max(cursor);
+        let mut interval_end = m.end;
+        // Absorb later matches that overlap this (growing) interval.
+        let mut j = i + 1;
+        while j < matches.len() && matches[j].start < interval_end {
+            interval_end = interval_end.max(matches[j].end);
+            j += 1;
+        }
+        out.push_str(&text[cursor..interval_start]);
+        out.push_str(placeholder);
+        cursor = interval_end;
+        i = j;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 /// Generate a fresh random placeholder namespace (8 hex chars) for a sanitizer
@@ -631,6 +670,50 @@ mod tests {
         assert!(
             !sanitized.contains(&leaked),
             "placeholder must not embed a query-derived hash the cloud can recompute"
+        );
+    }
+
+    #[test]
+    fn replacement_does_not_corrupt_minted_placeholders_fort_r2_03() {
+        // FORT-R2-03: global String::replace over length-sorted values let a
+        // known-entity named "EMAIL" replace INSIDE the minted [EMAIL_<ns>_001]
+        // placeholder, destroying it. Span-based single-pass replacement builds
+        // the output from the ORIGINAL text only, so nothing lands in a minted
+        // placeholder.
+        let mut detector = PiiDetector::new();
+        detector.add_entity("EMAIL");
+        let sanitizer = QuerySanitizer::with_detector(detector);
+        let sanitized = sanitizer
+            .sanitize("EMAIL alice@example.com please")
+            .sanitized_text()
+            .to_string();
+        // Exactly one INTACT email placeholder. RED pre-fix: the entity "EMAIL"
+        // replaced inside it, so the "[EMAIL_" count was 0 (corrupted).
+        assert_eq!(
+            sanitized.matches("[EMAIL_").count(),
+            1,
+            "the minted email placeholder must survive intact, got: {sanitized}"
+        );
+        assert!(!sanitized.contains("alice@example.com"), "email must be redacted");
+    }
+
+    #[test]
+    fn overlapping_matches_are_fully_covered_fort_r2_03() {
+        // Overlap-resolution rule: overlapping matches are absorbed into one
+        // maximal cover interval (the first by start owns the placeholder; later
+        // overlapping matches are absorbed). The property is coverage-by-
+        // SOMETHING: every byte of every detected PII value is redacted even when
+        // one detector's match sits inside another's (a URL containing an email).
+        let sanitizer = QuerySanitizer::new();
+        let input = "Visit https://host.example/u?cc=user@host.example now";
+        let sanitized = sanitizer.sanitize(input).sanitized_text().to_string();
+        assert!(
+            !sanitized.contains("user@host.example"),
+            "the embedded email must be covered, got: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("host.example"),
+            "the URL host must be covered, got: {sanitized}"
         );
     }
 }

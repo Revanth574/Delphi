@@ -17,6 +17,12 @@ argon2 = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 
+# ZKQP digit classification (FORT-R2-01): General_Category = Decimal_Number
+# (Nd) is the authoritative "decimal digit, any script" — hand-enumerated
+# ranges proved incomplete twice (full-width, then Arabic-Indic). Same crate
+# and pattern as die-orchestrator's path sanitation (Task 3A.6).
+unicode-general-category = "1"
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 criterion = { workspace = true }

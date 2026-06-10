@@ -645,18 +645,28 @@ fn is_pii_separator(c: char) -> bool {
 }
 
 /// True for characters that function as digits in phone numbers, credit cards,
-/// and national IDs — ASCII `0-9` plus the full-width forms U+FF10..=U+FF19,
-/// which render as digits but fail `is_ascii_digit()` (so the scanners silently
-/// skipped them — the FORT-R1-01 silent-leak class).
+/// and national IDs — Unicode **General_Category = Decimal_Number (Nd)**, the
+/// authoritative definition of "decimal digit, any script" (FORT-R2-01).
+///
+/// Hand-enumerated ranges proved incomplete twice in one sweep: ASCII-only
+/// missed full-width forms (U+FF10..), and ASCII+full-width missed Arabic-Indic
+/// — with Devanagari, Bengali, Thai, and every other Nd script behind it. The
+/// category closes the class non-enumeratively: a script never listed here is
+/// still caught because its digits are Nd by definition. The ASCII check is a
+/// fast path only (ASCII `0-9` is itself Nd); the property-table lookup is a
+/// pure function, so detection stays deterministic for the egress HMAC binding.
+/// Deliberately NOT `char::is_numeric()`, which also accepts Letter_Number /
+/// Other_Number (Roman numerals, fractions) and would over-match.
 ///
 /// Same broaden-in-place rule as [`is_pii_separator`]: the scanners accept these
-/// **in the original text** rather than normalizing full-width→ASCII first,
-/// which would put the match value/offsets in normalized coordinates that no
-/// longer substring-match the input (the `c86e075` offset class). Full-width
-/// digits are 3 bytes each, so all offsets must flow through `char_indices` —
-/// never byte arithmetic on a digit count.
+/// **in the original text** rather than normalizing to ASCII first, which would
+/// put the match value/offsets in normalized coordinates that no longer
+/// substring-match the input (the `c86e075` offset class). Nd digits are
+/// multibyte, so all offsets must flow through `char_indices` — never byte
+/// arithmetic on a digit count.
 fn is_pii_digit(c: char) -> bool {
-    c.is_ascii_digit() || ('\u{FF10}'..='\u{FF19}').contains(&c)
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    c.is_ascii_digit() || get_general_category(c) == GeneralCategory::DecimalNumber
 }
 
 /// True for characters valid in an email local part: the full RFC 5322 `atext`

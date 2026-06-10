@@ -511,6 +511,35 @@ mod tests {
                 "\u{FF16}\u{FF17}\u{FF18}\u{FF19}",
                 "SSN full-width digits",
             ),
+            // FORT-R2-01: digits from OTHER Unicode scripts (General_Category =
+            // Nd). Hand-enumerated ranges (ASCII, then +full-width) missed these
+            // — the category, not another range, is the fix. Thai is the proof
+            // row: a script never specifically enumerated anywhere in this file.
+            (
+                "Call \u{0665}\u{0665}\u{0665}-\u{0668}\u{0666}\u{0667}-\u{0665}\u{0663}\u{0660}\u{0669} today",
+                "\u{0665}\u{0663}\u{0660}\u{0669}",
+                "phone Arabic-Indic digits",
+            ),
+            (
+                "Card \u{06F4}\u{06F1}\u{06F1}\u{06F1} \u{06F1}\u{06F1}\u{06F1}\u{06F1} \u{06F1}\u{06F1}\u{06F1}\u{06F1} \u{06F1}\u{06F1}\u{06F1}\u{06F1} ok",
+                "\u{06F4}\u{06F1}\u{06F1}\u{06F1}",
+                "card Extended-Arabic-Indic digits",
+            ),
+            (
+                "SSN \u{0967}\u{0968}\u{0969}-\u{096A}\u{096B}-\u{096C}\u{096D}\u{096E}\u{096F} filed",
+                "\u{096C}\u{096D}\u{096E}\u{096F}",
+                "SSN Devanagari digits",
+            ),
+            (
+                "Call \u{09E7}\u{09E8}\u{09E9}\u{09EA}\u{09EB}\u{09EC}\u{09ED}\u{09EE}\u{09EF}\u{09E6} now",
+                "\u{09ED}\u{09EE}\u{09EF}\u{09E6}",
+                "phone Bengali digits",
+            ),
+            (
+                "Card \u{0E54}\u{0E51}\u{0E51}\u{0E51} \u{0E51}\u{0E51}\u{0E51}\u{0E51} \u{0E51}\u{0E51}\u{0E51}\u{0E51} \u{0E51}\u{0E51}\u{0E51}\u{0E51} ok",
+                "\u{0E54}\u{0E51}\u{0E51}\u{0E51}",
+                "card Thai digits (never-enumerated script)",
+            ),
         ];
         let sanitizer = QuerySanitizer::new();
         let mut leaks = Vec::new();

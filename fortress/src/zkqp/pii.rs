@@ -669,16 +669,21 @@ fn is_pii_digit(c: char) -> bool {
     c.is_ascii_digit() || get_general_category(c) == GeneralCategory::DecimalNumber
 }
 
-/// True for characters valid in an email local part: the full RFC 5322 `atext`
-/// set plus `.` (dot-atom). The old scan allowed only alphanumerics and `._-`,
-/// so a local part like `johndoe+tag` was truncated at `+`, leaking the prefix.
+/// True for characters valid in an email local part: the RFC 5322 `atext` set
+/// plus `.` (dot-atom). The old scan allowed only alphanumerics and `._-`, so a
+/// local part like `johndoe+tag` was truncated at `+`, leaking the prefix.
+///
+/// `/` is `atext` per RFC 5322 but is deliberately EXCLUDED (FORT-R2-04): real
+/// local parts essentially never contain it, and treating it as a local-part
+/// character made `/api/users@host` redact the whole URL path as one email
+/// (over-redaction). Excluding it keeps the left boundary at the path separator.
 fn is_email_local_char(c: char) -> bool {
     c.is_alphanumeric()
         || c == '.'
         || matches!(
             c,
-            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '/' | '=' | '?' | '^' | '_'
-                | '`' | '{' | '|' | '}' | '~'
+            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '=' | '?' | '^' | '_' | '`'
+                | '{' | '|' | '}' | '~'
         )
 }
 
@@ -940,6 +945,25 @@ mod tests {
         assert_ne!(
             ma["alice@example.com"], mb["alice@example.com"],
             "same value at a different position must get a different placeholder"
+        );
+    }
+
+    #[test]
+    fn atext_email_does_not_slurp_url_path_fort_r2_04() {
+        // FORT-R2-04: '/' is RFC 5322 atext, but treating it as a local-part char
+        // made "/api/users@example.com" redact the whole path as one email
+        // (over-redaction). '/' is now excluded, so detection stops at the path
+        // separator and only the real email is captured.
+        let detector = PiiDetector::new();
+        let matches = detector.detect("GET /api/users@example.com HTTP");
+        let email = matches
+            .iter()
+            .find(|m| m.pii_type == PiiType::Email)
+            .expect("an email must be detected");
+        // RED pre-fix: value was "/api/users@example.com" (path slurped).
+        assert_eq!(
+            email.value, "users@example.com",
+            "only the email must be captured, not the URL path"
         );
     }
 }

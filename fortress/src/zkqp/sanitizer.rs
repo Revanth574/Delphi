@@ -494,6 +494,23 @@ mod tests {
             ("Card 4111\u{00A0}1111\u{00A0}1111\u{00A0}1111 ok", "4111", "card NBSP separators"),
             ("Pay 4111\u{2011}1111\u{2011}1111\u{2011}1111 now", "4111", "card non-breaking-hyphen separators"),
             ("SSN 123\u{2011}45\u{2011}6789 filed", "6789", "SSN non-breaking-hyphen separators"),
+            // Full-width digits (U+FF10..U+FF19): look like digits, but
+            // is_ascii_digit() is false, so the digit scanners skipped them.
+            (
+                "Call \u{FF15}\u{FF15}\u{FF15}-\u{FF18}\u{FF16}\u{FF17}-\u{FF15}\u{FF13}\u{FF10}\u{FF19} today",
+                "\u{FF15}\u{FF13}\u{FF10}\u{FF19}",
+                "phone full-width digits",
+            ),
+            (
+                "Card \u{FF14}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} ok",
+                "\u{FF14}\u{FF11}\u{FF11}\u{FF11}",
+                "card full-width digits",
+            ),
+            (
+                "SSN \u{FF11}\u{FF12}\u{FF13}-\u{FF14}\u{FF15}-\u{FF16}\u{FF17}\u{FF18}\u{FF19} filed",
+                "\u{FF16}\u{FF17}\u{FF18}\u{FF19}",
+                "SSN full-width digits",
+            ),
         ];
         let sanitizer = QuerySanitizer::new();
         let mut leaks = Vec::new();

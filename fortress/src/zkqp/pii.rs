@@ -299,22 +299,22 @@ impl PiiDetector {
 
         while i < chars.len() {
             // Look for sequences of digits possibly separated by -/./space
-            if chars[i].is_ascii_digit()
-                || (chars[i] == '+' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+            if is_pii_digit(chars[i])
+                || (chars[i] == '+' && i + 1 < chars.len() && is_pii_digit(chars[i + 1]))
             {
                 let start = i;
                 let mut digit_count = 0;
                 let mut j = i;
 
                 while j < chars.len()
-                    && (chars[j].is_ascii_digit()
+                    && (is_pii_digit(chars[j])
                         || is_pii_separator(chars[j])
                         || chars[j] == '.'
                         || chars[j] == '('
                         || chars[j] == ')'
                         || chars[j] == '+')
                 {
-                    if chars[j].is_ascii_digit() {
+                    if is_pii_digit(chars[j]) {
                         digit_count += 1;
                     }
                     j += 1;
@@ -478,16 +478,16 @@ impl PiiDetector {
         let mut i = 0;
 
         while i < chars.len() {
-            if chars[i].is_ascii_digit() {
+            if is_pii_digit(chars[i]) {
                 let start = i;
                 let mut digit_count = 0;
                 let mut last_digit = i + 1; // exclusive char-end of the last digit
                 let mut j = i;
 
                 while j < chars.len()
-                    && (chars[j].is_ascii_digit() || is_pii_separator(chars[j]))
+                    && (is_pii_digit(chars[j]) || is_pii_separator(chars[j]))
                 {
-                    if chars[j].is_ascii_digit() {
+                    if is_pii_digit(chars[j]) {
                         digit_count += 1;
                         last_digit = j + 1;
                     }
@@ -526,20 +526,20 @@ impl PiiDetector {
         let mut i = 0;
         // SSN: 3 digits '-' 2 digits '-' 4 digits (11 chars total).
         while i + 10 < chars.len() {
-            let shaped = chars[i].is_ascii_digit()
-                && chars[i + 1].is_ascii_digit()
-                && chars[i + 2].is_ascii_digit()
+            let shaped = is_pii_digit(chars[i])
+                && is_pii_digit(chars[i + 1])
+                && is_pii_digit(chars[i + 2])
                 && is_pii_separator(chars[i + 3])
-                && chars[i + 4].is_ascii_digit()
-                && chars[i + 5].is_ascii_digit()
+                && is_pii_digit(chars[i + 4])
+                && is_pii_digit(chars[i + 5])
                 && is_pii_separator(chars[i + 6])
-                && chars[i + 7].is_ascii_digit()
-                && chars[i + 8].is_ascii_digit()
-                && chars[i + 9].is_ascii_digit()
-                && chars[i + 10].is_ascii_digit();
+                && is_pii_digit(chars[i + 7])
+                && is_pii_digit(chars[i + 8])
+                && is_pii_digit(chars[i + 9])
+                && is_pii_digit(chars[i + 10]);
             // Reject when embedded in a longer digit run (e.g. inside a card).
-            let isolated = (i == 0 || !chars[i - 1].is_ascii_digit())
-                && (i + 11 >= chars.len() || !chars[i + 11].is_ascii_digit());
+            let isolated = (i == 0 || !is_pii_digit(chars[i - 1]))
+                && (i + 11 >= chars.len() || !is_pii_digit(chars[i + 11]));
             if shaped && isolated {
                 let byte_start = text.char_indices().nth(i).map_or(0, |(b, _)| b);
                 let byte_end = text
@@ -642,6 +642,21 @@ fn is_pii_separator(c: char) -> bool {
         c,
         ' ' | '-' | '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2010}' | '\u{2011}' | '\u{2012}'
     )
+}
+
+/// True for characters that function as digits in phone numbers, credit cards,
+/// and national IDs — ASCII `0-9` plus the full-width forms U+FF10..=U+FF19,
+/// which render as digits but fail `is_ascii_digit()` (so the scanners silently
+/// skipped them — the FORT-R1-01 silent-leak class).
+///
+/// Same broaden-in-place rule as [`is_pii_separator`]: the scanners accept these
+/// **in the original text** rather than normalizing full-width→ASCII first,
+/// which would put the match value/offsets in normalized coordinates that no
+/// longer substring-match the input (the `c86e075` offset class). Full-width
+/// digits are 3 bytes each, so all offsets must flow through `char_indices` —
+/// never byte arithmetic on a digit count.
+fn is_pii_digit(c: char) -> bool {
+    c.is_ascii_digit() || ('\u{FF10}'..='\u{FF19}').contains(&c)
 }
 
 /// True for characters valid in an email local part: the full RFC 5322 `atext`
@@ -861,6 +876,27 @@ mod tests {
                 .iter()
                 .any(|m| m.pii_type == PiiType::NationalId && m.value == "123-45-6789"),
             "an SSN must be detected as NationalId"
+        );
+    }
+
+    #[test]
+    fn full_width_card_value_is_a_substring_of_the_original_zkqp() {
+        // FORT-R1-01 class, byte-vs-char guard: full-width digits are 3 BYTES
+        // each (vs 1 for ASCII), so any scanner conflating byte length with
+        // digit count would emit a value/offsets that no longer line up with
+        // the original — and sanitize() could not redact it (the c86e075
+        // class). The value must equal the original-text slice exactly.
+        let detector = PiiDetector::new();
+        let input = "pay \u{FF14}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} now";
+        let cc = detector
+            .detect(input)
+            .into_iter()
+            .find(|m| m.pii_type == PiiType::CreditCard)
+            .expect("a full-width-digit credit card must be detected");
+        assert_eq!(
+            cc.value.as_str(),
+            &input[cc.start..cc.end],
+            "full-width value must equal the original-text slice at [start, end)"
         );
     }
 

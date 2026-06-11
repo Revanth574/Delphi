@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use tracing::{info, warn};
 
-use crate::zkqp::pii::PiiDetector;
+use crate::zkqp::pii::{PiiDetector, PiiMatch};
 use crate::zkqp::scorer::{PrivacyScore, PrivacyScorer};
 
 /// Result of sanitizing a query.
@@ -76,6 +76,12 @@ pub struct SanitizationResult {
     /// original query is intentionally NOT stored (SVC-1 — minimal PII
     /// footprint), so the only way the originals leave this struct is via
     /// [`restore`](Self::restore), which consumes them.
+    ///
+    /// This is the **minted** map (FORT-R3-01): only the placeholders actually
+    /// emitted into [`sanitized_text`](Self::sanitized_text). Under overlap
+    /// absorption (FORT-R2-03) a covered match's placeholder is never minted, so
+    /// it is deliberately absent here — `restore` can therefore only rewrite a
+    /// placeholder that was genuinely sent, never re-inject a never-minted one.
     mapping: HashMap<String, String>,
     /// Whether user confirmation is needed (score > threshold).
     requires_confirmation: bool,
@@ -126,6 +132,13 @@ impl SanitizationResult {
     /// moment de-sanitization completes — it is structurally impossible to
     /// reuse the mapping or let it outlive this single call.
     ///
+    /// Operates on the **minted** map only (FORT-R3-01): the restore set IS the
+    /// set of placeholders emitted into the sanitized text, by construction. A
+    /// placeholder that was never minted (e.g. an embedded email absorbed into a
+    /// URL interval, or a model-guessed look-alike) is not a key here, so it
+    /// cannot be rewritten back to raw PII — closing the R1-02 re-injection class
+    /// for overlap cases.
+    ///
     /// # Examples
     ///
     /// ```
@@ -170,6 +183,12 @@ pub struct QuerySanitizer {
     detector: PiiDetector,
     /// Privacy scorer.
     scorer: PrivacyScorer,
+    /// Per-instance random placeholder namespace (FORT-R2-02). Generated once at
+    /// construction and STORED, so it is stable for this instance's lifetime
+    /// (per-instance determinism = the SVC-1 retry binding holds) yet RANDOM
+    /// across instances (unlinkable across sessions). It is NOT derived from any
+    /// query, so the wire-visible placeholder leaks nothing about the query.
+    namespace: String,
 }
 
 impl QuerySanitizer {
@@ -187,6 +206,7 @@ impl QuerySanitizer {
         Self {
             detector: PiiDetector::new(),
             scorer: PrivacyScorer::new(),
+            namespace: random_namespace(),
         }
     }
 
@@ -209,6 +229,7 @@ impl QuerySanitizer {
         Self {
             detector,
             scorer: PrivacyScorer::new(),
+            namespace: random_namespace(),
         }
     }
 
@@ -247,23 +268,23 @@ impl QuerySanitizer {
         // Step 2: Score privacy.
         let score = self.scorer.score(&matches);
 
-        // Step 3: Build mapping (memory-only).
-        let mapping = self.detector.build_mapping(&matches);
+        // Step 3: Build mapping (memory-only). The per-instance namespace makes
+        // placeholders collision-resistant against look-alikes in cloud responses
+        // (FORT-R1-02) WITHOUT deriving any wire-visible value from the query
+        // (FORT-R2-02); it is stable for this instance, so retry is deterministic.
+        let mapping = self.detector.build_mapping(&matches, &self.namespace);
 
-        // Step 4: Replace PII with placeholders.
-        let sanitized_text = if mapping.is_empty() {
-            query.to_string()
-        } else {
-            let mut result = query.to_string();
-            // Replace longest matches first to avoid partial replacements.
-            let mut sorted_pairs: Vec<(&String, &String)> = mapping.iter().collect();
-            sorted_pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-            for (original, placeholder) in sorted_pairs {
-                result = result.replace(original.as_str(), placeholder);
-            }
-            result
-        };
+        // Step 4: Replace PII with placeholders by BYTE SPAN, single pass over
+        // the ORIGINAL text (FORT-R2-03). Value-based global replace let a later
+        // replacement land inside an already-minted placeholder (an entity named
+        // "EMAIL" rewriting [EMAIL_<ns>_001]); span replacement appends
+        // placeholders and never re-scans them. `replace_spans` returns the
+        // sanitized text AND the MINTED submap — the placeholders it actually
+        // emitted. Overlap absorption means a covered match's placeholder is
+        // never minted; `restore` must act on the minted set ONLY, or a cloud
+        // response echoing a never-sent placeholder could be rewritten back to
+        // raw PII (FORT-R3-01 re-injection under overlap).
+        let (sanitized_text, minted) = replace_spans(query, &matches, &mapping);
 
         // Step 5: Determine if confirmation needed.
         let requires_confirmation = !score.safe_to_sanitize;
@@ -273,9 +294,9 @@ impl QuerySanitizer {
                 score = score.total,
                 "ZKQP: privacy score too high — user confirmation required"
             );
-        } else if !mapping.is_empty() {
+        } else if !minted.is_empty() {
             info!(
-                pii_count = mapping.len(),
+                pii_count = minted.len(),
                 score = score.total,
                 "ZKQP: query sanitized"
             );
@@ -284,7 +305,7 @@ impl QuerySanitizer {
         SanitizationResult {
             sanitized_text,
             score,
-            mapping,
+            mapping: minted,
             requires_confirmation,
         }
     }
@@ -312,6 +333,87 @@ impl Default for QuerySanitizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Replace every PII match with its placeholder by BYTE SPAN, in a single pass
+/// over the ORIGINAL text (FORT-R2-03), returning the sanitized text AND the
+/// **minted** map — the `value -> placeholder` pairs actually emitted.
+///
+/// `matches` are start-sorted (`PiiDetector::detect`). Overlapping matches — a
+/// URL containing an email, an SSN also matched as a phone — are absorbed into
+/// one maximal cover interval whose placeholder is the FIRST match's (by start;
+/// detect order breaks ties). Three properties hold by construction:
+///
+/// - **No placeholder corruption:** the output is built only from the original
+///   text, and appended placeholders are never re-scanned, so no replacement can
+///   land inside a minted placeholder (the value-based global-replace bug).
+/// - **Coverage by something:** every byte of every match is inside an emitted
+///   redaction, even under overlap — no PII byte survives.
+/// - **Minted == emitted (FORT-R3-01):** the returned map contains an entry only
+///   for a placeholder that was actually pushed into `out`. An absorbed match's
+///   placeholder is never minted, so `restore` (which consumes this map) cannot
+///   rewrite a never-sent placeholder back to raw PII. The full detection
+///   `mapping` is the *lookup* source; the minted map is the *restore* source —
+///   keeping these distinct is the whole fix.
+///
+/// All offsets are byte offsets the detectors produced via `char_indices`, so
+/// the slices are always on char boundaries.
+fn replace_spans(
+    text: &str,
+    matches: &[PiiMatch],
+    mapping: &HashMap<String, String>,
+) -> (String, HashMap<String, String>) {
+    let mut out = String::with_capacity(text.len());
+    let mut minted: HashMap<String, String> = HashMap::new();
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < matches.len() {
+        let m = &matches[i];
+        if m.end <= cursor {
+            i += 1;
+            continue;
+        }
+        let Some(placeholder) = mapping.get(&m.value) else {
+            i += 1;
+            continue;
+        };
+        let interval_start = m.start.max(cursor);
+        let mut interval_end = m.end;
+        // Absorb later matches that overlap this (growing) interval.
+        let mut j = i + 1;
+        while j < matches.len() && matches[j].start < interval_end {
+            interval_end = interval_end.max(matches[j].end);
+            j += 1;
+        }
+        out.push_str(&text[cursor..interval_start]);
+        out.push_str(placeholder);
+        // Record ONLY the placeholder just emitted. The absorbed matches in
+        // i+1..j are covered by THIS placeholder and are deliberately NOT
+        // recorded, so the minted map equals the set of placeholders in `out`
+        // (FORT-R3-01: restore must never act on a never-minted placeholder).
+        minted.insert(m.value.clone(), placeholder.clone());
+        cursor = interval_end;
+        i = j;
+    }
+    out.push_str(&text[cursor..]);
+    (out, minted)
+}
+
+/// Generate a fresh random placeholder namespace (8 hex chars) for a sanitizer
+/// instance (FORT-R2-02).
+///
+/// The namespace's only jobs are to be UNGUESSABLE to the cloud (so a literal
+/// placeholder-shaped string in a response cannot collide with a minted one —
+/// FORT-R1-02) and STABLE for the instance (so a confirmed retry on the same
+/// gateway re-sanitizes identically — the SVC-1 HMAC binding). It is
+/// query-INDEPENDENT: the earlier `SHA-256(query)` derivation was wire-visible
+/// and let the cloud link identical queries and offline-verify guessed PII; a
+/// random, query-independent namespace removes that fingerprint.
+fn random_namespace() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 4];
+    rand::rng().fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -434,27 +536,267 @@ mod tests {
         assert!(restored.contains("user@test.com"));
     }
 
-    /// SVC-1-R1-1 PRECONDITION: sanitization must be deterministic.
+    /// SVC-1-R1-1 PRECONDITION: sanitization is deterministic PER INSTANCE.
     ///
-    /// The cloud-egress `ConfirmationToken` (die-inference) binds an HMAC to
-    /// the sanitized text, so a confirmed retry re-sanitizes and re-checks the
-    /// HMAC. That only works if `sanitize` is byte-stable for the same input:
-    /// same input -> same `sanitized_text`, across repeated calls AND across
-    /// fresh sanitizer instances (no per-instance state perturbs the
-    /// placeholder assignment). If this ever fails, the token design is
-    /// unsound and the non-determinism must be fixed before relying on it.
+    /// The cloud-egress `ConfirmationToken` (die-inference) binds an HMAC to the
+    /// sanitized text, so a confirmed retry re-sanitizes and re-checks the HMAC.
+    /// The egress gateway holds ONE `QuerySanitizer` for its lifetime
+    /// (`egress.rs`), so the original send and the retry re-sanitize on the SAME
+    /// instance -> same `sanitized_text` -> the token re-verifies.
+    ///
+    /// Cross-INSTANCE determinism is deliberately NOT a property (FORT-R2-02): a
+    /// query-derived, instance-stable token was a wire-visible fingerprint that
+    /// let the cloud link identical queries / offline-verify guessed PII. The
+    /// placeholder namespace is now a per-instance secret, so two instances
+    /// differ by design. This is a CORRECTION of the contract the test encodes
+    /// (per-instance is what SVC-1 actually needs), not a weakening of it.
     #[test]
-    fn sanitize_is_deterministic() {
+    fn sanitize_is_deterministic_per_instance_fort_r2_02() {
         let input = "Email a@a.com and b@b.com from 10.0.0.1 on 2024-06-15";
-        let s1 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
-        let s2 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
-        assert_eq!(s1, s2, "sanitization must be deterministic for token HMAC binding");
-
-        // Also stable across repeated calls on the same instance.
         let sanitizer = QuerySanitizer::new();
         let a = sanitizer.sanitize(input).sanitized_text().to_string();
         let b = sanitizer.sanitize(input).sanitized_text().to_string();
-        assert_eq!(a, b);
-        assert_eq!(a, s1);
+        assert_eq!(a, b, "same instance must be byte-stable (SVC-1 retry binding)");
+    }
+
+    #[test]
+    fn zkqp_detection_completeness_table_fort_r1_01() {
+        // FORT-R1-01 (P1 LIVE): a false negative in ZKQP is a SILENT PII LEAK to
+        // the cloud — the score reads clean, the send proceeds, raw PII egresses.
+        // Each row carries PII of a CLAIMED-supported class in a valid-but-unusual
+        // form; `canary` is a distinctive substring that MUST be redacted. This
+        // single test reports the WHOLE table of leaks at once (it does NOT abort
+        // on the first), so the full false-negative surface is visible in the RED
+        // run before it is closed.
+        let cases: &[(&str, &str, &str)] = &[
+            // (input, leaked canary that must be redacted, axis)
+            ("Contact johndoe+tag@example.com please", "johndoe", "email +atext (RFC 5322)"),
+            ("Mail user.name+filter@mail.example now", "user.name", "email +atext (RFC 5322)"),
+            ("See HTTPS://secret-host.example/p?k=v here", "secret-host.example", "URL scheme uppercase (RFC 3986)"),
+            ("Visit HtTp://other.example/x now", "other.example", "URL scheme mixed case (RFC 3986)"),
+            ("Host 8.8.8.8, is up", "8.8.8.8", "IPv4 trailing comma"),
+            ("End at 8.8.4.4.", "8.8.4.4", "IPv4 trailing period"),
+            ("Paren (1.2.3.4) here", "1.2.3.4", "IPv4 surrounding parens"),
+            ("Call 555\u{00A0}867\u{00A0}5309 today", "5309", "phone NBSP separators"),
+            ("Ring 555\u{202F}123\u{202F}4567 now", "4567", "phone narrow-NBSP separators"),
+            ("Card 4111\u{00A0}1111\u{00A0}1111\u{00A0}1111 ok", "4111", "card NBSP separators"),
+            ("Pay 4111\u{2011}1111\u{2011}1111\u{2011}1111 now", "4111", "card non-breaking-hyphen separators"),
+            ("SSN 123\u{2011}45\u{2011}6789 filed", "6789", "SSN non-breaking-hyphen separators"),
+            // Full-width digits (U+FF10..U+FF19): look like digits, but
+            // is_ascii_digit() is false, so the digit scanners skipped them.
+            (
+                "Call \u{FF15}\u{FF15}\u{FF15}-\u{FF18}\u{FF16}\u{FF17}-\u{FF15}\u{FF13}\u{FF10}\u{FF19} today",
+                "\u{FF15}\u{FF13}\u{FF10}\u{FF19}",
+                "phone full-width digits",
+            ),
+            (
+                "Card \u{FF14}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} \u{FF11}\u{FF11}\u{FF11}\u{FF11} ok",
+                "\u{FF14}\u{FF11}\u{FF11}\u{FF11}",
+                "card full-width digits",
+            ),
+            (
+                "SSN \u{FF11}\u{FF12}\u{FF13}-\u{FF14}\u{FF15}-\u{FF16}\u{FF17}\u{FF18}\u{FF19} filed",
+                "\u{FF16}\u{FF17}\u{FF18}\u{FF19}",
+                "SSN full-width digits",
+            ),
+            // FORT-R2-01: digits from OTHER Unicode scripts (General_Category =
+            // Nd). Hand-enumerated ranges (ASCII, then +full-width) missed these
+            // — the category, not another range, is the fix. Thai is the proof
+            // row: a script never specifically enumerated anywhere in this file.
+            (
+                "Call \u{0665}\u{0665}\u{0665}-\u{0668}\u{0666}\u{0667}-\u{0665}\u{0663}\u{0660}\u{0669} today",
+                "\u{0665}\u{0663}\u{0660}\u{0669}",
+                "phone Arabic-Indic digits",
+            ),
+            (
+                "Card \u{06F4}\u{06F1}\u{06F1}\u{06F1} \u{06F1}\u{06F1}\u{06F1}\u{06F1} \u{06F1}\u{06F1}\u{06F1}\u{06F1} \u{06F1}\u{06F1}\u{06F1}\u{06F1} ok",
+                "\u{06F4}\u{06F1}\u{06F1}\u{06F1}",
+                "card Extended-Arabic-Indic digits",
+            ),
+            (
+                "SSN \u{0967}\u{0968}\u{0969}-\u{096A}\u{096B}-\u{096C}\u{096D}\u{096E}\u{096F} filed",
+                "\u{096C}\u{096D}\u{096E}\u{096F}",
+                "SSN Devanagari digits",
+            ),
+            (
+                "Call \u{09E7}\u{09E8}\u{09E9}\u{09EA}\u{09EB}\u{09EC}\u{09ED}\u{09EE}\u{09EF}\u{09E6} now",
+                "\u{09ED}\u{09EE}\u{09EF}\u{09E6}",
+                "phone Bengali digits",
+            ),
+            (
+                "Card \u{0E54}\u{0E51}\u{0E51}\u{0E51} \u{0E51}\u{0E51}\u{0E51}\u{0E51} \u{0E51}\u{0E51}\u{0E51}\u{0E51} \u{0E51}\u{0E51}\u{0E51}\u{0E51} ok",
+                "\u{0E54}\u{0E51}\u{0E51}\u{0E51}",
+                "card Thai digits (never-enumerated script)",
+            ),
+        ];
+        let sanitizer = QuerySanitizer::new();
+        let mut leaks = Vec::new();
+        for &(input, canary, axis) in cases {
+            let out = sanitizer.sanitize(input);
+            if out.sanitized_text().contains(canary) {
+                leaks.push(format!(
+                    "  LEAK [{axis}]: {canary:?} survived -> {:?}",
+                    out.sanitized_text()
+                ));
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "ZKQP silent PII leaks: {} of {} variants egressed raw PII:\n{}",
+            leaks.len(),
+            cases.len(),
+            leaks.join("\n")
+        );
+    }
+
+    #[test]
+    fn restore_ignores_response_lookalike_placeholders_fort_r1_02() {
+        // FORT-R1-02: placeholders were predictable ([EMAIL_001]) and restore did
+        // a global string replace, so a cloud RESPONSE containing a bare
+        // [EMAIL_001] look-alike was rewritten to the original PII (re-injection).
+        let sanitizer = QuerySanitizer::new();
+        let result = sanitizer.sanitize("Contact alice@example.com please");
+        // The cloud response echoes the (query-bound) minted placeholder AND also
+        // contains a bare predictable-format look-alike the model emitted itself.
+        let minted = result.sanitized_text().to_string();
+        let response = format!("{minted} -- see also [EMAIL_001] in the archive");
+        let restored = result.restore(&response);
+        // The minted placeholder restores to the real email...
+        assert!(
+            restored.contains("alice@example.com"),
+            "the minted placeholder must restore to the original"
+        );
+        // ...but the bare look-alike must survive untouched (no re-injection).
+        // RED pre-fix: predictable [EMAIL_001] minted == the look-alike, so it was
+        // rewritten to alice@example.com.
+        assert!(
+            restored.contains("[EMAIL_001]"),
+            "a bare look-alike placeholder must NOT be rewritten to PII"
+        );
+    }
+
+    #[test]
+    fn identical_queries_are_unlinkable_across_instances_fort_r2_02() {
+        // R2-02: the wire-visible placeholder token must not let the cloud
+        // correlate identical queries across sessions. Pre-fix the token was
+        // SHA-256(query)[..4], a keyless function of the query -> identical for
+        // the same query in any instance -> linkable. RED pre-fix: p1 == p2.
+        let input = "Contact alice@example.com please";
+        let p1 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        let p2 = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        assert_ne!(
+            p1, p2,
+            "identical queries must not yield correlatable placeholders across instances"
+        );
+    }
+
+    #[test]
+    fn placeholder_token_is_not_a_query_hash_fort_r2_02() {
+        // R2-02: no offline verifier. Pre-fix the placeholder embedded
+        // SHA-256(query)[..4] hex, which the cloud could recompute from a GUESSED
+        // query to confirm the guess. RED pre-fix: the sanitized text contains it.
+        use sha2::{Digest, Sha256};
+        let input = "Contact alice@example.com please";
+        let sanitized = QuerySanitizer::new().sanitize(input).sanitized_text().to_string();
+        let leaked: String = Sha256::digest(input.as_bytes())[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            !sanitized.contains(&leaked),
+            "placeholder must not embed a query-derived hash the cloud can recompute"
+        );
+    }
+
+    #[test]
+    fn replacement_does_not_corrupt_minted_placeholders_fort_r2_03() {
+        // FORT-R2-03: global String::replace over length-sorted values let a
+        // known-entity named "EMAIL" replace INSIDE the minted [EMAIL_<ns>_001]
+        // placeholder, destroying it. Span-based single-pass replacement builds
+        // the output from the ORIGINAL text only, so nothing lands in a minted
+        // placeholder.
+        let mut detector = PiiDetector::new();
+        detector.add_entity("EMAIL");
+        let sanitizer = QuerySanitizer::with_detector(detector);
+        let sanitized = sanitizer
+            .sanitize("EMAIL alice@example.com please")
+            .sanitized_text()
+            .to_string();
+        // Exactly one INTACT email placeholder. RED pre-fix: the entity "EMAIL"
+        // replaced inside it, so the "[EMAIL_" count was 0 (corrupted).
+        assert_eq!(
+            sanitized.matches("[EMAIL_").count(),
+            1,
+            "the minted email placeholder must survive intact, got: {sanitized}"
+        );
+        assert!(!sanitized.contains("alice@example.com"), "email must be redacted");
+    }
+
+    #[test]
+    fn overlapping_matches_are_fully_covered_fort_r2_03() {
+        // Overlap-resolution rule: overlapping matches are absorbed into one
+        // maximal cover interval (the first by start owns the placeholder; later
+        // overlapping matches are absorbed). The property is coverage-by-
+        // SOMETHING: every byte of every detected PII value is redacted even when
+        // one detector's match sits inside another's (a URL containing an email).
+        let sanitizer = QuerySanitizer::new();
+        let input = "Visit https://host.example/u?cc=user@host.example now";
+        let sanitized = sanitizer.sanitize(input).sanitized_text().to_string();
+        assert!(
+            !sanitized.contains("user@host.example"),
+            "the embedded email must be covered, got: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("host.example"),
+            "the URL host must be covered, got: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn restore_only_acts_on_minted_placeholders_under_overlap_fort_r3_01() {
+        // FORT-R3-01 (the R2-02/R2-03 composition seam): R2-03's span-merge
+        // absorbs the embedded email into the URL interval, so ONLY the URL
+        // placeholder is minted into the prompt. Pre-fix, restore() still iterated
+        // the FULL detection mapping, which retained the absorbed email's entry
+        // (user@host.example -> [EMAIL_<ns>_001]). So a cloud response that merely
+        // CONTAINED that never-sent placeholder (a model guess / look-alike) was
+        // rewritten back to raw PII the cloud never received — R1-02 re-injection,
+        // reopened for overlap. The fix: restore operates on the MINTED set only.
+        let sanitizer = QuerySanitizer::new();
+        let result = sanitizer.sanitize("Visit https://host.example/u?cc=user@host.example now");
+        let sanitized = result.sanitized_text().to_string();
+
+        // The URL placeholder is minted; the absorbed email placeholder is NOT.
+        assert!(
+            sanitized.contains("[URL_"),
+            "the URL placeholder must be minted: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("[EMAIL_"),
+            "the absorbed email must not be separately minted: {sanitized}"
+        );
+
+        // Reconstruct the email placeholder build_mapping WOULD have assigned the
+        // absorbed email: same per-instance namespace as the minted URL
+        // placeholder (parsed out of the output), [EMAIL_<ns>_001] (first email,
+        // per-type counter). This is the never-sent placeholder.
+        let ns_start = sanitized.find("[URL_").expect("URL placeholder present") + "[URL_".len();
+        let after = &sanitized[ns_start..];
+        let ns = &after[..after.find('_').expect("namespace terminator")];
+        let never_minted = format!("[EMAIL_{ns}_001]");
+
+        // A cloud response echoing the never-minted placeholder. RED pre-fix:
+        // restore rewrites it to user@host.example. Post-fix: the minted map
+        // lacks that entry, so it passes through untouched.
+        let response = format!("See {never_minted} for the contact");
+        let restored = result.restore(&response);
+        assert!(
+            !restored.contains("host.example"),
+            "a never-minted placeholder must NOT restore to raw PII: {restored}"
+        );
+        assert!(
+            restored.contains(&never_minted),
+            "the never-minted placeholder should pass through verbatim: {restored}"
+        );
     }
 }

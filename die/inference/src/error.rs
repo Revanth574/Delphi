@@ -19,10 +19,13 @@ use fortress::FortressError;
 /// use die_inference::InferenceError;
 /// use fortress::FortressError;
 ///
-/// // FortressError converts automatically via From trait.
+/// // FortressError converts automatically via From trait. Its Display is
+/// // redacted (FORT-R1-04), so the credential name does not leak across the
+/// // #[from] boundary; the converted error stays actionable.
 /// let fortress_err = FortressError::CredentialNotFound("openai-key".to_string());
 /// let inference_err: InferenceError = fortress_err.into();
-/// assert!(inference_err.to_string().contains("openai-key"));
+/// assert!(!inference_err.to_string().contains("openai-key"));
+/// assert!(inference_err.to_string().contains("credential access failed"));
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceError {
@@ -53,9 +56,17 @@ mod tests {
 
     #[test]
     fn fortress_error_converts_to_inference_error() {
+        // FORT-R1-04: FortressError's redacted Display crosses this #[from]
+        // boundary, so the credential name must NOT surface in the converted
+        // error. The conversion stays actionable via the static wrapper text;
+        // the name remains available to local tracing via FortressError::diagnostic().
         let fortress_err = FortressError::CredentialNotFound("anthropic-key".to_string());
         let inference_err: InferenceError = fortress_err.into();
-        assert!(inference_err.to_string().contains("anthropic-key"));
+        assert!(
+            !inference_err.to_string().contains("anthropic-key"),
+            "credential name must not leak across the #[from] boundary"
+        );
+        assert!(inference_err.to_string().contains("credential access failed"));
     }
 
     #[test]

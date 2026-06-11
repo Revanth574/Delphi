@@ -58,10 +58,17 @@ mod tests {
 
     #[test]
     fn all_downstream_errors_convert() {
-        // Verify fortress → orchestrator conversion.
-        let fortress_err = fortress::FortressError::CredentialNotFound("key".to_string());
+        // Verify fortress → orchestrator conversion. FORT-R1-04: FortressError's
+        // Display is redacted, so the credential name must NOT leak through this
+        // #[from] boundary; the conversion is witnessed by the static wrapper text.
+        let fortress_err =
+            fortress::FortressError::CredentialNotFound("secret-cred-name".to_string());
         let orch_err: OrchestratorError = fortress_err.into();
-        assert!(orch_err.to_string().contains("key"));
+        assert!(orch_err.to_string().contains("security error"));
+        assert!(
+            !orch_err.to_string().contains("secret-cred-name"),
+            "credential name must not leak across the #[from] boundary"
+        );
 
         // Verify inference → orchestrator conversion.
         let inf_err = die_inference::InferenceError::NoBackend;

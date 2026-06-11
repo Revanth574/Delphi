@@ -125,6 +125,13 @@ impl PermissionChecker {
 
     /// Add a per-module override.
     ///
+    /// Overrides take priority over all rules and may set ANY tier, so — like
+    /// [`load_config_str`](Self::load_config_str) — this can *downgrade* a
+    /// built-in default. It is part of the same downgrade class and the same
+    /// **escalation-only** forward requirement (documented on `load_config_str`),
+    /// acceptable as-built only because the caller is trusted (no untrusted code
+    /// calls it).
+    ///
     /// # Examples
     ///
     /// ```
@@ -206,6 +213,30 @@ impl PermissionChecker {
     }
 
     /// Load permission overrides from a TOML config string.
+    ///
+    /// # Precedence and trust model (as-built)
+    ///
+    /// Custom rules are **prepended** ahead of the defaults, and `check` is
+    /// first-match-wins — so a config rule can **override, including downgrade**,
+    /// a built-in tier (e.g. map a `financial_*` action from `Biometric` down to
+    /// `Autonomous`). This is acceptable **only because the config is trusted**:
+    /// the sole live consumer of the policy engine is the `services` crate's
+    /// `AuthGuard`, which builds the checker via `PermissionChecker::new` from
+    /// its own compiled `METHOD_POLICY` and does **not** call `load_config_str`.
+    /// There is no untrusted caller of this method today.
+    ///
+    /// # Forward requirement (fail-safe target)
+    ///
+    /// Two methods can lower a built-in tier and together form **one downgrade
+    /// class**: this `load_config_str` (prepended config rules win, first-match)
+    /// and [`add_override`](Self::add_override) (per-module overrides win
+    /// outright). Before *either* is exposed to a **less-trusted** source, the
+    /// whole class MUST be changed to **escalation-only**: a config rule or an
+    /// override may only *raise* an action's tier, never *lower* a built-in
+    /// default. Allowing a downgrade is a fail-open footgun — a misconfiguration
+    /// (or a tampered config) would *silently weaken* a security tier.
+    /// Escalation-only fails safe: the worst case over-restricts (extra
+    /// confirmation prompts), never under-protects.
     ///
     /// # Errors
     ///

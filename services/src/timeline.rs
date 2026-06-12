@@ -123,9 +123,10 @@ impl TimelineService {
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialization failed: {e}")))
     }
 
-    /// Undo an action by ID.
+    /// Preview undo availability for an action by ID.
     ///
-    /// Returns the undo command that was executed.
+    /// The runtime executor owns actual undo execution; this transport must not
+    /// mark a timeline entry as undone before a reversing operation succeeds.
     async fn undo(
         &self,
         #[zbus(header)] header: Header<'_>,
@@ -139,8 +140,9 @@ impl TimelineService {
 
         let tl = self.timeline.lock()
             .map_err(|e| zbus::fdo::Error::Failed(format!("lock poisoned: {e}")))?;
-        tl.undo_action(&action_id)
-            .map_err(|e| crate::error::opaque("timeline operation failed", e))
+        tl.preview_undo(&action_id)
+            .map_err(|e| crate::error::opaque("timeline operation failed", e))?;
+        Ok("undo available; execute through the guarded runtime action API".to_string())
     }
 
     /// Get the total action count.

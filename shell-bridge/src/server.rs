@@ -20,7 +20,12 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request as WsRequest, Response as WsResponse,
+};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tracing::{error, info, warn};
 
 use crate::handler::Handler;
@@ -244,12 +249,13 @@ impl BridgeServer {
 /// Upgrades the TCP stream, then enters a read loop: parse each
 /// text frame as a [`Request`], dispatch through the handler, and
 /// send back the [`Response`] as JSON.
-async fn handle_connection(
-    handler: Arc<Handler>,
-    stream: TcpStream,
-    peer: SocketAddr,
-) {
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+async fn handle_connection(handler: Arc<Handler>, stream: TcpStream, peer: SocketAddr) {
+    if !peer.ip().is_loopback() {
+        warn!(peer = %peer, "rejecting non-loopback WebSocket peer");
+        return;
+    }
+
+    let ws_stream = match accept_hdr_async(stream, validate_ws_origin).await {
         Ok(ws) => ws,
         Err(e) => {
             error!(peer = %peer, error = %e, "WebSocket handshake failed");
@@ -307,10 +313,7 @@ async fn handle_connection(
 /// Parse a text message as a [`Request`] and dispatch it.
 ///
 /// If parsing fails, returns an error response with id 0.
-async fn process_text_message(
-    handler: &Handler,
-    text: &str,
-) -> Response {
+async fn process_text_message(handler: &Handler, text: &str) -> Response {
     match serde_json::from_str::<Request>(text) {
         Ok(req) => handler.dispatch(req).await,
         Err(e) => {
@@ -318,6 +321,72 @@ async fn process_text_message(
             Response::err(0, -32700, &format!("parse error: {e}"))
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_ws_origin(req: &WsRequest, resp: WsResponse) -> Result<WsResponse, ErrorResponse> {
+    if is_allowed_origin(req) {
+        Ok(resp)
+    } else {
+        Err(forbidden_response("origin not allowed"))
+    }
+}
+
+fn is_allowed_origin(req: &WsRequest) -> bool {
+    let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) else {
+        return request_has_valid_bridge_token(req);
+    };
+    if origin.eq_ignore_ascii_case("null") {
+        return request_has_valid_bridge_token(req);
+    }
+    let origin = origin.to_ascii_lowercase();
+    origin.starts_with("http://127.0.0.1:")
+        || origin.starts_with("http://localhost:")
+        || origin.starts_with("http://[::1]:")
+        || origin.starts_with("https://127.0.0.1:")
+        || origin.starts_with("https://localhost:")
+        || origin.starts_with("https://[::1]:")
+        || origin.starts_with("tauri://localhost")
+}
+
+fn request_has_valid_bridge_token(req: &WsRequest) -> bool {
+    let Some(expected) = load_bridge_auth_token() else {
+        return false;
+    };
+    request_bridge_token(req).is_some_and(|provided| provided == expected)
+}
+
+fn request_bridge_token(req: &WsRequest) -> Option<String> {
+    if let Some(token) = req
+        .headers()
+        .get("x-delphi-bridge-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|token| !token.is_empty())
+    {
+        return Some(token.to_string());
+    }
+
+    let query = req.uri().query()?;
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == "bridge_token" && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn load_bridge_auth_token() -> Option<String> {
+    std::env::var("DELPHI_BRIDGE_AUTH_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+fn forbidden_response(message: &str) -> ErrorResponse {
+    http_response(StatusCode::FORBIDDEN, message)
+}
+
+fn http_response(status: StatusCode, message: &str) -> ErrorResponse {
+    let mut response = ErrorResponse::new(Some(message.to_string()));
+    *response.status_mut() = status;
+    response
 }
 
 #[cfg(test)]
@@ -330,6 +399,8 @@ mod tests {
     use die_orchestrator::timeline::Timeline;
     use semantic_fs::indexer::Indexer;
     use tokio::sync::RwLock;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
 
     /// Create a test handler with empty services.
     fn test_handler() -> Arc<Handler> {
@@ -338,8 +409,19 @@ mod tests {
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
+            Arc::new(Mutex::new(
+                die_orchestrator::learning::LearningFacade::in_memory().unwrap(),
+            )),
         ))
+    }
+
+    fn localhost_request(addr: SocketAddr) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Origin",
+            HeaderValue::from_static("http://localhost:5173"),
+        );
+        request
     }
 
     #[test]
@@ -354,6 +436,29 @@ mod tests {
         let handler = test_handler();
         let server = BridgeServer::new(handler, "0.0.0.0:8080");
         assert_eq!(server.addr(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn origin_policy_rejects_missing_or_null_without_bridge_token() {
+        let missing = WsRequest::builder()
+            .uri("ws://127.0.0.1:9800")
+            .body(())
+            .unwrap();
+        assert!(!is_allowed_origin(&missing));
+
+        let null_origin = WsRequest::builder()
+            .uri("ws://127.0.0.1:9800")
+            .header("Origin", "null")
+            .body(())
+            .unwrap();
+        assert!(!is_allowed_origin(&null_origin));
+
+        let localhost = WsRequest::builder()
+            .uri("ws://127.0.0.1:9800")
+            .header("Origin", "http://localhost:5173")
+            .body(())
+            .unwrap();
+        assert!(is_allowed_origin(&localhost));
     }
 
     #[tokio::test]
@@ -416,10 +521,9 @@ mod tests {
         });
 
         // Connect as client
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(localhost_request(addr))
+            .await
+            .unwrap();
 
         // Send a request
         let req = r#"{"id": 1, "method": "inference.status"}"#;
@@ -456,20 +560,19 @@ mod tests {
             }
         });
 
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(localhost_request(addr))
+            .await
+            .unwrap();
 
         // Set a mode
-        let set_req = r#"{"id": 1, "method": "mode.set", "params": {"window_id": "win-1", "mode": "Focus"}}"#;
+        let set_req =
+            r#"{"id": 1, "method": "mode.set", "params": {"window_id": "win-1", "mode": "Focus"}}"#;
         ws_stream
             .send(Message::Text(set_req.to_string().into()))
             .await
             .unwrap();
         let msg = ws_stream.next().await.unwrap().unwrap();
-        let resp: serde_json::Value =
-            serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
         assert_eq!(resp["result"]["mode"], "Focus");
 
         // Get the mode back
@@ -479,8 +582,7 @@ mod tests {
             .await
             .unwrap();
         let msg = ws_stream.next().await.unwrap().unwrap();
-        let resp: serde_json::Value =
-            serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
         assert_eq!(resp["result"]["mode"], "Focus");
 
         ws_stream.close(None).await.unwrap();

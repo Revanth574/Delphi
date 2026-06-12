@@ -938,6 +938,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "delphi-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "die-inference",
+ "die-orchestrator",
+ "semantic-fs",
+ "shell-bridge",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "delphi-proto"
 version = "0.1.0"
 dependencies = [
@@ -3990,9 +4004,11 @@ dependencies = [
  "die-learning",
  "die-orchestrator",
  "futures-util",
+ "rand 0.9.4",
  "semantic-fs",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",

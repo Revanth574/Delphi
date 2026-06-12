@@ -15,6 +15,7 @@
 //! | `mode.*` | Window mode management |
 //! | `timeline.*` | Action timeline (die-orchestrator) |
 //! | `learning.*` | Learning suggestions |
+//! | `runtime.*` / `tools.*` / `actions.*` | Local daemon runtime loop |
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,10 +25,12 @@ use tracing::{info, warn};
 
 use die_inference::router::Router;
 use die_inference::{ConfirmationTokenWire, InferenceRequest, RouteOutcome};
-use die_orchestrator::timeline::Timeline;
+use die_learning::LearningError;
 use die_orchestrator::learning::{LearningFacade, LearningFacadeError};
+use die_orchestrator::timeline::Timeline;
 use semantic_fs::indexer::Indexer;
 
+use crate::actions::{self, ActionApiError};
 use crate::protocol::{Request, Response};
 
 /// Central message handler for WebSocket requests.
@@ -68,6 +71,10 @@ pub struct Handler {
     /// authoritative accept/dismiss implementation across both transports
     /// instead of duplicated, independently-buggy `Vec<Suggestion>` copies (SVC-5).
     learning: Arc<Mutex<LearningFacade>>,
+    /// Server-issued one-shot approval capabilities for controlled local actions.
+    approvals: Arc<Mutex<actions::ApprovalRegistry>>,
+    /// App-local secret required to mint action approval capabilities.
+    bridge_auth_token: Option<String>,
 }
 
 impl Handler {
@@ -106,7 +113,19 @@ impl Handler {
             modes,
             timeline,
             learning,
+            approvals: Arc::new(Mutex::new(actions::ApprovalRegistry::new())),
+            bridge_auth_token: load_bridge_auth_token(),
         }
+    }
+
+    /// Override the app-local bridge auth token.
+    ///
+    /// Used by tests and by future embedding surfaces that provision an
+    /// authenticated shell session without relying on process environment.
+    #[must_use]
+    pub fn with_bridge_auth_token(mut self, token: Option<String>) -> Self {
+        self.bridge_auth_token = token;
+        self
     }
 
     /// Dispatch a request to the appropriate backend.
@@ -144,6 +163,14 @@ impl Handler {
         info!(id = req.id, method = %req.method, "dispatching request");
 
         match req.method.as_str() {
+            // Runtime / Tools / Actions
+            "runtime.status" => self.handle_runtime_status(req.id).await,
+            "tools.capabilities" => self.handle_tools_capabilities(req.id).await,
+            "actions.plan" => self.handle_actions_plan(req.id, &req.params).await,
+            "actions.approve" => self.handle_actions_approve(req.id, &req.params).await,
+            "actions.execute" => self.handle_actions_execute(req.id, &req.params).await,
+            "actions.undo" => self.handle_actions_undo(req.id, &req.params).await,
+
             // ── Inference ──────────────────────────────────
             "inference.query" => self.handle_inference_query(req.id, &req.params).await,
             "inference.status" => self.handle_inference_status(req.id).await,
@@ -166,6 +193,7 @@ impl Handler {
 
             // ── Learning ───────────────────────────────────
             "learning.suggestions" => self.handle_learning_suggestions(req.id).await,
+            "learning.detect" => self.handle_learning_detect(req.id).await,
             "learning.accept" => self.handle_learning_accept(req.id, &req.params).await,
             "learning.dismiss" => self.handle_learning_dismiss(req.id, &req.params).await,
             "learning.count" => self.handle_learning_count(req.id).await,
@@ -178,15 +206,231 @@ impl Handler {
     }
 }
 
+// Runtime / action handlers
+
+impl Handler {
+    /// Handle `runtime.status` by summarizing local daemon-owned state.
+    async fn handle_runtime_status(&self, id: u64) -> Response {
+        let router = self.router.read().await;
+        let has_local = router.has_local_model();
+        let has_cloud = router.has_cloud();
+        drop(router);
+
+        let mode_count = self.modes.read().await.len();
+
+        let (timeline_count, pending_count) = match self.timeline.lock() {
+            Ok(tl) => {
+                let count = match tl.count() {
+                    Ok(count) => count,
+                    Err(e) => return Response::err(id, -1, &e.to_string()),
+                };
+                let pending = match tl.list_pending_actions() {
+                    Ok(actions) => actions.len(),
+                    Err(e) => return Response::err(id, -1, &e.to_string()),
+                };
+                (count, pending)
+            }
+            Err(_) => return Response::err(id, -1, "timeline state unavailable"),
+        };
+
+        let (learning_focus, learning_suggestions) = match self.learning.lock() {
+            Ok(facade) => (facade.focus_active(), facade.list_suggestions().len()),
+            Err(_) => return Response::err(id, -1, "learning state unavailable"),
+        };
+
+        Response::ok(
+            id,
+            serde_json::json!({
+                "runtime": "dev-local",
+                "bridge": "ready",
+                "listen_addr": crate::DEFAULT_ADDR,
+                "daemon_required": true,
+                "shared_state": {
+                    "inference_router": { "has_local": has_local, "has_cloud": has_cloud },
+                    "semantic_index": "in_memory",
+                    "mode_count": mode_count,
+                    "timeline_count": timeline_count,
+                    "timeline_pending_count": pending_count,
+                    "learning_focus_active": learning_focus,
+                    "learning_suggestion_count": learning_suggestions,
+                }
+            }),
+        )
+    }
+
+    /// Handle `tools.capabilities`.
+    async fn handle_tools_capabilities(&self, id: u64) -> Response {
+        Response::ok(id, actions::capabilities_payload())
+    }
+
+    /// Handle `actions.plan`.
+    async fn handle_actions_plan(&self, id: u64, params: &serde_json::Value) -> Response {
+        match actions::plan(params) {
+            Ok(plan) => match serde_json::to_value(plan) {
+                Ok(value) => Response::ok(id, value),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(e) => action_error(id, e),
+        }
+    }
+
+    /// Handle `actions.approve`.
+    async fn handle_actions_approve(&self, id: u64, params: &serde_json::Value) -> Response {
+        if let Err(e) = self.authorize_approval_mint(params) {
+            return action_error(id, e);
+        }
+        let kind = match actions::approval_kind_for_plan(params) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return action_error(id, ActionApiError::MissingParam("repo_path")),
+            Err(e) => return action_error(id, e),
+        };
+        let capability = {
+            let mut approvals = match self.approvals.lock() {
+                Ok(approvals) => approvals,
+                Err(_) => {
+                    return action_error(
+                        id,
+                        ActionApiError::ApprovalInvalid("approval state unavailable".to_string()),
+                    );
+                }
+            };
+            approvals.issue(kind)
+        };
+        match serde_json::to_value(capability) {
+            Ok(value) => Response::ok(id, value),
+            Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+        }
+    }
+
+    fn authorize_approval_mint(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<(), ActionApiError> {
+        if !params
+            .get("user_confirmed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(ActionApiError::UserConfirmationRequired);
+        }
+
+        let expected = self
+            .bridge_auth_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .ok_or(ActionApiError::BridgeAuthRequired)?;
+        let provided = params
+            .get("bridge_auth_token")
+            .and_then(|value| value.as_str())
+            .filter(|token| !token.is_empty())
+            .ok_or(ActionApiError::BridgeAuthRequired)?;
+
+        if provided == expected {
+            Ok(())
+        } else {
+            Err(ActionApiError::BridgeAuthInvalid)
+        }
+    }
+
+    /// Handle `actions.execute`.
+    async fn handle_actions_execute(&self, id: u64, params: &serde_json::Value) -> Response {
+        let request = match actions::normalize_execute_request(params) {
+            Ok(request) => request,
+            Err(e) => return action_error(id, e),
+        };
+        let token = match actions::required_approval_token(params) {
+            Ok(token) => token,
+            Err(e) => return action_error(id, e),
+        };
+        {
+            let mut approvals = match self.approvals.lock() {
+                Ok(approvals) => approvals,
+                Err(_) => {
+                    return action_error(
+                        id,
+                        ActionApiError::ApprovalInvalid("approval state unavailable".to_string()),
+                    );
+                }
+            };
+            if let Err(e) = approvals.consume_execute(&token, &request) {
+                return action_error(id, e);
+            }
+        }
+
+        match actions::execute(request, &self.timeline, &self.learning).await {
+            Ok(receipt) => match serde_json::to_value(receipt) {
+                Ok(value) => Response::ok(id, value),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(e) => action_error(id, e),
+        }
+    }
+
+    /// Handle `actions.undo`.
+    async fn handle_actions_undo(&self, id: u64, params: &serde_json::Value) -> Response {
+        let request = match actions::normalize_undo_request(params) {
+            Ok(request) => request,
+            Err(e) => return action_error(id, e),
+        };
+        let token = match actions::required_approval_token(params) {
+            Ok(token) => token,
+            Err(e) => return action_error(id, e),
+        };
+        {
+            let mut approvals = match self.approvals.lock() {
+                Ok(approvals) => approvals,
+                Err(_) => {
+                    return action_error(
+                        id,
+                        ActionApiError::ApprovalInvalid("approval state unavailable".to_string()),
+                    );
+                }
+            };
+            if let Err(e) = approvals.consume_undo(&token, &request) {
+                return action_error(id, e);
+            }
+        }
+
+        match actions::undo(request, &self.timeline).await {
+            Ok(receipt) => match serde_json::to_value(receipt) {
+                Ok(value) => Response::ok(id, value),
+                Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+            },
+            Err(e) => action_error(id, e),
+        }
+    }
+}
+
+fn action_error(id: u64, error: ActionApiError) -> Response {
+    let code = match error {
+        ActionApiError::MissingParam(_)
+        | ActionApiError::InvalidRepoPath
+        | ActionApiError::InvalidCommand(_)
+        | ActionApiError::ApprovalRequired
+        | ActionApiError::ApprovalInvalid(_)
+        | ActionApiError::BridgeAuthRequired
+        | ActionApiError::BridgeAuthInvalid
+        | ActionApiError::UserConfirmationRequired => -32602,
+        ActionApiError::UnsupportedWorkflow(_) => -32601,
+        ActionApiError::TimelineUnavailable
+        | ActionApiError::LearningUnavailable
+        | ActionApiError::Timeline(_)
+        | ActionApiError::Serialization(_) => -1,
+    };
+    Response::err(id, code, &error.to_string())
+}
+
+fn load_bridge_auth_token() -> Option<String> {
+    std::env::var("DELPHI_BRIDGE_AUTH_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
 // ── Inference handlers ─────────────────────────────────────────
 
 impl Handler {
     /// Handle `inference.query` — route a prompt through the inference engine.
-    async fn handle_inference_query(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    async fn handle_inference_query(&self, id: u64, params: &serde_json::Value) -> Response {
         let prompt = match params.get("prompt").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => return Response::err(id, -32602, "missing required param: prompt"),
@@ -297,20 +541,13 @@ impl Handler {
 
 impl Handler {
     /// Handle `file_search.search` — semantic file search.
-    async fn handle_file_search(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    async fn handle_file_search(&self, id: u64, params: &serde_json::Value) -> Response {
         let query = match params.get("query").and_then(|v| v.as_str()) {
             Some(q) => q.to_string(),
             None => return Response::err(id, -32602, "missing required param: query"),
         };
 
-        let limit = params
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
         let indexer = match self.indexer.lock() {
             Ok(i) => i,
@@ -340,11 +577,7 @@ impl Handler {
 
 impl Handler {
     /// Handle `mode.get` — get a window's current mode.
-    async fn handle_mode_get(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    async fn handle_mode_get(&self, id: u64, params: &serde_json::Value) -> Response {
         let window_id = match params.get("window_id").and_then(|v| v.as_str()) {
             Some(w) => w.to_string(),
             None => return Response::err(id, -32602, "missing required param: window_id"),
@@ -360,11 +593,7 @@ impl Handler {
     }
 
     /// Handle `mode.set` — change a window's mode.
-    async fn handle_mode_set(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    async fn handle_mode_set(&self, id: u64, params: &serde_json::Value) -> Response {
         let window_id = match params.get("window_id").and_then(|v| v.as_str()) {
             Some(w) => w.to_string(),
             None => return Response::err(id, -32602, "missing required param: window_id"),
@@ -408,15 +637,8 @@ impl Handler {
 
 impl Handler {
     /// Handle `timeline.recent` — get recent actions.
-    async fn handle_timeline_recent(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
-        let limit = params
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20) as u32;
+    async fn handle_timeline_recent(&self, id: u64, params: &serde_json::Value) -> Response {
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
 
         let tl = match self.timeline.lock() {
             Ok(t) => t,
@@ -434,6 +656,9 @@ impl Handler {
                             "timestamp": r.timestamp,
                             "reversible": r.reversible,
                             "expires_at": r.expires_at,
+                            "status": r.status.as_str(),
+                            "action_type": r.action_type,
+                            "outputs_summary": actions::timeline_outputs_summary(r.outputs.as_deref()),
                         })
                     })
                     .collect();
@@ -444,11 +669,7 @@ impl Handler {
     }
 
     /// Handle `timeline.undo` — undo an action by ID.
-    async fn handle_timeline_undo(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    async fn handle_timeline_undo(&self, id: u64, params: &serde_json::Value) -> Response {
         let action_id = match params.get("action_id").and_then(|v| v.as_str()) {
             Some(a) => a.to_string(),
             None => return Response::err(id, -32602, "missing required param: action_id"),
@@ -459,8 +680,16 @@ impl Handler {
             Err(e) => return Response::err(id, -1, &format!("lock poisoned: {e}")),
         };
 
-        match tl.undo_action(&action_id) {
-            Ok(cmd) => Response::ok(id, serde_json::json!({ "undo_command": cmd })),
+        match tl.preview_undo(&action_id) {
+            Ok(cmd) => Response::ok(
+                id,
+                serde_json::json!({
+                    "undo_preview": actions::undo_payload_preview(&cmd),
+                    "requires_approval": true,
+                    "executed": false,
+                    "message": "timeline.undo is a preview; use actions.plan/actions.undo to execute"
+                }),
+            ),
             Err(e) => Response::err(id, -1, &e.to_string()),
         }
     }
@@ -495,11 +724,33 @@ impl Handler {
     }
 
     /// Handle `learning.accept` — accept a suggestion.
-    async fn handle_learning_accept(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    /// Handle `learning.detect` by running metadata-only pattern detection now.
+    async fn handle_learning_detect(&self, id: u64) -> Response {
+        let (detected_count, suggestions) = {
+            let mut facade = match self.learning.lock() {
+                Ok(f) => f,
+                Err(_) => return Response::err(id, -1, "learning state unavailable"),
+            };
+            let detected_count = match facade.run_detection() {
+                Ok(patterns) => patterns.len(),
+                Err(LearningError::NoPatternsFound { .. }) => 0,
+                Err(LearningError::ObserverPaused) => {
+                    return Response::err(id, -1, "learning observer is paused");
+                }
+                Err(_) => return Response::err(id, -1, "learning detection failed"),
+            };
+            (detected_count, facade.list_suggestions())
+        };
+        match serde_json::to_value(serde_json::json!({
+            "detected_count": detected_count,
+            "suggestions": suggestions,
+        })) {
+            Ok(v) => Response::ok(id, v),
+            Err(e) => Response::err(id, -1, &format!("serialize: {e}")),
+        }
+    }
+
+    async fn handle_learning_accept(&self, id: u64, params: &serde_json::Value) -> Response {
         let suggestion_id = match params.get("suggestion_id").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return Response::err(id, -32602, "missing required param: suggestion_id"),
@@ -526,11 +777,7 @@ impl Handler {
     }
 
     /// Handle `learning.dismiss` — dismiss a suggestion.
-    async fn handle_learning_dismiss(
-        &self,
-        id: u64,
-        params: &serde_json::Value,
-    ) -> Response {
+    async fn handle_learning_dismiss(&self, id: u64, params: &serde_json::Value) -> Response {
         let suggestion_id = match params.get("suggestion_id").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return Response::err(id, -32602, "missing required param: suggestion_id"),
@@ -567,6 +814,8 @@ impl Handler {
 mod tests {
     use super::*;
 
+    const TEST_BRIDGE_AUTH_TOKEN: &str = "test-bridge-auth-token";
+
     /// Helper to create a handler with default empty services.
     fn test_handler() -> Handler {
         Handler::new(
@@ -574,8 +823,11 @@ mod tests {
             Arc::new(Mutex::new(Indexer::in_memory().unwrap())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(Mutex::new(Timeline::in_memory().unwrap())),
-            Arc::new(Mutex::new(die_orchestrator::learning::LearningFacade::in_memory().unwrap())),
+            Arc::new(Mutex::new(
+                die_orchestrator::learning::LearningFacade::in_memory().unwrap(),
+            )),
         )
+        .with_bridge_auth_token(Some(TEST_BRIDGE_AUTH_TOKEN.to_string()))
     }
 
     #[tokio::test]
@@ -963,7 +1215,11 @@ mod tests {
             .build(&())
             .unwrap();
         mode_svc
-            .set_mode(setmode_msg.header(), "win-1".to_string(), "Direct".to_string())
+            .set_mode(
+                setmode_msg.header(),
+                "win-1".to_string(),
+                "Direct".to_string(),
+            )
             .await
             .unwrap();
 
@@ -980,6 +1236,339 @@ mod tests {
                 .any(|s| s.id == suggestion_id),
             "disarmed facade must surface the seeded suggestion again"
         );
+    }
+
+    fn repo_root() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("shell-bridge should live under the workspace root")
+            .display()
+            .to_string()
+    }
+
+    async fn approval_token_for(handler: &Handler, id: u64, params: &serde_json::Value) -> String {
+        let mut approval_params = params.clone();
+        approval_params["bridge_auth_token"] =
+            serde_json::Value::String(TEST_BRIDGE_AUTH_TOKEN.to_string());
+        approval_params["user_confirmed"] = serde_json::Value::Bool(true);
+        let approval = handler
+            .dispatch(Request {
+                id,
+                method: "actions.approve".to_string(),
+                params: approval_params,
+            })
+            .await;
+        assert!(
+            approval.error.is_none(),
+            "approve failed: {:?}",
+            approval.error
+        );
+        approval.result.unwrap()["token"]
+            .as_str()
+            .expect("approve should mint an approval token")
+            .to_string()
+    }
+
+    async fn execute_developer_repo_check(handler: &Handler, id: u64) -> Response {
+        let mut params = serde_json::json!({
+            "workflow": "developer_repo_check",
+            "repo_path": repo_root(),
+            "timeout_secs": 30
+        });
+        let token = approval_token_for(handler, id + 10_000, &params).await;
+        params["approval_token"] = serde_json::Value::String(token);
+        handler
+            .dispatch(Request {
+                id,
+                method: "actions.execute".to_string(),
+                params,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn runtime_status_works() {
+        let handler = test_handler();
+        let req = Request {
+            id: 30,
+            method: "runtime.status".to_string(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handler.dispatch(req).await;
+        assert!(
+            resp.error.is_none(),
+            "runtime.status failed: {:?}",
+            resp.error
+        );
+        let result = resp.result.unwrap();
+        assert_eq!(result["runtime"], "dev-local");
+        assert_eq!(result["bridge"], "ready");
+        assert_eq!(result["daemon_required"], true);
+    }
+
+    #[tokio::test]
+    async fn tools_capabilities_include_developer_workflow() {
+        let handler = test_handler();
+        let req = Request {
+            id: 31,
+            method: "tools.capabilities".to_string(),
+            params: serde_json::Value::Null,
+        };
+        let resp = handler.dispatch(req).await;
+        assert!(resp.error.is_none());
+        let workflows = resp.result.unwrap()["workflows"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            workflows
+                .iter()
+                .any(|workflow| workflow["id"] == "developer_repo_check")
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_execute_refuses_unapproved_execution() {
+        let handler = test_handler();
+        let req = Request {
+            id: 32,
+            method: "actions.execute".to_string(),
+            params: serde_json::json!({
+                "workflow": "developer_repo_check",
+                "repo_path": repo_root(),
+                "approved": true
+            }),
+        };
+        let resp = handler.dispatch(req).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("approval"));
+    }
+
+    #[tokio::test]
+    async fn actions_plan_is_preview_only() {
+        let handler = test_handler();
+        let resp = handler
+            .dispatch(Request {
+                id: 32_010,
+                method: "actions.plan".to_string(),
+                params: serde_json::json!({
+                    "workflow": "developer_repo_check",
+                    "repo_path": repo_root(),
+                    "timeout_secs": 30
+                }),
+            })
+            .await;
+        assert!(resp.error.is_none(), "plan failed: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["requires_approval"], true);
+        assert_eq!(result["approval"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn actions_approve_requires_bridge_auth_and_user_confirmation() {
+        let handler = test_handler();
+        let base = serde_json::json!({
+            "workflow": "developer_repo_check",
+            "repo_path": repo_root(),
+            "timeout_secs": 30
+        });
+
+        let no_auth = handler
+            .dispatch(Request {
+                id: 32_020,
+                method: "actions.approve".to_string(),
+                params: base.clone(),
+            })
+            .await;
+        assert!(no_auth.error.is_some());
+        assert!(no_auth.error.unwrap().message.contains("confirmation"));
+
+        let mut no_token = base.clone();
+        no_token["user_confirmed"] = serde_json::Value::Bool(true);
+        let missing_token = handler
+            .dispatch(Request {
+                id: 32_021,
+                method: "actions.approve".to_string(),
+                params: no_token,
+            })
+            .await;
+        assert!(missing_token.error.is_some());
+        assert!(missing_token
+            .error
+            .unwrap()
+            .message
+            .contains("bridge auth"));
+
+        let mut wrong_token = base.clone();
+        wrong_token["user_confirmed"] = serde_json::Value::Bool(true);
+        wrong_token["bridge_auth_token"] = serde_json::Value::String("wrong".to_string());
+        let wrong = handler
+            .dispatch(Request {
+                id: 32_022,
+                method: "actions.approve".to_string(),
+                params: wrong_token,
+            })
+            .await;
+        assert!(wrong.error.is_some());
+        assert!(wrong.error.unwrap().message.contains("bridge auth"));
+    }
+
+    #[tokio::test]
+    async fn actions_execute_rejects_reused_or_mismatched_approval() {
+        let handler = test_handler();
+        let params = serde_json::json!({
+            "workflow": "developer_repo_check",
+            "repo_path": repo_root(),
+            "timeout_secs": 30
+        });
+
+        let token = approval_token_for(&handler, 32_100, &params).await;
+        let mut mismatched = params.clone();
+        mismatched["timeout_secs"] = serde_json::json!(31);
+        mismatched["approval_token"] = serde_json::Value::String(token.clone());
+        let mismatch = handler
+            .dispatch(Request {
+                id: 32_101,
+                method: "actions.execute".to_string(),
+                params: mismatched,
+            })
+            .await;
+        assert!(mismatch.error.is_some());
+        assert!(
+            mismatch
+                .error
+                .unwrap()
+                .message
+                .contains("different execution request")
+        );
+
+        let mut reuse_after_mismatch = params.clone();
+        reuse_after_mismatch["approval_token"] = serde_json::Value::String(token);
+        let reused = handler
+            .dispatch(Request {
+                id: 32_102,
+                method: "actions.execute".to_string(),
+                params: reuse_after_mismatch,
+            })
+            .await;
+        assert!(reused.error.is_some());
+        assert!(reused.error.unwrap().message.contains("already used"));
+
+        let mut approved = params;
+        let token = approval_token_for(&handler, 32_103, &approved).await;
+        approved["approval_token"] = serde_json::Value::String(token.clone());
+        let first = handler
+            .dispatch(Request {
+                id: 32_104,
+                method: "actions.execute".to_string(),
+                params: approved.clone(),
+            })
+            .await;
+        assert!(first.error.is_none(), "execute failed: {:?}", first.error);
+
+        let second = handler
+            .dispatch(Request {
+                id: 32_105,
+                method: "actions.execute".to_string(),
+                params: approved,
+            })
+            .await;
+        assert!(second.error.is_some());
+        assert!(second.error.unwrap().message.contains("already used"));
+    }
+
+    #[tokio::test]
+    async fn developer_workflow_records_terminal_timeline_receipt() {
+        let handler = test_handler();
+        let resp = execute_developer_repo_check(&handler, 33).await;
+        assert!(resp.error.is_none(), "execute failed: {:?}", resp.error);
+        let receipt = resp.result.unwrap();
+        assert!(
+            receipt["timeline_id"].as_str().unwrap().starts_with("tl-"),
+            "receipt should include a timeline id"
+        );
+        assert_eq!(receipt["reversibility"]["undo_available"], false);
+        assert_eq!(receipt["learning"]["observed"], true);
+
+        let recent = handler
+            .dispatch(Request {
+                id: 34,
+                method: "timeline.recent".to_string(),
+                params: serde_json::json!({ "limit": 1 }),
+            })
+            .await;
+        assert!(recent.error.is_none());
+        let actions = recent.result.unwrap().as_array().unwrap().clone();
+        assert_eq!(actions.len(), 1);
+        assert_ne!(actions[0]["status"], "pending");
+        assert_eq!(actions[0]["action_type"], "developer.workflow.repo_check");
+        assert!(
+            actions[0]["outputs_summary"]["workflow"]
+                .as_str()
+                .unwrap()
+                .contains("developer_repo_check")
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_mode_blocks_workflow_learning_observation() {
+        let handler = test_handler();
+        let focus = handler
+            .dispatch(Request {
+                id: 35,
+                method: "mode.set".to_string(),
+                params: serde_json::json!({ "window_id": "win-focus", "mode": "Focus" }),
+            })
+            .await;
+        assert!(focus.error.is_none());
+
+        let resp = execute_developer_repo_check(&handler, 36).await;
+        assert!(resp.error.is_none(), "execute failed: {:?}", resp.error);
+        let receipt = resp.result.unwrap();
+        assert_eq!(receipt["learning"]["observed"], false);
+        assert_eq!(receipt["learning"]["blocked_reason"], "focus_mode");
+    }
+
+    #[tokio::test]
+    async fn developer_workflow_can_be_observed_and_accepted_to_practice_only() {
+        let handler = test_handler();
+        for id in 40..43 {
+            let resp = execute_developer_repo_check(&handler, id).await;
+            assert!(resp.error.is_none(), "execute failed: {:?}", resp.error);
+        }
+
+        let detect = handler
+            .dispatch(Request {
+                id: 44,
+                method: "learning.detect".to_string(),
+                params: serde_json::Value::Null,
+            })
+            .await;
+        assert!(detect.error.is_none(), "detect failed: {:?}", detect.error);
+        let detect_result = detect.result.unwrap();
+        let suggestions = detect_result["suggestions"].as_array().unwrap();
+        assert!(
+            suggestions.iter().any(|s| s["description"]
+                .as_str()
+                .unwrap()
+                .contains("developer_repo_check")),
+            "workflow episodes should surface a developer workflow candidate: {suggestions:?}"
+        );
+        let suggestion_id = suggestions[0]["id"].as_str().unwrap().to_string();
+
+        let accept = handler
+            .dispatch(Request {
+                id: 45,
+                method: "learning.accept".to_string(),
+                params: serde_json::json!({ "suggestion_id": suggestion_id }),
+            })
+            .await;
+        assert!(accept.error.is_none(), "accept failed: {:?}", accept.error);
+        let accepted = accept.result.unwrap();
+        assert_eq!(accepted["new_stage"], "practicing");
+        assert_ne!(accepted["new_stage"], "automated");
     }
 
     #[tokio::test]

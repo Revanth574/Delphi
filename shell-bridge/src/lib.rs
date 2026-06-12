@@ -28,6 +28,7 @@
 //!                                     die-inference / semantic-fs / die-orchestrator
 //! ```
 
+pub mod actions;
 pub mod handler;
 pub mod protocol;
 pub mod server;

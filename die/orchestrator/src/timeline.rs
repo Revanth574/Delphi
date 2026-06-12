@@ -33,6 +33,8 @@ pub enum ActionStatus {
     Complete,
     /// Action partially completed and remains undoable for cleanup.
     PartiallyCompleted,
+    /// Action reached a terminal failed state.
+    Failed,
     /// Undo is currently in progress.
     Undoing,
     /// Undo completed; the action cannot be undone again.
@@ -49,6 +51,7 @@ impl ActionStatus {
             Self::Pending => "pending",
             Self::Complete => "complete",
             Self::PartiallyCompleted => "partially_completed",
+            Self::Failed => "failed",
             Self::Undoing => "undoing",
             Self::Undone => "undone",
             Self::Irreversible => "irreversible",
@@ -60,6 +63,7 @@ impl ActionStatus {
             "pending" => Ok(Self::Pending),
             "complete" => Ok(Self::Complete),
             "partially_completed" => Ok(Self::PartiallyCompleted),
+            "failed" => Ok(Self::Failed),
             "undoing" => Ok(Self::Undoing),
             "undone" => Ok(Self::Undone),
             "irreversible" => Ok(Self::Irreversible),
@@ -77,7 +81,7 @@ impl ActionStatus {
     fn is_reversible_terminal(self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::Complete | Self::PartiallyCompleted
+            Self::Pending | Self::Complete | Self::PartiallyCompleted | Self::Failed
         )
     }
 }
@@ -324,6 +328,41 @@ impl Timeline {
         Ok(action_id)
     }
 
+    /// Record an audit-only action before it executes.
+    ///
+    /// Use this for observation or check workflows that must be visible in the
+    /// timeline but do not have a meaningful undo operation.
+    pub fn record_pending_irreversible(
+        &self,
+        action_type: &str,
+        description: &str,
+    ) -> Result<String, OrchestratorError> {
+        let now = current_timestamp();
+        let action_id = format!("tl-{now}-{}", rand_suffix());
+
+        self.conn
+            .execute(
+                "INSERT INTO actions (
+                    action_id, description, timestamp, reversible, undo_command, expires_at,
+                    status, action_type, outputs
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    action_id,
+                    description,
+                    now,
+                    false,
+                    "",
+                    now,
+                    ActionStatus::Pending.as_str(),
+                    action_type
+                ],
+            )
+            .map_err(|e| map_sqlite_err(e, "failed to record pending irreversible action"))?;
+
+        debug!(action_id = %action_id, action_type, "pending irreversible action recorded");
+        Ok(action_id)
+    }
+
     /// Transition a pending action to complete.
     pub fn complete_pending(
         &self,
@@ -331,6 +370,15 @@ impl Timeline {
         outputs: Option<&str>,
     ) -> Result<(), OrchestratorError> {
         self.transition_pending(action_id, ActionStatus::Complete, outputs)
+    }
+
+    /// Transition a pending action to failed.
+    pub fn fail_pending(
+        &self,
+        action_id: &str,
+        outputs: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        self.transition_pending(action_id, ActionStatus::Failed, outputs)
     }
 
     /// Transition a pending action to partially completed.
@@ -390,7 +438,11 @@ impl Timeline {
         }
 
         if now > record.expires_at {
-            tracing::debug!(action_id, expires_at = record.expires_at, "undo window expired");
+            tracing::debug!(
+                action_id,
+                expires_at = record.expires_at,
+                "undo window expired"
+            );
             return Err(OrchestratorError::Conflict {
                 domain: "timeline",
                 reason: "undo window expired",
@@ -487,6 +539,38 @@ impl Timeline {
         Ok(self.get_action(action_id)?.status)
     }
 
+    /// Return the undo payload without mutating timeline state.
+    ///
+    /// This is for planning and UI previews only. Callers that actually run an
+    /// undo must use `begin_undo`, execute the reversing operation, then call
+    /// `complete_undo` or `abort_undo`.
+    pub fn preview_undo(&self, action_id: &str) -> Result<String, OrchestratorError> {
+        let now = current_timestamp();
+        let record = self.get_action(action_id)?;
+
+        if !record.reversible || !record.status.is_reversible_terminal() {
+            tracing::debug!(action_id, "action is not reversible");
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "action is not reversible",
+            });
+        }
+
+        if now > record.expires_at {
+            tracing::debug!(
+                action_id,
+                expires_at = record.expires_at,
+                "undo window expired"
+            );
+            return Err(OrchestratorError::Conflict {
+                domain: "timeline",
+                reason: "undo window expired",
+            });
+        }
+
+        Ok(record.undo_command)
+    }
+
     /// List actions still in pending state.
     pub fn list_pending_actions(&self) -> Result<Vec<ActionRecord>, OrchestratorError> {
         let mut stmt = self
@@ -526,10 +610,12 @@ impl Timeline {
             .ok_or(OrchestratorError::NotFound { entity: "action" })
     }
 
-    /// Attempt to undo an action.
+    /// Preview the undo payload for an action.
     ///
     /// Returns the undo command if the action is within the 24-hour window.
-    /// The caller is responsible for executing the command.
+    /// This compatibility method does not mutate action state. Callers that
+    /// actually execute undo must use `begin_undo`, execute the reversing
+    /// operation, then call `complete_undo` or `abort_undo`.
     ///
     /// # Errors
     ///
@@ -599,37 +685,21 @@ impl Timeline {
         }
 
         if now > record.expires_at {
-            tracing::debug!(action_id, expires_at = record.expires_at, "undo window expired");
+            tracing::debug!(
+                action_id,
+                expires_at = record.expires_at,
+                "undo window expired"
+            );
             return Err(OrchestratorError::Conflict {
                 domain: "timeline",
                 reason: "undo window expired",
             });
         }
 
-        // Mark as undone.
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE actions
-                 SET reversible = 0, undo_command = '[UNDONE]', status = ?1,
-                     undo_restore_status = NULL
-                  WHERE action_id = ?2 AND status = ?3 AND reversible = 1",
-                params![
-                    ActionStatus::Undone.as_str(),
-                    action_id,
-                    record.status.as_str()
-                ],
-            )
-            .map_err(|e| map_sqlite_err(e, "failed to mark undone"))?;
-        if changed == 0 {
-            tracing::debug!(action_id, "undo_action: action could not be marked undone");
-            return Err(OrchestratorError::Conflict {
-                domain: "timeline",
-                reason: "action could not be marked undone",
-            });
-        }
-
-        info!(action_id, "action undone");
+        debug!(
+            action_id,
+            "undo_action returned undo payload without mutating state"
+        );
         Ok(record.undo_command)
     }
 
@@ -862,7 +932,13 @@ mod tests {
         let id = tl.record_irreversible("did a thing").unwrap();
         let err = tl.undo_action(&id).unwrap_err();
         assert!(
-            matches!(err, OrchestratorError::Conflict { domain: "timeline", .. }),
+            matches!(
+                err,
+                OrchestratorError::Conflict {
+                    domain: "timeline",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
         assert!(
@@ -909,6 +985,38 @@ mod tests {
         assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Pending);
         tl.complete_pending(&id, Some(r#""Completed""#)).unwrap();
         assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Complete);
+    }
+
+    #[test]
+    fn pending_irreversible_action_can_complete_without_undo() {
+        let tl = Timeline::in_memory().unwrap();
+        let id = tl
+            .record_pending_irreversible("developer.workflow", "inspect repo")
+            .unwrap();
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Pending);
+        tl.complete_pending(&id, Some(r#"{"ok":true}"#)).unwrap();
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Complete);
+        let err = tl.undo_action(&id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Conflict {
+                    domain: "timeline",
+                    ..
+                }
+            ),
+            "irreversible workflow should not produce an undo command: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pending_action_can_fail_terminally() {
+        let tl = Timeline::in_memory().unwrap();
+        let id = tl
+            .record_pending_irreversible("developer.workflow", "inspect repo")
+            .unwrap();
+        tl.fail_pending(&id, Some(r#"{"ok":false}"#)).unwrap();
+        assert_eq!(tl.get_action_status(&id).unwrap(), ActionStatus::Failed);
     }
 
     #[test]

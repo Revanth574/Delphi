@@ -1,0 +1,16 @@
+[package]
+name = "delphi-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local development daemon owning Delphi shared runtime state"
+
+[dependencies]
+anyhow = { workspace = true }
+die-inference = { workspace = true }
+die-orchestrator = { workspace = true }
+semantic-fs = { workspace = true }
+shell-bridge = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -7,3 +7,11 @@ description = "Delphi shared hardening primitives — each module forecloses a r
 
 [dependencies]
 sha2 = { workspace = true }
+
+# safe_open: openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) is Linux-specific; the
+# syscall is invoked via libc on unix. On non-unix the module returns Unsupported.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

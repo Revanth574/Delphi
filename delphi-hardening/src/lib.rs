@@ -18,5 +18,8 @@
 //! - [`canonical_hash`] — injective, length-prefixed hashing with a
 //!   declared-field-count guard (forecloses under-coverage hashing /
 //!   non-injective encoding).
+//! - [`safe_open`] — `openat2`-anchored race-free safe-open beneath a held
+//!   trusted-root handle (forecloses path-resolution races / symlink TOCTOU).
 
 pub mod canonical_hash;
+pub mod safe_open;

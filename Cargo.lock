@@ -1443,6 +1443,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "criterion",
+ "delphi-hardening",
  "rand 0.9.4",
  "serde",
  "sha2",

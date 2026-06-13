@@ -6,6 +6,7 @@ license.workspace = true
 description = "Delphi OS security subsystem: encryption, ZK proofs, TPM, federated sync"
 
 [dependencies]
+delphi-hardening = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

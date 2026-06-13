@@ -38,59 +38,46 @@
 //! the canonical home — every public store imports it via
 //! `crate::sqlite::{init_sqlite_connection, map_sqlite_err}`.
 
-use std::time::Duration;
-
-use rusqlite::{Connection, Error as SqliteError, ErrorCode};
+use rusqlite::{Connection, Error as SqliteError};
 
 use crate::error::OrchestratorError;
 
-/// **Codex re-review FIX 22 (round 8):** project-wide standard
-/// busy_timeout. 5 seconds — long enough that the typical
-/// foreign_key_check / migration commit window stays well inside one
-/// retry attempt, short enough that a stuck store surfaces
-/// `TransientLock` within a bounded retry budget. See CLAUDE.md
-/// "SQLite Connection Policy".
-pub const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Project-wide standard SQLite `busy_timeout`, re-exported from the shared
+/// [`delphi_hardening::pragma_setup`] primitive (leverage pass P2). 5 seconds —
+/// see CLAUDE.md "SQLite Connection Policy".
+pub use delphi_hardening::pragma_setup::SQLITE_BUSY_TIMEOUT;
 
-/// **Codex re-review FIX 22 (round 8):** apply the project-wide SQLite
-/// connection-init policy to `conn`.
+/// Apply the project-wide SQLite connection-init policy to `conn` — a thin
+/// wrapper over [`delphi_hardening::pragma_setup::init_connection`] (the
+/// `busy_timeout` pin + the documented seam for future per-connection policy).
+/// Sibling stores must call this on every connection open — including `:memory:`
+/// constructors (F23 constructor-parity policy). Idempotent.
 ///
-/// Currently this sets `busy_timeout` to [`SQLITE_BUSY_TIMEOUT`]. The
-/// function is the documented single seam for adding future
-/// connection-wide policy items (e.g. additional PRAGMAs, foreign-key
-/// enforcement defaults). Sibling stores must call this on every
-/// connection open — including `:memory:` constructors (F23
-/// constructor-parity policy).
+/// # Errors
 ///
-/// Idempotent — calling it twice on the same connection just resets
-/// the busy timeout to the same value.
+/// Propagates the `rusqlite` error if setting the pragma fails.
 pub fn init_sqlite_connection(conn: &Connection) -> Result<(), SqliteError> {
-    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+    delphi_hardening::pragma_setup::init_connection(conn)
 }
 
-/// **Codex re-review FIX 21 (round 7) + FIX 22 (round 8):** map
-/// `rusqlite::Error` to the orchestrator's error type per the
-/// project-wide SQLite Connection Policy.
+/// Map `rusqlite::Error` to the orchestrator's error type per the project-wide
+/// SQLite Connection Policy.
 ///
-/// - `SqliteFailure` with `code = DatabaseBusy | DatabaseLocked` →
-///   [`OrchestratorError::TransientLock`] carrying the full
-///   `rusqlite::Error` as `source`. The base `ErrorCode` mask catches
-///   both base and extended busy/locked codes
-///   (`SQLITE_BUSY_RECOVERY`, `SQLITE_LOCKED_SHAREDCACHE`, etc.) per
-///   libsqlite3-sys's `Error::new` `& 0xff` mask.
-/// - All other variants → [`OrchestratorError::Planning`] with the
-///   caller-supplied `context` prefix preserved for debug strings.
+/// The transient-lock CLASSIFICATION is the shared
+/// [`delphi_hardening::pragma_setup::is_transient_lock`] predicate (STOP POINT A:
+/// the classification is shared, error CONSTRUCTION stays per-crate); this site
+/// builds the orchestrator's typed error from it:
 ///
-/// `context` is `&str` rather than `&'static str` so dynamic callers
-/// can pass `&format!("...")` for per-call-site context — the borrow
-/// is consumed within the closure and not retained.
+/// - a transient lock (`DatabaseBusy` / `DatabaseLocked`, incl. extended codes
+///   like `SQLITE_BUSY_SNAPSHOT` / `SQLITE_LOCKED_SHAREDCACHE` — the predicate
+///   matches the base `ErrorCode`, which libsqlite3-sys masks the extended code
+///   down to) → [`OrchestratorError::TransientLock`] carrying the full error.
+/// - all other variants → [`OrchestratorError::Planning`] with the
+///   caller-supplied `context` prefix preserved.
+///
+/// `context` is `&str` so dynamic callers can pass `&format!("...")`.
 pub fn map_sqlite_err(err: SqliteError, context: &str) -> OrchestratorError {
-    if let SqliteError::SqliteFailure(ref ffi_err, _) = err
-        && matches!(
-            ffi_err.code,
-            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
-        )
-    {
+    if delphi_hardening::pragma_setup::is_transient_lock(&err) {
         return OrchestratorError::TransientLock { source: err };
     }
     OrchestratorError::Planning(format!("{context}: {err}"))

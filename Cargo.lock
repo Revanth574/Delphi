@@ -942,6 +942,7 @@ name = "delphi-hardening"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rusqlite",
  "sha2",
  "tempfile",
 ]

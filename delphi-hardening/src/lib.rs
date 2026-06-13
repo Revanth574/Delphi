@@ -20,6 +20,10 @@
 //!   non-injective encoding).
 //! - [`safe_open`] — `openat2`-anchored race-free safe-open beneath a held
 //!   trusted-root handle (forecloses path-resolution races / symlink TOCTOU).
+//! - [`pragma_setup`] — per-connection SQLite policy: the `busy_timeout` pin and
+//!   the transient-lock classification (forecloses per-connection state drift +
+//!   conflating transient contention with genuine failures).
 
 pub mod canonical_hash;
+pub mod pragma_setup;
 pub mod safe_open;

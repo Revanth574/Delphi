@@ -7,6 +7,9 @@ description = "Delphi shared hardening primitives — each module forecloses a r
 
 [dependencies]
 sha2 = { workspace = true }
+# pragma_setup: per-connection SQLite policy (busy_timeout pin + transient-lock
+# classification). rusqlite is the shared SQLite layer across the workspace.
+rusqlite = { workspace = true }
 
 # safe_open: openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) is Linux-specific; the
 # syscall is invoked via libc on unix. On non-unix the module returns Unsupported.

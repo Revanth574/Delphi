@@ -2342,159 +2342,31 @@ pub fn safe_open_under_root_handle(
     trusted_root_handle: &std::fs::File,
     target: &Path,
 ) -> std::io::Result<std::fs::File> {
-    #[cfg(target_os = "linux")]
-    {
-        linux_openat2_under_held_root(trusted_root_handle, target)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // FIX 16: explicit feature-gate. See module docs and the
-        // commit message for the full rationale. The Windows
-        // component-walk in round-3 had unfixable TOCTOU races; the
-        // only correct Windows path is undocumented NT-level APIs
-        // we don't want to depend on at this build stage. Other
-        // Unix variants are similarly deferred.
-        let _ = (trusted_root_handle, target);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "knowledge file ingestion is supported on Linux only in this build. \
-             Linux uses openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) anchored to a \
-             held directory handle for kernel-level race-free safe-open. Windows \
-             lacks a documented kernel-level equivalent (NtCreateFile + \
-             OBJ_DONT_REPARSE is undocumented and version-unstable); macOS support \
-             via repeated openat walks is deferred. Use the ingest_text D-Bus \
-             method to ingest content without filesystem access.",
-        ))
-    }
+    // Thin wrapper over the shared openat2 primitive (leverage pass P2): the
+    // race-free safe-open guts (openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH +
+    // /proc/self/fd re-validation) now live in
+    // `delphi_hardening::safe_open::open_beneath`, lifted byte-identically. This
+    // site keeps the knowledge-domain non-Linux Unsupported message (the message
+    // is domain-specific, so the generic primitive takes it as a parameter).
+    // ValidatedIngestionPath and its path-safety test suite are unchanged — the
+    // unforgeable `TrustedRoot` capability newtype is a tracked follow-up (see
+    // docs/DEFECT_CLASSES.md, capability-type pattern: invariants enforced by
+    // convention should be enforced by an unforgeable type).
+    delphi_hardening::safe_open::open_beneath(trusted_root_handle, target, SAFE_OPEN_UNSUPPORTED_MSG)
 }
 
-/// Linux-specific implementation: `openat2(2)` with
-/// `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, anchored to a held
-/// directory file descriptor.
-///
-/// The kernel walks `target` relative to the held `dirfd` and
-/// returns `-ELOOP` if any component is a symlink, or `-EXDEV`
-/// (ENOTDIR/EXDEV depending on cause) if the resolution would
-/// escape the directory FD even if no symlinks are involved.
-///
-/// **The /proc/self/fd readlink trick:** to compute the path
-/// relative to the held root, we need to know the root's *current*
-/// canonical path (which may differ from what was originally passed
-/// at registration time, if a directory rename has happened). We
-/// readlink `/proc/self/fd/<n>` where `n` is the held fd's number;
-/// the kernel returns the inode's current canonical path, which we
-/// then `strip_prefix` from `target` to get the relative path for
-/// `openat2`.
-///
-/// `SYS_openat2` is syscall 437 on every Linux ABI — confirmed via
-/// libc 0.2.186 source for x86_64. Stable since kernel 5.6.
-///
-/// Memory safety (per CLAUDE.md §3):
-/// - the `OpenHow` struct is owned on the stack, lives until after
-///   the syscall returns, and is only read by the kernel;
-/// - `relative_cstr` owns its bytes for the syscall's lifetime;
-/// - the returned raw fd is immediately wrapped via `OwnedFd` (which
-///   would close it on drop), then converted to `File` (transferring
-///   ownership), so there is no double-close or leak path.
-#[cfg(target_os = "linux")]
-fn linux_openat2_under_held_root(
-    trusted_root_handle: &std::fs::File,
-    target: &Path,
-) -> std::io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    // The held fd IS the trust anchor. We never re-open trusted_root
-    // by path; openat2's dirfd parameter takes the raw fd of an
-    // already-open directory, and the kernel resolves `target`
-    // relative to that fd. Even if the original path string for
-    // this fd has since been swapped for a symlink, the kernel's
-    // view of the fd is bound to the original inode.
-    let root_fd = trusted_root_handle.as_raw_fd();
-
-    // Compute the current canonical path of the held inode via
-    // /proc/self/fd readlink. This is the kernel's view of "where
-    // does this fd point right now" — robust against directory
-    // renames that happened after the fd was opened.
-    let proc_path = format!("/proc/self/fd/{root_fd}");
-    let canonical_root = std::fs::read_link(&proc_path).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("could not resolve held root fd via /proc/self/fd: {e}"),
-        )
-    })?;
-
-    // Strip the canonical root from the target to get the relative
-    // path we'll pass to openat2. If the target doesn't lie under
-    // the held root's CURRENT canonical path, refuse — defense in
-    // depth against a buggy caller passing a target that lexically
-    // doesn't fit (the services-side check_path_allowed_with_root
-    // is supposed to enforce this, but we re-verify here).
-    let relative = target.strip_prefix(&canonical_root).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "target path is not under the held trusted root",
-        )
-    })?;
-
-    // openat2 wants a NUL-terminated C string for the relative path.
-    let relative_cstr = CString::new(relative.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "relative path contains an embedded NUL byte",
-        )
-    })?;
-
-    // The `open_how` struct passed to openat2(2). Mirrors
-    // <linux/openat2.h>'s definition exactly. libc 0.2.186 exposes
-    // SYS_openat2 but not the surrounding ABI, so we define it
-    // inline.
-    #[repr(C)]
-    struct OpenHow {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
-    // From <linux/openat2.h> kernel uapi headers. Stable since 5.6.
-    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
-    const RESOLVE_BENEATH: u64 = 0x08;
-
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        resolve: RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
-    };
-
-    // SAFETY: we pass the kernel a raw root_fd that we own (the
-    // caller's `trusted_root_handle` is alive for the syscall via
-    // borrow), a NUL-terminated C string we own, and a pointer to a
-    // stack-allocated OpenHow with its size. The kernel reads from
-    // the path bytes and writes nothing through these pointers. The
-    // returned value is the new file descriptor on success or `-1`
-    // with errno set on failure.
-    let raw_fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root_fd,
-            relative_cstr.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    };
-
-    if raw_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // SAFETY: raw_fd is a positive i64 value that the kernel has
-    // verified is a valid newly-opened file descriptor. We
-    // immediately transfer ownership into OwnedFd (which would close
-    // it on drop if anything panicked), then into File via
-    // From<OwnedFd>. No other code holds a reference to raw_fd.
-    let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw_fd as i32) };
-    Ok(std::fs::File::from(owned))
-}
+/// Verbatim non-Linux `Unsupported` message for knowledge file ingestion, passed
+/// to the shared safe-open primitive. The message is the *behavior* on non-Linux
+/// platforms; it is pinned (on every platform) by
+/// `safe_open_unsupported_message_is_verbatim` so the byte-identical extraction
+/// cannot silently drift.
+const SAFE_OPEN_UNSUPPORTED_MSG: &str = "knowledge file ingestion is supported on Linux only in this build. \
+     Linux uses openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) anchored to a \
+     held directory handle for kernel-level race-free safe-open. Windows \
+     lacks a documented kernel-level equivalent (NtCreateFile + \
+     OBJ_DONT_REPARSE is undocumented and version-unstable); macOS support \
+     via repeated openat walks is deferred. Use the ingest_text D-Bus \
+     method to ingest content without filesystem access.";
 
 /// **Codex re-review FIX 9 (P2-medium):** infer the schema epoch from
 /// the actual `sources` table SQL when no `schema_version` row is
@@ -5080,6 +4952,26 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    /// canonical safe-open extraction (leverage pass P2): byte-identical proof
+    /// for the NON-Linux path. The Unsupported message is behavior on that
+    /// platform; this test runs on EVERY platform (not cfg-gated — the F18
+    /// lesson: a platform-gated test that doesn't execute on CI masks drift) and
+    /// pins the verbatim message the shared `open_beneath` primitive emits when
+    /// `safe_open_under_root_handle` delegates to it on non-Linux.
+    #[test]
+    fn safe_open_unsupported_message_is_verbatim() {
+        assert_eq!(
+            SAFE_OPEN_UNSUPPORTED_MSG,
+            "knowledge file ingestion is supported on Linux only in this build. \
+             Linux uses openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) anchored to a \
+             held directory handle for kernel-level race-free safe-open. Windows \
+             lacks a documented kernel-level equivalent (NtCreateFile + \
+             OBJ_DONT_REPARSE is undocumented and version-unstable); macOS support \
+             via repeated openat walks is deferred. Use the ingest_text D-Bus \
+             method to ingest content without filesystem access."
+        );
+    }
+
     #[test]
     fn safe_open_under_root_handle_accepts_real_file() {
         // Sanity: a regular file under the held trusted root must open.

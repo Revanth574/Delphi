@@ -6,6 +6,7 @@ license.workspace = true
 description = "Central planning agent for the Delphi Intelligence Engine"
 
 [dependencies]
+delphi-hardening = { workspace = true }
 fortress = { workspace = true }
 die-browser = { workspace = true }
 die-inference = { workspace = true }

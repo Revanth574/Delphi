@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use delphi_hardening::canonical_hash::CanonicalHasher;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -291,51 +292,52 @@ impl Workflow {
     /// must never be LESS sensitive than execution behavior, only more.
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        // ORCH-R2-02: canonical LENGTH-PREFIXED encoding. Every variable-length
-        // field is emitted via `fp_field` (u64-LE byte length ++ bytes) and every
-        // collection is count-prefixed, so the byte stream is unambiguous — no
-        // two distinct workflows can produce the same bytes. The delimiter
-        // joining this replaced let ("a\0b","c") vs ("a","b\0c") and {"a":"b=c"}
-        // vs {"a=b":"c"} collide (the git `blob <len>\0<content>` lesson).
-        fp_field(&mut h, self.name.as_bytes());
-        h.update((self.steps.len() as u64).to_le_bytes());
-        for step in &self.steps {
-            fp_field(&mut h, step.step_id.as_bytes());
-            fp_field(&mut h, step.app_id.as_bytes());
-            fp_field(&mut h, step.capability.as_bytes());
-            // Per-step confidence is execution-affecting (the execute_step gate
-            // reads it) so it MUST be bound (ORCH-R1-05 round-2). Fixed 8 bytes.
-            h.update(step.confidence.to_bits().to_le_bytes());
-            let mut keys: Vec<&String> = step.params.keys().collect();
-            keys.sort();
-            h.update((keys.len() as u64).to_le_bytes());
-            for k in keys {
-                fp_field(&mut h, k.as_bytes());
-                fp_field(&mut h, step.params[k].as_bytes());
+        // ORCH-R2-02: canonical LENGTH-PREFIXED, injective encoding via the shared
+        // `canonical_hash` primitive (leverage pass P2). Two top-level fields —
+        // `name` and the `steps` sequence; `consent` is deliberately excluded (it
+        // is the binding TARGET: the token binds to this fingerprint, so it cannot
+        // bind to itself). Every variable field is length-prefixed and every
+        // collection count-prefixed, so no two distinct workflows share a byte
+        // stream (the git `blob <len>\0` lesson — the delimiter join this replaced
+        // let ("a\0b","c") collide with ("a","b\0c") and {"a":"b=c"} with
+        // {"a=b":"c"}). Per-step `confidence` is execution-affecting (the
+        // execute_step gate reads it) so it MUST be bound (ORCH-R1-05 round-2);
+        // name + step/dep/produce order are over-included (a reorder forces
+        // conservative re-consent) — the binding must never be LESS sensitive than
+        // execution behavior, only more.
+        let mut h = CanonicalHasher::new(2);
+        h.field(self.name.as_bytes()).seq(self.steps.len(), |steps| {
+            for step in &self.steps {
+                steps
+                    .field(step.step_id.as_bytes())
+                    .field(step.app_id.as_bytes())
+                    .field(step.capability.as_bytes())
+                    // Fixed 8 bytes (f64 bit pattern); execution-affecting, bound.
+                    .fixed(&step.confidence.to_bits().to_le_bytes());
+                let mut keys: Vec<&String> = step.params.keys().collect();
+                keys.sort();
+                steps.seq(keys.len(), |kv| {
+                    for k in keys {
+                        kv.field(k.as_bytes()).field(step.params[k].as_bytes());
+                    }
+                });
+                steps.seq(step.depends_on.len(), |dep| {
+                    for d in &step.depends_on {
+                        dep.field(d.as_bytes());
+                    }
+                });
+                steps.seq(step.produces.len(), |prod| {
+                    for p in &step.produces {
+                        prod.field(p.as_bytes());
+                    }
+                });
             }
-            h.update((step.depends_on.len() as u64).to_le_bytes());
-            for d in &step.depends_on {
-                fp_field(&mut h, d.as_bytes());
-            }
-            h.update((step.produces.len() as u64).to_le_bytes());
-            for p in &step.produces {
-                fp_field(&mut h, p.as_bytes());
-            }
-        }
-        h.finalize().into()
+        });
+        // Infallible by construction: exactly two top-level fields are appended,
+        // matching the declared count. `expect` is the fail-closed posture.
+        h.finish()
+            .expect("workflow fingerprint hashes exactly 2 declared fields (name + steps)")
     }
-}
-
-/// Length-prefix a variable-length field into the workflow-fingerprint hasher
-/// (ORCH-R2-02): a u64-LE byte length followed by the bytes, so a field's
-/// CONTENT can never be confused with a delimiter and no two distinct workflows
-/// can produce the same byte stream (the git `blob <len>\0<content>` lesson).
-fn fp_field(h: &mut sha2::Sha256, bytes: &[u8]) {
-    use sha2::Digest;
-    h.update((bytes.len() as u64).to_le_bytes());
-    h.update(bytes);
 }
 
 /// Unforgeable proof that the user consented to a specific [`Workflow`]
@@ -1372,6 +1374,62 @@ mod tests {
         assert!(
             !token.authorizes(&wf2),
             "consent for one param map must not authorize the colliding other"
+        );
+    }
+
+    /// canonical_hash extraction (leverage pass P2, site 2 — the `seq()`
+    /// exerciser): byte-identical proof + struct-grew tripwires at BOTH levels.
+    ///
+    /// The no-`..` destructures of `Workflow` AND `WorkflowStep` fail to COMPILE
+    /// when either struct grows, forcing the "must this new field be in the
+    /// fingerprint?" decision at field-add time. `consent` is deliberately NOT
+    /// fingerprinted — it is the binding TARGET (the token binds to the
+    /// fingerprint, so it cannot bind to itself); the destructure binds it
+    /// explicitly so a future field cannot hide behind a `..`.
+    ///
+    /// `GOLDEN` is `wf.fingerprint()` captured from the pre-extraction
+    /// implementation; the `CanonicalHasher`/`seq`-based fingerprint must
+    /// reproduce it exactly — the byte-identical proof for the nested shape.
+    #[test]
+    fn fingerprint_is_exhaustive_and_byte_identical_canonical_hash() {
+        let mut s1 = WorkflowStep::new("s1", "org.app", "file.open")
+            .with_param("path", "/doc")
+            .with_param("mode", "ro");
+        s1.produces.push("handle".to_string());
+        let s2 = WorkflowStep::new("s2", "org.export", "pdf.make").depends_on("s1");
+        let wf = Workflow::new("wf-golden").with_step(s1).with_step(s2);
+
+        // Top-level struct-grew tripwire — NO `..`.
+        let Workflow {
+            name,
+            steps,
+            consent,
+        } = &wf;
+        let _ = (name, steps, consent); // consent: deliberately NOT fingerprinted (binding target)
+
+        // Per-step struct-grew tripwire — NO `..`.
+        for step in &wf.steps {
+            let WorkflowStep {
+                step_id,
+                app_id,
+                capability,
+                params,
+                depends_on,
+                produces,
+                confidence,
+            } = step;
+            let _ = (step_id, app_id, capability, params, depends_on, produces, confidence);
+        }
+
+        // Pinned from the pre-extraction `fp_field`-based fingerprint.
+        const GOLDEN: [u8; 32] = [
+            25, 224, 140, 3, 20, 12, 23, 107, 59, 16, 35, 105, 240, 247, 138, 218, 130, 143, 110,
+            52, 248, 89, 133, 175, 108, 234, 28, 36, 166, 56, 253, 131,
+        ];
+        assert_eq!(
+            wf.fingerprint(),
+            GOLDEN,
+            "workflow fingerprint must be byte-identical across the canonical_hash extraction"
         );
     }
 

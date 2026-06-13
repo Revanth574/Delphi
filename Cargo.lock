@@ -1076,6 +1076,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "criterion",
+ "delphi-hardening",
  "die-browser",
  "die-inference",
  "die-learning",

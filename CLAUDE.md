@@ -1624,3 +1624,14 @@ When tempted to take a shortcut:
 - "I remember this pattern from another project" → NO. Verify it applies here.
 
 Rigor is not in tension with innovation. Rigor is what makes innovation real.
+
+### 13.9 Defect-class corpus (fix-known, don't-rediscover)
+
+`docs/DEFECT_CLASSES.md` is the institutional memory of every defect *class* the project's adversarial reviews have surfaced (Task 3A.5 F4–F26, Task 3A.6 R1–R5, the Phase 3B.0 `services`/`orchestrator`/`fortress` sweeps, INF-1), each with the **foreclosing primitive** (a `delphi-hardening` module where extracted — `canonical_hash`, `safe_open`, `pragma_setup` — or a discipline otherwise) and the **RED-proof test shape** that proves a fix closes it.
+
+**Every new task's design step AND every Codex round-1 prompt MUST reference `docs/DEFECT_CLASSES.md` and explicitly partition the relevant classes into:**
+
+- **(a) pre-foreclosed by `delphi-hardening`** — list these so the reviewer does **not** spend budget re-hunting a class a primitive already closes by construction; and
+- **(b) applicable but NOT yet foreclosed** (the disciplines + the deferred patterns: `atomic_migration`, `uniform_reject`, `TrustedRoot`) — list these so they get **explicit** coverage rather than being assumed-handled.
+
+The purpose is **review-attention allocation**: skip the foreclosed, concentrate the review on the unforeclosed. This is what makes "fix-known, don't-rediscover" actually collapse double-review-rounds rather than be a ritual. A token citation that does *not* partition the classes — that just names the file — misses the point: it is the (a)/(b) split that directs reviewer attention and prevents re-deriving a closed class the hard way. When a task forecloses a *new* class (extracts a new primitive or establishes a new discipline), it MUST add the entry to `docs/DEFECT_CLASSES.md` in the same change.

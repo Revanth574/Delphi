@@ -17,6 +17,7 @@
 #     Never lower it to make a red CI green without that justification.
 #
 # Provenance: 1882 measured by the leverage-pass P2 full-workspace gate
-# (`cargo test --workspace`, 0 failed); P3 added documentation only (0 tests).
-# Re-confirmed before this commit.
-1882
+# (`cargo test --workspace`, 0 failed); P3 added documentation only (0 tests);
+# P4-proptest +3 (delphi-hardening canonical_hash injectivity P1/P2/P3) -> 1885,
+# verified `cargo test --workspace` 0 failed before this commit.
+1885

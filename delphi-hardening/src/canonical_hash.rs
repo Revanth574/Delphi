@@ -353,3 +353,136 @@ mod tests {
         assert_ne!(a.finish().unwrap(), b.finish().unwrap());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based injectivity tests (leverage pass P4). These generalize the
+    //! hand-picked collision cases in `mod tests` into the property the
+    //! non-injective-encoding findings (ORCH-R2-02 consent-fingerprint delimiter
+    //! collision) turned into law: **distinct field STRUCTURE must yield a
+    //! distinct digest.**
+    //!
+    //! ## Injectivity level: the SHA-256 digest, not the pre-hash byte stream
+    //!
+    //! [`CanonicalHasher`] exposes only `finish() -> [u8; 32]`; its `Sha256` is
+    //! private and there is no pre-hash byte-stream accessor (and these tests do
+    //! NOT invent one — the `manual()` helper in `mod tests` is a test-local
+    //! reference encoder, not a primitive accessor). So the assertions are on the
+    //! digest. Modulo a SHA-256 collision — which proptest cannot find; that would
+    //! be a break of SHA-256, not an encoding bug — a digest collision IS an
+    //! encoding-injectivity failure. So in practice these are encoding tests; this
+    //! note records the one theoretical confound.
+    //!
+    //! ## Why the generators split ONE content two ways (witness reachability)
+    //!
+    //! Two *independently*-random field vectors essentially never share a
+    //! flattening, so a dropped-length-prefix bug would never collide them and the
+    //! property would be **decorative** (green against the very bug it guards).
+    //! P1/P2 instead take one flattened content and split it at two distinct points
+    //! — same concatenation, different field/collection boundaries — the
+    //! `("ab","c")` vs `("a","bc")` shape — so the boundary-collision witness is
+    //! reachable by construction and each property actually bites its target bug.
+    //!
+    //! ## Why `fixed` is absent from the injectivity generators (schema invariant)
+    //!
+    //! [`CanonicalHasher`] is deliberately NOT injective over arbitrary
+    //! `Vec<Field>`: `fixed` is unprefixed and the declared count is not hashed, so
+    //! `[fixed("ab"), fixed("c")]` and `[fixed("abc")]` hash identically — correct,
+    //! because `fixed` is contractually constant-width (u64 / f64 / discriminant),
+    //! so injectivity holds only WITHIN a fixed schema. A generator emitting
+    //! arbitrary-width `fixed` would manufacture a correct-behaviour "collision" (a
+    //! false finding). So P1/P2 vary only the self-delimiting kinds; `fixed` is
+    //! covered instead by P3's fixed-vs-field distinction.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Hash a flat sequence of variable (length-prefixed) `field`s.
+    fn hash_fields(fields: &[Vec<u8>]) -> [u8; 32] {
+        let mut h = CanonicalHasher::new(fields.len());
+        for f in fields {
+            h.field(f);
+        }
+        h.finish().expect("declared == appended by construction")
+    }
+
+    /// Hash two consecutive `seq`s (each a count-prefixed collection).
+    fn hash_two_seqs(a: &[Vec<u8>], b: &[Vec<u8>]) -> [u8; 32] {
+        let mut h = CanonicalHasher::new(2);
+        h.seq(a.len(), |s| {
+            for e in a {
+                s.field(e);
+            }
+        })
+        .seq(b.len(), |s| {
+            for e in b {
+                s.field(e);
+            }
+        });
+        h.finish().expect("declared 2 top-level seqs")
+    }
+
+    proptest! {
+        /// P1 — length-prefix injectivity. One byte content split at two distinct
+        /// points gives two 2-field vectors with the SAME concatenation but
+        /// different field boundaries; their digests must differ. RED-proof:
+        /// making `field` drop its length prefix collapses both to `content` and
+        /// this fails (regenerates the ("ab","c") vs ("a","bc") collision).
+        #[test]
+        fn p1_length_prefix_makes_field_boundaries_injective(
+            (content, i, j) in prop::collection::vec(any::<u8>(), 1..64usize)
+                .prop_flat_map(|c| {
+                    let n = c.len();
+                    (Just(c), 0..=n, 0..=n)
+                }),
+        ) {
+            prop_assume!(i != j);
+            let split = |k: usize| vec![content[..k].to_vec(), content[k..].to_vec()];
+            prop_assert_ne!(hash_fields(&split(i)), hash_fields(&split(j)));
+        }
+
+        /// P2 — seq count-prefix injectivity. One element content split into two
+        /// consecutive seqs at two distinct points: same flattened elements,
+        /// different collection boundary. RED-proof: making `seq` drop its count
+        /// prefix collapses both to the same element stream and this fails
+        /// (finds []++["x"] vs ["x"]++[]).
+        #[test]
+        fn p2_seq_count_prefix_makes_collection_boundaries_injective(
+            (elems, i, j) in prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 0..16usize), 1..16usize)
+                .prop_flat_map(|e| {
+                    let n = e.len();
+                    (Just(e), 0..=n, 0..=n)
+                }),
+        ) {
+            prop_assume!(i != j);
+            prop_assert_ne!(
+                hash_two_seqs(&elems[..i], &elems[i..]),
+                hash_two_seqs(&elems[..j], &elems[j..])
+            );
+        }
+
+        /// P3 — fixed-vs-field distinction. For the SAME bytes, a `fixed` (raw)
+        /// field and a `field` (length-prefixed) must hash differently: the two
+        /// encodings are not interchangeable. RED-proof: making `fixed`
+        /// length-prefix its bytes makes `fixed(x)` == `field(x)` and this fails —
+        /// collapsing the raw/prefixed distinction BOTH golden call sites depend on
+        /// (fixed = raw timestamps / f64 / discriminants; field = prefixed bytes).
+        #[test]
+        fn p3_fixed_and_field_are_not_interchangeable(
+            x in prop::collection::vec(any::<u8>(), 0..64usize),
+        ) {
+            let as_fixed = {
+                let mut h = CanonicalHasher::new(1);
+                h.fixed(&x);
+                h.finish().unwrap()
+            };
+            let as_field = {
+                let mut h = CanonicalHasher::new(1);
+                h.field(&x);
+                h.finish().unwrap()
+            };
+            prop_assert_ne!(as_fixed, as_field);
+        }
+    }
+}

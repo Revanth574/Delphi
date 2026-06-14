@@ -18,3 +18,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# canonical_hash injectivity property tests (P1 length-prefix, P2 seq count-prefix,
+# P3 fixed-vs-field distinction). Leverage pass P4.
+proptest = { workspace = true }

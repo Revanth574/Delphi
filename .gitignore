@@ -1,6 +1,12 @@
 # Rust
 /target/
 **/*.rs.bk
+# proptest failure-seed persistence. Not committed: the only seeds generated so far
+# are RED-proof residue (inputs that failed under deliberately-injected, reverted
+# bugs — not real regressions of shipped code). A genuine future failure is caught
+# by CI and its minimal input logged in the run output, so replay persistence is
+# not relied upon here.
+**/proptest-regressions/
 
 # Node
 node_modules/

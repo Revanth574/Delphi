@@ -104,6 +104,10 @@ jobs:
       - run: pnpm test --run
       - run: pnpm build
 
-  # NOTE: a 60s/target ZKQP fuzz-smoke job is added with the cargo-fuzz targets
-  # (P4 item 3, the next commit after this CI lands) — it is not in this commit
-  # because the fuzz targets do not exist yet.
+  # NOTE: there is intentionally NO nightly cargo-fuzz job. The ZKQP detector
+  # adversary is a STABLE proptest suite (fortress/tests/zkqp_completeness.rs) that
+  # runs inside the rust job above and is gated by the test-count floor — the
+  # Nd-digit / Unicode-separator completeness contract (FORT-R2-01) and the IP/date
+  # ASCII-only scope are shape-driven invariants a structured generator expresses
+  # directly, so coverage-guided byte fuzzing (and a rot-prone nightly job) buys
+  # nothing here. See PROGRESS.md (leverage pass P4) for the rationale.

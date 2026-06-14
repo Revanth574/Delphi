@@ -27,3 +27,8 @@ unicode-general-category = "1"
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 criterion = { workspace = true }
+# ZKQP detector completeness property tests (tests/zkqp_completeness.rs): the
+# Nd-digit / Unicode-separator completeness contract (FORT-R2-01) and the
+# deliberate ASCII-only scope of the IP/date scanners, as properties. Leverage
+# pass P4 (stable proptest, not nightly cargo-fuzz — the invariant is shape-driven).
+proptest = { workspace = true }

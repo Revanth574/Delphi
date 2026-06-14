@@ -21,6 +21,17 @@ P4 lands the project's first CI (`CODEBASE_REVIEW` WS-2 — there was none): `.g
 
 The unsound gate is **genuinely live**, not decorative: `cargo audit --deny unsound` returns RC 1 without the lru `--ignore` (a future unsound advisory fails CI) and RC 0 with it. The lru acceptance rests on the reachability proof — if a tantivy upgrade ever routed through `lru::IterMut`, the re-check turns the acceptance back into a live finding.
 
+### P4 property-based test suites (RED-proven, test-only)
+
+Two proptest suites turn adversarial-review lessons into executable law. Every property was RED-proven against the exact bug it guards (the property must FAIL against an injected pre-fix regression, then the break is reverted) — a property that can't bite is decorative.
+
+- **canonical_hash injectivity** (`delphi-hardening`, +3 → 1885): P1 length-prefix, P2 seq count-prefix, P3 fixed≠field. Injectivity asserted on the SHA-256 digest (the `Sha256` is private; no pre-hash accessor invented) modulo a collision proptest can't find. Witness-reachable generators (one content split two ways) so the boundary collision exists by construction. `proptest 1.11` added as a workspace dev-dep.
+- **ZKQP detector completeness** (`fortress/tests/zkqp_completeness.rs`, +6 → 1891): the FORT-R2-01 Nd-digit / Unicode-separator completeness contract as metamorphic properties — phone/credit-card/national-id/email detected across Arabic-Indic, Devanagari, Bengali, Thai, full-width scripts by construction — plus the **deliberate ASCII-only scope** of IP and date (date = ISO `YYYY-MM-DD` per the code). Public-API only; `pii.rs` byte-identical to HEAD (no fortress source touched). **Engine decision:** stable proptest, NOT nightly cargo-fuzz — the invariant is shape-driven (a generation problem), so coverage-guided byte fuzzing and a rot-prone nightly CI job buy nothing; the suite runs in the existing rust test job, gated by the count floor. The pending fuzz-smoke note in `ci.yml` was removed accordingly.
+
+**Two `detect_dates` follow-ups surfaced here, NOT fixed (kept this commit pure test-only):**
+- **Doc/code drift → P5 honesty pass.** The `detect_dates` comment claims `MM/DD/YYYY` but the code implements ISO `YYYY-MM-DD` only ([pii.rs:397](fortress/src/zkqp/pii.rs:397)). Same doc-lie class as INF-3 / vault-zeroize; fix it there with its siblings, not ad hoc in a test commit.
+- **Non-ISO false-negative → detector-scope / §10-coverage triage** (alongside FORT-Q4 address/name/geo gap). Framed as an OPEN SCOPE QUESTION, not a confirmed bug: is `detect_dates` meant to be format-complete, or deliberately ISO-only like the IP scanner is deliberately ASCII-only? Does §10 require date redaction across formats? If "format-complete," it's a production `fortress/zkqp` detector change = its own branch + Codex review. Spun out as a background task.
+
 ## INF-1 (API-key Debug redaction) — CLOSED (2026-06-12)
 
 **First triage of a `CODEBASE_REVIEW.md` security candidate** (from the `quality/elevation-pass` review), fixed and merged ahead of the leverage-pass scoping. `CloudClient` (`die/inference/src/cloud.rs`) derived `Debug` over a raw `api_key: String`, so a `{:?}` of the client — or of any struct holding one — would print the live Anthropic API key.

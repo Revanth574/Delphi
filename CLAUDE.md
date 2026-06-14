@@ -735,9 +735,10 @@ fortress         (foundation — no internal dependencies)
 die-inference    (depends on: fortress)
 die-browser      (standalone — subprocess management only)
 die-voice        (standalone — subprocess management only)
+die-learning     (depends on: fortress)
 semantic-fs      (depends on: fortress)
   ↑
-die-orchestrator (depends on: die-inference, die-browser, semantic-fs, fortress)
+die-orchestrator (depends on: die-inference, die-browser, die-learning, semantic-fs, fortress)
   ↑
 delphi-services  (depends on: die-inference, die-orchestrator, semantic-fs, fortress)
   ↑
@@ -1389,12 +1390,12 @@ The spec (`DELPHI_COMPLETE_SPEC.md`) defines 18 capabilities. Track status expli
 | # | Capability | Status | Phase |
 |---|-----------|--------|-------|
 | 1 | Behavioral learning engine | Built + wiring in Phase 2 | 0+2 |
-| 2 | Deep internet agency | Built (die-browser) | 1 |
+| 2 | Deep internet agency | Partial — die-browser IPC layer built + tested, but the Playwright `agent.js` it drives does not exist in-repo; no production consumer (Brain unwired) | 1 |
 | 3 | Multi-specialty reasoning | Partial — router exists, specialist mesh needed | 3 |
 | 4 | Infinite task chaining | Built (orchestrator brain + checkpoints) | 1+2 |
-| 5 | Conversational presence | Partial — voice I/O exists, persistent conversation memory needed | 3 |
+| 5 | Conversational presence | Partial — voice I/O scaffolded (STT/TTS are stubs: placeholder text / silence, no whisper-rs/Piper); persistent conversation memory needed | 3 |
 | 6 | Goal and planning architecture | Not started | 3 |
-| 7 | Full-stack builder | Phase 2 Task 2.4 | 2 |
+| 7 | Full-stack builder | Scaffold-only — template file-copy works; `{{project_name}}` substitution, Generating/Building/Testing states, minijinja, post-scaffold exec all unimplemented; no production consumer | 2 |
 | 8 | Client/company workspace adaptation | Not started | 3 |
 | 9 | Sovereign local intelligence | Partial — Fortress + ZKQP in Phase 2 | 0+2 |
 | 10 | Non-interference philosophy | Encoded in iron laws (no code needed) | 0 |

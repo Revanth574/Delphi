@@ -301,9 +301,10 @@ impl TtsEngine {
             }
         }
 
-        // DECISION: Actual PCM audio reading deferred to Phase 2.
-        // In Phase 1, we return a placeholder chunk. The real
-        // implementation reads raw 16-bit PCM from Piper's stdout.
+        // STUB: real Piper PCM reading is not built (deferred — Phase 3B+). This
+        // returns a placeholder chunk of SILENCE (zeroed samples sized from text
+        // length), NOT synthesized speech. The real implementation reads raw
+        // 16-bit PCM from Piper's stdout.
         let estimated_samples =
             (text.len() as u32 * TTS_SAMPLE_RATE) / 15; // ~15 chars/sec
         Ok(AudioChunk {

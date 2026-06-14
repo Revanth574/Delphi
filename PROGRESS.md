@@ -274,12 +274,12 @@ ssi/sdk-rust/           # Rust SSI SDK
 | # | Capability | Status | Phase |
 |---|-----------|--------|-------|
 | 1 | Behavioral learning engine | Phase 2 complete (built + tested) | 0+2 |
-| 2 | Deep internet agency | Phase 1 complete (built + tested) | 1 |
+| 2 | Deep internet agency | Partial — die-browser IPC layer built + tested; the Playwright `agent.js` it drives does not exist in-repo, no production consumer (Brain unwired) | 1 |
 | 3 | Multi-specialty reasoning | Partial — router exists; specialist mesh → Phase 3 | 3 |
 | 4 | Infinite task chaining | Phase 1+2 complete (brain + checkpoints + apps) | 1+2 |
-| 5 | Conversational presence | **Task 3A.1 complete** — persistent memory + FTS + reference resolution + memory tiering shipped at `2d67a29`; voice I/O from Phase 1 | 3A |
+| 5 | Conversational presence | **Task 3A.1 complete** — persistent memory + FTS + reference resolution + memory tiering shipped at `2d67a29`; voice I/O scaffolded in Phase 1 (STT/TTS are stubs — placeholder text / silence, no whisper-rs/Piper) | 3A |
 | 6 | Goal and planning architecture | **Task 3A.2 complete** — goal graph + timeline estimation + stale/deadline detection + D-Bus `org.delphi.Goals` shipped at `609826d` | 3A |
-| 7 | Full-stack builder | Phase 2 complete (built + tested) | 2 |
+| 7 | Full-stack builder | Scaffold-only — template file-copy built + tested; `{{project_name}}` substitution, Generating/Building/Testing states, minijinja, post-scaffold exec all unimplemented; no production consumer | 2 |
 | 8 | Client/company workspace adaptation | Not started | 3B |
 | 9 | Sovereign local intelligence | Partial — Fortress + ZKQP built | 0+2 |
 | 10 | Non-interference philosophy | Encoded (no code) | 0 |

@@ -12,9 +12,11 @@
 //! notify (OS events) → channel → watcher task → Indexer::index_file()
 //! ```
 //!
-//! The watcher debounces rapid successive events on the same path
-//! (e.g., editors that write-rename-delete) by batching events before
-//! forwarding them to the indexer.
+//! NOTE: event debouncing/batching is NOT implemented — each event is forwarded
+//! to the indexer and the index is committed after every file (see
+//! `process_events`). Debounce + batch-commit (to coalesce editor
+//! write-rename-delete save-bursts and avoid a commit storm) is a forward
+//! optimization, not current behavior.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

@@ -2,13 +2,16 @@
 
 //! Intent planning and execution.
 //!
-//! The planner takes a user intent, decomposes it into a sequence of
-//! steps, and coordinates execution across DIE subsystems. Each step
-//! is logged in the action timeline for the 24-hour undo window.
+//! NOTE (honest-record): this module defines the planner INTERFACE; the
+//! decomposition logic is NOT yet implemented. [`Planner::plan`] returns an
+//! `OrchestratorError::Planning` ("inference backends not yet available") on
+//! every call — an interface shell awaiting the inference backends, not a
+//! working decomposer. The cycle below is the INTENDED design, not current
+//! behavior.
 //!
-//! # Design
+//! # Design (intended — not yet implemented)
 //!
-//! The planner follows a plan-execute-verify cycle:
+//! The planner is to follow a plan-execute-verify cycle:
 //! 1. Decompose intent into steps
 //! 2. Validate each step against security policy (fortress)
 //! 3. Execute steps, using inference and semantic-fs as needed
@@ -17,7 +20,9 @@
 
 use crate::OrchestratorError;
 
-/// The central planner that decomposes intents into executable steps.
+/// The central planner. INTERFACE SHELL (honest-record): decomposition is not
+/// yet implemented — [`plan`](Self::plan) returns a "not yet available" error on
+/// every call.
 ///
 /// # Examples
 ///
@@ -49,8 +54,9 @@ impl Planner {
 
     /// Plan the execution of a natural language intent.
     ///
-    /// Decomposes the intent into steps and validates each against
-    /// security policy.
+    /// NOT YET IMPLEMENTED — returns `OrchestratorError::Planning` ("inference
+    /// backends not yet available") on every call. The INTENDED behavior is to
+    /// decompose the intent into steps and validate each against security policy.
     ///
     /// # Errors
     ///

@@ -607,8 +607,8 @@ impl Embedder for MockEmbedder {
     }
 }
 
-/// Local model-based embedder. Stub implementation: returns
-/// `Fidelity::Unavailable` when no model file is configured. Meant to be
+/// STUB (not built): local model-based embedder. `embed()` returns an empty
+/// vector with `Fidelity::Unavailable` when no model file is configured. To be
 /// replaced with a real candle-based embedder in a future task.
 pub struct LocalEmbedder {
     model_path: Option<PathBuf>,

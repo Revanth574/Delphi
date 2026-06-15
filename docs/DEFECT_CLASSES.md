@@ -378,6 +378,42 @@ invariants; concurrent-opener tests proving serialization.
 
 ---
 
+## 14. Guard must cover all forms of what it guards  *(new — leverage pass P4/P5)*
+
+**Description.** A guard, ignore-pattern, or detector that covers *some* forms of
+what it targets but not all passes silently on the uncovered form — and a guard that
+cannot fire against its target is decorative (worse than none: false confidence). The
+reliable check is to read what a thing DOES, not to pattern-match the markers it
+carries. Sibling instances of "covered one form, missed another" already in this
+corpus: the count-guard's silent-extraction mode (Class 7/10 — a `tee`/`grep` chain
+masking a real `cargo` exit), and `is_transient_lock` matching the base `ErrorCode`
+so it also covers the extended busy/locked codes (Class 3).
+
+**Foreclosing primitive.** **NONE — discipline.** When writing a guard, enumerate the
+forms its target takes and confirm coverage of each; when classifying code, read the
+behavior, not the markers.
+
+**Instances (grounded):**
+- **gitignore dir-form vs file-form (P4):** `**/proptest-regressions/` matched the
+  *directory* a unit test's proptest writes, but NOT the integration-test
+  `<name>.proptest-regressions` *file* — residue slipped into a commit, was caught on
+  the post-commit status, amended out, and the pattern broadened to
+  `*.proptest-regressions`.
+- **stub-grep vs error-returning shell (P5):** a `grep STUB|todo!()|unimplemented!`
+  hollow-implementation check classified `die/orchestrator/src/planner.rs` "built"
+  because `plan()` returns a plain `Err("inference backends not yet available")` with
+  no marker. Reading what `plan()` DOES (logs, then unconditionally errors) overturned
+  it — a doc-lie (interface shell), not a stub. Same category-not-marker lesson as the
+  date-scope precision: assert what the detector DOES under a transform, not what the
+  Unicode category suggests.
+
+**RED-proof shape.** Demonstrate the guard FAILING against the uncovered form before
+broadening it — both instances here actually fired in reality (the residue file
+reached a commit; the stub-grep actually mis-classified). A guard not shown to miss
+the form it missed is unproven.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -395,3 +431,4 @@ invariants; concurrent-opener tests proving serialization.
 | 11. Error-message oracles | `services::error::opaque`; **DEFERRED** (1 crate + transport-coupled) | Local helper |
 | 12. Reject the invalid class | discipline (gate the class, fail-closed) | Discipline |
 | 13. Atomic versioned migration | **DEFERRED** (1 consumer; extract at the 2nd) | Pattern recorded |
+| 14. Guard must cover all forms | discipline (enumerate forms; read behavior, not markers) | Discipline |

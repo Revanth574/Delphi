@@ -165,10 +165,10 @@ impl SttEngine {
             "loading Whisper model"
         );
 
-        // DECISION: Actual whisper-rs integration deferred to Phase 2.
-        // This validates the model path exists and transitions state.
-        // The inference call will return a placeholder until the real
-        // model is loaded.
+        // STUB: actual whisper-rs integration is not built (whisper-rs is not a
+        // dependency yet; deferred — Phase 3B+). This only validates the model
+        // path exists and transitions state; transcribe() returns a placeholder
+        // transcript, not real speech-to-text.
 
         self.model_path = Some(model_path.clone());
         self.state = SttState::Ready;
@@ -242,8 +242,9 @@ impl SttEngine {
             "transcribing audio"
         );
 
-        // DECISION: Placeholder until whisper-rs is integrated in Phase 2.
-        // Returns a synthetic transcript based on audio duration.
+        // STUB: returns a synthetic placeholder transcript based on audio
+        // duration — NOT real transcription. Replaced when whisper-rs is
+        // integrated (Phase 3B+).
         if duration_ms < 100 {
             return Err(VoiceError::NoSpeechDetected);
         }

@@ -14,6 +14,7 @@ members = [
     "proto",
     "services",
     "shell-bridge",
+    "delphi-hardening",
 ]
 
 [workspace.package]
@@ -117,7 +118,11 @@ tempfile = "3"
 # Benchmarks
 criterion = "0.5"
 
+# Property-based testing (delphi-hardening canonical_hash injectivity proptests)
+proptest = "1.11"
+
 # Internal workspace crates
+delphi-hardening = { path = "delphi-hardening" }
 fortress = { path = "fortress" }
 die-browser = { path = "die/browser" }
 die-inference = { path = "die/inference" }

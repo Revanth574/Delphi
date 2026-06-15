@@ -1,11 +1,74 @@
 # Delphi OS — Progress State
 
 Last updated: 2026-06-12 (INF-1 (API-key Debug redaction) **FIXED + Codex APPROVE, 0 findings**, merging to main via `fix/inf-1-apikey-redaction` — the first `CODEBASE_REVIEW` security candidate triaged; see the INF-1 section below. Prior milestone — Phase 3B.0 — **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED TO MAIN `84d84b3`**. The FINAL Phase 3B.0 sweep — **Phase 3B.0 is now CLOSED** (the D-Bus boundary `services/`, `die/orchestrator/`, and the security layer `fortress/` have all been swept and merged). Three adversarial Codex rounds + one scoped re-verification: **R1 FAIL (5 findings) → R2 FAIL (4 findings) → R3 FAIL (1 composition-seam regression) → R3-reverify APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **7 pre-review fixes** and **3 dead detection paths wired before round 1** (the "fix what you find" discipline). Severities are Codex's actual verdicts — **two P1s** (FORT-R1-01 the silent ZKQP PII leak that justified the sweep; FORT-R2-01 the digit-completeness class), both fixed and verified, so main holds no known P1. The full-workspace pre-merge audit additionally caught 3 downstream tests that encoded the pre-R1-04 credential-name leak across `#[from]` boundaries — corrected (`e7fdbb0`). The 18 fix commits + the pre-merge PROGRESS chore (`06c46a1`) landed via `--no-ff` merge **`84d84b3`** (`68b045d..84d84b3`), pushed to origin, branch `phase-3b/sweep-fortress` deleted. Prior milestone: `die/orchestrator/` sweep merged `ab1ffc7`.)
-Current phase: Phase 3B.0 — **CLOSED**: `fortress/` sweep MERGED (`84d84b3`); all three crate sweeps (services / orchestrator / fortress) done. Next major unit: the leverage pass (`infra/leverage-pass`, the Fable "Exponential Leverage" document), against stable post-merge `main`.
-Current task: **INF-1 (API-key Debug redaction) — FIXED + Codex APPROVE, merging to main** via `fix/inf-1-apikey-redaction` (the first `CODEBASE_REVIEW` candidate triaged; see the INF-1 section). Prior: fortress sweep done + on main (`84d84b3`, on origin). Next: scope the leverage pass. NOTE: a parallel review branch `quality/elevation-pass` (1 commit `8d97cb0`, a WIP codebase-comprehension DRAFT `docs/CODEBASE_REVIEW.md`, rebased onto `84d84b3`, in worktree `C:/dev/Delphi-quality`) exists and is to be **reconciled into the leverage-pass scoping** — do not run two infra branches in parallel.
-Current step: merge `84d84b3` (`--no-ff`, parents `68b045d` main + `06c46a1` branch) on origin; branch `phase-3b/sweep-fortress` deleted. This post-merge PROGRESS chore records the merge SHA — the post-merge counterpart to the pre-merge `06c46a1` that rode the merge (mirrors the orchestrator sweep's `9edab8c`); local (ahead 1) until the next push. **Next: leverage-pass scoping (reconciling the `quality/elevation-pass` review).**
-Status: **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED `84d84b3`** — main on origin, clean; **Phase 3B.0 CLOSED**; ready to scope the leverage pass
-Tests passing: **1,861 Rust verified 2026-06-12 (INF-1 fix on `fix/inf-1-apikey-redaction`; +3 over the fortress merge's 1,858 — the three INF-1 redaction tests)** (`cargo test --workspace`, 0 failed — every `test result:` line ok; `cargo clippy --workspace --all-targets -- -D warnings` clean; real exit codes per CLAUDE.md §13.4) + **94 TypeScript** (`pnpm test --run` / `pnpm build` in `shell/`, 0 failed)
+Current phase: **Leverage pass (`infra/leverage-pass`) — P0–P5 COMPLETE; held for Codex review before merge.** Next units, in order: (a) the Codex review round, then (b) the runtime arc (trust-model-FIRST), with (c) the focused-fix queue in parallel — see the close-out section's "Next actions". Prior milestone: Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
+Current task: leverage-pass **close-out (P7)** — branch NOT merged to main. The branch is the **review unit**, not done-work-waiting-to-merge: `delphi-hardening` touches security-critical hash/open/sqlite sites across `fortress` + `die/orchestrator`, so it is sweep-grade review material until the byte-identical lifts are confirmed behavior-preserving.
+Current step: P7 close-out recorded. **Next: the Codex round-1 over `f0f626e..HEAD`** (central question: did the byte-identical extractions preserve behavior; §13.9 class partition pre-stated). On APPROVE → `--no-ff` merge + tag.
+Status: **Leverage pass COMPLETE, awaiting Codex review; NOT merged, NOT pushed.**
+Tests passing: **1,891 Rust** (`cargo test --workspace`, 0 failed; **+30 over the 1,861 branch-point** — P2 extractions ≈ +21 → 1,882, P4 proptests +9 → 1,891) + **94 TypeScript** (`pnpm test --run` in `shell/`, 0 failed — verified on Windows where `node_modules` matches the platform; WSL hits the npm optional-dep platform mismatch, not a real failure). `cargo clippy --workspace --all-targets -- -D warnings` clean; real exit codes per §13.4.
+
+## Leverage pass (`infra/leverage-pass`) — CLOSE-OUT: P0–P5 COMPLETE, held for Codex review (2026-06-15)
+
+The Exponential Leverage Pass converted the project's adversarial-review learnings into permanent machinery with **zero new attack surface**. **18 commits** from branch point `f0f626e`; **NOT merged to main, NOT pushed** — the branch is the review unit. Before → after: **1,861 → 1,891 Rust** (0 failed), **94 TS** (0 failed), **CI from zero**, a 14-class defect corpus, the `delphi-hardening` crate, honest docs end-to-end.
+
+### Phase ledger
+
+| Phase | Delivered | Commits |
+|-------|-----------|---------|
+| P1 | WSL target-dir config + clippy pre-commit hook (no fmt gate — workspace not rustfmt-clean) | `1c865c8` |
+| P2 | `delphi-hardening` crate — 3 primitives extracted **byte-identically** with pinned goldens: `canonical_hash` (+ audit-hash `dec4026` & workflow-fingerprint `dc03a5f`), `safe_open` (+ knowledge `635649b`), `pragma_setup` (+ sqlite-policy `6ebbd5a`). 3 deferred-with-corpus-entry. | `b95e9c7 dec4026 dc03a5f 132d031 635649b ec4eac0 6ebbd5a` |
+| P3 | `docs/DEFECT_CLASSES.md` corpus (grounded in F4–F26 / sweep history) + CLAUDE.md §13.9 review-attention-partition rule | `e2e7cfc` |
+| P4 | First CI (clippy / test + count-floor / audit / deny / shell); `canonical_hash` injectivity proptests (P1/P2/P3 RED-proven); ZKQP detector completeness proptests (Nd-script + ASCII-scope RED-proven); 3 RustSec advisories accepted, split by class (detail in the P4 section below) | `3363901 ac240f9 2c43ea7` |
+| P5 | Honest-record: 6 doc-lies fixed + 4 STUB markers + capability tracker corrected; honest README (status table, 1891+94, no-executable reality); CONTRIBUTING; SECURITY (TODO channel); 7 grounded ADRs + DEFECT_CLASSES class 14; STARTER_TASKS (12, grounded) | `584ee29 99ede09 c736b91 bbe06cb bd17170 9cb8d0d` |
+
+(P0 = branch open; **P6 runtime split out** as the next unit — it is the runtime arc in Next action (b).)
+
+### Deferrals recorded (rule-of-three / dependency-direction — surfaced and NOT forced)
+
+- **atomic_migration** (DEFECT_CLASSES 13): 1 versioned-migration consumer (`knowledge.rs`, F14/F17/F19-hardened). Extract `run_migration(...)` into `delphi-hardening` **when a 2nd versioned store appears**, as its own reviewed change + Codex round.
+- **uniform_reject** (class 11): 1 crate, zbus-transport-coupled. Local `services::error::opaque` helper today; extract at the 2nd cross-crate consumer.
+- **TrustedRoot** (class 5): capability-type reshape of the (already-hardened) `safe_open` root handle. Pending; idiom documented.
+
+### Next actions (priority order)
+
+**(a) Codex review round — BEFORE any merge.** `infra/leverage-pass` is NOT merged. `delphi-hardening` touches security-critical sites — the fortress audit-chain hash, the orchestrator workflow-fingerprint, knowledge safe-open, sqlite policy — across two crates, so this is sweep-grade. The review's job is NOT "find bugs in new code"; it is to **verify the byte-identical lifts preserved behavior and opened no surface**. The evidence is already assembled: pinned goldens before/after each migration, RED-proven proptests, and a clean full-workspace gate that caught no cross-crate regression. Run Codex round-1 scoped to `git diff f0f626e..HEAD`, referencing `docs/DEFECT_CLASSES.md` per §13.9 — **partition the relevant classes into pre-foreclosed-by-`delphi-hardening` (the reviewer SKIPS these — do not re-hunt) vs. applicable-but-not (explicit coverage)** — so attention concentrates on the one question that matters: did extraction preserve behavior, or did a subtle non-byte-identical drift slip in? On APPROVE → `--no-ff` merge + tag.
+
+**(b) THE RUNTIME ARC — immediately-next unit, trust-model-FIRST.** The #1 gap is that nothing runs. But the arc's FIRST deliverable is NOT code — it's a ratified trust-model document (STOP POINT B gates on THIS, before any daemon scaffold):
+- The auth boundary for tool execution, designed as a Fortress-class threat model: who mints tool-execution approval, what binds an approval to a specific action (not a blanket grant), how the WebSocket caller is authenticated, what process-isolation boundary contains a running tool.
+- The two-parallel-security-worlds reconciliation is a DECISION THIS DOC MAKES, not a task to discover later: built-but-unwired fortress vault/permissions vs. `services/`'s own auth → wire-fortress-in / retire-one / merge. "Which auth system guards tool execution" IS the trust model — leaving it open means building on an unresolved security fork (exactly how two parallel worlds arise).
+
+  THEN the runtime code against the ratified model: daemon + wire the Planner (an always-error shell today) + wire the Brain.
+
+  WHY trust-model-FIRST: the overnight prototype built the execution path and tried to retrofit the trust model — it failed two Critical approval-bypass reviews because the trust model is the FIRST artifact, not a property of the code. This arc inverts that. STOP-POINT-B-gated on the trust-model doc, NOT indefinite deferral (the daemon is the #1 gap and the arc is the immediately-next unit).
+
+**(c) Focused-fix queue — in parallel (does not block the review).** SFS-1 (incremental-reindex correctness — schema change + ratification), BVB-3 / BVB-4 (browser `file://` scheme allowlist; builder template path-traversal), the regex migration (ZKQP detectors → compiled-regex / Unicode-class design, security-reweighted), and the date-scope triage (`task_71334ce4`).
+
+**Do NOT merge `infra/leverage-pass` until the Codex round returns APPROVE.** The branch is the review unit.
+
+## Leverage pass (`infra/leverage-pass`) — P4 CI + RustSec advisory acceptances (2026-06-14)
+
+P4 lands the project's first CI (`CODEBASE_REVIEW` WS-2 — there was none): `.github/workflows/ci.yml` with `clippy -D warnings`, `cargo test --workspace` + an executed-test-count floor guard (`.github/rust-test-count-baseline` = **1882**), `cargo audit`, `cargo deny check` (`deny.toml`), and the shell (`pnpm test`/`build`) job. No `cargo fmt --check` gate (workspace not rustfmt-clean; deferred to its own `style(workspace)` commit per CLAUDE.md §6). Verified before commit: deny `advisories/bans/licenses/sources ok`; test count `1882 == floor`; the count-guard hardened against its own silent-failure mode (real `cargo test` exit via `PIPESTATUS`, empty/non-integer extraction guard, distinct from a count drop).
+
+**Three transitive RustSec advisories accepted — documented, not silenced.** Each surfaced by a local scan BEFORE the CI committed (the verification did its job: caught a day-one-red and a non-gating gap). The gate stays live for everything else — any new advisory, especially a vulnerability, still fails. Acceptance is split BY CLASS, each living once with the tool that actually gates that class (verified, not assumed: cargo-deny v2 gates unmaintained + vulnerability + yanked but has **no `unsound` knob** — `unsound = "deny"` fails config deserialization — so the unsound class is gated by `cargo audit --deny unsound`):
+
+| Advisory | Crate@ver | Class | Transitive via | Gated by | Why accepted | Re-check trigger |
+|----------|-----------|-------|----------------|----------|--------------|------------------|
+| RUSTSEC-2025-0057 | fxhash 0.2.1 | unmaintained | scraper→selectors | cargo-deny (`deny.toml` ignore) | unmaintained, not vulnerable; no in-range upgrade | scraper/selectors bump that retires fxhash |
+| RUSTSEC-2024-0436 | paste 1.0.15 | unmaintained | smithay→pixman | cargo-deny (`deny.toml` ignore) | unmaintained, not vulnerable; no in-range upgrade | smithay bump that retires paste |
+| RUSTSEC-2026-0002 | lru 0.12.5 | **unsound** (`IterMut` Stacked-Borrows UB) | tantivy 0.25→semantic-fs | cargo-audit (`--ignore` on the `--deny unsound` step) | **NON-REACHABILITY**, verified at source: tantivy 0.25's sole `LruCache` (store/reader.rs block cache) is touched only by `new`/`get`/`put`/`len`/`peek_lru` and never constructs `lru::IterMut` on any path — the exact unsound type is dead from tantivy's whole surface. 0.12.5 is the latest tantivy 0.25 permits. | any tantivy upgrade OR if semantic-fs's tantivy usage changes |
+
+The unsound gate is **genuinely live**, not decorative: `cargo audit --deny unsound` returns RC 1 without the lru `--ignore` (a future unsound advisory fails CI) and RC 0 with it. The lru acceptance rests on the reachability proof — if a tantivy upgrade ever routed through `lru::IterMut`, the re-check turns the acceptance back into a live finding.
+
+### P4 property-based test suites (RED-proven, test-only)
+
+Two proptest suites turn adversarial-review lessons into executable law. Every property was RED-proven against the exact bug it guards (the property must FAIL against an injected pre-fix regression, then the break is reverted) — a property that can't bite is decorative.
+
+- **canonical_hash injectivity** (`delphi-hardening`, +3 → 1885): P1 length-prefix, P2 seq count-prefix, P3 fixed≠field. Injectivity asserted on the SHA-256 digest (the `Sha256` is private; no pre-hash accessor invented) modulo a collision proptest can't find. Witness-reachable generators (one content split two ways) so the boundary collision exists by construction. `proptest 1.11` added as a workspace dev-dep.
+- **ZKQP detector completeness** (`fortress/tests/zkqp_completeness.rs`, +6 → 1891): the FORT-R2-01 Nd-digit / Unicode-separator completeness contract as metamorphic properties — phone/credit-card/national-id/email detected across Arabic-Indic, Devanagari, Bengali, Thai, full-width scripts by construction — plus the **deliberate ASCII-only scope** of IP and date (date = ISO `YYYY-MM-DD` per the code). Public-API only; `pii.rs` byte-identical to HEAD (no fortress source touched). **Engine decision:** stable proptest, NOT nightly cargo-fuzz — the invariant is shape-driven (a generation problem), so coverage-guided byte fuzzing and a rot-prone nightly CI job buy nothing; the suite runs in the existing rust test job, gated by the count floor. The pending fuzz-smoke note in `ci.yml` was removed accordingly.
+
+**Two `detect_dates` follow-ups surfaced here, NOT fixed (kept this commit pure test-only):**
+- **Doc/code drift → P5 honesty pass.** The `detect_dates` comment claims `MM/DD/YYYY` but the code implements ISO `YYYY-MM-DD` only ([pii.rs:397](fortress/src/zkqp/pii.rs:397)). Same doc-lie class as INF-3 / vault-zeroize; fix it there with its siblings, not ad hoc in a test commit.
+- **Non-ISO false-negative → detector-scope / §10-coverage triage** (alongside FORT-Q4 address/name/geo gap). Framed as an OPEN SCOPE QUESTION, not a confirmed bug: is `detect_dates` meant to be format-complete, or deliberately ISO-only like the IP scanner is deliberately ASCII-only? Does §10 require date redaction across formats? If "format-complete," it's a production `fortress/zkqp` detector change = its own branch + Codex review. Spun out as a background task.
 
 ## INF-1 (API-key Debug redaction) — CLOSED (2026-06-12)
 
@@ -249,12 +312,12 @@ ssi/sdk-rust/           # Rust SSI SDK
 | # | Capability | Status | Phase |
 |---|-----------|--------|-------|
 | 1 | Behavioral learning engine | Phase 2 complete (built + tested) | 0+2 |
-| 2 | Deep internet agency | Phase 1 complete (built + tested) | 1 |
+| 2 | Deep internet agency | Partial — die-browser IPC layer built + tested; the Playwright `agent.js` it drives does not exist in-repo, no production consumer (Brain unwired) | 1 |
 | 3 | Multi-specialty reasoning | Partial — router exists; specialist mesh → Phase 3 | 3 |
 | 4 | Infinite task chaining | Phase 1+2 complete (brain + checkpoints + apps) | 1+2 |
-| 5 | Conversational presence | **Task 3A.1 complete** — persistent memory + FTS + reference resolution + memory tiering shipped at `2d67a29`; voice I/O from Phase 1 | 3A |
+| 5 | Conversational presence | **Task 3A.1 complete** — persistent memory + FTS + reference resolution + memory tiering shipped at `2d67a29`; voice I/O scaffolded in Phase 1 (STT/TTS are stubs — placeholder text / silence, no whisper-rs/Piper) | 3A |
 | 6 | Goal and planning architecture | **Task 3A.2 complete** — goal graph + timeline estimation + stale/deadline detection + D-Bus `org.delphi.Goals` shipped at `609826d` | 3A |
-| 7 | Full-stack builder | Phase 2 complete (built + tested) | 2 |
+| 7 | Full-stack builder | Scaffold-only — template file-copy built + tested; `{{project_name}}` substitution, Generating/Building/Testing states, minijinja, post-scaffold exec all unimplemented; no production consumer | 2 |
 | 8 | Client/company workspace adaptation | Not started | 3B |
 | 9 | Sovereign local intelligence | Partial — Fortress + ZKQP built | 0+2 |
 | 10 | Non-interference philosophy | Encoded (no code) | 0 |

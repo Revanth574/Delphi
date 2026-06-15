@@ -13,7 +13,11 @@
 //!   pinned explicitly rather than the weaker version-dependent `Params::DEFAULT`
 //! - Encryption: AES-256-GCM with random 96-bit nonces
 //! - Storage: each credential is independently encrypted (no bulk decrypt)
-//! - In-memory: keys are zeroized when the vault locks
+//! - In-memory: on [`Vault::lock`] the master-key handle and decrypted cache are
+//!   dropped (`key = None`, `cache.clear()`). NOTE: the underlying key/plaintext
+//!   bytes are NOT yet scrubbed — `zeroize`-on-drop is a forward-requirement
+//!   (there is no `zeroize` dependency today), tracked as a vault crypto-hygiene
+//!   item, not current behavior.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

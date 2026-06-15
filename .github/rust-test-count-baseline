@@ -1,0 +1,24 @@
+# Rust workspace executed-test-count FLOOR.
+#
+# The number below is the minimum acceptable sum of passed counts across every
+# `test result: ok` line of `cargo test --workspace` (unit + integration +
+# doctests). CI fails if the actual executed count drops BELOW it — a test
+# silently disappeared (DEFECT_CLASSES classes 7 + 10: cross-crate regression /
+# platform test-gating-masks-bugs — the F18 lesson). A green crate-scoped run can
+# hide a count drop; this floor is the whole-workspace catch.
+#
+# Protocol:
+#   * Count goes UP freely. Adding tests needs no change here (CI passes whenever
+#     actual >= this floor). Bumping this number up alongside a test addition is
+#     encouraged so the floor stays close to reality, but not required by CI.
+#   * A DROP below this floor fails CI.
+#   * LOWERING this number is only legitimate when tests are deliberately removed,
+#     and REQUIRES an explicit, justified commit (say why in the commit message).
+#     Never lower it to make a red CI green without that justification.
+#
+# Provenance: 1882 measured by the leverage-pass P2 full-workspace gate
+# (`cargo test --workspace`, 0 failed); P3 added documentation only (0 tests);
+# P4-proptest +3 (delphi-hardening canonical_hash injectivity P1/P2/P3) -> 1885;
+# P4-completeness +6 (fortress ZKQP detector completeness, tests/zkqp_completeness.rs)
+# -> 1891, verified `cargo test --workspace` 0 failed before this commit.
+1891

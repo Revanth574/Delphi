@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Delphi pre-commit hook — clippy lint gate on staged Rust crates.
+#
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Scoped to the crates that actually have staged .rs changes, so the hook stays
+# fast (whole-workspace clippy on every commit would just get --no-verify'd).
+# Honors .cargo/config.toml's target-dir.
+#
+# NOTE — there is intentionally NO `cargo fmt --check` gate yet. The workspace is
+# not rustfmt-clean (76/101 files diverge from rustfmt defaults; no rustfmt.toml).
+# That is a tracked, deferred honest-record item (the WS-5 family). rustfmt will
+# be adopted as its OWN isolated `style(workspace)` commit (with a pinned
+# rustfmt.toml + .git-blame-ignore-revs), deliberately, NOT as a side-effect of an
+# unrelated change. The fmt gate is added to this hook at that time.
+set -euo pipefail
+
+staged_rs="$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')"
+if [ -z "$staged_rs" ]; then
+    exit 0
+fi
+
+# Map each staged .rs file to its owning crate (nearest ancestor Cargo.toml),
+# then run clippy per affected crate via --manifest-path. -D warnings is the gate.
+declare -A manifests
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    d="$(dirname "$f")"
+    while [ "$d" != "." ] && [ "$d" != "/" ]; do
+        if [ -f "$d/Cargo.toml" ]; then
+            manifests["$d/Cargo.toml"]=1
+            break
+        fi
+        d="$(dirname "$d")"
+    done
+done <<< "$staged_rs"
+
+for m in "${!manifests[@]}"; do
+    echo "[pre-commit] cargo clippy --manifest-path $m --all-targets -- -D warnings"
+    cargo clippy --manifest-path "$m" --all-targets -- -D warnings
+done

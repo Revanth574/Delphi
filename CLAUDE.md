@@ -735,9 +735,10 @@ fortress         (foundation — no internal dependencies)
 die-inference    (depends on: fortress)
 die-browser      (standalone — subprocess management only)
 die-voice        (standalone — subprocess management only)
+die-learning     (depends on: fortress)
 semantic-fs      (depends on: fortress)
   ↑
-die-orchestrator (depends on: die-inference, die-browser, semantic-fs, fortress)
+die-orchestrator (depends on: die-inference, die-browser, die-learning, semantic-fs, fortress)
   ↑
 delphi-services  (depends on: die-inference, die-orchestrator, semantic-fs, fortress)
   ↑
@@ -1008,6 +1009,8 @@ Established 2026-05-16 immediately after the Task 3A.5 merge as a one-time boots
 **Windows tree location (relocated 2026-05):** the Windows working tree now lives at `C:\dev\Delphi` (a non-cloud-synced path). It was moved out of its former location under OneDrive (`C:\Users\kvlnr\OneDrive\Desktop\Delphi`), which is retained as `Delphi-onedrive-archived-2026-05`. Keeping the working tree and its `.git` directory outside a continuously-syncing cloud folder avoids object-store corruption and lock contention from background sync racing git operations. The origin-canonical sync model above is unchanged — the relocated tree pushes / pulls from the same `origin`; only the local filesystem path changed. (Any tooling, scripts, or PROGRESS.md notes still referencing the OneDrive path are stale and should be updated to `C:\dev\Delphi`.)
 
 **WSL HTTPS-git auth note:** WSL git's credential helper is configured locally (per-repo, not global) to delegate to the Windows Git Credential Manager at `/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe`. This shares the single Windows credential store across both trees, satisfying CLAUDE.md §10 ("never store credentials outside the Fortress vault" — the Windows credential vault is the closest available equivalent until Fortress's federated credential layer ships). If you ever see a hung WSL `git fetch`/`git push`, the credential helper is missing or misconfigured: re-run `git config --local credential.helper '/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe'` from the repo root.
+
+**Build target-dir + pre-commit hooks (WSL dev convenience, codified 2026-06-13):** the workspace `.cargo/config.toml` pins `build.target-dir` to a WSL-native path (`/home/raven/delphi-target`) so build artifacts stay off the slow `/mnt/c` 9p mount. Cargo commands therefore **no longer need a manual `export CARGO_TARGET_DIR=…` prefix** — `cargo check`/`test`/`clippy` from the repo root pick it up automatically (this retires the old inline-export operational convention). The path is a documented developer-local assumption (it is `raven`-specific); `.cargo/config.toml` carries per-environment override notes, and the `CARGO_TARGET_DIR` env var still overrides it (CI sets its own, so it never depends on `/home/raven`). Enable the lint pre-commit gate once per clone with `git config core.hooksPath .githooks` (`.githooks/pre-commit` runs `clippy -D warnings` on the crates with staged changes). There is intentionally **no `cargo fmt` gate yet** — the workspace is not rustfmt-clean (76/101 `.rs` files diverge from rustfmt defaults; no `rustfmt.toml`), tracked as a deferred honest-record item: rustfmt is to be adopted as its own isolated `style(workspace)` commit (pinned `rustfmt.toml` + `.git-blame-ignore-revs`), never as a side-effect, at which point the fmt gate is added to the hook.
 
 **Required for every cross-tree handoff:**
 
@@ -1387,12 +1390,12 @@ The spec (`DELPHI_COMPLETE_SPEC.md`) defines 18 capabilities. Track status expli
 | # | Capability | Status | Phase |
 |---|-----------|--------|-------|
 | 1 | Behavioral learning engine | Built + wiring in Phase 2 | 0+2 |
-| 2 | Deep internet agency | Built (die-browser) | 1 |
+| 2 | Deep internet agency | Partial — die-browser IPC layer built + tested, but the Playwright `agent.js` it drives does not exist in-repo; no production consumer (Brain unwired) | 1 |
 | 3 | Multi-specialty reasoning | Partial — router exists, specialist mesh needed | 3 |
 | 4 | Infinite task chaining | Built (orchestrator brain + checkpoints) | 1+2 |
-| 5 | Conversational presence | Partial — voice I/O exists, persistent conversation memory needed | 3 |
+| 5 | Conversational presence | Partial — voice I/O scaffolded (STT/TTS are stubs: placeholder text / silence, no whisper-rs/Piper); persistent conversation memory needed | 3 |
 | 6 | Goal and planning architecture | Not started | 3 |
-| 7 | Full-stack builder | Phase 2 Task 2.4 | 2 |
+| 7 | Full-stack builder | Scaffold-only — template file-copy works; `{{project_name}}` substitution, Generating/Building/Testing states, minijinja, post-scaffold exec all unimplemented; no production consumer | 2 |
 | 8 | Client/company workspace adaptation | Not started | 3 |
 | 9 | Sovereign local intelligence | Partial — Fortress + ZKQP in Phase 2 | 0+2 |
 | 10 | Non-interference philosophy | Encoded in iron laws (no code needed) | 0 |
@@ -1622,3 +1625,14 @@ When tempted to take a shortcut:
 - "I remember this pattern from another project" → NO. Verify it applies here.
 
 Rigor is not in tension with innovation. Rigor is what makes innovation real.
+
+### 13.9 Defect-class corpus (fix-known, don't-rediscover)
+
+`docs/DEFECT_CLASSES.md` is the institutional memory of every defect *class* the project's adversarial reviews have surfaced (Task 3A.5 F4–F26, Task 3A.6 R1–R5, the Phase 3B.0 `services`/`orchestrator`/`fortress` sweeps, INF-1), each with the **foreclosing primitive** (a `delphi-hardening` module where extracted — `canonical_hash`, `safe_open`, `pragma_setup` — or a discipline otherwise) and the **RED-proof test shape** that proves a fix closes it.
+
+**Every new task's design step AND every Codex round-1 prompt MUST reference `docs/DEFECT_CLASSES.md` and explicitly partition the relevant classes into:**
+
+- **(a) pre-foreclosed by `delphi-hardening`** — list these so the reviewer does **not** spend budget re-hunting a class a primitive already closes by construction; and
+- **(b) applicable but NOT yet foreclosed** (the disciplines + the deferred patterns: `atomic_migration`, `uniform_reject`, `TrustedRoot`) — list these so they get **explicit** coverage rather than being assumed-handled.
+
+The purpose is **review-attention allocation**: skip the foreclosed, concentrate the review on the unforeclosed. This is what makes "fix-known, don't-rediscover" actually collapse double-review-rounds rather than be a ritual. A token citation that does *not* partition the classes — that just names the file — misses the point: it is the (a)/(b) split that directs reviewer attention and prevents re-deriving a closed class the hard way. When a task forecloses a *new* class (extracts a new primitive or establishes a new discipline), it MUST add the entry to `docs/DEFECT_CLASSES.md` in the same change.

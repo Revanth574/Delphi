@@ -2,16 +2,20 @@
 
 //! Encryption at rest module for the Fortress security subsystem.
 //!
-//! Provides AES-256-GCM encryption services used by `semantic-fs`
-//! and other subsystems that store user data. Raw keys never leave
-//! this module — callers receive opaque handles.
+//! STUB: this is the INTERFACE for at-rest AES-256-GCM encryption; the
+//! implementation is not built. [`EncryptionService::encrypt`] and `decrypt`
+//! return `FortressError::Encryption` on every call. Its only consumer
+//! (die-learning's privacy guard) therefore cannot encrypt learning data yet —
+//! a forward-requirement (ORCH-R1-06 / FORT-Q7), not current behavior.
 
 use crate::FortressError;
 
 /// Service for encrypting and decrypting data at rest.
 ///
-/// Wraps AES-256-GCM operations. Keys are managed internally and
-/// never exposed to callers.
+/// STUB: the at-rest encryption implementation is not built — `encrypt`/`decrypt`
+/// return `FortressError::Encryption` on every call (the `_initialized` field is
+/// a placeholder). The intended design wraps AES-256-GCM with keys managed
+/// internally and never exposed to callers.
 ///
 /// # Examples
 ///
@@ -19,8 +23,9 @@ use crate::FortressError;
 /// use fortress::encryption::EncryptionService;
 ///
 /// let service = EncryptionService::new();
-/// // In production, keys are loaded from TPM or derived from passphrase.
-/// // The service provides opaque encrypt/decrypt operations.
+/// // STUB: encrypt/decrypt currently return an error until the at-rest
+/// // implementation lands (keys to be loaded from TPM or derived from passphrase).
+/// assert!(service.encrypt(b"data").is_err());
 /// ```
 pub struct EncryptionService {
     _initialized: bool,

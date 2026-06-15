@@ -15,8 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
+use delphi_hardening::canonical_hash::CanonicalHasher;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::FortressError;
@@ -380,33 +380,38 @@ impl AuditLog {
 ///   (e.g. an audit that records `Denied` must not be silently editable to
 ///   `Allowed`, nor a `Biometric` tier downgraded to `Autonomous`).
 /// - **Length-prefixed (injective) encoding.** Each variable-length field is
-///   prefixed with its `u64`-LE byte length via [`hash_field`], so distinct
-///   entries can never alias by shifting a field boundary (the ORCH-R2-02
-///   delimiter-collision class). Fixed-width fields (`timestamp`, the two enum
-///   discriminants) need no prefix.
+///   prefixed with its `u64`-LE byte length via [`CanonicalHasher::field`], so
+///   distinct entries can never alias by shifting a field boundary (the
+///   ORCH-R2-02 delimiter-collision class). Fixed-width fields (`timestamp`, the
+///   two enum discriminants) use [`CanonicalHasher::fixed`] (no prefix).
+///
+/// The injective length-prefixing and the declared-field-count guard both come
+/// from the shared [`delphi_hardening::canonical_hash`] primitive (leverage pass
+/// P2): `CanonicalHasher::new(8)` declares the eight fields, and `finish()`
+/// refuses to produce a digest if a different number is appended. The
+/// byte-identical extraction from the previous in-place implementation is pinned
+/// by `audit_entry_hash_is_exhaustive_and_byte_identical_canonical_hash`.
 fn hash_entry(entry: &AuditEntry) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hash_field(&mut hasher, entry.action_id.as_bytes());
-    hasher.update(entry.timestamp.to_le_bytes());
-    hash_field(&mut hasher, entry.module.as_bytes());
-    hash_field(&mut hasher, entry.action.as_bytes());
-    hash_field(&mut hasher, entry.target.as_bytes());
-    hasher.update([entry.permission_tier as u8]);
-    hasher.update([match entry.result {
-        AuditResult::Allowed => 0u8,
-        AuditResult::Denied => 1,
-        AuditResult::Pending => 2,
-    }]);
-    hash_field(&mut hasher, &entry.proof_hash);
-    hasher.finalize().to_vec()
-}
-
-/// Length-prefix a variable-length field into the running hash
-/// (`u64`-LE byte length, then the bytes), making the entry encoding injective
-/// so no field-boundary shift can produce a colliding hash.
-fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
+    let mut h = CanonicalHasher::new(8);
+    h.field(entry.action_id.as_bytes())
+        .fixed(&entry.timestamp.to_le_bytes())
+        .field(entry.module.as_bytes())
+        .field(entry.action.as_bytes())
+        .field(entry.target.as_bytes())
+        .fixed(&[entry.permission_tier as u8])
+        .fixed(&[match entry.result {
+            AuditResult::Allowed => 0u8,
+            AuditResult::Denied => 1,
+            AuditResult::Pending => 2,
+        }])
+        .field(&entry.proof_hash);
+    // Infallible by construction: exactly eight fields are appended above, matching
+    // the declared count. `expect` is the fail-closed posture — a future edit that
+    // desyncs the count is caught here (debug panic / release Err) rather than
+    // silently emitting a wrong digest.
+    h.finish()
+        .expect("audit entry hashes exactly 8 declared fields")
+        .to_vec()
 }
 
 /// Serialization helpers using TOML format.
@@ -609,6 +614,73 @@ mod tests {
             hash_entry(&mk("ab", "c")),
             hash_entry(&mk("a", "bc")),
             "field-boundary-shifted entries must not produce the same hash"
+        );
+    }
+
+    /// Helper: a fixed entry exercising every field with distinctive values.
+    fn golden_entry() -> AuditEntry {
+        AuditEntry {
+            action_id: "act-001".to_string(),
+            timestamp: 1_712_400_000,
+            module: "die-orchestrator".to_string(),
+            action: "read_file".to_string(),
+            target: "/home/user/doc.txt".to_string(),
+            permission_tier: PermissionTier::Confirm,
+            result: AuditResult::Denied,
+            proof_hash: vec![7u8; 32],
+        }
+    }
+
+    /// canonical_hash extraction (leverage pass P2): byte-identical proof + the
+    /// struct-grew tripwire.
+    ///
+    /// The `let AuditEntry { .. }` destructure has **NO `..`** on purpose: adding
+    /// a field to `AuditEntry` breaks THIS test at COMPILE TIME, forcing the
+    /// decision "must the new field be hashed?" (and an update to `hash_entry` +
+    /// its declared field count). The `CanonicalHasher` declared-count guard
+    /// closes the append≠declare half of the under-coverage class; this no-`..`
+    /// destructure closes the struct-grew half. BOTH are required.
+    ///
+    /// `GOLDEN` is `hash_entry(golden_entry())` captured from the pre-extraction
+    /// implementation; the `CanonicalHasher`-based `hash_entry` must reproduce it
+    /// exactly — proving the extraction is byte-identical, not merely behaviorally
+    /// similar.
+    #[test]
+    fn audit_entry_hash_is_exhaustive_and_byte_identical_canonical_hash() {
+        let entry = golden_entry();
+
+        // Compile-time struct-grew tripwire — NO `..`. Each binding is a field
+        // that `hash_entry` must cover.
+        let AuditEntry {
+            action_id,
+            timestamp,
+            module,
+            action,
+            target,
+            permission_tier,
+            result,
+            proof_hash,
+        } = &entry;
+        let _ = (
+            action_id,
+            timestamp,
+            module,
+            action,
+            target,
+            permission_tier,
+            result,
+            proof_hash,
+        );
+
+        // Pinned from the pre-extraction `hash_entry` (the byte-identical anchor).
+        const GOLDEN: [u8; 32] = [
+            9, 181, 49, 214, 52, 229, 130, 211, 244, 121, 66, 55, 44, 230, 195, 180, 239, 59, 166,
+            40, 156, 118, 59, 208, 174, 46, 81, 180, 141, 149, 161, 236,
+        ];
+        assert_eq!(
+            hash_entry(&entry).as_slice(),
+            GOLDEN.as_slice(),
+            "audit-entry hash must be byte-identical across the canonical_hash extraction"
         );
     }
 }

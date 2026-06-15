@@ -394,7 +394,10 @@ impl PiiDetector {
         matches
     }
 
-    /// Detect date patterns (YYYY-MM-DD, MM/DD/YYYY, etc.).
+    /// Detect ISO `YYYY-MM-DD` dates. NOTE: ISO is the ONLY format implemented —
+    /// `MM/DD/YYYY` and other formats are deliberately out of scope for now
+    /// (multi-format date detection is an open detector-scope question; see the
+    /// date-scope triage task recorded in PROGRESS.md).
     fn detect_dates(&self, text: &str) -> Vec<PiiMatch> {
         let mut matches = Vec::new();
 

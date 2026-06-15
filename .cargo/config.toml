@@ -1,0 +1,21 @@
+# Delphi workspace Cargo configuration.
+#
+# Build artifacts are pinned to a WSL-native target directory so they live on
+# the Linux filesystem instead of the /mnt/c 9p mount (the mount is dramatically
+# slower for the heavily-churned target dir). This retires the previous manual
+# discipline of prefixing every cargo invocation with
+#   export CARGO_TARGET_DIR=/home/raven/delphi-target
+#
+# DEVELOPER-LOCAL ASSUMPTION (be honest about this — CODEBASE_REVIEW.md INF-6
+# flagged hardcoded paths as a cross-OS hazard, and cargo config cannot express a
+# per-OS target-dir cleanly). The path below is specific to the primary WSL dev
+# environment (Linux user `raven`). Adjust for your environment:
+#   * other WSL users  : change `raven` to your username, or any fast Linux path
+#   * native Windows / macOS / Linux : comment the [build] block out entirely
+#                        (cargo's default ./target is correct there)
+#   * CI               : set CARGO_TARGET_DIR in the workflow (the env var
+#                        overrides this file), so CI never depends on /home/raven
+#
+# The CARGO_TARGET_DIR environment variable always overrides this setting.
+[build]
+target-dir = "/home/raven/delphi-target"

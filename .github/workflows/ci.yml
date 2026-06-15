@@ -1,0 +1,113 @@
+name: CI
+
+# Delphi CI (leverage pass P4). The project had NO CI before this (CODEBASE_REVIEW
+# WS-2). Gates: clippy -D warnings, the full workspace test suite + an
+# executed-test-count floor guard, cargo-audit, cargo-deny, and the shell suite.
+#
+# There is intentionally NO `cargo fmt --check` gate: the workspace is not
+# rustfmt-clean (76/101 files; no rustfmt.toml). rustfmt adoption is deferred to
+# its own isolated `style(workspace)` commit (CLAUDE.md §6); the fmt gate joins
+# this workflow at that time — same call as the P1 pre-commit hook.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The workspace .cargo/config.toml pins build.target-dir to a WSL-dev path
+  # (/home/raven/...) that does not exist on CI runners. The env var overrides the
+  # config file (documented in .cargo/config.toml), so CI never depends on it.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  rust:
+    name: Rust — clippy, test (+count guard), audit, deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, edition 2024)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test (workspace) + executed-count floor guard
+        # The count-guard catches silent test disappearance, so it must not have a
+        # silent-failure mode of its own. Each cause is reported distinctly:
+        # tests-failed (real exit via PIPESTATUS, not pipefail alone — the tee+grep
+        # chain can mask it), extraction-broke (empty/non-integer), count-dropped.
+        # A mis-extracting guard that accidentally PASSES is worse than no guard —
+        # false confidence is the exact failure it exists to prevent.
+        run: |
+          set -eo pipefail
+          cargo test --workspace 2>&1 | tee test-output.log
+          test_rc=${PIPESTATUS[0]}
+          [ "$test_rc" -ne 0 ] && { echo "::error::cargo test failed (exit $test_rc) — not a count issue"; exit 1; }
+          actual=$(grep -E 'test result: ok' test-output.log | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          [ -z "$actual" ] && { echo "::error::count extraction yielded empty — output format changed?"; exit 1; }
+          echo "$actual" | grep -qE '^[0-9]+$' || { echo "::error::count not an integer: '$actual'"; exit 1; }
+          baseline=$(grep -oE '^[0-9]+' .github/rust-test-count-baseline | head -1)
+          [ "$actual" -lt "$baseline" ] && { echo "::error::count $actual dropped below floor $baseline — a test silently disappeared (DEFECT_CLASSES 7 & 10). If intentional, lower .github/rust-test-count-baseline with a justification (see its protocol header)"; exit 1; }
+          echo "test count $actual >= floor $baseline ✓"
+
+      - name: Install cargo-audit + cargo-deny (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit — vulnerabilities (always) + UNSOUND class gate
+        # Division of labour with cargo-deny (below): cargo-deny v2 gates
+        # unmaintained + vulnerability + yanked but has NO `unsound` knob, so the
+        # UNSOUND advisory class is gated HERE. `--deny unsound` escalates unsound
+        # advisories to a hard failure (a FUTURE unsound advisory fails CI);
+        # vulnerabilities always fail regardless of flags. Unmaintained stays a
+        # warning here — it is cargo-deny's job (deny.toml), so no double-accept.
+        #
+        # RUSTSEC-2026-0002 (lru 0.12.5 `IterMut` Stacked-Borrows UB) is accepted
+        # by ID on a REACHABILITY argument, not because unsoundness is harmless:
+        # the unsound path `lru::IterMut` is unreachable — tantivy 0.25's sole
+        # LruCache (store/reader.rs block cache) is touched only by
+        # new/get/put/len/peek_lru and never constructs IterMut on any path
+        # (verified in tantivy 0.25 store/reader.rs). 0.12.5 is the latest tantivy
+        # 0.25 permits. Re-check / drop this --ignore on a tantivy upgrade OR if
+        # semantic-fs's tantivy usage changes.
+        run: cargo audit --deny unsound --ignore RUSTSEC-2026-0002
+
+      - name: cargo deny check (unmaintained advisories, licenses, sources, bans)
+        run: cargo deny check
+
+  shell:
+    name: Shell — TypeScript test + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: shell/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test --run
+      - run: pnpm build
+
+  # NOTE: there is intentionally NO nightly cargo-fuzz job. The ZKQP detector
+  # adversary is a STABLE proptest suite (fortress/tests/zkqp_completeness.rs) that
+  # runs inside the rust job above and is gated by the test-count floor — the
+  # Nd-digit / Unicode-separator completeness contract (FORT-R2-01) and the IP/date
+  # ASCII-only scope are shape-driven invariants a structured generator expresses
+  # directly, so coverage-guided byte fuzzing (and a rot-prone nightly job) buys
+  # nothing here. See PROGRESS.md (leverage pass P4) for the rationale.

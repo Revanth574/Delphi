@@ -1,0 +1,23 @@
+[package]
+name = "delphi-hardening"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Delphi shared hardening primitives — each module forecloses a recurring defect class from the project's adversarial-review history (canonical hashing, safe-open, SQLite policy, atomic migration, uniform rejection)."
+
+[dependencies]
+sha2 = { workspace = true }
+# pragma_setup: per-connection SQLite policy (busy_timeout pin + transient-lock
+# classification). rusqlite is the shared SQLite layer across the workspace.
+rusqlite = { workspace = true }
+
+# safe_open: openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) is Linux-specific; the
+# syscall is invoked via libc on unix. On non-unix the module returns Unsupported.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# canonical_hash injectivity property tests (P1 length-prefix, P2 seq count-prefix,
+# P3 fixed-vs-field distinction). Leverage pass P4.
+proptest = { workspace = true }

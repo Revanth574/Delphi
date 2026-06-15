@@ -8,9 +8,12 @@
 //!
 //! # Security
 //!
-//! API keys are retrieved from the Fortress credential vault at
-//! runtime. They are never stored in config files, environment
-//! variables, or source code.
+//! The API key is provided to [`CloudClient::new`] by the caller (today
+//! `Router::set_cloud_api_key`, ultimately the services layer) and held as a
+//! redacted `ApiKey` newtype that never renders the secret in `Debug`/`Display`
+//! (INF-1). It is never written to config files, environment variables, or
+//! source code. Fortress-vault-backed retrieval is a forward-requirement — the
+//! `fortress::Vault` is not yet wired as the key source (FORT-Q5 / INF-3).
 
 use std::fmt;
 use std::time::Duration;

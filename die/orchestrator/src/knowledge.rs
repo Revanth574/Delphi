@@ -2357,9 +2357,12 @@ pub fn safe_open_under_root_handle(
 
 /// Verbatim non-Linux `Unsupported` message for knowledge file ingestion, passed
 /// to the shared safe-open primitive. The message is the *behavior* on non-Linux
-/// platforms; it is pinned (on every platform) by
-/// `safe_open_unsupported_message_is_verbatim` so the byte-identical extraction
-/// cannot silently drift.
+/// platforms. Two tests pin it in BOTH dimensions (DEFECT_CLASSES #14 — a
+/// const-only pin covers only one form): `safe_open_unsupported_message_is_verbatim`
+/// checks the constant TEXT is unchanged (every platform), and — on non-Linux only —
+/// `safe_open_under_root_handle_emits_unsupported_on_non_linux` CALLS the wrapper and
+/// asserts the EMITTED error is `Unsupported` carrying this exact string. So the
+/// byte-identical extraction cannot silently drift in either dimension.
 const SAFE_OPEN_UNSUPPORTED_MSG: &str = "knowledge file ingestion is supported on Linux only in this build. \
      Linux uses openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) anchored to a \
      held directory handle for kernel-level race-free safe-open. Windows \
@@ -4951,13 +4954,15 @@ mod tests {
         std::fs::File::open(path).expect("open_test_root_handle fallback")
     }
 
-    #[cfg(target_os = "linux")]
-    /// canonical safe-open extraction (leverage pass P2): byte-identical proof
-    /// for the NON-Linux path. The Unsupported message is behavior on that
-    /// platform; this test runs on EVERY platform (not cfg-gated — the F18
-    /// lesson: a platform-gated test that doesn't execute on CI masks drift) and
-    /// pins the verbatim message the shared `open_beneath` primitive emits when
-    /// `safe_open_under_root_handle` delegates to it on non-Linux.
+    /// CONST-VALUE guard (runs on EVERY platform — the constant is
+    /// platform-independent): asserts the `SAFE_OPEN_UNSUPPORTED_MSG` text is
+    /// unchanged. This is NOT the emitted-message behavioral proof — it only
+    /// compares the constant to its literal, never calls the wrapper, so on its own
+    /// it would not catch the wrapper emitting a *different* error (DEFECT_CLASSES
+    /// #14: a const-only pin covers one form). The behavioral pin — call the wrapper
+    /// and assert the EMITTED Unsupported error — is
+    /// `safe_open_under_root_handle_emits_unsupported_on_non_linux` (cfg-gated to
+    /// non-Linux, where that path runs).
     #[test]
     fn safe_open_unsupported_message_is_verbatim() {
         assert_eq!(
@@ -4972,6 +4977,12 @@ mod tests {
         );
     }
 
+    // Linux-gated: on non-Linux the wrapper returns Unsupported (the emitted-message
+    // pin below covers that path), so a success-expecting test only makes sense on
+    // Linux. Restoring this gate is R1-01: it drifted OFF during the P2 lift, so on
+    // non-Linux this test would `.expect("real file must open")` against a path that
+    // correctly returns Unsupported and panic (the F18 platform-gating class).
+    #[cfg(target_os = "linux")]
     #[test]
     fn safe_open_under_root_handle_accepts_real_file() {
         // Sanity: a regular file under the held trusted root must open.
@@ -4986,6 +4997,31 @@ mod tests {
         let mut buf = String::new();
         file.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "# Hello\n\nWorld.\n");
+    }
+
+    /// The REAL emitted-message pin for the non-Linux path (R1-01 / DEFECT_CLASSES
+    /// #14): CALL the wrapper and assert it returns `ErrorKind::Unsupported` carrying
+    /// the exact verbatim message — not merely that the constant equals a literal.
+    /// cfg-gated to non-Linux because the Unsupported behavior only manifests there
+    /// (on Linux the wrapper does the real `openat2`). On this Linux host / CI it is
+    /// compile-checked but does NOT execute; it runs on macOS / Windows. Grounded in
+    /// `open_beneath`'s non-Linux branch, which returns
+    /// `io::Error::new(ErrorKind::Unsupported, unsupported_msg)`.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn safe_open_under_root_handle_emits_unsupported_on_non_linux() {
+        // The wrapper takes a &File handle; on non-Linux the primitive ignores it and
+        // returns Unsupported, so any real regular file serves as the handle (avoids
+        // opening a directory, which is not portable).
+        let tmp = TempDir::new().unwrap();
+        let handle_path = tmp.path().join("handle");
+        std::fs::write(&handle_path, b"x").unwrap();
+        let handle = std::fs::File::open(&handle_path).unwrap();
+        let target = tmp.path().join("anything.md");
+        let err = safe_open_under_root_handle(&handle, &target)
+            .expect_err("non-Linux must return Unsupported, never open a file");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(err.to_string(), SAFE_OPEN_UNSUPPORTED_MSG);
     }
 
     #[cfg(target_os = "linux")]

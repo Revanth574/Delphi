@@ -50,9 +50,15 @@ describes the security *properties of the components as built*, and is explicit 
 Because the repository is private and pre-product, please report security issues **privately**
 — do **not** open a public issue or pull request.
 
-- Contact: **`<security contact — fill in: a dedicated security email or a GitHub private
-  security advisory>`**
-- Include: affected crate/file, a description, and (ideally) a reproducing test.
+> **⚠️ TODO — no reporting channel is established yet.** There is currently **no** monitored
+> security contact for this project; this section does not yet describe a path that reliably
+> reaches a maintainer. Before the repository becomes meaningfully public, a real channel must
+> be set up. Recommended: enable **GitHub private vulnerability reporting** (repo *Settings →
+> Security → Report a vulnerability*) — a built-in private advisory channel with no email
+> address to publish. This notice will be replaced with the live channel once it exists.
+
+When a channel exists, a report should include: the affected crate/file, a description, and
+(ideally) a reproducing test.
 
 We aim to acknowledge reports within a reasonable window. Given the pre-product stage, fixes
 are prioritized by exploitability against the built-and-wired surface (today: the ZKQP egress

@@ -1,303 +1,243 @@
 # Delphi Runtime Trust Model
 
-- **Status: DRAFT v2 — STOP POINT B, re-spined after a Codex round-1 FAIL.** Round-1
-  broke the v1 design on paper (findings F1–F6) before any runtime code — the arc working
-  as intended (the prototype's equivalent holes were found *after* building, in two
-  Critical reviews). v2 re-spines around the root error; it is **not** ratified. It goes
-  to a **round-2 adversarial threat-model review** (does the re-spine close F1–F6 and is
-  the crux truly resolved), then to operator ratification. No runtime code until APPROVE +
-  ratify.
-- **What round-1 found (the diagnosis we re-spine around):**
-  - **Root (F1+F2 — the FAIL):** v1 reduced "requester ≠ approver" to "different uid."
-    `SO_PEERCRED` proves a **uid**, but the runtime runs *as the user*, so the AI, any
-    same-uid process/malware, and any in-process refactor all present the **approver's**
-    uid; `0600` excludes other *users*, not same-*user* processes. And the cloud-send
-    pattern v1 generalized is **same-*caller* binding — a capability/continuity pattern,
-    NOT a human-*consent* proof.** v1 conflated *continuity-of-caller* with
-    *a-human-approved*.
-  - **Canonicalization (F3+F4+F6):** v1 lacked a single immutable source of truth, so
-    *preview*, *enforced scope*, *approval*, and *audit* could diverge.
-  - **Honesty (F5):** bwrap cannot enforce a network allowlist (R3) — a previewed
-    "net only to github.com" would be a decorative guard (the human approves a restriction
-    that does not exist).
+- **Status: DRAFT v3 — STOP POINT B, specification pass after a converging round-2 FAIL.**
+  Round-1 FAIL (F1–F6) broke the v1 *structure*; v2 re-spined it. Round-2 confirmed the
+  **structure is sound** but returned FAIL on a real defect: the document claimed the
+  approver-placement "DECIDED" while leaving the **mechanisms it rests on open** (the
+  private-channel launch topology; the polkit replay seam) — an internal contradiction
+  (*the approver identity **is** the mechanism; an open mechanism is not a decided
+  identity*). v3 is a **specification pass**: each named requirement is pinned to a
+  concrete, host-verified mechanism, and the contradiction is resolved. Not ratified;
+  goes to **round-3** (does each mechanism close its finding, are the failure modes real),
+  then operator ratification. No runtime code until APPROVE + ratify.
+- **Provenance:** draft `9a7e3b9` → round-1 FAIL → re-spine `d25b987` → round-2 FAIL →
+  this spec pass → round-3 → ratified (separate later commit).
+- **Verified-on-host primitives this pass rests on** (probed; the target Delphi-OS kernel
+  must guarantee them): `PR_SET_DUMPABLE`=0 + Yama `ptrace_scope`=1 block
+  `pidfd_getfd`/ptrace fd-theft (kernel 6.6, `pidfd_getfd` needs
+  `PTRACE_MODE_ATTACH_REALCREDS`, denied for a non-dumpable target by a same-uid non-root
+  caller); polkit `auth_self` (non-`_keep`) via `pkcheck` (present); `fexecve`/`execveat`
+  (present) for fd-based exec; `close_range`/`CLOEXEC` for fd hygiene; the `AuditEntry`
+  `canonical_hash` + no-`..` pattern ([audit.rs:57](fortress/src/audit.rs:57)) to mirror.
 
 ---
 
-## §0 · Scope, first goal, sequencing
+## §0 · Scope, first goal, sequencing — unchanged
 
-Unchanged from v1 and not at issue in the FAIL. The boundary is designed for the **hard
-case — arbitrary `argv` execution** (the developer-workflow first goal: set up a project,
-run tests). Two sub-surfaces: **(a)** the enumerated, tier-classified method set
-(`METHOD_POLICY`, [auth.rs:232](services/src/auth.rs:232)); **(b)** arbitrary `argv` (no
-static policy — the command is data, the highest-risk surface, where the prototype's
-bypass landed). **Increment 1** proves the *whole* boundary (now incl. the v2 consent
-proof) on the known-method surface; **Increment 2** admits `argv` through the proven
-boundary. The autonomous AI tool-invoker (`Brain`, **unwired** — zero consumers) is wired
+Boundary designed for the hard case (**arbitrary `argv`** for a developer workflow); two
+sub-surfaces — (a) the enumerated tier-classified methods ([auth.rs:232](services/src/auth.rs:232)),
+(b) arbitrary `argv`. **Increment 1** proves the whole boundary on the known-method
+surface; **Increment 2** admits `argv` through it. Autonomous `Brain` (unwired) is wired
 only after both hold.
 
----
+## §1 · Adversary — unchanged (same-uid is central)
 
-## §1 · Assets and adversary (the same-uid adversary is now central)
+The AI runs *as the user* (its own low-priv uid, §5); same-uid malware presents the same
+uid; injected content makes the *honest* AI request destructive actions. uid is necessary
+but **not sufficient** to identify the approver. (v2 §1 stands.)
 
-Assets: the user's filesystem, credentials (Fortress vault), network identity, process
-execution, and **the integrity of the consent record**.
+## §2 · The boundary: human-consent ≠ caller-continuity — unchanged
 
-The FAIL forces the adversary model to be explicit about **same-uid**:
-
-1. **The AI as an untrusted requester running *as the user*.** It presents the user's uid.
-   Any defense that authenticates a uid authenticates the AI as readily as the human.
-2. **Same-uid malware / a co-resident process.** Identical uid; `0600`/peer-uid does not
-   exclude it.
-3. **An in-process component** (if the AI shared the daemon's address space) — "one refactor
-   from holding the mint" (F2). v2 **removes this category by construction** (§5: the
-   requester is a separate process, separate uid).
-4. **Prompt-injection / tool-observed content** — the AI is *honest but manipulated* into
-   *requesting* a destructive action. A distinct threat from self-minting; defeated only if
-   the human approves the **true** action (§3 canonical object + §4 preview fidelity).
-5. **A compromised tool** attacking the host (delete/exfiltrate/fork-bomb) — §6 sandbox.
-
-**Consequence:** uid is necessary but **not sufficient** to identify the approver. The
-approver must be a **specific, attested shell instance** plus, for high-risk, a **real
-human-presence challenge the same-uid AI structurally cannot satisfy** (§4).
+Two distinct things both hold: **(A) caller-continuity** (SVC-2 same-caller binding,
+[auth.rs:534](services/src/auth.rs:534) — reused on the *requester* side) and **(B)
+human-consent** (a signal the same-uid requester cannot produce). v3 specifies the
+mechanisms for (B); the principle is v2's.
 
 ---
 
-## §2 · The trust boundary: human-consent ≠ caller-continuity (the root fix)
+## §3 · The canonical `PendingAction` — SPECIFIED (incl. executable pinning, F3 fix)
 
-The corrected principle, stated to foreclose the v1 conflation:
-
-> **Two different things must both hold, and they are NOT the same mechanism:**
-> **(A) caller-continuity** — the entity that *completes* an action is the same one the
-> approval was issued to (SVC-2's same-caller binding does this; reused on the
-> *requester* side); and
-> **(B) human-consent** — *a human approved this exact action*, proven by a signal the
-> requester (the AI, even same-uid) **cannot produce**.
-
-v1 had only (A) and miscalled it (B). v2 adds (B) as a distinct layer:
-
-- **The approver is a specific trusted *shell instance*, not a uid.** It is reached by a
-  **private, daemon-created approval channel** (a `socketpair` whose far end is handed to
-  the shell *at launch* and **never** placed in the AI process's fd table — §4/R1). The
-  `approve` operation is **not exposed on the general IPC socket at all.** A same-uid
-  process that connects to the general socket cannot reach `approve`; it does not have the
-  private fd.
-- **High-risk actions additionally require OS user-presence** the same-uid AI cannot fake:
-  a **polkit** `auth_self`/`auth_admin` challenge (R2 — the user authenticates in the
-  *trusted polkit agent*, a process the AI does not control), optionally biometric/TPM via
-  PAM/polkit on target hardware. This is the human-consent proof (B) that same-caller
-  binding (A) is not.
-
-(A) is reused, not reinvented: the same-caller binding ([auth.rs:534-663](services/src/auth.rs:534))
-and `CallerIdentity` ([auth.rs:86](services/src/auth.rs:86)) bind the *requester's*
-completion to its issuance — correct and kept. The error was using (A) *as* (B).
-
----
-
-## §3 · The canonical PendingAction (the spine — closes F3/F4/F6)
-
-The single structural fix for the divergence findings: **one immutable, arbiter-generated
-canonical action object** that **preview, approval-digest, sandbox construction, and audit
-all derive from.** Nothing AI-supplied flows into any of those four; nothing can diverge.
+One immutable arbiter-built object; preview, approval-digest, sandbox, and audit all
+derive from it. v3 pins the **executable** so the digest covers the *object that execs*,
+not a path (R2-F3):
 
 ```
-PendingAction {                       // built ONLY by the arbiter, immutable once created
-  pending_id        : Uuid,           // unguessable (v4), single-use, never reused
-  preview_version   : u32,            // bumped if the arbiter re-renders; approval pins it
-  // the EXACT thing that will run — the arbiter's own normalization, never AI text:
-  executable        : PathBuf,        // resolved absolute path
-  executable_digest : [u8;32],        // hash of the binary that will exec (TOCTOU-closed)
-  argv              : Vec<String>,    // the literal argument vector
-  cwd               : PathBuf,
-  env_delta         : Vec<(String,String)>,   // explicit; the base env is scrubbed (§6)
-  fs_binds          : Vec<(PathBuf, BindMode)>,// ro/rw, the EXACT mounts the jail gets
-  net_policy        : NetPolicy,      // None | Full  (R3 — no allowlist; §6)
-  timeout           : Duration,
-  required_tier     : PermissionTier, // from METHOD_POLICY / argv-risk classification
+PendingAction {                       // arbiter-built, immutable; id = Uuidv4, single-use
+  pending_id, preview_version,
+  executable_fd     : OwnedFd,        // OPENED before preview (O_PATH→O_RDONLY); the kernel
+                                      //   object, not a path — no swap window
+  executable_digest : [u8;32],        // hash of the bytes read THROUGH executable_fd
+  argv, cwd, env_delta,
+  fs_binds          : Vec<(PathBuf,BindMode)>,
+  net_policy        : NetPolicy::{None|Full},   // R3 — no allowlist (see §6)
+  timeout, required_tier,
+  // for scripts: interpreter_fd + interpreter_digest + script is content-pinned too
 }
+action_digest = delphi_hardening::canonical_hash(PendingAction)   // injective; no-`..`
 ```
 
-- **`action_digest = canonical_hash(PendingAction)`** — the injective, length-prefixed,
-  field-counted digest from `delphi_hardening::canonical_hash` (the leverage-pass
-  primitive; the no-`..` destructure discipline applies so a new field can't be silently
-  unhashed). **`PendingAction` is a capability-type in this project's own corpus sense**
-  (DEFECT_CLASSES §5): the unforgeable object everything binds to.
-- **Preview = the arbiter's rendering of `PendingAction`** — argv array, cwd, executable
-  path+digest, env delta, FS bind modes, net policy, timeout. **Never AI-supplied text, and
-  never derived from attacker-controlled content** (closes F3 *and* the §1.4 injection
-  vector: the human sees what *runs*, not what the AI or an injected page *claims*). The
-  prototype literally shows the bug it forecloses: its `approval_scope(&kind)` omitted the
-  `check_command` that `request_hash(&kind)` included — **shown scope ≠ enforced scope**
-  ([actions.rs `approval_scope`/`request_hash`](shell-bridge/src/actions.rs)). Here preview
-  and enforcement are the *same object*.
-- **Approval pins the digest** (closes F4 — the approve-A/mint-B race): the approval the
-  shell returns carries `{pending_id, action_digest, preview_version}`. The arbiter mints
-  **only** if the digest matches the live `PendingAction` and it has not expired; at execute
-  time it **re-verifies** the digest before constructing the sandbox. `pending_id`s are
-  unguessable and single-use; `PendingAction` records are immutable (a re-render is a new id).
-- **Sandbox is constructed from the same object** (§6) — the jail's binds/net/limits are the
-  object's fields, so the box is exactly the previewed-and-approved scope.
-- **Audit logs the object** (§7) — not AI text.
+- **Executable pinning (F3):** the arbiter `open`s the executable **before** preview, hashes
+  the bytes read *through that fd*, binds **that exact fd** read-only into the jail, and
+  execs it by descriptor — `fexecve`/`execveat(AT_EMPTY_PATH)` (host-verified). There is no
+  path→exec window for a same-uid swap. **Scripts** (`#!`) pin *both* the interpreter fd +
+  digest **and** the script content (a script is data the interpreter reads; the digest
+  covers the opened script object, and it is bound read-only and passed by fd, never re-read
+  from a swappable path).
+- **The digest is the binding** for preview = approval = sandbox = audit (F3/F4/F6). The
+  no-`..` `canonical_hash` discipline means a new `PendingAction` field cannot be silently
+  unhashed (DEFECT_CLASSES §1, both-halves).
+- **Preview is the arbiter's rendering of this object** — never AI text, never derived from
+  observed content (defeats the §1 injection vector: the human sees what *execs*).
 
 ---
 
-## §4 · Approval and the consent event (re-spined around §2/§3)
+## §4 · The consent path — SPECIFIED (launch topology F1, polkit F2; the contradiction resolved)
 
-The protocol is **request-response, no server push** ([protocol.rs](shell-bridge/src/protocol.rs)).
-The flow, with the v2 corrections:
+The flow is v2's; v3 **specifies the two mechanisms the approver identity rests on**, so
+"the approver is a trusted shell instance" is now a *decided, implementable* claim, not a
+named requirement.
 
-1. **Request (AI, over the general socket).** The AI proposes an action. The arbiter
-   **normalizes it into a `PendingAction`** (§3) — resolving the executable, fixing argv,
-   computing the digest. It does **not** act. It returns `confirmation_required{pending_id,
-   preview}` to the AI. The AI holds a **`pending_id` (an identifier), never a completable
-   token.**
-2. **Surface to the approver — over the PRIVATE approval channel, not the general socket.**
-   The arbiter delivers the `PendingAction` preview to the **shell instance** on the private
-   `socketpair` fd (R1). Because there is no push on the general socket, the private channel
-   is the daemon→shell path; it is also where `approve` is *received* (and nowhere else).
-   The shell renders the arbiter's exact preview.
-3. **The consent event.** The human clicks **Approve/Deny** in the shell. For a **high-risk**
-   tier, this additionally triggers a **polkit `auth_self`** challenge (R2) — the user
-   authenticates in the trusted polkit agent; **the same-uid AI cannot satisfy it.** This is
-   human-consent proof (B), not caller-continuity (A).
-4. **Mint (approver → arbiter, on the private channel).** The shell returns
-   `{pending_id, action_digest, preview_version}` **on the private channel**. The arbiter
-   verifies digest + version + freshness, verifies the polkit result for high-risk, then
-   mints the HMAC capability bound to the digest + TTL (the R1 token pattern,
-   [token.rs:67](die/inference/src/token.rs:67)). **The mint is reachable only via the
-   private channel from the attested shell** — never from the general socket the AI uses.
-5. **Complete (AI → arbiter, general socket).** The AI presents the token; the arbiter
-   `consume`s it one-shot (the prototype's sound half), **re-verifies the digest against the
-   live `PendingAction`**, and executes the §6 sandbox built from that object.
+### The launch topology (R2-F1 — the new crux, now SPECIFIED to a real mechanism)
 
-**Why the same-uid AI cannot forge consent now:** (i) the token is HMAC-bound (forgery);
-(ii) the mint fires only on `approve` over the **private channel**, which the AI's process
-**does not have an fd to** (R1) — *not* on a uid it shares; (iii) high-risk additionally
-requires a **polkit** challenge the AI cannot answer (R2). The three are independent.
+`installer/` is empty (greenfield), so this is *designed*, not retrofitted:
 
----
+- **Parent / root of trust:** the **daemon is the trusted launcher.** It creates the
+  approval `socketpair(AF_UNIX, SOCK_SEQPACKET)` and **spawns both the shell and the AI
+  itself** (fork+exec), controlling each child's fd table and uid.
+- **fd passing — only the shell:** the shell is exec'd with the approval-channel fd present
+  in its fd table (that one fd's `CLOEXEC` cleared); the daemon holds the other end. The AI
+  is exec'd with **`close_range(3, ~0, 0)`** clearing every inherited fd, and is **never**
+  passed the approval fd (no `SCM_RIGHTS` to it, ever). `approve` is exposed **only** on
+  this private channel — never on the general IPC socket.
+- **fd-theft closure (the verified mechanism):** the boundary-holding processes — daemon and
+  shell — call **`prctl(PR_SET_DUMPABLE, 0)`** at startup. With Yama `ptrace_scope`=1, a
+  same-uid non-root process (the AI, or same-uid malware) **cannot** `ptrace`-attach or
+  `pidfd_getfd` the shell to duplicate its approval fd: `ptrace_may_access` denies
+  `PTRACE_MODE_ATTACH_REALCREDS` against a non-dumpable target (host-verified). The fd is
+  unreachable via `/proc/<pid>/fd` for the same reason (the dir is root-owned for a
+  non-dumpable process). **The AI also runs under a separate, lower-priv uid** (§5), which
+  independently denies ptrace.
+- **Failure modes (the APPROVE bar requires them):**
+  - **Daemon restart:** the daemon owns the `PendingAction` registry (in-memory) and both
+    socketpair ends. On restart the registry is empty and the old channel is dead → **all
+    pending approvals are invalidated (fail-closed)**; the daemon re-spawns the shell + AI
+    and re-creates the channel. No stale approval survives a restart.
+  - **Shell crash:** the daemon sees EOF on the private channel → **denies all pending
+    approvals bound to that shell instance**; it re-spawns the shell with a fresh channel +
+    fresh `PendingAction` ids. A crashed-and-respawned shell cannot complete an approval
+    issued to the prior instance.
+  - **AI-launched-first / ordering:** irrelevant — the daemon controls fd inheritance
+    per-child, so the AI never receives the approval fd regardless of spawn order; and the
+    daemon accepts `approve` **only** on the private channel, which the AI has no fd to.
 
-## §5 · Transport and process identity (re-spined — the placement crux, DECIDED)
+### The consent event + polkit (R2-F2 — replay seam SPECIFIED)
 
-- **The requester (AI) runs as a separate process under a dedicated, lower-privilege uid.**
-  **In-process is dropped** (F2: code-discipline, not structure — "one refactor from
-  breach"). This is now **decided, not an open item.** The AI's blast radius shrinks as a
-  bonus (it cannot read the user's files or the vault directly).
-- **`SO_PEERCRED` is used for *requester-side* identity** — distinguishing the AI's uid from
-  others, and binding the requester's completion (caller-continuity, A) — **NOT as the
-  approver proof.** The approver proof is the private channel + user-presence (§4).
-- **The general IPC socket** is AF_UNIX + `SO_PEERCRED` + `0600` (still worthwhile: excludes
-  other *users* and gives requester identity). It exposes request/query/complete — **never
-  `approve`.**
-- **The private approval channel** is a `socketpair` the daemon (or a trusted launcher)
-  creates and hands to the shell at launch (R1 — greenfield: no launch topology exists yet,
-  so it is designed correctly from the start). The AI process is spawned **without** that fd
-  (controlled fd inheritance / no `SCM_RIGHTS` pass to the AI; CLOEXEC on everything not
-  explicitly passed). **The launch topology is the new crux and must be specified precisely
-  (see open items).**
+1. AI requests → arbiter builds `PendingAction` (§3) → returns `confirmation_required
+   {pending_id, preview}` (the AI gets an id, not a token).
+2. Arbiter delivers the preview to the shell **on the private channel**; the shell renders
+   the exact action.
+3. **Consent event.** Human clicks Approve/Deny. For a **high-risk tier**, the **daemon**
+   (not the shell) performs a polkit check via `pkcheck`/libpolkit:
+   - a **custom action `org.delphi.runtime.approve`** with `<allow_active>auth_self</allow_active>`,
+     `<allow_any>no</allow_any>`, `<allow_inactive>no</allow_inactive>`, and **no `_keep`
+     variant** (so each check forces a fresh authentication — **no cached/replayed
+     authorization**, closing the consent-replay seam);
+   - the **subject is the shell process** (pid + start-time, race-safe), and `pending_id` +
+     `action_digest` are passed as **action details** (the authorization is for *this exact
+     action*, surfaced in the agent prompt);
+   - **polkit / an active trusted agent absent, or not an active local session → DENY**
+     (no fail-open — the prototype's ghost). On hardware with biometric/TPM, that rides the
+     same polkit/PAM path.
+4. **Mint (private channel only).** The shell returns `{pending_id, action_digest,
+   preview_version}` on the private channel; the arbiter verifies digest + version +
+   freshness **and the polkit result for high-risk**, then mints the HMAC capability
+   ([token.rs:67](die/inference/src/token.rs:67)) bound to the digest + TTL. The mint is
+   reachable **only** here.
+5. **Complete (general socket).** The AI presents the token; the arbiter consumes it
+   one-shot, **re-verifies the digest** against the live `PendingAction`, and executes the
+   §6 sandbox built from that object.
 
----
-
-## §6 · Execution sandbox — honest scopes, socket/fd/env discipline (R2/R3 + F5)
-
-A `bwrap` jail per execution, **constructed from the `PendingAction`** (§3), default-deny:
-
-- **Filesystem:** start with **no filesystem**; mount exactly `fs_binds` (the approved ro/rw
-  binds). The vault path and `$HOME` are never in the default set.
-- **Network — HONEST scopes only (F5 correction):** bwrap is namespace on/off (R3:
-  `--unshare-net` / `--share-net`, **no host allowlist**). So the only scopes that can be
-  *enforced* are **`none`** (`--unshare-net`) and **`full`** (`--share-net`, previewed
-  explicitly as "full host network"). A "net only to host X" scope is **not offered** until
-  real per-exec enforcement exists (nftables per-namespace / a forced filtering proxy /
-  eBPF) — a previewed-but-unenforced allowlist would be a decorative guard the human
-  approves falsely.
-- **Daemon-reentry containment (F5):** the executed tool runs as a **non-approver, non-daemon
-  uid**; the daemon's IPC sockets are **outside** the jail (no abstract-namespace sockets
-  reachable from inside; close all inherited fds; scrub the environment to `env_delta`
-  only). Otherwise the approved command could connect back to the daemon and **request more
-  actions / self-approve** — re-entering the boundary from inside the box.
-- **Syscalls/resources:** seccomp default-deny of dangerous classes; cgroup v2 mem/pids/CPU
-  caps; wall-clock timeout + kill-on-expiry (the prototype already had output/kill
-  discipline, [actions.rs:40-44](shell-bridge/src/actions.rs:40)).
-- **Landlock** is an **optional in-process FS backstop** where the target kernel guarantees
-  it (R2: not exposable on WSL) — **FS only, not network**; Increment 1 must hold on
-  bwrap+seccomp+cgroups alone.
+**Both reopening seams are now closed by verified mechanisms — equally weighted:** the
+**fd seam** (private socketpair + `PR_SET_DUMPABLE`=0 + Yama + separate uid + `close_range`)
+and the **consent-replay seam** (custom polkit action, non-`_keep`, daemon-performed,
+absent→deny). The approver identity is therefore **DECIDED** (no longer contradicted by an
+open mechanism).
 
 ---
 
-## §7 · Audit — from the canonical object (closes F6)
+## §5 · Process identity — DECIDED, with the spec from §4
 
-Every mint, deny, and execution is logged through the built Fortress chain
-(`AuditLog::log_action` [audit.rs:177](fortress/src/audit.rs:177), `verify_chain`
-[audit.rs:289](fortress/src/audit.rs:289)) **from the `PendingAction` object, not AI text** —
-recording: requester uid, approver (shell-instance + polkit result), **`action_digest`**,
-token fingerprint, granted scope, **sandbox-profile digest**, and result. **Hash-chain
-integrity ≠ audit truth** (F6): integrity proves the log wasn't edited; *truth* comes from
-logging the same canonical object that drove preview + sandbox, so the record cannot
-describe something other than what ran. The entry hash is `canonical_hash` (injective).
+- **Requester = separate process, dedicated low-priv uid.** In-process **dropped** (F2). This
+  uid (a) gives the AI no direct read of user files/the vault, and (b) independently denies
+  ptrace of the boundary processes.
+- **`SO_PEERCRED`** on the general AF_UNIX socket (`0600`) gives **requester-side** identity
+  (caller-continuity, A) and excludes other *users* — **not** the approver proof. The
+  approver proof is §4 (private channel + polkit).
 
----
+## §6 · Sandbox — honest scopes + reentry folded into the launch discipline (F5)
 
-## §8 · Reconciliation (corrected)
+`bwrap` jail per execution, built from `PendingAction` (§3), default-deny:
 
-Not two auth systems — SVC-2 already wired Fortress's engine ("wire-don't-rebuild",
-[auth.rs:310](services/src/auth.rs:310); `PermissionChecker` consumed at
-[auth.rs:344](services/src/auth.rs:344)). The decision:
+- **FS:** no filesystem by default; mount exactly `fs_binds` (incl. the read-only
+  `executable_fd`); vault/`$HOME` never default-mounted.
+- **Network — `none`/`full` only (F5, R3-honest):** bwrap is `--unshare-net` (none) /
+  `--share-net` (full host net, previewed **unmissably** as full). No allowlist scope is
+  offered until real per-exec enforcement (nftables/proxy/eBPF) exists — a previewed-but-
+  unenforced allowlist would be a decorative guard.
+- **Reentry containment (F5, downstream of §4's launch discipline):** the tool runs under a
+  uid that **cannot reach daemon IPC**; **no daemon socket is mounted into the jail and no
+  abstract-namespace daemon socket exists** (the daemon uses a filesystem socket outside the
+  jail's mount set); inherited fds are cleared (`close_range`); env is scrubbed to
+  `env_delta`. The approved command therefore has **no path back into the daemon** to
+  request or self-approve more.
+- **Syscalls/resources:** seccomp default-deny; cgroup v2 mem/pids/CPU caps; timeout +
+  kill-on-expiry. **Landlock** = optional in-process FS backstop where the target kernel
+  guarantees it (FS only, not net).
 
-1. **Fortress is the policy/audit/capability substrate**, on both transports.
-2. **Caller-continuity (SVC-2 same-caller binding) is reused for the requester**; **human-
-   consent is a new, distinct layer** (private channel + polkit) — the explicit
-   v1→v2 correction.
-3. **Structural confirmation replaces the shell-UI-by-convention gap**
-   ([auth_guard.rs:106](services/src/auth_guard.rs:106)) for the runtime's destructive
-   surface, via §3/§4.
-4. **One gated tool surface** (known methods → tier; argv → §3 approval + §6 sandbox); no
-   ungated path.
+## §7 · Audit — a TYPED runtime entry from the canonical object (F4 fix, SPECIFIED)
 
----
+The existing `log_action` records only `module/action/target/tier/result`
+([audit.rs:177](fortress/src/audit.rs:177)) — it **cannot** carry the runtime object, so the
+canonical-object audit was aspirational. **Spec:** a typed `RuntimeAuditEntry` whose hash
+derives from the **same `PendingAction` + `SandboxProfile`** used for preview/approval/
+sandbox, carrying: requester uid, approver (shell-instance id + polkit result),
+`action_digest`, token fingerprint, granted scope, **sandbox-profile digest**, and result.
+Its hash uses `canonical_hash` with a **no-`..` exhaustive-destructure test mirroring
+`AuditEntry`'s** (the dec4026 pattern at [audit.rs:57](fortress/src/audit.rs:57); 8-field
+hasher + destructure) — so a field cannot be silently omitted (DEFECT_CLASSES §1). Hash-
+chain integrity ≠ audit truth (F6): truth comes from logging the *same object* that drove
+preview + sandbox.
 
-## Resolved open items (per the round-1 review)
+## §8 · Reconciliation — unchanged (v2 §8)
 
-1. **AI placement — DECIDED: separate process + dedicated low-priv uid.** In-process dropped.
-2. **Approver identity — DECIDED: trusted shell instance via a private channel + polkit
-   user-presence for high-risk.** The same-uid "shell credential over the general socket"
-   idea is **dropped** (it didn't separate approver from requester).
-3. **Digest-verified approval is MANDATORY** — preview, approval, sandbox, audit all bind to
-   `action_digest = canonical_hash(PendingAction)`; mint and execute both verify it.
-4. **Landlock = optional FS backstop, not network** — Increment 1 holds without it.
-5. **Scope object is full** — `{executable+digest, argv, cwd, env_delta, fs_binds, net_policy
-   (none/full), timeout, tier}`, not just FS+net.
-
----
-
-## New open items / what round-2 must attack
-
-- **The private-channel launch topology (the new crux, R1 greenfield).** *Who* creates the
-  `socketpair` and launches the shell vs. the AI such that only the shell gets the fd? Is it
-  the daemon (then who launches the daemon and the shell — systemd user units? a trusted
-  launcher?), and can a same-uid process intercept the fd at launch, re-exec, or inherit it?
-  This must be specified precisely; it is where the new approver-identity rests.
-- **polkit integration fidelity (R2).** Is the polkit action defined so the AI cannot
-  pre-authorize, cache, or replay an `auth_self` result? Does `loginctl` seat-presence need
-  to be a precondition? What is the fallback on a target without polkit/biometric — deny, or
-  a weaker presence signal (and is that honest)?
-- **Executable-digest TOCTOU (§3).** Between digest and exec, can the binary be swapped?
-  (bwrap `--ro-bind` of the resolved path; re-verify under the mount.)
-- **Daemon-reentry (§6).** Prove the jailed tool has *no* path back to any daemon socket
-  (abstract namespace, `/proc`, inherited fd, `$XDG_RUNTIME_DIR`).
-- **Network honesty (§6/F5).** Confirm `none`/`full` are the only scopes offered until real
-  enforcement exists; ensure "full" is previewed unmissably.
+Fortress is the policy/audit/capability substrate on both transports; caller-continuity
+reused for the requester, human-consent a new layer; structural confirmation replaces the
+shell-UI-by-convention gap ([auth_guard.rs:106](services/src/auth_guard.rs:106)); one gated
+surface.
 
 ---
 
-## What goes to round-2
+## Resolved items (round-1 + round-2)
 
-Codex round-2: **does the re-spine close F1–F6, and is the crux truly resolved?** Confirm:
-(F1/F2) the approver is no longer a uid — attack the private channel + polkit instead;
-(F3/F4/F6) the canonical `PendingAction` actually makes preview = enforcement = approval =
-audit, with no divergence path (re-attack the injection vector §1.4 and the
-approve-A/mint-B race); (F5) the network claim is honest and daemon-reentry is closed. And
-the convergence bar: **APPROVE requires the new launch-topology crux (private-channel
-mechanism) resolved or named** — the boundary's strength now rests there, as it rested on
-placement before.
+1. **AI placement — separate low-priv uid** (in-process dropped). [DECIDED, v2]
+2. **Approver identity — trusted shell instance via the SPECIFIED launch topology**
+   (socketpair + `PR_SET_DUMPABLE`=0 + Yama + separate uid + `close_range`; `approve` only
+   on the private channel) **+ the SPECIFIED polkit consent** (custom non-`_keep` action,
+   daemon-performed, absent→deny). The v2 DECIDED-vs-open contradiction is resolved: the
+   mechanism is now real. [DECIDED + SPECIFIED, v3]
+3. **Digest-verified approval mandatory** — bind everything to
+   `action_digest = canonical_hash(PendingAction)`; verify at mint AND execute. [SPECIFIED]
+4. **Executable TOCTOU — pinned by fd** (`open`→hash-through-fd→`fexecve`; scripts pin
+   interpreter+content). [SPECIFIED, F3]
+5. **Audit truth — typed `RuntimeAuditEntry` from the canonical object + no-`..` test.**
+   [SPECIFIED, F4]
+6. **Network honesty — `none`/`full` only; reentry closed via §4 launch discipline.**
+   [SPECIFIED, F5]
+7. **Landlock = optional FS backstop, not net.** [DECIDED]
 
-No code until round-2 APPROVE and operator ratification.
+## What round-3 must confirm (mechanisms, not concepts)
+
+- **Each mechanism closes its finding** against the live primitives: does
+  `PR_SET_DUMPABLE`=0 + Yama actually deny `pidfd_getfd`/ptrace fd-theft on the **target**
+  kernel (not just WSL)? Is the custom polkit action non-replayable as specified (no `_keep`,
+  daemon-performed, absent→deny — any path to a cached/forged result)? Is `fexecve`-of-fd
+  truly swap-free incl. the script case? Does the typed audit entry's no-`..` test foreclose
+  field omission?
+- **The failure modes are real, not gestured** (daemon restart / shell crash / AI-first) —
+  attack each: any window where a stale approval survives, a respawned shell completes a
+  prior instance's approval, or the AI obtains the fd across a restart.
+- **Residual seams:** a same-uid process that is *itself* made non-dumpable racing the
+  launcher; `pidfd` obtained before `PR_SET_DUMPABLE` is set (set it **before** the first
+  `exec` and before any fd is live); polkit agent spoofing under the same uid.
+
+No code until round-3 APPROVE and operator ratification.

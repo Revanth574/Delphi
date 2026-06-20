@@ -1,20 +1,22 @@
 # Delphi Runtime Trust Model
 
-- **Status: DRAFT v4 — STOP POINT B, root-anchor specification pass after a converging
-  round-3 REVISE.** Round-1 FAIL (F1–F6) broke the v1 *structure*; v2 re-spined it; round-2
-  FAIL caught a DECIDED-vs-open contradiction; v3 specified each mechanism. **Round-3
-  CLOSED F1 the strong way** (sibling-topology + Yama `ptrace_scope`=1 — see §4) and
-  returned REVISE on the **two trust-chain-bottom links**: the document *named* a "trusted
-  launcher" (R3-01) and a "trusted agent" (R3-02) without **establishing** either against
-  the OS trust root — and a same-uid process can pre-empt anything established only at user
-  level. v4 anchors both to **root** (the floor: same-uid malware cannot become root), and
-  fixes the subject-binding (R3-03) and script-pinning (R3-04) mechanics. Not ratified;
-  goes to **round-4** (is the launcher grounded to the OS root with nothing below it, is the
-  auth party genuine, are the mechanics closed), then operator ratification. **No runtime
-  code until APPROVE + ratify.**
+- **Status: DRAFT v5 — STOP POINT B, floor-precise specification pass after a converging
+  round-4 REVISE.** Rounds 1–2 fixed structure; v3 specified each mechanism; v4 anchored the
+  two trust-chain-bottom links to **root**. **Round-4 confirmed the chain has bottomed out —
+  no residual principal below root** (Yama/F1 again, PAM agent-substitution removed, logind
+  active-session *not* forgeable, pidfd pid-reuse closed) — and returned REVISE on **two
+  spec-precision defects, not trust holes:** (R4-01) v4 *asserted* the runtime directory is
+  root-owned but its named mechanism (`@%i` per-user template) implied `User=`, which `man
+  systemd.exec` confirms makes the directory **user-owned** (anchor lost); and (R4-02) v4's
+  `close_range(3,~0,0)` *closes* the fds it needed to keep — it conflated *closing* with
+  *marking close-on-exec*. v5 pins the **privilege-split unit config** (daemon as root,
+  fork-then-drop children) with the anchor attributed to **root-owned-directory** semantics,
+  and the corrected `close_range(…, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` mechanic. Not
+  ratified; goes to **round-5** (do both mechanisms deliver their property as specified),
+  then operator ratification. **No runtime code until APPROVE + ratify.**
 - **Provenance:** draft `9a7e3b9` → round-1 FAIL → re-spine `d25b987` → round-2 FAIL → spec
-  pass `410b9b3` → round-3 REVISE → this root-anchor pass → round-4 → ratified (separate
-  later commit).
+  pass `410b9b3` → round-3 REVISE → root-anchor `c7fee38` → round-4 REVISE → this
+  floor-precise pass → round-5 → ratified (separate later commit).
 - **Verified-on-host primitives this pass rests on** (probed; the target Delphi-OS must
   guarantee them):
   - **systemd 255 is PID 1**, and **`/run` is `root:root 0755`** — a same-uid process
@@ -31,8 +33,14 @@
   - **`memfd_create` + `F_SEAL_WRITE`/`F_SEAL_EXEC` present** ⇒ script content is sealed
     immutable and the **interpreter fd** is exec'd directly, so the shebang never re-resolves
     by PATH (R3-04).
-  - `fexecve`/`execveat(AT_EMPTY_PATH)`, `close_range`/`CLOEXEC`, and the `AuditEntry`
-    `canonical_hash` + no-`..` pattern ([audit.rs:57](fortress/src/audit.rs:57)) — as v3.
+  - **`man systemd.exec`:** `RuntimeDirectory=` is owned by `User=`/`Group=` (default mode
+    0755); with **no `User=`** the directory is **root-owned** — the anchor depends on the
+    daemon running as root, not as the user (R4-01).
+  - **`man close_range`:** `CLOSE_RANGE_CLOEXEC` (Linux 5.11) **marks** the range
+    close-on-exec *rather than closing it*; `CLOSE_RANGE_UNSHARE` unshares the fd table first
+    to avoid races with threads sharing it (R4-02). `execveat(…, AT_EMPTY_PATH)` execs an fd.
+  - `fexecve`, `CLOEXEC`, and the `AuditEntry` `canonical_hash` + no-`..` pattern
+    ([audit.rs:57](fortress/src/audit.rs:57)) — as v3.
 
 ---
 
@@ -55,7 +63,7 @@ chain must bottom out at a principal the user's malware cannot become: **root.**
 ## §2 · The boundary: human-consent ≠ caller-continuity — unchanged
 
 Two distinct things both hold: **(A) caller-continuity** (SVC-2 same-caller binding,
-[auth.rs:534](services/src/auth.rs:534) — reused on the *requester* side) and **(B)
+[auth.rs:535](services/src/auth.rs:535) — reused on the *requester* side) and **(B)
 human-consent** (a signal the same-uid requester cannot produce). v4 grounds the mechanisms
 for (B) at the OS trust root.
 
@@ -103,14 +111,20 @@ action_digest = delphi_hardening::canonical_hash(PendingAction)   // injective; 
   4. **Execute the interpreter fd** — `execveat(interpreter_fd, "", ["python3",
      "/proc/self/fd/<script_memfd>", …], envp, AT_EMPTY_PATH)`. The shebang is **never
      re-resolved**: we exec the interpreter directly.
-  5. **Non-CLOEXEC caveat:** the interpreter reads `/proc/self/fd/<script_memfd>`, so the
-     memfd must survive the exec — clear `CLOEXEC` on **only** that fd **after**
-     `close_range(3, ~0, 0)` has cleared every *other* inherited fd, immediately before the
-     exec. The sealed content cannot be swapped (`F_SEAL_WRITE`), so passing by
-     `/proc/self/fd` is safe — the path resolves to the sealed kernel object, not a file an
-     attacker can replace. Executable-TOCTOU is thereby extended **to the interpreter**:
-     neither the interpreter binary (exec'd fd) nor the script content (sealed memfd) is
-     swappable between hash and exec.
+  5. **fd discipline + non-CLOEXEC caveat (R4-02 — corrected).** `close_range(3, ~0U,
+     CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` **marks** every inherited fd ≥ 3 close-on-exec
+     (it does **not** close them — `UNSHARE` first detaches the fd table so the marking can't
+     race other tasks); then clear `FD_CLOEXEC` on **only** the `script_memfd` (the interpreter
+     must read `/proc/self/fd/<script_memfd>`), and keep `interpreter_fd` open for the
+     `execveat` (it closes on exec naturally — only the script fd must survive). *Using flags=0
+     would instead **close** the script + interpreter fds and break the exec — and an
+     implementer fighting that broken call might skip fd cleanup entirely, leaking
+     daemon/private fds into the approved interpreter (the §6 reentry hole). The marking flag is
+     what keeps daemon IPC fds out of the sandboxed tool.* The sealed content cannot be swapped
+     (`F_SEAL_WRITE`), so passing by `/proc/self/fd` is safe — the path resolves to the sealed
+     kernel object, not a file an attacker can replace. Executable-TOCTOU is thereby extended
+     **to the interpreter**: neither the interpreter binary (exec'd fd) nor the script content
+     (sealed memfd) is swappable between hash and exec.
 - **The digest is the binding** for preview = approval = sandbox = audit. The no-`..`
   `canonical_hash` discipline means a new `PendingAction`/`ScriptPin` field cannot be
   silently unhashed (DEFECT_CLASSES §1, both-halves).
@@ -139,34 +153,56 @@ on the boundary processes and the AI's separate low-priv uid (§5) are **belt-an
 *(The sibling proof is only valid once a **genuine** daemon is the shared parent — which is
 exactly what R3-01 establishes.)*
 
-### R3-01 — the launcher, established by the OS trust root (THE KEYSTONE)
+### R3-01 / R4-01 — the launcher, established by the OS trust root (THE KEYSTONE)
 
-v3 *asserted* "the daemon is the trusted launcher" but never established the **genuine**
-daemon: a same-uid process could pre-empt a user-level socket/unit or stand up a fake
-topology **before** the real daemon exists. `installer/` is greenfield, so this is designed,
-not retrofitted. The genuine daemon is established **by root, not by the user**:
+v3 *asserted* "the daemon is the trusted launcher"; v4 anchored it to root but **named the
+wrong mechanism** — a `@%i` per-user template implies `User=%i`, and `man systemd.exec`
+confirms `RuntimeDirectory=` is then owned by **that user**, making the socket directory
+user-writable and the anchor forgeable. v5 pins the **concrete privilege-split unit config**
+that keeps the directory root-owned while the children run unprivileged. `installer/` is
+greenfield, so this is designed, not retrofitted:
 
-- **systemd *system* service (root).** The daemon binary is **root-owned** and exec'd by
-  **systemd (PID 1)** — a trusted exec chain from init, not a user-spawned process. A
-  per-user instance is templated (`delphi-runtime@%i.service`, started by the system manager
-  on session creation), still rooted in the system manager.
-- **Root-created runtime directory.** The unit declares the socket directory
-  **`/run/delphi/%i`** via `RuntimeDirectory=` (created by systemd as **root**). Because
-  `/run` is `root:root 0755` (host-verified), **a same-uid process cannot create
-  `/run/delphi` or place/substitute a socket inside the root-owned directory.** The daemon's
-  approval socket lives there; a stray/pre-existing entry is an error the (root) daemon
-  unlinks. **User-writable `$XDG_RUNTIME_DIR` or a systemd *user* unit is explicitly NOT
-  sufficient** — a same-uid process can pre-empt user-level establishment; only root-level
-  establishment defeats it.
+```ini
+# /usr/lib/systemd/system/delphi-runtimed@.service — SYSTEM manager unit (NOT a user unit)
+[Service]
+# NO User=, NO DynamicUser=  → the daemon runs as ROOT → /run/delphi/%i is root:root
+ExecStart=/usr/libexec/delphi-runtimed --session %i   # %i is the target USERNAME as an ARG the
+                                                      #   root daemon resolves to a uid itself —
+                                                      #   it is NOT User=%i
+RuntimeDirectory=delphi/%i
+RuntimeDirectoryMode=0711   # root-owned; user may traverse (x) to reach the socket but has no
+                            #   write (w) → cannot unlink/replace inodes in the directory
+```
+
+- **Root daemon, exec'd by PID 1.** The binary is **root-owned** and started by **systemd
+  (PID 1)** — a trusted exec chain from init. The daemon runs as **root** (no `User=`/
+  `DynamicUser=`); `%i` is a *username argument*, not `User=%i`. Running as root is precisely
+  what makes `RuntimeDirectory=delphi/%i` **root-owned** (`man systemd.exec`: the directory is
+  owned by `User=`/`Group=`, default mode 0755).
+- **The anchor is the root-owned *directory*, not the socket-file mode (R4-01 sharpening).**
+  v4's prose wrongly leaned on a "`0600` socket". The real mechanism: the socket file is mode
+  **`0660`** so the user's shell can `connect()` to it — but because the **directory** is
+  root-owned `0711`, **a same-uid process cannot `unlink`/recreate the socket inode**
+  (`unlink` needs **write on the directory**, which the user lacks). Unsubstitutability comes
+  from *directory* ownership, not file mode. Because `/run` is `root:root 0755` (host-verified)
+  a same-uid process cannot create `/run/delphi` at all, and within the root-owned per-uid
+  directory it can neither win a bind race nor occupy the path — there is **no window** for a
+  competing socket. **A systemd *user* unit or `$XDG_RUNTIME_DIR` is explicitly insufficient**
+  (user-owned → forgeable).
 - **Non-user-readable minting key.** The HMAC key behind the capability token
   ([token.rs:67](die/inference/src/token.rs:67)) is held in the root daemon's memory (or a
-  `0600` root-owned file) — **unreadable by the user's uid**, so same-uid malware cannot
-  forge a token even with the wire format.
-- **The anchor (the floor — nothing below it).** Root is the OS trust root the user's
-  malware **cannot become**. Root-established ⇒ the launcher, the socket directory, and the
-  minting key are all outside same-uid reach. The daemon then drops to the user's uid to
-  spawn the shell + AI as children, making the sibling topology's "trusted shared parent" a
-  **grounded** claim rather than an assumption.
+  `0600` root-owned file) — **unreadable by the user's uid**, so same-uid malware cannot forge
+  a token even with the wire format.
+- **Children dropped to the user (the privilege split).** The root daemon `fork()`s the shell
+  and the AI and, in **each child**, drops privileges **before** `execve` in the canonical
+  order **`setgroups([]) → setgid(target_gid) → setuid(target_uid)`** (`setuid` **last** — once
+  it relinquishes root it can no longer set the gid or supplementary groups). The daemon stays
+  root (owns the directory, the socket, the key, and the PAM auth); the children run as the
+  unprivileged user. This makes the sibling topology's "trusted shared parent" a **grounded**
+  claim, not an assumption.
+- **The floor — nothing below it.** The chain bottoms out at "root creates the directory and
+  execs the binary." There is, by construction, no principal below root for a same-uid attacker
+  to become.
 
 ### R3-02 — the auth party is the root daemon (PAM), not a substitutable agent
 
@@ -229,9 +265,10 @@ impersonate the approver.
 ### fd-channel hygiene (unchanged from v3, now under a grounded launcher)
 
 The shell is exec'd with the approval-channel fd present (its `CLOEXEC` cleared); the daemon
-holds the other end. The AI is exec'd with **`close_range(3, ~0, 0)`** and is **never**
-passed the approval fd (no `SCM_RIGHTS`, ever). `approve` is exposed **only** on the private
-channel — never on the general IPC socket.
+holds the other end. The AI is exec'd with **`close_range(3, ~0U, CLOSE_RANGE_CLOEXEC |
+CLOSE_RANGE_UNSHARE)`** (R4-02 — marks every inherited fd close-on-exec, so none survive the
+AI's `execve`; it un-marks nothing) and is **never** passed the approval fd (no `SCM_RIGHTS`,
+ever). `approve` is exposed **only** on the private channel — never on the general IPC socket.
 
 ### Failure modes (the APPROVE bar requires them — now anchored)
 
@@ -300,22 +337,25 @@ one gated surface.
 
 ---
 
-## Resolved items (rounds 1–3)
+## Resolved items (rounds 1–4)
 
 1. **AI placement — separate low-priv uid** (in-process dropped). [DECIDED, v2]
 2. **F1 — fd-theft of the approval channel — CLOSED by the sibling topology** (AI is the
    shell's sibling, not ancestor; Yama `ptrace_scope`=1 restricts attach to descendants;
    `PR_SET_DUMPABLE`=0 + separate uid are belt). [CLOSED by round-3]
-3. **R3-01 — launcher established by the OS trust root** (systemd *system* service,
-   root-owned `/run/delphi/%i`, non-user-readable minting key, reject user sockets). The
-   floor: same-uid malware cannot be root. [SPECIFIED, v4 — keystone]
+3. **R3-01 / R4-01 — launcher established by the OS trust root, to a concrete unit config**
+   (`delphi-runtimed@.service` with **no `User=`** → root-owned `/run/delphi/%i`; the anchor is
+   the root-owned **directory** — user can't `unlink` the `0660` socket; children dropped
+   `setgroups→setgid→setuid` before exec; minting key `0600` root-only). The floor: nothing
+   below "root creates the dir and execs the binary". [SPECIFIED, v5 — keystone]
 4. **R3-02 — the auth party is the root daemon via PAM** over the private channel + logind
    active-session gate; ambient polkit agents removed (no registration race). [SPECIFIED, v4]
 5. **R3-03 — approver subject = race-free pidfd** from the daemon's spawn table, not a racy
    `/proc` `pid+start-time` lookup. [SPECIFIED, v4]
-6. **R3-04 — script pinning is mechanical:** exec the **interpreter fd**, pass the script as
-   a **sealed memfd**, handle the non-CLOEXEC caveat — shebang never re-resolves by PATH.
-   [SPECIFIED, v4]
+6. **R3-04 / R4-02 — script pinning is mechanical:** exec the **interpreter fd**, pass the
+   script as a **sealed memfd**; fd discipline uses `close_range(…, CLOSE_RANGE_CLOEXEC |
+   CLOSE_RANGE_UNSHARE)` to **mark** (not close) then un-mark only the script fd — shebang
+   never re-resolves by PATH, and no daemon fd leaks into the tool. [SPECIFIED, v5]
 7. **Digest-verified approval mandatory** — bind everything to
    `action_digest = canonical_hash(PendingAction)`; verify at mint AND execute. [SPECIFIED]
 8. **Audit truth — typed `RuntimeAuditEntry` from the canonical object + no-`..` test.**
@@ -323,27 +363,24 @@ one gated surface.
 9. **Network honesty — `none`/`full` only; reentry closed via §4 launch discipline.** [SPECIFIED]
 10. **Landlock = optional FS backstop, not net.** [DECIDED]
 
-## What round-4 must confirm (the bottom link, grounded)
+## What round-5 must confirm (do both mechanisms deliver their property — nothing below root)
 
-- **Launcher grounded to root, nothing below it (R3-01).** Does systemd-as-PID-1 establishing
-  a **root-owned** binary + **root-created** `/run/delphi/%i` actually deny a same-uid process
-  any way to **be**, **pre-empt**, or **impersonate** the launcher — including: racing to
-  create the socket before the unit (root-owned dir denies it), occupying the path during a
-  restart, or templating-unit ordering games? Is the minting key genuinely out of same-uid
-  reach? Is there **any** principal below root this still rests on?
-- **Auth party genuine (R3-02).** Does daemon-owned `pam_authenticate` + the logind
-  active-local-session gate **remove every substitution surface** that the ambient-agent model
-  had — confirm no same-uid process can interpose on the PAM conversation, forge a logind
-  "active" verdict, or feed the daemon a false PAM result? Is the private channel the *only*
-  path the PAM prompt/response travels?
-- **Mechanics closed.** pidfd subject binding is race-free (R3-03); interpreter-fd exec +
-  sealed memfd is swap-free incl. the non-CLOEXEC caveat (R3-04); the typed audit no-`..` test
-  forecloses field omission.
-- **Failure modes real, not gestured** (daemon restart / shell crash / AI-first) under the
-  root-owned socket directory — attack each for a stale-approval or impostor-socket window.
-- **APPROVE bar:** the launcher is grounded to the OS root with nothing below it, the auth
-  party is genuine and non-substitutable, and the mechanics are closed. **REVISE** only if a
-  residual principal below root remains — name it (there is, by construction, nothing below
-  "root creates the directory and execs the binary").
+- **R4-01 — the privilege-split config delivers a root-owned directory.** Confirm against
+  `man systemd.exec`: a system unit with **no `User=`/`DynamicUser=`** yields a **root-owned**
+  `/run/delphi/%i`, and `%i`-as-argument (not `User=%i`) keeps it root-owned. Confirm the
+  anchor is correctly attributed to **directory** ownership (`unlink` needs write-on-dir) while
+  a `0660` socket remains connectable by the user, and that the `setgroups→setgid→setuid`
+  child-drop order is right with **no** window where a same-uid process binds the socket first.
+- **R4-02 — the fd discipline keeps the needed fds and drops the rest.** Confirm
+  `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` **marks** (does not close),
+  that un-marking only the `script_memfd` and `execveat(interpreter_fd, …, AT_EMPTY_PATH)`
+  yields a swap-free exec with **no daemon/private fd leaked** into the sandboxed interpreter,
+  and that the ordering (mark → un-mark script fd → exec) is sound.
+- **Everything else stays closed** (round-4 confirmed): Yama/F1, PAM agent-substitution
+  removal, logind non-forgeable active-session, pidfd pid-reuse, the typed-audit no-`..` test.
+- **APPROVE bar:** both mechanisms are specified to deliver their property, with **no residual
+  principal below root**. **REVISE** only on remaining *spec precision* (a mechanism that still
+  doesn't deliver as written) — **not** a new chain link, because the chain has bottomed out at
+  root. By construction this terminates.
 
-No code until round-4 APPROVE and operator ratification.
+No code until round-5 APPROVE and operator ratification.

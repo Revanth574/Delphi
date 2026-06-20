@@ -1,7 +1,8 @@
 # Delphi Runtime Trust Model
 
-- **Status: DRAFT v6 — STOP POINT B, terminal P3 syntax fix (R5-01) atop a converged
-  floor-precise pass.** Rounds 1–2 fixed structure; v3 specified each mechanism; v4 anchored the
+- **Status: RATIFIED @ `37f225a` (Codex 6-round adversarial review, APPROVE) —
+  STOP-POINT-B passed; this document is the boundary Increment 1 implements.** Rounds 1–2
+  fixed structure; v3 specified each mechanism; v4 anchored the
   two trust-chain-bottom links to **root**. **Round-4 confirmed the chain has bottomed out —
   no residual principal below root** (Yama/F1 again, PAM agent-substitution removed, logind
   active-session *not* forgeable, pidfd pid-reuse closed) — and returned REVISE on **two
@@ -14,11 +15,13 @@
   and the corrected `close_range(…, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` mechanic. Not
   ratified. **Round-5 confirmed every mechanism sound**, returning one **P3 (R5-01)** — the
   example unit block used inline comments, invalid per `systemd.syntax(7)` (a doc-syntax
-  defect, no mechanism change). v6 makes the block copy-valid; goes to **round-6** (trivial:
-  does the unit block parse), then operator ratification. **No runtime code until APPROVE + ratify.**
+  defect, no mechanism change). v6 made the block copy-valid; **round-6 returned APPROVE, no
+  findings.** The trust chain — grounded root-to-approver, every mechanism host-verified —
+  held across six adversarial rounds. **Increment 1 implements this document; runtime code
+  lands only as the ratified boundary specifies.**
 - **Provenance:** draft `9a7e3b9` → round-1 FAIL → re-spine `d25b987` → round-2 FAIL → spec
   pass `410b9b3` → round-3 REVISE → root-anchor `c7fee38` → round-4 REVISE → floor-precise
-  `a37965a` → round-5 REVISE → this terminal syntax fix → round-6 → ratified (separate later commit).
+  `a37965a` → round-5 REVISE → syntax `37f225a` → round-6 **APPROVE** → **RATIFIED** (this commit).
 - **Verified-on-host primitives this pass rests on** (probed; the target Delphi-OS must
   guarantee them):
   - **systemd 255 is PID 1**, and **`/run` is `root:root 0755`** — a same-uid process

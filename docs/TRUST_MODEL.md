@@ -1,7 +1,7 @@
 # Delphi Runtime Trust Model
 
-- **Status: DRAFT v5 — STOP POINT B, floor-precise specification pass after a converging
-  round-4 REVISE.** Rounds 1–2 fixed structure; v3 specified each mechanism; v4 anchored the
+- **Status: DRAFT v6 — STOP POINT B, terminal P3 syntax fix (R5-01) atop a converged
+  floor-precise pass.** Rounds 1–2 fixed structure; v3 specified each mechanism; v4 anchored the
   two trust-chain-bottom links to **root**. **Round-4 confirmed the chain has bottomed out —
   no residual principal below root** (Yama/F1 again, PAM agent-substitution removed, logind
   active-session *not* forgeable, pidfd pid-reuse closed) — and returned REVISE on **two
@@ -12,11 +12,13 @@
   *marking close-on-exec*. v5 pins the **privilege-split unit config** (daemon as root,
   fork-then-drop children) with the anchor attributed to **root-owned-directory** semantics,
   and the corrected `close_range(…, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` mechanic. Not
-  ratified; goes to **round-5** (do both mechanisms deliver their property as specified),
-  then operator ratification. **No runtime code until APPROVE + ratify.**
+  ratified. **Round-5 confirmed every mechanism sound**, returning one **P3 (R5-01)** — the
+  example unit block used inline comments, invalid per `systemd.syntax(7)` (a doc-syntax
+  defect, no mechanism change). v6 makes the block copy-valid; goes to **round-6** (trivial:
+  does the unit block parse), then operator ratification. **No runtime code until APPROVE + ratify.**
 - **Provenance:** draft `9a7e3b9` → round-1 FAIL → re-spine `d25b987` → round-2 FAIL → spec
-  pass `410b9b3` → round-3 REVISE → root-anchor `c7fee38` → round-4 REVISE → this
-  floor-precise pass → round-5 → ratified (separate later commit).
+  pass `410b9b3` → round-3 REVISE → root-anchor `c7fee38` → round-4 REVISE → floor-precise
+  `a37965a` → round-5 REVISE → this terminal syntax fix → round-6 → ratified (separate later commit).
 - **Verified-on-host primitives this pass rests on** (probed; the target Delphi-OS must
   guarantee them):
   - **systemd 255 is PID 1**, and **`/run` is `root:root 0755`** — a same-uid process
@@ -165,14 +167,16 @@ greenfield, so this is designed, not retrofitted:
 ```ini
 # /usr/lib/systemd/system/delphi-runtimed@.service — SYSTEM manager unit (NOT a user unit)
 [Service]
-# NO User=, NO DynamicUser=  → the daemon runs as ROOT → /run/delphi/%i is root:root
-ExecStart=/usr/libexec/delphi-runtimed --session %i   # %i is the target USERNAME as an ARG the
-                                                      #   root daemon resolves to a uid itself —
-                                                      #   it is NOT User=%i
+# NO User=, NO DynamicUser=  → the daemon runs as ROOT → /run/delphi/%i is root:root.
+# %i is the target USERNAME passed as an argument (the root daemon resolves it to a uid
+#   itself) — it is NOT User=%i.
+ExecStart=/usr/libexec/delphi-runtimed --session %i
 RuntimeDirectory=delphi/%i
-RuntimeDirectoryMode=0711   # root-owned; user may traverse (x) to reach the socket but has no
-                            #   write (w) → cannot unlink/replace inodes in the directory
+# RuntimeDirectoryMode 0711 → root-owned; the user may traverse (x) to reach the socket but
+#   has no write (w) → cannot unlink/replace inodes in the directory.
+RuntimeDirectoryMode=0711
 ```
+*(systemd.syntax(7): only whole-line `#`/`;` comments are honored — directive values are bare.)*
 
 - **Root daemon, exec'd by PID 1.** The binary is **root-owned** and started by **systemd
   (PID 1)** — a trusted exec chain from init. The daemon runs as **root** (no `User=`/
@@ -337,7 +341,7 @@ one gated surface.
 
 ---
 
-## Resolved items (rounds 1–4)
+## Resolved items (rounds 1–5)
 
 1. **AI placement — separate low-priv uid** (in-process dropped). [DECIDED, v2]
 2. **F1 — fd-theft of the approval channel — CLOSED by the sibling topology** (AI is the
@@ -362,25 +366,20 @@ one gated surface.
    [SPECIFIED]
 9. **Network honesty — `none`/`full` only; reentry closed via §4 launch discipline.** [SPECIFIED]
 10. **Landlock = optional FS backstop, not net.** [DECIDED]
+11. **R5-01 — the example unit block is copy-valid systemd** (whole-line `#` comments, bare
+    directive values per `systemd.syntax(7)`). Documentation-syntax fix, no mechanism change.
+    [FIXED, v6]
 
-## What round-5 must confirm (do both mechanisms deliver their property — nothing below root)
+## What round-6 must confirm (trivial — the unit block parses; everything else is closed)
 
-- **R4-01 — the privilege-split config delivers a root-owned directory.** Confirm against
-  `man systemd.exec`: a system unit with **no `User=`/`DynamicUser=`** yields a **root-owned**
-  `/run/delphi/%i`, and `%i`-as-argument (not `User=%i`) keeps it root-owned. Confirm the
-  anchor is correctly attributed to **directory** ownership (`unlink` needs write-on-dir) while
-  a `0660` socket remains connectable by the user, and that the `setgroups→setgid→setuid`
-  child-drop order is right with **no** window where a same-uid process binds the socket first.
-- **R4-02 — the fd discipline keeps the needed fds and drops the rest.** Confirm
-  `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` **marks** (does not close),
-  that un-marking only the `script_memfd` and `execveat(interpreter_fd, …, AT_EMPTY_PATH)`
-  yields a swap-free exec with **no daemon/private fd leaked** into the sandboxed interpreter,
-  and that the ordering (mark → un-mark script fd → exec) is sound.
-- **Everything else stays closed** (round-4 confirmed): Yama/F1, PAM agent-substitution
-  removal, logind non-forgeable active-session, pidfd pid-reuse, the typed-audit no-`..` test.
-- **APPROVE bar:** both mechanisms are specified to deliver their property, with **no residual
-  principal below root**. **REVISE** only on remaining *spec precision* (a mechanism that still
-  doesn't deliver as written) — **not** a new chain link, because the chain has bottomed out at
-  root. By construction this terminates.
+Round-5 confirmed every mechanism sound — the root-owned-directory anchor (`RuntimeDirectory=`
+with no `User=` is root-owned; the `0711` dir blocks same-uid bind/unlink/replace while the
+`0660` socket stays connectable), the `setgroups([])→setgid→setuid` drop order, and the full
+`close_range(…, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)` / `execveat(…, AT_EMPTY_PATH)` fd
+discipline — and returned a single **P3 (R5-01)**: the example unit block used inline `#`
+comments, which `systemd.syntax(7)` does not honor. Round-6 confirms **only** that the
+corrected block (whole-line comments, bare directive values) is **valid systemd syntax**.
+Nothing substantive is open — the trust chain was grounded and adversarially attacked across
+five rounds and bottoms out at root.
 
-No code until round-5 APPROVE and operator ratification.
+No code until round-6 APPROVE and operator ratification.

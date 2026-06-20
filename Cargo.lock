@@ -973,6 +973,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "delphi-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "delphi-services"
 version = "0.1.0"
 dependencies = [

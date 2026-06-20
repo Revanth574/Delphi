@@ -15,6 +15,7 @@ members = [
     "services",
     "shell-bridge",
     "delphi-hardening",
+    "runtime",
 ]
 
 [workspace.package]

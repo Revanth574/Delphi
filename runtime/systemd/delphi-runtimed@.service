@@ -1,0 +1,26 @@
+# delphi-runtimed@.service — the root runtime daemon, one instance per session user.
+#
+# SYSTEM manager unit (install under /usr/lib/systemd/system/), NOT a user unit.
+# Ratified in docs/TRUST_MODEL.md §4 (R3-01 / R4-01): the daemon runs as ROOT so
+# RuntimeDirectory= is root-owned — the anchor a same-uid attacker cannot pre-empt
+# or substitute. %i is the target USERNAME passed as an argument (the root daemon
+# resolves it to a uid itself); it is NOT User=%i. RuntimeDirectoryMode=0711 →
+# root-owned, user-traversable (x), user-non-writable (no w) so the user cannot
+# unlink/replace the socket inode in the directory.
+[Unit]
+Description=Delphi runtime daemon (root anchor) for session %i
+Documentation=file:///usr/share/doc/delphi/TRUST_MODEL.md
+
+[Service]
+Type=simple
+# NO User=, NO DynamicUser= → the daemon runs as root → /run/delphi/%i is root:root.
+ExecStart=/usr/libexec/delphi-runtimed --session %i
+RuntimeDirectory=delphi/%i
+RuntimeDirectoryMode=0711
+# Optional hardening (anchor holds regardless — /run is root-only): keep the
+# directory across restarts to avoid recreate churn.
+#   RuntimeDirectoryPreserve=restart
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

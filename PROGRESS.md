@@ -4,8 +4,8 @@ Last updated: 2026-06-15 (**Leverage pass MERGED to main at v0.4.1 (`b1bf565`)**
 Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increment 1a (the root-anchor keystone) is BUILT + GREEN** on branch `runtime/increment-1a`. In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
 Current task: **Increment 1a — root-established launcher + root-owned socket — COMPLETE as a build/test checkpoint; HOLDING for operator review before 1b.** Per the 1a/1d plan, 1a does NOT get its own Codex review — the single implementation review is batched at the end of 1d.
 Current step: the anchor is proven in running code — the both-halves test (**unsubstitutable YET connectable**) + the RED-proof, run as root via the WSL2-root lane. **Next: Increment 1b (pidfd-pinned shell + private approval channel) after operator review.**
-Status: **1a GREEN.** `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; raven: 3 lib unit + 3 doctest pass, privileged integration self-skips; **root (WSL2-root lane): both-halves + RED-proof positive control pass**; literal RED-proof demonstrated (anchor assertion fails against a user-owned dir) and reverted.
-Tests passing: the `delphi-runtime` crate adds **3 lib unit + 2 privileged integration (root-gated) + 3 doctests**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
+Status: **1a COMPLETE + GREEN** (kernel property AND production mechanism both proven). `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; raven: 3 lib unit + 3 doctest pass, privileged integration self-skips; **root (WSL2-root lane): both-halves + RED-proof + live-systemd smoke-test pass**; literal RED-proofs demonstrated (anchor assertion fails on a user-owned dir; `User=` flips RuntimeDirectory to user-owned) and reverted.
+Tests passing: the `delphi-runtime` crate adds **3 lib unit + 3 privileged integration (root-gated: 2 anchor + 1 systemd smoke) + 3 doctests**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
 
 ## Runtime arc — STOP-POINT-B PASSED + Increment 1a (root anchor) GREEN (2026-06-20)
 
@@ -40,12 +40,21 @@ Proof (running code, the analogue of the review findings):
   reverted.
 - **Unit (normal CI, no root):** privilege-drop ORDER via a mockable seam
   (`setgroups→setgid→setuid`), short-circuit-and-name on failure, `NotRoot` guard.
+- **Live-systemd smoke-test** (`shipped_unit_produces_root_owned_anchor_on_systemd`, root
+  lane, systemd 255): the SHIPPED `delphi-runtimed@.service`, `systemctl start`ed on real
+  systemd, produces `/run/delphi/<user>` **`root:root 0711`** AND the daemon binds the socket
+  **`root:<gid> 0660`** — closing the documented-vs-real gap (the kernel-equivalence test's
+  assumption verified against the real unit, not just `man systemd.exec`). **No difference
+  surfaced.** The dir OWNERSHIP is isolated to systemd (the daemon's idempotent
+  `ensure_runtime_dir` re-applies the mode but never `chown`s). **R4-01 confirmed live**
+  (throwaway, reverted): the same `RuntimeDirectory=` with `User=%i` flips the dir to
+  user-owned — the anchor lost — proving the smoke test bites the no-`User=` property.
 
 **MANDATORY PRIVILEGED-LANE GATE (record for the 1d review):** the both-halves test and the
 RED-proof are **EUID-gated** (not `#[ignore]`d): non-root → skip with the exact invocation;
 root → run. They do NOT run in normal CI (no systemd/second-uid there). They are a **required
 named gate at the 1d implementation-review boundary**, run via the WSL2-root lane:
-`wsl -u root -- env -C /mnt/c/dev/Delphi /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor -- --test-threads=1`.
+`wsl -u root -- env -C /mnt/c/dev/Delphi /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test systemd_smoke -- --test-threads=1`.
 A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a blocker).
 
 ## Leverage pass (`infra/leverage-pass`) — CLOSE-OUT: P0–P5 COMPLETE, MERGED at v0.4.1 `b1bf565` (2026-06-15)

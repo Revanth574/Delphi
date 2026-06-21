@@ -46,8 +46,11 @@ use std::path::PathBuf;
 pub mod anchor;
 pub mod channel;
 pub mod fdsec;
+pub mod logind;
+pub mod pam;
 pub mod pidfd;
 pub mod privdrop;
+pub mod token;
 
 pub use anchor::{bind_approval_socket, ensure_runtime_dir, AnchorPaths};
 pub use channel::approval_socketpair;
@@ -92,5 +95,17 @@ pub enum RuntimeError {
     NotRoot {
         /// The effective uid the daemon was started with.
         euid: u32,
+    },
+
+    /// A PAM consent step failed (Increment 1c).
+    ///
+    /// Carries the failing PAM operation and the library's detail string. A wrong
+    /// password surfaces here as `pam_authenticate` failed.
+    #[error("PAM {op} failed: {detail}")]
+    Pam {
+        /// The PAM operation that failed (e.g. "pam_authenticate").
+        op: &'static str,
+        /// The PAM library's error detail.
+        detail: String,
     },
 }

@@ -1,11 +1,11 @@
 # Delphi OS — Progress State
 
 Last updated: 2026-06-15 (**Leverage pass MERGED to main at v0.4.1 (`b1bf565`)** after a 2-round Codex review — primitives confirmed byte-identical (round-1), R1-01 test-fix (round-2 APPROVE); see the close-out section. Earlier milestones below. INF-1 (API-key Debug redaction) **FIXED + Codex APPROVE, 0 findings**, merged via `fix/inf-1-apikey-redaction` — the first `CODEBASE_REVIEW` security candidate triaged; see the INF-1 section below. Prior milestone — Phase 3B.0 — **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED TO MAIN `84d84b3`**. The FINAL Phase 3B.0 sweep — **Phase 3B.0 is now CLOSED** (the D-Bus boundary `services/`, `die/orchestrator/`, and the security layer `fortress/` have all been swept and merged). Three adversarial Codex rounds + one scoped re-verification: **R1 FAIL (5 findings) → R2 FAIL (4 findings) → R3 FAIL (1 composition-seam regression) → R3-reverify APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **7 pre-review fixes** and **3 dead detection paths wired before round 1** (the "fix what you find" discipline). Severities are Codex's actual verdicts — **two P1s** (FORT-R1-01 the silent ZKQP PII leak that justified the sweep; FORT-R2-01 the digit-completeness class), both fixed and verified, so main holds no known P1. The full-workspace pre-merge audit additionally caught 3 downstream tests that encoded the pre-R1-04 credential-name leak across `#[from]` boundaries — corrected (`e7fdbb0`). The 18 fix commits + the pre-merge PROGRESS chore (`06c46a1`) landed via `--no-ff` merge **`84d84b3`** (`68b045d..84d84b3`), pushed to origin, branch `phase-3b/sweep-fortress` deleted. Prior milestone: `die/orchestrator/` sweep merged `ab1ffc7`.)
-Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increments 1a (root-anchor keystone) + 1b (sibling-topology F1 + private channel) are BUILT + GREEN** on branch `runtime/increment-1a`. In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
-Current task: **Increment 1b — first child-spawn (pidfd-pinned shell + private SOCK_SEQPACKET channel + fd-discipline) + the F1 sibling-fd-theft test — COMPLETE as a build/test checkpoint; HOLDING for operator review before 1c.** Per the 1a/1d plan, 1a–1c do NOT get their own Codex review — the single implementation review is batched at the end of 1d.
-Current step: F1 proven in running code — a same-uid SIBLING AI is DENIED `pidfd_getfd` of the shell's approval fd (Yama scope=1, at dumpable=1 → topology load-bearing), with the ancestor-topology RED-proof. **Next: Increment 1c (daemon-PAM consent + logind gate + token mint) after operator review.**
-Status: **1a + 1b COMPLETE + GREEN.** `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; raven: 5 lib unit + 5 doctest pass, privileged integration self-skips; **root (WSL2-root lane): anchor both-halves + RED-proof, live-systemd smoke-test, AND F1 sibling-denied + ancestor-RED all pass**; literal RED-proofs demonstrated (anchor: user-owned dir; systemd: `User=` flip; F1: ancestor-topology theft) and reverted.
-Tests passing: the `delphi-runtime` crate has **5 lib unit + 5 privileged integration (root-gated: 2 anchor + 2 sibling-fd-theft + 1 systemd smoke) + 5 doctests**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
+Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increments 1a (root-anchor keystone) + 1b (sibling-topology F1 + private channel) + 1c (consent path: token + PAM + logind) are BUILT + GREEN** on branch `runtime/increment-1a`. In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
+Current task: **Increment 1c — the consent path (daemon-owned PAM over the private channel + logind active-local gate + digest-bound token mint) + its three attack tests — COMPLETE as a build/test checkpoint; HOLDING for operator review before 1d.** Per the 1a/1d plan, 1a–1c do NOT get their own Codex review — the single implementation review is batched at the end of 1d.
+Current step: the consent the AI cannot fabricate is proven across three surfaces — token (digest-binding), PAM (routing-over-private-channel, composed with 1b's channel-privacy), logind (decision + forge-resistance, live query proven, provisioning deferred). **Next: Increment 1d (canonical PendingAction + sandbox + execute, the single Biometric action end-to-end) + the one batched Codex implementation review.**
+Status: **1a + 1b + 1c COMPLETE + GREEN.** `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean. raven: 12 lib unit + 6 doctest + the 3 logind_gate tests pass; privileged integration self-skips. **root (WSL2-root lane): anchor both-halves+RED, live-systemd smoke, F1 sibling-denied+ancestor-RED, AND PAM interposition-denied+shared-surface-RED all pass.** RED-proofs: anchor user-owned-dir, systemd `User=`-flip, F1 ancestor-theft (each demonstrated+reverted); token replay (positive control), PAM shared-surface observe (positive control), logind same-uid-signal forge (positive control).
+Tests passing: the `delphi-runtime` crate has **12 lib unit + 6 doctest + 10 integration (7 privileged root-gated: 2 anchor + 2 sibling-fd-theft + 1 systemd smoke + 2 PAM interposition; 3 no-root logind_gate)**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
 
 ## Runtime arc — STOP-POINT-B PASSED + Increment 1a (root anchor) GREEN (2026-06-20)
 
@@ -78,12 +78,40 @@ per-user unit setting) — the sibling defense is conditional on it (the trust m
 it). The F1 test is gated on `scope == 1` (skips with a clear deploy-requirement message
 otherwise; WSL2 has it `=1`).
 
+**Increment 1c — the consent path — built and green** on the same branch, on top of 1b. The
+layer that makes the boundary mean something: a human-consent event the AI cannot fabricate.
+Three surfaces, three RED-proofs, each claim scoped to what it proves:
+- **Token** (`token`, no root): a runtime-local, **action-digest-bound**, daemon-minted HMAC
+  capability — the proven die-inference token *pattern*, not its type (binds the digest, not the
+  cloud tuple; deps grow to `hmac`+`sha2`, no die-inference dep). RED-proof (positive control):
+  a token minted for action A is **rejected for action B** — replay/substitution denied.
+- **PAM** (`pam` + `pam_interposition`, root): live `pam_authenticate` vs `/etc/shadow`
+  (`rc=0`/`rc=7`), the conversation routed over the 1b private channel via a custom
+  `pam-client2::ConversationHandler`. RED-proof (same experiment, routing the only variable):
+  the SAME same-uid attacker observes **nothing** over the private channel but **observes the
+  prompt** over a shared surface. **Claim scoped:** 1c proves the *routing*; 1b proves the
+  *channel-privacy* (reused); composed. Live PAM, human-response scripted — recorded honestly.
+- **logind** (`logind` + `logind_gate`, no root): the gate decision `active && !remote` queried
+  **directly from logind** via `sd_session_*` FFI (§13 highest fidelity — we declare the 3
+  stable symbols ourselves and link the system `libsystemd.so.0` by soname, because
+  `libsystemd-sys` is LGPL-2.1 outside `deny.toml` and needs `libsystemd-dev`; a `loginctl`
+  parser would be lower fidelity, deliberately avoided). RED-proof: a same-uid process **cannot**
+  forge logind's verdict for an unknown session but **can** forge a same-uid-writable signal —
+  same forge intent, trust source the only variable. The live `sd_session_*` query path is
+  exercised; provisioning a session for a daemon-spawned shell (`pam_open_session`) is a
+  documented **deploy requirement**.
+
+New crate deps: `hmac`/`sha2` (token); `pam-client2` MPL-2.0 + `pam-sys2` MIT/Apache (PAM,
+`deny.toml`-checked); the logind FFI adds **no** cargo dep (own MIT binding + soname link).
+Build dep: `libpam0g-dev` (the daemon links libpam). The token + logind RED-proofs run in
+**normal CI** (no root); the PAM interposition test is privileged.
+
 **MANDATORY PRIVILEGED-LANE GATE (record for the 1d review):** the privileged tests are
 **EUID-gated** (not `#[ignore]`d): non-root → skip with the exact invocation; root → run. They do
 NOT run in normal CI (no systemd/second-uid/Yama-controlled host there). They are a **required
 named gate at the 1d implementation-review boundary**, run via the WSL2-root lane:
-`wsl -u root -- env -C /mnt/c/dev/Delphi /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test sibling_fd_theft --test systemd_smoke -- --test-threads=1`.
-A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a/1b blocker).
+`wsl -u root -- env -C /mnt/c/dev/Delphi PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test sibling_fd_theft --test systemd_smoke --test pam_interposition -- --test-threads=1`.
+A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a/1b/1c blocker).
 
 ## Leverage pass (`infra/leverage-pass`) — CLOSE-OUT: P0–P5 COMPLETE, MERGED at v0.4.1 `b1bf565` (2026-06-15)
 

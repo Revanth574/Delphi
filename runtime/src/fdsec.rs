@@ -49,7 +49,7 @@ pub fn mark_cloexec_except(keep: &[RawFd]) -> Result<(), RuntimeError> {
 }
 
 /// Clear the `CLOEXEC` flag on a single fd so it survives `execve`.
-fn clear_cloexec(fd: RawFd) -> Result<(), RuntimeError> {
+pub(crate) fn clear_cloexec(fd: RawFd) -> Result<(), RuntimeError> {
     // SAFETY: borrow the raw fd for the duration of the two fcntl calls; the
     // borrow does not outlive the descriptor (the caller owns it across the call).
     let bf = unsafe { BorrowedFd::borrow_raw(fd) };

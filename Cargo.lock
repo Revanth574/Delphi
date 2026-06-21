@@ -980,6 +980,7 @@ name = "delphi-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "delphi-hardening",
  "hmac",
  "nix",
  "pam-client2",

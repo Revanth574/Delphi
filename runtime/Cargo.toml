@@ -33,6 +33,10 @@ tracing-subscriber = { workspace = true }
 # pattern but binding the action digest and minted by the root daemon.
 hmac = "0.12"
 sha2 = { workspace = true }
+# Canonical action digest (1d): the leverage-pass CanonicalHasher (declared-count
+# guard + the no-`..` exhaustive-destructure discipline) is the preview=approval=
+# sandbox=audit binding.
+delphi-hardening = { workspace = true }
 # PAM (1c): pam-client2 exposes a custom ConversationHandler trait so the consent
 # conversation can be routed over the 1b private channel (recon #1 — verified the
 # crate supports a non-tty custom conversation).

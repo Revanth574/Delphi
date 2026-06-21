@@ -43,13 +43,17 @@
 
 use std::path::PathBuf;
 
+pub mod action;
 pub mod anchor;
+pub mod audit;
 pub mod channel;
+pub mod execute;
 pub mod fdsec;
 pub mod logind;
 pub mod pam;
 pub mod pidfd;
 pub mod privdrop;
+pub mod sandbox;
 pub mod token;
 
 pub use anchor::{bind_approval_socket, ensure_runtime_dir, AnchorPaths};
@@ -108,4 +112,10 @@ pub enum RuntimeError {
         /// The PAM library's error detail.
         detail: String,
     },
+
+    /// Execution was attempted without a valid approval token for the action
+    /// (Increment 1d — the consent gate). The token did not verify against the
+    /// action's canonical digest, so the action is unapproved and is not run.
+    #[error("execution denied: no valid approval token for this action (the 1c consent gate)")]
+    Unapproved,
 }

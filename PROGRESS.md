@@ -1,11 +1,11 @@
 # Delphi OS — Progress State
 
 Last updated: 2026-06-15 (**Leverage pass MERGED to main at v0.4.1 (`b1bf565`)** after a 2-round Codex review — primitives confirmed byte-identical (round-1), R1-01 test-fix (round-2 APPROVE); see the close-out section. Earlier milestones below. INF-1 (API-key Debug redaction) **FIXED + Codex APPROVE, 0 findings**, merged via `fix/inf-1-apikey-redaction` — the first `CODEBASE_REVIEW` security candidate triaged; see the INF-1 section below. Prior milestone — Phase 3B.0 — **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED TO MAIN `84d84b3`**. The FINAL Phase 3B.0 sweep — **Phase 3B.0 is now CLOSED** (the D-Bus boundary `services/`, `die/orchestrator/`, and the security layer `fortress/` have all been swept and merged). Three adversarial Codex rounds + one scoped re-verification: **R1 FAIL (5 findings) → R2 FAIL (4 findings) → R3 FAIL (1 composition-seam regression) → R3-reverify APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **7 pre-review fixes** and **3 dead detection paths wired before round 1** (the "fix what you find" discipline). Severities are Codex's actual verdicts — **two P1s** (FORT-R1-01 the silent ZKQP PII leak that justified the sweep; FORT-R2-01 the digit-completeness class), both fixed and verified, so main holds no known P1. The full-workspace pre-merge audit additionally caught 3 downstream tests that encoded the pre-R1-04 credential-name leak across `#[from]` boundaries — corrected (`e7fdbb0`). The 18 fix commits + the pre-merge PROGRESS chore (`06c46a1`) landed via `--no-ff` merge **`84d84b3`** (`68b045d..84d84b3`), pushed to origin, branch `phase-3b/sweep-fortress` deleted. Prior milestone: `die/orchestrator/` sweep merged `ab1ffc7`.)
-Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increments 1a (root-anchor keystone) + 1b (sibling-topology F1 + private channel) + 1c (consent path: token + PAM + logind) are BUILT + GREEN** on branch `runtime/increment-1a`. In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
-Current task: **Increment 1c — the consent path (daemon-owned PAM over the private channel + logind active-local gate + digest-bound token mint) + its three attack tests — COMPLETE as a build/test checkpoint; HOLDING for operator review before 1d.** Per the 1a/1d plan, 1a–1c do NOT get their own Codex review — the single implementation review is batched at the end of 1d.
-Current step: the consent the AI cannot fabricate is proven across three surfaces — token (digest-binding), PAM (routing-over-private-channel, composed with 1b's channel-privacy), logind (decision + forge-resistance, live query proven, provisioning deferred). **Next: Increment 1d (canonical PendingAction + sandbox + execute, the single Biometric action end-to-end) + the one batched Codex implementation review.**
-Status: **1a + 1b + 1c COMPLETE + GREEN.** `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean. raven: 12 lib unit + 6 doctest + the 3 logind_gate tests pass; privileged integration self-skips. **root (WSL2-root lane): anchor both-halves+RED, live-systemd smoke, F1 sibling-denied+ancestor-RED, AND PAM interposition-denied+shared-surface-RED all pass.** RED-proofs: anchor user-owned-dir, systemd `User=`-flip, F1 ancestor-theft (each demonstrated+reverted); token replay (positive control), PAM shared-surface observe (positive control), logind same-uid-signal forge (positive control).
-Tests passing: the `delphi-runtime` crate has **12 lib unit + 6 doctest + 10 integration (7 privileged root-gated: 2 anchor + 2 sibling-fd-theft + 1 systemd smoke + 2 PAM interposition; 3 no-root logind_gate)**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
+Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increments 1a–1d are ALL BUILT + GREEN** on branch `runtime/increment-1a`; the full 1a→1d boundary composes end-to-end. **Next: the single batched Codex IMPLEMENTATION review** of the whole 1a–1d boundary (the inverse of the design rounds — does the code faithfully implement the ratified model). In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
+Current task: **Increment 1d — the capstone (canonical `PendingAction` + sandbox + execute + audit, the divergence property, one Biometric action end-to-end) — COMPLETE as a build/test checkpoint.** Per the 1a/1d plan, 1a–1d get NO per-increment Codex review — the **single implementation review** is batched now, at the 1d boundary.
+Current step: the divergence property is proven — preview/approval-digest/sandbox-profile/audit all derive from the one canonical object (RED: decouple one → diverges); the swap-proof fd-exec (`/proc/self/fd/N`) + the token gate (approve-A/execute-B closed); audit = approval + reality. **The end-to-end composes 1a→1d for one Biometric action under root. Next: the single 1a–1d implementation review (prompt prepared; operator runs Codex).**
+Status: **1a + 1b + 1c + 1d COMPLETE + GREEN.** `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean. raven: **23 lib unit + 8 doctest** pass + no-root integration (divergence 2, logind_gate 3, sandbox_reentry 2); root-gated self-skips. **root (WSL2-root lane): anchor 2, sibling_fd_theft 2, systemd_smoke 1, pam_interposition 2, end_to_end 1 all pass.** RED-proofs across the boundary: anchor user-owned-dir; systemd `User=`-flip; F1 ancestor-theft; token replay; PAM shared-surface; logind same-uid-signal; sandbox broadening-derivation + socket-bound-reentry; execute path-swap + ungated-run; audit synthesized-outcome; divergence decoupled-execution (each demonstrated/positive-control).
+Tests passing: the `delphi-runtime` crate has **23 lib unit + 8 doctest + 15 integration (8 privileged root-gated: 2 anchor + 2 sibling-fd-theft + 1 systemd smoke + 2 PAM interposition + 1 end-to-end; 7 no-root: 2 divergence + 3 logind_gate + 2 sandbox_reentry)**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol at the post-review merge). Real exit codes per §13.4.
 
 ## Runtime arc — STOP-POINT-B PASSED + Increment 1a (root anchor) GREEN (2026-06-20)
 
@@ -106,12 +106,39 @@ New crate deps: `hmac`/`sha2` (token); `pam-client2` MPL-2.0 + `pam-sys2` MIT/Ap
 Build dep: `libpam0g-dev` (the daemon links libpam). The token + logind RED-proofs run in
 **normal CI** (no root); the PAM interposition test is privileged.
 
-**MANDATORY PRIVILEGED-LANE GATE (record for the 1d review):** the privileged tests are
-**EUID-gated** (not `#[ignore]`d): non-root → skip with the exact invocation; root → run. They do
-NOT run in normal CI (no systemd/second-uid/Yama-controlled host there). They are a **required
-named gate at the 1d implementation-review boundary**, run via the WSL2-root lane:
-`wsl -u root -- env -C /mnt/c/dev/Delphi PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test sibling_fd_theft --test systemd_smoke --test pam_interposition -- --test-threads=1`.
-A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a/1b/1c blocker).
+**Increment 1d — the capstone — built and green** on the same branch. The canonical spine +
+the divergence property + one Biometric action end-to-end. Adds to `runtime/`:
+- **`action`** — the canonical `PendingAction` + `canonical_action_digest` (the leverage
+  `CanonicalHasher` under a no-`..` exhaustive destructure: every field bound, a new field fails
+  to compile until hashed) + `preview` (the human-readable rendering, one of the four
+  derivations). Deps grew by `delphi-hardening`.
+- **`sandbox`** — `SandboxProfile` derived from the approved scope (default-deny `--unshare-all`
+  + `--proc`/`--dev` jail-infrastructure + approved binds + net none/full). Two-part "sandbox =
+  approval": scope-approved (digest) + **enforcement-faithful** (derivation test, RED on a
+  broadening `--bind`-where-`--ro-bind` variant) + **reentry-contained** (bwrap+python3 attack
+  test: the jailed tool can't reach the daemon socket; RED on socket-bound-in) + net-type-enforced.
+- **`execute`** — the gate (`token::verify` vs the canonical digest **before** any exec) + the
+  **swap-proof fd-exec** (`/proc/self/fd/N` inside the jail — `execve` resolves the pinned inode;
+  Approach A `--ro-bind` was measured NOT swap-proof and rejected). RED-proofs: path-re-resolving
+  variant runs the swapped binary; ungated path runs the unapproved action.
+- **`audit`** — `RuntimeAuditEntry`: approved-action fields from the object (no-`..`, audit =
+  approval) + outcome wired from the **real** `execute_approved` return (audit = reality; RED on
+  a synthesized outcome).
+- **divergence test** — the four derivations from the one object cannot diverge (bound-file
+  observable); RED decouples execution from the object → preview-X/run-Y.
+- **end-to-end** — one Biometric action through **1a→1d** under root: anchor → channel → live PAM
+  consent over the channel → token mint → token-gated sandbox execute → audit. The chain composes.
+
+New crate deps: `delphi-hardening` (canonical hash); the logind FFI added no cargo dep (own MIT
+binding). bwrap runs unprivileged → sandbox/execute/divergence/audit RED-proofs are **normal-CI**;
+only the anchor/F1/systemd/PAM/end-to-end suites are privileged.
+
+**MANDATORY PRIVILEGED-LANE GATE (run NOW, at the 1d implementation review):** the privileged
+tests are **EUID-gated** (not `#[ignore]`d): non-root → skip with the exact invocation; root →
+run. They do NOT run in normal CI (no systemd/second-uid/Yama/root host there). Run via the
+WSL2-root lane:
+`wsl -u root -- env -C /mnt/c/dev/Delphi PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test sibling_fd_theft --test systemd_smoke --test pam_interposition --test end_to_end -- --test-threads=1`.
+A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a–1d blocker).
 
 ## Leverage pass (`infra/leverage-pass`) — CLOSE-OUT: P0–P5 COMPLETE, MERGED at v0.4.1 `b1bf565` (2026-06-15)
 

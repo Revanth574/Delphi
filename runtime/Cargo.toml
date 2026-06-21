@@ -24,7 +24,7 @@ path = "src/bin/delphi-runtimed.rs"
 # Syscall layer (§13.7: reuse the workspace's existing nix 0.30; add the feature
 # gates 1a needs — `user` for set{groups,gid,uid}/geteuid, `fs` for chown/unlink,
 # `process` for fork/execve used by the child-drop path).
-nix = { version = "0.30", features = ["user", "fs", "process"] }
+nix = { version = "0.30", features = ["user", "fs", "process", "socket", "signal"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

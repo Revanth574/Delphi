@@ -8,21 +8,29 @@
 //! same-uid attacker cannot pre-empt, substitute, or unlink, while the
 //! legitimate same-uid client can still `connect()`.
 //!
-//! # Scope of 1a (deliberately narrow)
+//! # Scope (Increments 1a–1b, built bottom-up)
 //!
-//! 1a establishes and proves the **anchor** in isolation. It contains ONLY:
+//! Each layer is proven in isolation before the next. So far:
 //!
-//! * [`anchor`] — create the root-owned runtime directory (mode `0711`) and bind
-//!   the approval socket inside it (mode `0660`, group-owned by the session user
-//!   so it stays connectable) — the running-code form of "unsubstitutable YET
-//!   connectable".
-//! * [`privdrop`] — the canonical child privilege-drop
+//! * [`anchor`] (1a) — create the root-owned runtime directory (mode `0711`) and
+//!   bind the approval socket inside it (mode `0660`, group-owned by the session
+//!   user so it stays connectable) — the running-code form of "unsubstitutable
+//!   YET connectable".
+//! * [`privdrop`] (1a) — the canonical child privilege-drop
 //!   (`setgroups([]) → setgid → setuid`, in that load-bearing order) behind a
 //!   mockable seam so the *order* is unit-testable without root.
+//! * [`channel`] (1b) — the private `SOCK_SEQPACKET` approval channel
+//!   (daemon end + shell end).
+//! * [`fdsec`] (1b) — the `close_range(CLOEXEC|UNSHARE)` fd-discipline that keeps
+//!   the approval fd out of every child except the shell.
+//! * [`pidfd`] (1b) — pinning the spawned shell by pidfd (R3-03). The sibling
+//!   topology means a same-uid *sibling* AI cannot `pidfd_getfd` the shell's
+//!   approval fd under Yama `ptrace_scope=1` — the F1 defense the 1b attack test
+//!   proves.
 //!
-//! It does NOT contain the private approval channel, PAM consent, token mint,
-//! sandbox, or execute — those are Increments 1b–1d, added on top of this proven
-//! anchor and reviewed together at the end of 1d.
+//! It does NOT yet contain PAM consent, token mint, the canonical action,
+//! sandbox, or execute — those are Increments 1c–1d, added on top and reviewed
+//! together at the end of 1d.
 //!
 //! # Fidelity
 //!
@@ -36,9 +44,14 @@
 use std::path::PathBuf;
 
 pub mod anchor;
+pub mod channel;
+pub mod fdsec;
+pub mod pidfd;
 pub mod privdrop;
 
 pub use anchor::{bind_approval_socket, ensure_runtime_dir, AnchorPaths};
+pub use channel::approval_socketpair;
+pub use fdsec::mark_cloexec_except;
 pub use privdrop::{drop_privileges, PrivDropOps, RealPrivDropOps};
 
 /// Errors from establishing or operating the root anchor.

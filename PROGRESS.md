@@ -1,11 +1,11 @@
 # Delphi OS — Progress State
 
 Last updated: 2026-06-15 (**Leverage pass MERGED to main at v0.4.1 (`b1bf565`)** after a 2-round Codex review — primitives confirmed byte-identical (round-1), R1-01 test-fix (round-2 APPROVE); see the close-out section. Earlier milestones below. INF-1 (API-key Debug redaction) **FIXED + Codex APPROVE, 0 findings**, merged via `fix/inf-1-apikey-redaction` — the first `CODEBASE_REVIEW` security candidate triaged; see the INF-1 section below. Prior milestone — Phase 3B.0 — **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED TO MAIN `84d84b3`**. The FINAL Phase 3B.0 sweep — **Phase 3B.0 is now CLOSED** (the D-Bus boundary `services/`, `die/orchestrator/`, and the security layer `fortress/` have all been swept and merged). Three adversarial Codex rounds + one scoped re-verification: **R1 FAIL (5 findings) → R2 FAIL (4 findings) → R3 FAIL (1 composition-seam regression) → R3-reverify APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **7 pre-review fixes** and **3 dead detection paths wired before round 1** (the "fix what you find" discipline). Severities are Codex's actual verdicts — **two P1s** (FORT-R1-01 the silent ZKQP PII leak that justified the sweep; FORT-R2-01 the digit-completeness class), both fixed and verified, so main holds no known P1. The full-workspace pre-merge audit additionally caught 3 downstream tests that encoded the pre-R1-04 credential-name leak across `#[from]` boundaries — corrected (`e7fdbb0`). The 18 fix commits + the pre-merge PROGRESS chore (`06c46a1`) landed via `--no-ff` merge **`84d84b3`** (`68b045d..84d84b3`), pushed to origin, branch `phase-3b/sweep-fortress` deleted. Prior milestone: `die/orchestrator/` sweep merged `ab1ffc7`.)
-Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increment 1a (the root-anchor keystone) is BUILT + GREEN** on branch `runtime/increment-1a`. In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
-Current task: **Increment 1a — root-established launcher + root-owned socket — COMPLETE as a build/test checkpoint; HOLDING for operator review before 1b.** Per the 1a/1d plan, 1a does NOT get its own Codex review — the single implementation review is batched at the end of 1d.
-Current step: the anchor is proven in running code — the both-halves test (**unsubstitutable YET connectable**) + the RED-proof, run as root via the WSL2-root lane. **Next: Increment 1b (pidfd-pinned shell + private approval channel) after operator review.**
-Status: **1a COMPLETE + GREEN** (kernel property AND production mechanism both proven). `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; raven: 3 lib unit + 3 doctest pass, privileged integration self-skips; **root (WSL2-root lane): both-halves + RED-proof + live-systemd smoke-test pass**; literal RED-proofs demonstrated (anchor assertion fails on a user-owned dir; `User=` flips RuntimeDirectory to user-owned) and reverted.
-Tests passing: the `delphi-runtime` crate adds **3 lib unit + 3 privileged integration (root-gated: 2 anchor + 1 systemd smoke) + 3 doctests**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
+Current phase: **Runtime arc — STOP-POINT-B PASSED.** The runtime trust model is **RATIFIED** (`docs/TRUST_MODEL.md` @ `0065919`, after a **6-round Codex adversarial review → APPROVE, 0 findings**). **Increments 1a (root-anchor keystone) + 1b (sibling-topology F1 + private channel) are BUILT + GREEN** on branch `runtime/increment-1a`. In parallel: the focused-fix queue (SFS-1, BVB-3/4, regex migration, date-scope triage `task_71334ce4`). Prior milestones: leverage pass MERGED `b1bf565` (v0.4.1); Phase 3B.0 `fortress/` sweep MERGED `84d84b3`; INF-1 merged `f0f626e`.
+Current task: **Increment 1b — first child-spawn (pidfd-pinned shell + private SOCK_SEQPACKET channel + fd-discipline) + the F1 sibling-fd-theft test — COMPLETE as a build/test checkpoint; HOLDING for operator review before 1c.** Per the 1a/1d plan, 1a–1c do NOT get their own Codex review — the single implementation review is batched at the end of 1d.
+Current step: F1 proven in running code — a same-uid SIBLING AI is DENIED `pidfd_getfd` of the shell's approval fd (Yama scope=1, at dumpable=1 → topology load-bearing), with the ancestor-topology RED-proof. **Next: Increment 1c (daemon-PAM consent + logind gate + token mint) after operator review.**
+Status: **1a + 1b COMPLETE + GREEN.** `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; raven: 5 lib unit + 5 doctest pass, privileged integration self-skips; **root (WSL2-root lane): anchor both-halves + RED-proof, live-systemd smoke-test, AND F1 sibling-denied + ancestor-RED all pass**; literal RED-proofs demonstrated (anchor: user-owned dir; systemd: `User=` flip; F1: ancestor-topology theft) and reverted.
+Tests passing: the `delphi-runtime` crate has **5 lib unit + 5 privileged integration (root-gated: 2 anchor + 2 sibling-fd-theft + 1 systemd smoke) + 5 doctests**; workspace baseline remains **1,891 Rust + 94 TS** (full-workspace re-count + the 8-step phase-end protocol run at the **1d** boundary, not per-increment). Real exit codes per §13.4.
 
 ## Runtime arc — STOP-POINT-B PASSED + Increment 1a (root anchor) GREEN (2026-06-20)
 
@@ -50,12 +50,40 @@ Proof (running code, the analogue of the review findings):
   (throwaway, reverted): the same `RuntimeDirectory=` with `User=%i` flips the dir to
   user-owned — the anchor lost — proving the smoke test bites the no-`User=` property.
 
-**MANDATORY PRIVILEGED-LANE GATE (record for the 1d review):** the both-halves test and the
-RED-proof are **EUID-gated** (not `#[ignore]`d): non-root → skip with the exact invocation;
-root → run. They do NOT run in normal CI (no systemd/second-uid there). They are a **required
+**Increment 1b — first child-spawn + the F1 defense — built and green** on the same branch, on
+top of 1a. Adds to the `runtime/` crate: `channel` (the private `SOCK_SEQPACKET` approval
+socketpair — daemon end + shell end), `fdsec` (the `close_range(CLOSE_RANGE_CLOEXEC |
+CLOSE_RANGE_UNSHARE)` fd-discipline — **marks** close-on-exec, does NOT close — plus the
+kept-fd un-mark), `pidfd` (the daemon's race-free pin of the spawned shell, R3-03). Scope is
+exactly 1b — spawn-topology + channel + fd-discipline + the attack test; NO PAM/consent/token/
+sandbox/execute (1c–1d). Deps still syscall-layer only (nix features grown to `socket`+`signal`).
+
+F1 proof (running code — the review's strongest result):
+- **Sibling-fd-theft test** (`f1_sibling_cannot_steal_shell_fd`, root lane): the daemon parents
+  BOTH the shell and the AI (same throwaway uid), so the AI is the shell's SIBLING; the AI's
+  `pidfd_getfd` of the shell's approval fd is **DENIED** (Yama `ptrace_scope=1`). Proven at
+  **`PR_SET_DUMPABLE=1`** → the denial is the sibling TOPOLOGY (load-bearing), `dumpable=0` is
+  belt-and-suspenders (the round-3 distinction, in code).
+- **RED-proof** (`red_proof_ancestor_can_steal_shell_fd`, durable positive control): when the AI
+  is the shell's ANCESTOR (AI forks the shell, then drops to the same uid) the theft SUCCEEDS —
+  proving the denial bites the not-ancestor property, not something incidental. Directionality
+  nailed (attacker-as-ancestor, not -as-child which stays green for the wrong reason). Literal RED
+  demonstrated (throwaway: the F1 denial assertion run against the ancestor topology fails) and
+  reverted.
+- **Unit (normal CI, no root):** `channel` is a connected SEQPACKET pair (send/recv a byte);
+  `fdsec::mark_cloexec_except` sets CLOEXEC on a non-kept fd and clears it on the kept fd.
+
+**DEPLOY REQUIREMENT (1b):** Yama `kernel.yama.ptrace_scope = 1` (a boot-time sysctl, NOT a
+per-user unit setting) — the sibling defense is conditional on it (the trust model already names
+it). The F1 test is gated on `scope == 1` (skips with a clear deploy-requirement message
+otherwise; WSL2 has it `=1`).
+
+**MANDATORY PRIVILEGED-LANE GATE (record for the 1d review):** the privileged tests are
+**EUID-gated** (not `#[ignore]`d): non-root → skip with the exact invocation; root → run. They do
+NOT run in normal CI (no systemd/second-uid/Yama-controlled host there). They are a **required
 named gate at the 1d implementation-review boundary**, run via the WSL2-root lane:
-`wsl -u root -- env -C /mnt/c/dev/Delphi /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test systemd_smoke -- --test-threads=1`.
-A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a blocker).
+`wsl -u root -- env -C /mnt/c/dev/Delphi /home/raven/.cargo/bin/cargo test -p delphi-runtime --test anchor --test sibling_fd_theft --test systemd_smoke -- --test-threads=1`.
+A privileged CI job is DEFERRED to Phase 3B/3C cross-OS CI (tracked, not a 1a/1b blocker).
 
 ## Leverage pass (`infra/leverage-pass`) — CLOSE-OUT: P0–P5 COMPLETE, MERGED at v0.4.1 `b1bf565` (2026-06-15)
 

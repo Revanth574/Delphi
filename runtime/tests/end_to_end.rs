@@ -35,7 +35,7 @@ use nix::unistd::{fork, geteuid, ForkResult, Gid, Uid, User};
 
 use delphi_runtime::action::{canonical_action_digest, preview, BindMode, NetPolicy, PendingAction, RequiredTier};
 use delphi_runtime::audit::{ExecOutcome, RuntimeAuditEntry};
-use delphi_runtime::execute::execute_approved;
+use delphi_runtime::execute::{execute_approved, ConsumptionLedger};
 use delphi_runtime::sandbox::SandboxProfile;
 use delphi_runtime::token::{mint, MintingKey};
 use delphi_runtime::{approval_socketpair, bind_approval_socket, drop_privileges, ensure_runtime_dir, RealPrivDropOps};
@@ -163,7 +163,7 @@ fn one_biometric_action_through_1a_to_1d() {
     let token = mint(&key, &digest, NOW);
 
     // ---- 1d: token-gated execute in the sandbox + audit the real outcome. ----
-    let real = execute_approved(&action, &token, &key, NOW);
+    let real = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
     let observed = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
     let entry = RuntimeAuditEntry::record(&action, &SandboxProfile::derive(&action), &real, NOW);
 

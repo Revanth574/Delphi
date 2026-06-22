@@ -30,7 +30,7 @@ use delphi_runtime::action::{
     canonical_action_digest, preview, BindMode, NetPolicy, PendingAction, RequiredTier,
 };
 use delphi_runtime::audit::RuntimeAuditEntry;
-use delphi_runtime::execute::execute_approved;
+use delphi_runtime::execute::{execute_approved, ConsumptionLedger};
 use delphi_runtime::sandbox::SandboxProfile;
 use delphi_runtime::token::{mint, MintingKey};
 
@@ -142,7 +142,7 @@ fn the_four_derivations_cannot_diverge() {
     let key = MintingKey::from_bytes([1u8; 32]);
     let token = mint(&key, &digest, NOW);
 
-    let real = execute_approved(&action, &token, &key, NOW);
+    let real = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
     let observed = read_result(&env.result);
     let entry = RuntimeAuditEntry::record(&action, &profile, &real, NOW);
 

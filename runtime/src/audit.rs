@@ -144,7 +144,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::action::{BindMode, NetPolicy};
-    use crate::execute::execute_approved;
+    use crate::execute::{execute_approved, ConsumptionLedger};
     use crate::token::{mint, MintingKey};
 
     const NOW: u64 = 1_000;
@@ -294,7 +294,7 @@ mod tests {
         let key = MintingKey::from_bytes([1u8; 32]);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
-        let real = execute_approved(&action, &token, &key, NOW);
+        let real = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
         let audit = RuntimeAuditEntry::record(&action, &profile, &real, NOW);
         assert_eq!(
             audit.exit_code,

@@ -179,12 +179,31 @@ pub fn canonical_action_digest(action: &PendingAction) -> [u8; 32] {
     h.finish().expect("declared 11 top-level fields, appended 11")
 }
 
+/// Lowercase hex of a 32-byte digest (a content fingerprint for the preview).
+fn hex32(d: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for b in d {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// The human-readable rendering of the action — what the human approves.
 ///
 /// One of the four derivations from the canonical object (preview / approval-digest
-/// / sandbox-profile / audit). It is the arbiter's rendering of the *exact* action
-/// (never AI text, never derived from observed content — `docs/TRUST_MODEL.md` §3):
-/// what the human sees is what the digest binds and what the sandbox executes.
+/// / sandbox-profile / audit). It is the arbiter's rendering (never AI text, never
+/// derived from observed content — `docs/TRUST_MODEL.md` §3): what the human sees is
+/// what the digest binds and what the sandbox executes.
+///
+/// It renders **every behaviour-affecting field** — argv, cwd, env-delta, fs-binds,
+/// net policy, timeout, tier, the executable content fingerprint, and (for scripts)
+/// the interpreter + script content fingerprints — so the prompt-injection defence
+/// holds: the human can inspect everything that affects what runs, and any change to
+/// a behaviour-affecting field changes the preview. The only fields NOT rendered are
+/// `pending_id` (a single-use id) and `preview_version` (the rendering's own schema
+/// version) — metadata that does not affect what executes; both are still bound by
+/// the digest.
 ///
 /// # Examples
 ///
@@ -195,11 +214,12 @@ pub fn canonical_action_digest(action: &PendingAction) -> [u8; 32] {
 ///     pending_id: "p".into(), preview_version: 1,
 ///     executable_fd: std::fs::File::open("/dev/null").unwrap().into(),
 ///     executable_digest: [0; 32], argv: vec!["echo".into(), "hi".into()],
-///     cwd: "/".into(), env_delta: vec![], fs_binds: vec![],
-///     net_policy: NetPolicy::None, timeout: Duration::from_secs(30),
+///     cwd: "/".into(), env_delta: vec![("K".into(), "V".into())],
+///     fs_binds: vec![], net_policy: NetPolicy::None, timeout: Duration::from_secs(30),
 ///     required_tier: RequiredTier::Biometric, script: None,
 /// };
-/// assert!(preview(&a).contains("echo hi"));
+/// let p = preview(&a);
+/// assert!(p.contains("echo hi") && p.contains("K=V"));
 /// ```
 #[must_use]
 pub fn preview(action: &PendingAction) -> String {
@@ -215,15 +235,32 @@ pub fn preview(action: &PendingAction) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let env = action
+        .env_delta
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let net = match action.net_policy {
         NetPolicy::None => "none",
         NetPolicy::Full => "full",
     };
+    let script = match &action.script {
+        None => "none".to_string(),
+        Some(sp) => format!(
+            "interp:{} content:{}",
+            hex32(&sp.interpreter_digest),
+            hex32(&sp.script_digest)
+        ),
+    };
     format!(
-        "Run: {}\n  cwd: {}\n  net: {net}\n  binds: [{binds}]\n  tier: {:?}",
+        "Run: {}\n  cwd: {}\n  env: [{env}]\n  net: {net}\n  binds: [{binds}]\n  \
+         timeout: {}s\n  tier: {:?}\n  exe: {}\n  script: {script}",
         action.argv.join(" "),
         action.cwd.display(),
+        action.timeout.as_secs(),
         action.required_tier,
+        hex32(&action.executable_digest),
     )
 }
 
@@ -316,5 +353,41 @@ mod tests {
         let mut exe = sample();
         exe.executable_digest = [0xCD; 32];
         assert_ne!(base, canonical_action_digest(&exe), "executable content binds");
+    }
+
+    /// RUNTIME-1D-04: the preview renders EVERY behaviour-affecting field — changing
+    /// any one changes the rendered preview (so the human inspects what execs).
+    #[test]
+    fn preview_renders_every_behavior_affecting_field() {
+        let base = preview(&sample());
+        let with = |f: &dyn Fn(&mut PendingAction)| {
+            let mut a = sample();
+            f(&mut a);
+            preview(&a)
+        };
+        assert_ne!(base, with(&|a| a.argv.push("EXTRA".into())), "argv rendered");
+        assert_ne!(base, with(&|a| a.cwd = PathBuf::from("/other")), "cwd rendered");
+        assert_ne!(base, with(&|a| a.env_delta.push(("X".into(), "Y".into()))), "env_delta rendered");
+        assert_ne!(
+            base,
+            with(&|a| a.fs_binds.push((PathBuf::from("/extra"), BindMode::ReadWrite))),
+            "fs_binds rendered"
+        );
+        assert_ne!(base, with(&|a| a.net_policy = NetPolicy::Full), "net_policy rendered");
+        assert_ne!(base, with(&|a| a.timeout = Duration::from_secs(99)), "timeout rendered");
+        assert_ne!(base, with(&|a| a.required_tier = RequiredTier::Autonomous), "tier rendered");
+        assert_ne!(base, with(&|a| a.executable_digest = [0xCD; 32]), "executable fingerprint rendered");
+        assert_ne!(
+            base,
+            with(&|a| {
+                a.script = Some(ScriptPin {
+                    interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
+                    interpreter_digest: [0x01; 32],
+                    script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
+                    script_digest: [0x02; 32],
+                });
+            }),
+            "script interpreter/content fingerprints rendered"
+        );
     }
 }

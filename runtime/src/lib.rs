@@ -118,4 +118,11 @@ pub enum RuntimeError {
     /// action's canonical digest, so the action is unapproved and is not run.
     #[error("execution denied: no valid approval token for this action (the 1c consent gate)")]
     Unapproved,
+
+    /// The action's approval was already consumed (Increment 1d — one-shot,
+    /// `docs/TRUST_MODEL.md` §4: "the arbiter consumes it one-shot"). One human
+    /// approval authorizes ONE execution, not repeated execution within the token
+    /// TTL (closes approve-once/execute-many).
+    #[error("execution denied: this action's approval was already consumed (one-shot — TRUST_MODEL.md §4)")]
+    AlreadyConsumed,
 }

@@ -125,4 +125,11 @@ pub enum RuntimeError {
     /// TTL (closes approve-once/execute-many).
     #[error("execution denied: this action's approval was already consumed (one-shot — TRUST_MODEL.md §4)")]
     AlreadyConsumed,
+
+    /// A pinned script's content memfd is not write-sealed (`F_SEAL_WRITE`), so its
+    /// bytes could be mutated between the digest and the exec (Increment 1d — R4-02).
+    /// The ratified mechanism is interpreter-pinned AND script-sealed; an unsealed
+    /// script is refused before any exec path, closing the content-mutation window.
+    #[error("execution denied: the script content is not write-sealed (F_SEAL_WRITE) — it could be mutated after approval (TRUST_MODEL.md §4, R4-02)")]
+    UnsealedScript,
 }

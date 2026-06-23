@@ -13,12 +13,19 @@
 //! `UNSHARE` detaches the fd table first so the marking cannot race a sibling
 //! thread. The kept fds then have `CLOEXEC` cleared so they survive the exec.
 
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::RawFd;
 
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
 use crate::RuntimeError;
+
+// Used only by the test-only single-fd helper `clear_cloexec` and the test module
+// (the production fd-discipline un-marks kept fds inline, allocation-free, in
+// `mark_cloexec_except_raw`).
+#[cfg(test)]
+use std::os::fd::BorrowedFd;
+#[cfg(test)]
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
 /// Mark every fd `>= 3` close-on-exec except those in `keep`.
 ///
@@ -30,8 +37,28 @@ use crate::RuntimeError;
 ///
 /// [`RuntimeError::Syscall`] if `close_range` or the per-fd `fcntl` fails.
 pub fn mark_cloexec_except(keep: &[RawFd]) -> Result<(), RuntimeError> {
+    mark_cloexec_except_raw(keep)
+        .map_err(|source| RuntimeError::Syscall { op: "fd-discipline (close_range/fcntl)", source })
+}
+
+/// Async-signal-safe core of [`mark_cloexec_except`] — raw `close_range`/`fcntl`
+/// syscalls only, returning the failing [`Errno`] on error and **allocating
+/// nothing**.
+///
+/// This is the variant the post-`fork` child runs inside
+/// [`std::os::unix::process::CommandExt::pre_exec`] (`execute.rs`): between `fork`
+/// and `execve` the child must call only async-signal-safe operations — a heap
+/// allocation could deadlock on the allocator lock if it was held by a thread that
+/// did not survive the fork. `Errno` is a plain `i32`, so the caller maps it to an
+/// `io::Error` via `from_raw_os_error` (which wraps the integer — no `Box`), never
+/// `io::Error::other` (which allocates). [`mark_cloexec_except`] is the ergonomic
+/// [`RuntimeError`] wrapper for pre-fork callers; both share this one implementation
+/// of the discipline.
+pub(crate) fn mark_cloexec_except_raw(keep: &[RawFd]) -> Result<(), Errno> {
     // SAFETY: `close_range` with CLOSE_RANGE_CLOEXEC only sets the close-on-exec
-    // flag across the descriptor range; it closes nothing and touches no memory.
+    // flag across the range (it closes nothing); UNSHARE detaches the fd table first
+    // so the marking cannot race a sibling thread. `Errno::last` reads the
+    // thread-local errno. No allocation — async-signal-safe.
     let rc = unsafe {
         nix::libc::close_range(
             3,
@@ -40,15 +67,33 @@ pub fn mark_cloexec_except(keep: &[RawFd]) -> Result<(), RuntimeError> {
         )
     };
     if rc != 0 {
-        return Err(RuntimeError::Syscall { op: "close_range", source: Errno::last() });
+        return Err(Errno::last());
     }
     for &fd in keep {
-        clear_cloexec(fd)?;
+        // SAFETY: raw fcntl on a descriptor the caller owns across the call; reads
+        // then clears FD_CLOEXEC so the kept fd survives execve. No allocation.
+        let cleared = unsafe {
+            let bits = nix::libc::fcntl(fd, nix::libc::F_GETFD);
+            if bits < 0 {
+                return Err(Errno::last());
+            }
+            nix::libc::fcntl(fd, nix::libc::F_SETFD, bits & !nix::libc::FD_CLOEXEC)
+        };
+        if cleared < 0 {
+            return Err(Errno::last());
+        }
     }
     Ok(())
 }
 
 /// Clear the `CLOEXEC` flag on a single fd so it survives `execve`.
+///
+/// Test-only: the production fd-discipline un-marks the kept fds inline inside
+/// [`mark_cloexec_except_raw`] (which must stay allocation-free for the post-`fork`
+/// `pre_exec` path). This single-fd helper is used only by the `execute` tests to
+/// stage non-`CLOEXEC` fds; gating it on `cfg(test)` keeps it from being dead code
+/// in production builds without an `#[allow(dead_code)]`.
+#[cfg(test)]
 pub(crate) fn clear_cloexec(fd: RawFd) -> Result<(), RuntimeError> {
     // SAFETY: borrow the raw fd for the duration of the two fcntl calls; the
     // borrow does not outlive the descriptor (the caller owns it across the call).

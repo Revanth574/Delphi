@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use delphi_hardening::canonical_hash::CanonicalHasher;
+use sha2::{Digest, Sha256};
 
 /// Network policy for the sandboxed action. Honest scopes only (R3/F5): `bwrap`
 /// can switch the net namespace on or off, but cannot enforce a host allowlist.
@@ -189,6 +190,23 @@ fn hex32(d: &[u8; 32]) -> String {
     s
 }
 
+/// A short, non-reversible fingerprint of an env value (first 8 bytes of its
+/// SHA-256, hex). The preview shows WHICH env vars are set and whether a value
+/// changed — without exposing the value itself. Env values are a classic secret
+/// location (API keys, tokens, passwords), so the preview renders their presence
+/// and identity, never their plaintext; the digest still binds the full value.
+fn value_fingerprint(v: &str) -> String {
+    use std::fmt::Write as _;
+    let mut h = Sha256::new();
+    h.update(v.as_bytes());
+    let d: [u8; 32] = h.finalize().into();
+    let mut s = String::with_capacity(16);
+    for b in &d[..8] {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// The human-readable rendering of the action — what the human approves.
 ///
 /// One of the four derivations from the canonical object (preview / approval-digest
@@ -200,10 +218,22 @@ fn hex32(d: &[u8; 32]) -> String {
 /// net policy, timeout, tier, the executable content fingerprint, and (for scripts)
 /// the interpreter + script content fingerprints — so the prompt-injection defence
 /// holds: the human can inspect everything that affects what runs, and any change to
-/// a behaviour-affecting field changes the preview. The only fields NOT rendered are
-/// `pending_id` (a single-use id) and `preview_version` (the rendering's own schema
-/// version) — metadata that does not affect what executes; both are still bound by
-/// the digest.
+/// a behaviour-affecting field changes the preview.
+///
+/// Two renderings are deliberate, so "render everything" does not become "leak
+/// secrets" or "round away precision":
+/// * **env values** are shown as `KEY=#<fingerprint>` (key + a non-reversible
+///   SHA-256 prefix), never plaintext — env values are a classic secret location
+///   (API keys, tokens, passwords). The human sees WHICH vars are set and whether a
+///   value changed, without the secret being displayed; the digest still binds the
+///   full value.
+/// * **timeout** is rendered via `Duration`'s `Debug` (e.g. `30s`, `30.9s`), which
+///   carries the same nanosecond precision the digest binds (`timeout.as_nanos()`),
+///   so a sub-second change is visible — not rounded to whole seconds.
+///
+/// The only fields NOT rendered are `pending_id` (a single-use id) and
+/// `preview_version` (the rendering's own schema version) — metadata that does not
+/// affect what executes; both are still bound by the digest.
 ///
 /// # Examples
 ///
@@ -219,7 +249,8 @@ fn hex32(d: &[u8; 32]) -> String {
 ///     required_tier: RequiredTier::Biometric, script: None,
 /// };
 /// let p = preview(&a);
-/// assert!(p.contains("echo hi") && p.contains("K=V"));
+/// // env value is fingerprinted (key shown, value not), timeout at full precision.
+/// assert!(p.contains("echo hi") && p.contains("K=#") && !p.contains("K=V"));
 /// ```
 #[must_use]
 pub fn preview(action: &PendingAction) -> String {
@@ -238,7 +269,7 @@ pub fn preview(action: &PendingAction) -> String {
     let env = action
         .env_delta
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{k}=#{}", value_fingerprint(v)))
         .collect::<Vec<_>>()
         .join(", ");
     let net = match action.net_policy {
@@ -255,10 +286,10 @@ pub fn preview(action: &PendingAction) -> String {
     };
     format!(
         "Run: {}\n  cwd: {}\n  env: [{env}]\n  net: {net}\n  binds: [{binds}]\n  \
-         timeout: {}s\n  tier: {:?}\n  exe: {}\n  script: {script}",
+         timeout: {:?}\n  tier: {:?}\n  exe: {}\n  script: {script}",
         action.argv.join(" "),
         action.cwd.display(),
-        action.timeout.as_secs(),
+        action.timeout,
         action.required_tier,
         hex32(&action.executable_digest),
     )
@@ -374,7 +405,13 @@ mod tests {
             "fs_binds rendered"
         );
         assert_ne!(base, with(&|a| a.net_policy = NetPolicy::Full), "net_policy rendered");
-        assert_ne!(base, with(&|a| a.timeout = Duration::from_secs(99)), "timeout rendered");
+        // SUB-SECOND change (30.0s → 30.9s): the digest binds `as_nanos()`, so the
+        // preview must too — `as_secs()` would round both to "30s" and miss this.
+        assert_ne!(
+            base,
+            with(&|a| a.timeout = Duration::from_millis(30_900)),
+            "timeout rendered at the digest's (nanosecond) granularity, not whole seconds"
+        );
         assert_ne!(base, with(&|a| a.required_tier = RequiredTier::Autonomous), "tier rendered");
         assert_ne!(base, with(&|a| a.executable_digest = [0xCD; 32]), "executable fingerprint rendered");
         assert_ne!(
@@ -388,6 +425,34 @@ mod tests {
                 });
             }),
             "script interpreter/content fingerprints rendered"
+        );
+    }
+
+    /// RUNTIME-1D-04 (#4): the preview shows WHICH env vars are set and reflects a
+    /// value change (via a non-reversible fingerprint), but NEVER the plaintext
+    /// value — "render everything" must not become "leak secrets".
+    #[test]
+    fn preview_fingerprints_env_values_without_exposing_them() {
+        // A secret-shaped value must not appear in the preview.
+        let mut a = sample();
+        a.env_delta = vec![("API_KEY".into(), "sk-live-SUPERSECRET-9z".into())];
+        let p = preview(&a);
+        assert!(p.contains("API_KEY"), "the human sees WHICH env var is set");
+        assert!(
+            !p.contains("sk-live-SUPERSECRET-9z"),
+            "the secret VALUE must NOT appear in the preview — only key + fingerprint"
+        );
+
+        // A value change changes the preview (so the value's influence IS rendered),
+        // without either plaintext leaking.
+        let mut a1 = sample();
+        a1.env_delta = vec![("K".into(), "value-one".into())];
+        let mut a2 = sample();
+        a2.env_delta = vec![("K".into(), "value-two".into())];
+        assert_ne!(preview(&a1), preview(&a2), "an env value change changes the preview");
+        assert!(
+            !preview(&a1).contains("value-one") && !preview(&a2).contains("value-two"),
+            "neither raw value appears in its preview"
         );
     }
 }

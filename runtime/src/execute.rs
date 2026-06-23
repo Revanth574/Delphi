@@ -20,8 +20,12 @@
 //!    **pinned inode** (the one whose bytes were hashed), not a re-resolvable path
 //!    (verified: binding the path re-resolves and is NOT swap-proof; exec'ing the fd
 //!    is). For a **script** (R4-02) the **pinned interpreter** fd is exec'd with the
-//!    **sealed script memfd** as its argument — never the script fd, whose shebang
-//!    would re-resolve the interpreter by PATH. `--proc /proc` in the
+//!    script memfd as its argument — never the script fd, whose shebang would
+//!    re-resolve the interpreter by PATH. The script memfd's **write-seal is
+//!    verified** (`F_SEAL_WRITE` via `F_GET_SEALS`) before any exec path, so its
+//!    content cannot be mutated between the digest and the exec — interpreter-pinning
+//!    defeats interpreter-PATH-swap, sealing defeats script-CONTENT-mutation, and the
+//!    two together are the full R4-02 mechanism. `--proc /proc` in the
 //!    [`SandboxProfile`] makes `/proc/self/fd/N` resolve.
 //! 4. **fd-discipline (§6).** The 1b `fdsec` close-range runs in the child before
 //!    bwrap's exec, so no daemon fd (the approval channel, the anchor socket) leaks
@@ -31,6 +35,8 @@ use std::collections::HashSet;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
+
+use nix::errno::Errno;
 
 use crate::action::{canonical_action_digest, PendingAction};
 use crate::sandbox::SandboxProfile;
@@ -90,6 +96,27 @@ pub fn execute_approved(
     run_fd_pinned(action)
 }
 
+/// R4-02: a pinned script's content fd MUST be write-sealed (`F_SEAL_WRITE`) so its
+/// bytes cannot be mutated between the digest and the exec. Refuse a script memfd
+/// whose `F_GET_SEALS` lacks `F_SEAL_WRITE`.
+///
+/// # Errors
+///
+/// [`RuntimeError::Syscall`] if `F_GET_SEALS` fails; [`RuntimeError::UnsealedScript`]
+/// if the memfd is not write-sealed.
+fn require_write_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
+    // SAFETY: F_GET_SEALS reads the memfd's seal bitmask; it touches no caller memory
+    // and returns the seals (>= 0) or -1 with errno set.
+    let seals = unsafe { nix::libc::fcntl(script_fd, nix::libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(RuntimeError::Syscall { op: "fcntl F_GET_SEALS", source: Errno::last() });
+    }
+    if seals & nix::libc::F_SEAL_WRITE == 0 {
+        return Err(RuntimeError::UnsealedScript);
+    }
+    Ok(())
+}
+
 /// Build the bwrap invocation and execute the **fd-pinned** program inside it
 /// (`/proc/self/fd/N` — the swap-proof inode).
 ///
@@ -98,6 +125,13 @@ pub fn execute_approved(
 ///   the **sealed script memfd** as its argument — never the script fd, whose
 ///   shebang would re-resolve the interpreter by PATH.
 fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
+    // R4-02 (the OTHER half of script-pinning): a pinned script's content memfd must
+    // be write-sealed, so its bytes cannot be swapped after the digest was taken.
+    // Interpreter-pinning alone defeats interpreter-PATH-swap; sealing defeats
+    // script-CONTENT-mutation. Refuse a non-sealed script before any exec path.
+    if let Some(sp) = &action.script {
+        require_write_sealed(sp.script_memfd.as_raw_fd())?;
+    }
     // Which fd(s) the jailed tool must keep (the rest are closed before its exec).
     let (program_fd, script_arg_fd, keep): (RawFd, Option<RawFd>, Vec<RawFd>) =
         match &action.script {
@@ -134,10 +168,17 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // program fd(s). No daemon fd (the approval channel, the anchor socket, ...)
     // leaks into bwrap or the jailed tool; only the pinned program survives so
     // `/proc/self/fd/N` resolves.
-    // SAFETY: pre_exec runs in the forked child before execve; `mark_cloexec_except`
-    // performs only `close_range`/`fcntl` syscalls.
+    // SAFETY: pre_exec runs in the forked child between fork and execve, so it must
+    // be async-signal-safe and MUST NOT allocate (a malloc could deadlock on the
+    // allocator lock if a non-surviving thread held it). `mark_cloexec_except_raw`
+    // performs only `close_range`/`fcntl` + an errno read (no allocation), and
+    // `io::Error::from_raw_os_error` wraps the errno integer inline — never
+    // `io::Error::other`, which would `Box` (allocate).
     unsafe {
-        cmd.pre_exec(move || crate::fdsec::mark_cloexec_except(&keep).map_err(std::io::Error::other));
+        cmd.pre_exec(move || {
+            crate::fdsec::mark_cloexec_except_raw(&keep)
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
     }
     cmd.output().map_err(|source| RuntimeError::Filesystem {
         op: "spawn bwrap",
@@ -375,6 +416,56 @@ mod tests {
             assert_eq!(nix::libc::fcntl(fd, nix::libc::F_ADD_SEALS, seals), 0, "seal memfd");
             std::os::fd::OwnedFd::from_raw_fd(fd)
         }
+    }
+
+    /// An UNSEALED memfd holding `content` (`MFD_ALLOW_SEALING` but NO seals applied,
+    /// so its bytes can still be mutated) — the negative case for R4-02 sealing.
+    fn unsealed_memfd(content: &[u8]) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        // SAFETY: memfd_create returns a fresh fd; we write it and wrap once, applying
+        // NO seals — its content remains mutable.
+        unsafe {
+            let fd = nix::libc::memfd_create(
+                c"delphi-script-unsealed".as_ptr(),
+                (nix::libc::MFD_CLOEXEC | nix::libc::MFD_ALLOW_SEALING) as nix::libc::c_uint,
+            );
+            assert!(fd >= 0, "memfd_create");
+            let n = nix::libc::write(fd, content.as_ptr().cast(), content.len());
+            assert_eq!(n, content.len() as isize, "write memfd");
+            std::os::fd::OwnedFd::from_raw_fd(fd)
+        }
+    }
+
+    /// RUNTIME-1D-01 (SEALING half) — the ratified R4-02 mechanism is interpreter-
+    /// pinned AND script-WRITE-SEALED. An UNSEALED script memfd (its content could be
+    /// swapped after the digest) is REFUSED before any exec path — so the guarantee
+    /// bites the script-CONTENT-mutation threat, not only interpreter-PATH-swap. No
+    /// bwrap: the seal check precedes the spawn, so this runs in plain CI.
+    #[test]
+    fn unsealed_script_memfd_is_refused() {
+        let env = Env::new("unsealed");
+        let script_src = b"#!/bin/sh\n:\n";
+        let mut action =
+            build_action(&env.exe, &write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
+        action.script = Some(crate::action::ScriptPin {
+            interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_digest: sha256(b"interp"),
+            script_memfd: unsealed_memfd(script_src), // NOT sealed
+            script_digest: sha256(script_src),
+        });
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        // The token verifies (the digest binds the script_digest, not the seal state),
+        // the ledger consumes — then the seal check refuses before any exec.
+        let res = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+        assert!(
+            matches!(res, Err(RuntimeError::UnsealedScript)),
+            "RED: an UNSEALED script memfd must be REFUSED before exec — its content could be \
+             mutated after the digest was taken; only a write-sealed (F_SEAL_WRITE) script may \
+             run (R4-02). got {res:?}"
+        );
+        assert!(!env.result.exists(), "refused before any exec → no output");
     }
 
     /// RUNTIME-1D-01 — SCRIPT PINNING (R4-02): the pinned INTERPRETER fd runs even

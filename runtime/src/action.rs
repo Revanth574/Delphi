@@ -21,7 +21,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use delphi_hardening::canonical_hash::CanonicalHasher;
+use nix::errno::Errno;
 use sha2::{Digest, Sha256};
+
+use crate::RuntimeError;
 
 /// Network policy for the sandboxed action. Honest scopes only (R3/F5): `bwrap`
 /// can switch the net namespace on or off, but cannot enforce a host allowlist.
@@ -66,10 +69,98 @@ pub struct ScriptPin {
     pub interpreter_fd: OwnedFd,
     /// Hash of the bytes read through `interpreter_fd`.
     pub interpreter_digest: [u8; 32],
-    /// The sealed (`F_SEAL_WRITE`) script content.
+    /// The fully-sealed (immutable) script content memfd.
     pub script_memfd: OwnedFd,
     /// Hash of the sealed script content.
     pub script_digest: [u8; 32],
+}
+
+impl ScriptPin {
+    /// The full immutability seal set required of a pinned script's content memfd
+    /// (`docs/TRUST_MODEL.md` §3): `F_SEAL_WRITE` prevents content mutation,
+    /// `F_SEAL_SHRINK` + `F_SEAL_GROW` prevent length mutation (a write-seal alone
+    /// does NOT stop `ftruncate`), and `F_SEAL_SEAL` locks the seal set itself so it
+    /// cannot be relaxed. The execute path re-validates exactly this set.
+    pub(crate) const FULL_SEALS: i32 = nix::libc::F_SEAL_WRITE
+        | nix::libc::F_SEAL_SHRINK
+        | nix::libc::F_SEAL_GROW
+        | nix::libc::F_SEAL_SEAL;
+
+    /// Build a pinned script whose content memfd is FULLY sealed (immutable) and
+    /// whose `script_digest` is the SHA-256 of exactly those sealed bytes.
+    ///
+    /// This is the sanctioned constructor (defense in depth, R4-02): it applies the
+    /// full [`FULL_SEALS`](Self::FULL_SEALS) set at construction so the sealed bytes
+    /// and `script_digest` cannot disagree, and the execute path re-validates the
+    /// full set before any exec — content cannot mutate (write) and length cannot
+    /// mutate (shrink/grow) between the digest and the exec.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Syscall`] if `memfd_create` / `write` / `fcntl` fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use delphi_runtime::action::ScriptPin;
+    /// let interp = std::fs::File::open("/bin/sh").unwrap().into();
+    /// let pin = ScriptPin::sealed(interp, [0u8; 32], b"#!/bin/sh\n:\n").unwrap();
+    /// assert_eq!(pin.script_digest.len(), 32);
+    /// ```
+    pub fn sealed(
+        interpreter_fd: OwnedFd,
+        interpreter_digest: [u8; 32],
+        script_content: &[u8],
+    ) -> Result<Self, RuntimeError> {
+        let script_memfd = seal_immutable_memfd(script_content)?;
+        Ok(Self {
+            interpreter_fd,
+            interpreter_digest,
+            script_memfd,
+            script_digest: sha256(script_content),
+        })
+    }
+}
+
+/// Create a memfd holding `content` and seal it fully immutable
+/// ([`ScriptPin::FULL_SEALS`]).
+fn seal_immutable_memfd(content: &[u8]) -> Result<OwnedFd, RuntimeError> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: memfd_create returns a fresh owned fd; we wrap it once (RAII closes it
+    // on every error path), write the content, then apply the full seal set.
+    unsafe {
+        let fd = nix::libc::memfd_create(
+            c"delphi-script".as_ptr(),
+            (nix::libc::MFD_CLOEXEC | nix::libc::MFD_ALLOW_SEALING) as nix::libc::c_uint,
+        );
+        if fd < 0 {
+            return Err(RuntimeError::Syscall { op: "memfd_create", source: Errno::last() });
+        }
+        let owned = OwnedFd::from_raw_fd(fd);
+        let mut written = 0usize;
+        while written < content.len() {
+            let n = nix::libc::write(
+                fd,
+                content[written..].as_ptr().cast(),
+                content.len() - written,
+            );
+            if n < 0 {
+                return Err(RuntimeError::Syscall { op: "write script memfd", source: Errno::last() });
+            }
+            written += n as usize;
+        }
+        if nix::libc::fcntl(fd, nix::libc::F_ADD_SEALS, ScriptPin::FULL_SEALS) < 0 {
+            return Err(RuntimeError::Syscall { op: "fcntl F_ADD_SEALS", source: Errno::last() });
+        }
+        Ok(owned)
+    }
+}
+
+/// SHA-256 of `bytes` (the content-binding digest for a sealed script).
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
 }
 
 /// The canonical, immutable, arbiter-built action object. Preview, approval
@@ -190,23 +281,6 @@ fn hex32(d: &[u8; 32]) -> String {
     s
 }
 
-/// A short, non-reversible fingerprint of an env value (first 8 bytes of its
-/// SHA-256, hex). The preview shows WHICH env vars are set and whether a value
-/// changed — without exposing the value itself. Env values are a classic secret
-/// location (API keys, tokens, passwords), so the preview renders their presence
-/// and identity, never their plaintext; the digest still binds the full value.
-fn value_fingerprint(v: &str) -> String {
-    use std::fmt::Write as _;
-    let mut h = Sha256::new();
-    h.update(v.as_bytes());
-    let d: [u8; 32] = h.finalize().into();
-    let mut s = String::with_capacity(16);
-    for b in &d[..8] {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 /// The human-readable rendering of the action — what the human approves.
 ///
 /// One of the four derivations from the canonical object (preview / approval-digest
@@ -222,11 +296,16 @@ fn value_fingerprint(v: &str) -> String {
 ///
 /// Two renderings are deliberate, so "render everything" does not become "leak
 /// secrets" or "round away precision":
-/// * **env values** are shown as `KEY=#<fingerprint>` (key + a non-reversible
-///   SHA-256 prefix), never plaintext — env values are a classic secret location
-///   (API keys, tokens, passwords). The human sees WHICH vars are set and whether a
-///   value changed, without the secret being displayed; the digest still binds the
-///   full value.
+/// * **env values** are rendered as `KEY=[redacted]` — the key (structure) is shown,
+///   the value is NOT. Env values are a classic secret location (API keys, tokens,
+///   passwords), and the preview is handed to the UNTRUSTED requester (§3:
+///   `{pending_id, preview}`). Plaintext would leak; an *unkeyed* value fingerprint
+///   would be an offline dictionary oracle for low-entropy values (the attacker holds
+///   the hash and enumerates guesses). The human's one-shot approval acts on WHICH
+///   vars are set (an injected `LD_PRELOAD`/`API_KEY` is the high-signal threat), and
+///   a human cannot verify a value fingerprint against intent anyway — so the value
+///   is redacted, not fingerprinted. The digest still binds the full value, so the
+///   approval covers the exact bytes that execute.
 /// * **timeout** is rendered via `Duration`'s `Debug` (e.g. `30s`, `30.9s`), which
 ///   carries the same nanosecond precision the digest binds (`timeout.as_nanos()`),
 ///   so a sub-second change is visible — not rounded to whole seconds.
@@ -249,8 +328,8 @@ fn value_fingerprint(v: &str) -> String {
 ///     required_tier: RequiredTier::Biometric, script: None,
 /// };
 /// let p = preview(&a);
-/// // env value is fingerprinted (key shown, value not), timeout at full precision.
-/// assert!(p.contains("echo hi") && p.contains("K=#") && !p.contains("K=V"));
+/// // env value is redacted (key shown, value not), timeout at full precision.
+/// assert!(p.contains("echo hi") && p.contains("K=[redacted]") && !p.contains("K=V"));
 /// ```
 #[must_use]
 pub fn preview(action: &PendingAction) -> String {
@@ -269,7 +348,7 @@ pub fn preview(action: &PendingAction) -> String {
     let env = action
         .env_delta
         .iter()
-        .map(|(k, v)| format!("{k}=#{}", value_fingerprint(v)))
+        .map(|(k, _v)| format!("{k}=[redacted]"))
         .collect::<Vec<_>>()
         .join(", ");
     let net = match action.net_policy {
@@ -428,31 +507,37 @@ mod tests {
         );
     }
 
-    /// RUNTIME-1D-04 (#4): the preview shows WHICH env vars are set and reflects a
-    /// value change (via a non-reversible fingerprint), but NEVER the plaintext
-    /// value — "render everything" must not become "leak secrets".
+    /// RUNTIME-1D-04 (#2, round-3): the preview shows WHICH env vars are set but the
+    /// value is `[redacted]` — neither plaintext (the round-2 finding) NOR a
+    /// value-derived token. The latter is the subtle one: an UNKEYED fingerprint is
+    /// an offline dictionary ORACLE for low-entropy values (the untrusted requester
+    /// sees the preview, holds the hash, and enumerates guesses). Redaction carries
+    /// no value-derived data, so it is unconditionally non-oracle.
     #[test]
-    fn preview_fingerprints_env_values_without_exposing_them() {
-        // A secret-shaped value must not appear in the preview.
+    fn preview_redacts_env_values_no_oracle() {
+        // A low-entropy, enumerable value — exactly the oracle threat.
         let mut a = sample();
-        a.env_delta = vec![("API_KEY".into(), "sk-live-SUPERSECRET-9z".into())];
+        a.env_delta = vec![("DEPLOY".into(), "production".into())];
         let p = preview(&a);
-        assert!(p.contains("API_KEY"), "the human sees WHICH env var is set");
-        assert!(
-            !p.contains("sk-live-SUPERSECRET-9z"),
-            "the secret VALUE must NOT appear in the preview — only key + fingerprint"
-        );
+        assert!(p.contains("DEPLOY"), "the human sees WHICH env var is set (structure)");
+        assert!(!p.contains("production"), "the value plaintext must NOT appear");
 
-        // A value change changes the preview (so the value's influence IS rendered),
-        // without either plaintext leaking.
-        let mut a1 = sample();
-        a1.env_delta = vec![("K".into(), "value-one".into())];
-        let mut a2 = sample();
-        a2.env_delta = vec![("K".into(), "value-two".into())];
-        assert_ne!(preview(&a1), preview(&a2), "an env value change changes the preview");
+        // NON-ORACLE (distinct from not-plaintext): the unkeyed SHA-256 prefix an
+        // attacker would compute for the guess is ABSENT — the round-2 fingerprint
+        // scheme rendered exactly this, making the preview a dictionary oracle.
+        let unkeyed_guess = {
+            let d = sha256(b"production");
+            let mut s = String::with_capacity(16);
+            for b in &d[..8] {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
         assert!(
-            !preview(&a1).contains("value-one") && !preview(&a2).contains("value-two"),
-            "neither raw value appears in its preview"
+            !p.contains(&unkeyed_guess),
+            "no value-derived fingerprint the untrusted requester could dictionary-match \
+             (an unkeyed hash of a low-entropy value is an offline oracle)"
         );
     }
 }

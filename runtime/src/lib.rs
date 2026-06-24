@@ -126,10 +126,12 @@ pub enum RuntimeError {
     #[error("execution denied: this action's approval was already consumed (one-shot — TRUST_MODEL.md §4)")]
     AlreadyConsumed,
 
-    /// A pinned script's content memfd is not write-sealed (`F_SEAL_WRITE`), so its
-    /// bytes could be mutated between the digest and the exec (Increment 1d — R4-02).
-    /// The ratified mechanism is interpreter-pinned AND script-sealed; an unsealed
-    /// script is refused before any exec path, closing the content-mutation window.
-    #[error("execution denied: the script content is not write-sealed (F_SEAL_WRITE) — it could be mutated after approval (TRUST_MODEL.md §4, R4-02)")]
+    /// A pinned script's content memfd is not FULLY sealed against mutation
+    /// (Increment 1d — R4-02, `docs/TRUST_MODEL.md` §3). The ratified immutability is
+    /// the full seal set `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`:
+    /// write-sealing alone does NOT stop `ftruncate` shrink/grow, so a write-only
+    /// seal still permits content/length mutation between the digest and the exec.
+    /// A script missing any of the four seals is refused before any exec path.
+    #[error("execution denied: the script content is not fully sealed (need F_SEAL_WRITE|SHRINK|GROW|SEAL) — its content or length could be mutated after approval (TRUST_MODEL.md §3, R4-02)")]
     UnsealedScript,
 }

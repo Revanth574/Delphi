@@ -21,12 +21,14 @@
 //!    (verified: binding the path re-resolves and is NOT swap-proof; exec'ing the fd
 //!    is). For a **script** (R4-02) the **pinned interpreter** fd is exec'd with the
 //!    script memfd as its argument — never the script fd, whose shebang would
-//!    re-resolve the interpreter by PATH. The script memfd's **write-seal is
-//!    verified** (`F_SEAL_WRITE` via `F_GET_SEALS`) before any exec path, so its
-//!    content cannot be mutated between the digest and the exec — interpreter-pinning
-//!    defeats interpreter-PATH-swap, sealing defeats script-CONTENT-mutation, and the
-//!    two together are the full R4-02 mechanism. `--proc /proc` in the
-//!    [`SandboxProfile`] makes `/proc/self/fd/N` resolve.
+//!    re-resolve the interpreter by PATH. The script memfd's **full immutability
+//!    seal set is verified** (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
+//!    F_SEAL_SEAL` via `F_GET_SEALS`) before any exec path, so neither its content
+//!    (write) nor its length (`ftruncate` shrink/grow) can mutate between the digest
+//!    and the exec — interpreter-pinning defeats interpreter-PATH-swap, full sealing
+//!    defeats script-CONTENT/LENGTH-mutation, and the two together are the full R4-02
+//!    mechanism. `--proc /proc` in the [`SandboxProfile`] makes `/proc/self/fd/N`
+//!    resolve.
 //! 4. **fd-discipline (§6).** The 1b `fdsec` close-range runs in the child before
 //!    bwrap's exec, so no daemon fd (the approval channel, the anchor socket) leaks
 //!    into bwrap or the jailed tool; only the pinned program fd(s) survive.
@@ -38,7 +40,7 @@ use std::process::{Command, Output};
 
 use nix::errno::Errno;
 
-use crate::action::{canonical_action_digest, PendingAction};
+use crate::action::{canonical_action_digest, PendingAction, ScriptPin};
 use crate::sandbox::SandboxProfile;
 use crate::token::{self, ApprovalToken, MintingKey};
 use crate::RuntimeError;
@@ -96,22 +98,25 @@ pub fn execute_approved(
     run_fd_pinned(action)
 }
 
-/// R4-02: a pinned script's content fd MUST be write-sealed (`F_SEAL_WRITE`) so its
-/// bytes cannot be mutated between the digest and the exec. Refuse a script memfd
-/// whose `F_GET_SEALS` lacks `F_SEAL_WRITE`.
+/// R4-02: a pinned script's content fd MUST carry the FULL immutability seal set
+/// ([`ScriptPin::FULL_SEALS`] — `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
+/// F_SEAL_SEAL`) so neither its content (write) nor its length (`ftruncate`
+/// shrink/grow) can mutate between the digest and the exec. A write-seal ALONE is
+/// insufficient: it does not stop shrink/grow. Refuse a script memfd missing any of
+/// the four seals.
 ///
 /// # Errors
 ///
 /// [`RuntimeError::Syscall`] if `F_GET_SEALS` fails; [`RuntimeError::UnsealedScript`]
-/// if the memfd is not write-sealed.
-fn require_write_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
+/// if the memfd lacks any required seal.
+fn require_fully_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
     // SAFETY: F_GET_SEALS reads the memfd's seal bitmask; it touches no caller memory
     // and returns the seals (>= 0) or -1 with errno set.
     let seals = unsafe { nix::libc::fcntl(script_fd, nix::libc::F_GET_SEALS) };
     if seals < 0 {
         return Err(RuntimeError::Syscall { op: "fcntl F_GET_SEALS", source: Errno::last() });
     }
-    if seals & nix::libc::F_SEAL_WRITE == 0 {
+    if seals & ScriptPin::FULL_SEALS != ScriptPin::FULL_SEALS {
         return Err(RuntimeError::UnsealedScript);
     }
     Ok(())
@@ -126,11 +131,11 @@ fn require_write_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
 ///   shebang would re-resolve the interpreter by PATH.
 fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // R4-02 (the OTHER half of script-pinning): a pinned script's content memfd must
-    // be write-sealed, so its bytes cannot be swapped after the digest was taken.
-    // Interpreter-pinning alone defeats interpreter-PATH-swap; sealing defeats
-    // script-CONTENT-mutation. Refuse a non-sealed script before any exec path.
+    // be FULLY sealed, so neither its bytes nor its length can change after the digest
+    // was taken. Interpreter-pinning alone defeats interpreter-PATH-swap; the full
+    // seal set defeats script-CONTENT/LENGTH-mutation. Refuse before any exec path.
     if let Some(sp) = &action.script {
-        require_write_sealed(sp.script_memfd.as_raw_fd())?;
+        require_fully_sealed(sp.script_memfd.as_raw_fd())?;
     }
     // Which fd(s) the jailed tool must keep (the rest are closed before its exec).
     let (program_fd, script_arg_fd, keep): (RawFd, Option<RawFd>, Vec<RawFd>) =
@@ -397,23 +402,26 @@ mod tests {
         );
     }
 
-    /// Build a sealed (`F_SEAL_WRITE`) memfd holding `content`.
-    fn sealed_memfd(content: &[u8]) -> std::os::fd::OwnedFd {
+    /// A memfd holding `content` with ONLY `F_SEAL_WRITE` (NOT shrink/grow/seal) —
+    /// the PARTIAL-seal case: write-sealed but still `ftruncate`-able, so its content
+    /// length is mutable after the digest. The negative case that proves the exec
+    /// check requires the FULL seal set, not a subset.
+    fn write_sealed_only_memfd(content: &[u8]) -> std::os::fd::OwnedFd {
         use std::os::fd::FromRawFd;
-        // SAFETY: memfd_create returns a fresh fd; we write + seal it, then wrap once.
+        // SAFETY: fresh memfd; write content, apply ONLY F_SEAL_WRITE, wrap once.
         unsafe {
             let fd = nix::libc::memfd_create(
-                c"delphi-script".as_ptr(),
+                c"delphi-script-partial".as_ptr(),
                 (nix::libc::MFD_CLOEXEC | nix::libc::MFD_ALLOW_SEALING) as nix::libc::c_uint,
             );
             assert!(fd >= 0, "memfd_create");
             let n = nix::libc::write(fd, content.as_ptr().cast(), content.len());
             assert_eq!(n, content.len() as isize, "write memfd");
-            let seals = nix::libc::F_SEAL_WRITE
-                | nix::libc::F_SEAL_SHRINK
-                | nix::libc::F_SEAL_GROW
-                | nix::libc::F_SEAL_SEAL;
-            assert_eq!(nix::libc::fcntl(fd, nix::libc::F_ADD_SEALS, seals), 0, "seal memfd");
+            assert_eq!(
+                nix::libc::fcntl(fd, nix::libc::F_ADD_SEALS, nix::libc::F_SEAL_WRITE),
+                0,
+                "seal write-only"
+            );
             std::os::fd::OwnedFd::from_raw_fd(fd)
         }
     }
@@ -437,10 +445,10 @@ mod tests {
     }
 
     /// RUNTIME-1D-01 (SEALING half) — the ratified R4-02 mechanism is interpreter-
-    /// pinned AND script-WRITE-SEALED. An UNSEALED script memfd (its content could be
-    /// swapped after the digest) is REFUSED before any exec path — so the guarantee
-    /// bites the script-CONTENT-mutation threat, not only interpreter-PATH-swap. No
-    /// bwrap: the seal check precedes the spawn, so this runs in plain CI.
+    /// pinned AND script-FULLY-SEALED. A FULLY-UNSEALED script memfd (its content
+    /// could be swapped after the digest) is REFUSED before any exec path — so the
+    /// guarantee bites the script-CONTENT-mutation threat, not only interpreter-PATH-
+    /// swap. No bwrap: the seal check precedes the spawn, so this runs in plain CI.
     #[test]
     fn unsealed_script_memfd_is_refused() {
         let env = Env::new("unsealed");
@@ -461,9 +469,40 @@ mod tests {
         let res = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
         assert!(
             matches!(res, Err(RuntimeError::UnsealedScript)),
-            "RED: an UNSEALED script memfd must be REFUSED before exec — its content could be \
-             mutated after the digest was taken; only a write-sealed (F_SEAL_WRITE) script may \
-             run (R4-02). got {res:?}"
+            "RED: a FULLY-UNSEALED script memfd must be REFUSED before exec — its content could \
+             be mutated after the digest was taken; only a fully-sealed script may run (R4-02). \
+             got {res:?}"
+        );
+        assert!(!env.result.exists(), "refused before any exec → no output");
+    }
+
+    /// RUNTIME-1D-01 (SEAL SET, round-3) — the ratified §3 immutability is the FULL
+    /// seal set (`WRITE|SHRINK|GROW|SEAL`). `F_SEAL_WRITE` alone does NOT stop
+    /// `ftruncate` shrink/grow, so a WRITE-only-sealed memfd's content/length is still
+    /// mutable after the digest. A PARTIAL (write-only) seal is REFUSED, proving the
+    /// exec check requires ALL FOUR — distinct from the fully-unsealed RED above. No
+    /// bwrap (the seal check precedes the spawn).
+    #[test]
+    fn partial_seal_write_only_is_refused() {
+        let env = Env::new("partialseal");
+        let script_src = b"#!/bin/sh\n:\n";
+        let mut action =
+            build_action(&env.exe, &write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
+        action.script = Some(crate::action::ScriptPin {
+            interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_digest: sha256(b"interp"),
+            script_memfd: write_sealed_only_memfd(script_src), // ONLY F_SEAL_WRITE
+            script_digest: sha256(script_src),
+        });
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let res = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+        assert!(
+            matches!(res, Err(RuntimeError::UnsealedScript)),
+            "RED: a WRITE-only-sealed script memfd must be REFUSED — F_SEAL_WRITE does not stop \
+             ftruncate shrink/grow, so its content/length is still mutable after the digest; the \
+             exec path must require the FULL seal set (WRITE|SHRINK|GROW|SEAL). got {res:?}"
         );
         assert!(!env.result.exists(), "refused before any exec → no output");
     }
@@ -489,17 +528,16 @@ mod tests {
         let interp_fd: std::os::fd::OwnedFd = fs::File::open(&interp).unwrap().into();
         // The script: shebang points at the interpreter PATH (the RED re-resolves it).
         let script_src = format!("#!{}\n:\n", interp.display());
-        let script_memfd = sealed_memfd(script_src.as_bytes());
 
         let mut action = build_action(&env.exe, &write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
         // Bind the dir holding the interpreter (so the RED's shebang path resolves).
         action.fs_binds.push((env.dir.clone(), BindMode::ReadWrite));
-        action.script = Some(crate::action::ScriptPin {
-            interpreter_fd: interp_fd,
-            interpreter_digest: sha256(b"INTERP-V1"),
-            script_memfd,
-            script_digest: sha256(script_src.as_bytes()),
-        });
+        // The sanctioned constructor: a FULLY-sealed script memfd (so the exec-time
+        // require_fully_sealed check passes on the legitimate path).
+        action.script = Some(
+            ScriptPin::sealed(interp_fd, sha256(b"INTERP-V1"), script_src.as_bytes())
+                .expect("seal script memfd"),
+        );
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
@@ -534,65 +572,87 @@ mod tests {
         );
     }
 
-    /// RUNTIME-1D-03 — fd-DISCIPLINE: a deliberately non-CLOEXEC daemon fd is CLOSED
-    /// before the jailed tool runs (close_range in pre_exec); the RED (no close_range)
-    /// leaks it into the tool.
+    /// RUNTIME-1D-03 — fd-DISCIPLINE: `mark_cloexec_except_raw` run in `pre_exec`
+    /// (exactly as `run_fd_pinned` wires it) marks every inherited fd `>= 3` CLOEXEC
+    /// except the keep-list, so a non-CLOEXEC daemon fd is CLOSED at the child's
+    /// `execve`.
+    ///
+    /// Tested by a DIRECT fork+exec of `/bin/sh` — deliberately NOT through bwrap:
+    /// bwrap 0.9.0 closes every inherited fd itself (verified empirically — an
+    /// inherited fd 3/7/50 all fail to reach the jailed command), which would MASK
+    /// whether OUR discipline closed it (the discipline's value is closing daemon fds
+    /// *before* `execve(bwrap)`, so they never reach bwrap's process either — not
+    /// relying on bwrap). The leak target is a FILE: deterministic and parallelism-
+    /// robust (a concurrent fork inheriting the fd writes nothing to it, and a file
+    /// read never blocks on EOF the way a pipe does). No bwrap/root → runs everywhere.
     #[test]
-    fn daemon_fd_does_not_leak_into_the_jailed_tool() {
-        if !bwrap_available() {
-            eprintln!("SKIP daemon_fd_does_not_leak_into_the_jailed_tool: requires bwrap + unprivileged userns");
-            return;
-        }
-        // Build an action whose script tries to write "LEAKED" to `leak_fd`.
-        fn leak_action(env: &Env, leak_fd: RawFd) -> PendingAction {
-            let src = format!(
-                "#!/bin/sh\necho LEAKED >&{leak_fd} 2>/dev/null\necho done > {}\n",
-                env.result.display()
+    fn fd_discipline_closes_a_daemon_fd_at_exec() {
+        // Fork+exec /bin/sh with a non-CLOEXEC "daemon" fd open; the child tries to
+        // write "LEAKED" to it. `close_range` selects whether the 1D-03 pre_exec
+        // discipline runs. Returns the file's contents after the child exits.
+        fn probe(close_range: bool) -> String {
+            let dir = PathBuf::from(format!(
+                "/tmp/delphi-fdleak-{}-{}",
+                std::process::id(),
+                u8::from(close_range)
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let ran_path = dir.join("ran");
+            let leaked_path = dir.join("leaked");
+            // The "daemon" fd: a non-CLOEXEC fd the child must NOT see after the
+            // discipline runs. The child probes its OWN fd table via /proc/self/fd/N
+            // (robust — no shell `>&N` redirect quirks) and reports to a FILE.
+            let f = fs::File::open("/dev/null").unwrap();
+            let leak = f.as_raw_fd();
+            crate::fdsec::clear_cloexec(leak).unwrap();
+
+            let mut cmd = Command::new("/bin/sh");
+            // `echo RAN` proves the child exec'd; the `test -e /proc/self/fd/N` is true
+            // iff the daemon fd is still OPEN in the exec'd child.
+            cmd.arg("-c").arg(format!(
+                "echo RAN > {}; if test -e /proc/self/fd/{leak}; then echo LEAKED > {}; fi",
+                ran_path.display(),
+                leaked_path.display()
+            ));
+            if close_range {
+                let keep: Vec<RawFd> = Vec::new(); // exec by PATH → keep no fd
+                // SAFETY: pre_exec runs post-fork/pre-execve; mark_cloexec_except_raw
+                // is allocation-free + async-signal-safe, and from_raw_os_error wraps
+                // the errno int inline (no Box) — the exact wiring run_fd_pinned uses.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        crate::fdsec::mark_cloexec_except_raw(&keep)
+                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+                    });
+                }
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "/bin/sh: {}", String::from_utf8_lossy(&out.stderr));
+            drop(f);
+            // The child RAN regardless of the fd's state — so an absent LEAKED means
+            // "fd closed", not "the child never ran".
+            assert_eq!(
+                fs::read_to_string(&ran_path).unwrap_or_default().trim(),
+                "RAN",
+                "the child exec'd"
             );
-            fs::write(&env.exe, &src).unwrap();
-            fs::set_permissions(&env.exe, fs::Permissions::from_mode(0o755)).unwrap();
-            build_action(&env.exe, src.as_bytes(), &env.out_dir)
-        }
-        fn drain(read_fd: std::os::fd::OwnedFd) -> String {
-            use std::io::Read;
-            let mut s = String::new();
-            let _ = std::fs::File::from(read_fd).read_to_string(&mut s);
+            let s = fs::read_to_string(&leaked_path).unwrap_or_default();
+            let _ = fs::remove_dir_all(&dir);
             s
         }
 
-        // CORRECT: close_range in execute_approved closes the leak fd before the tool.
-        {
-            let env = Env::new("fdleak-ok");
-            let (r, w) = nix::unistd::pipe().unwrap();
-            crate::fdsec::clear_cloexec(w.as_raw_fd()).unwrap(); // non-CLOEXEC → would leak without close_range
-            let action = leak_action(&env, w.as_raw_fd());
-            let key = MintingKey::from_bytes(KEY);
-            let token = mint(&key, &canonical_action_digest(&action), NOW);
-            let _ = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
-            drop(w);
-            assert!(
-                !drain(r).contains("LEAKED"),
-                "the daemon fd must be CLOSED in the jailed tool (close_range in pre_exec)"
-            );
-        }
-        // RED: without close_range, the non-CLOEXEC fd leaks into the tool.
-        {
-            let env = Env::new("fdleak-red");
-            let (r, w) = nix::unistd::pipe().unwrap();
-            crate::fdsec::clear_cloexec(w.as_raw_fd()).unwrap();
-            let action = leak_action(&env, w.as_raw_fd());
-            let exe_fd = action.executable_fd.as_raw_fd();
-            crate::fdsec::clear_cloexec(exe_fd).unwrap();
-            let mut a = SandboxProfile::derive(&action).args().to_vec();
-            a.push("--".into());
-            a.push(format!("/proc/self/fd/{exe_fd}"));
-            let _ = Command::new("bwrap").args(&a).output().unwrap(); // NO pre_exec close_range
-            drop(w);
-            assert!(
-                drain(r).contains("LEAKED"),
-                "RED: without the close_range fd-discipline, a non-CLOEXEC daemon fd LEAKS into \
-                 the jailed tool — it wrote to it"
-            );
-        }
+        // RED: WITHOUT the fd-discipline, the non-CLOEXEC daemon fd survives execve →
+        // the child writes to it.
+        assert!(
+            probe(false).contains("LEAKED"),
+            "RED: without the close_range fd-discipline a non-CLOEXEC daemon fd survives execve \
+             into the child — it wrote to it"
+        );
+        // CORRECT: the discipline marks it CLOEXEC → closed at execve → child can't write.
+        assert!(
+            !probe(true).contains("LEAKED"),
+            "the fd-discipline (mark_cloexec_except_raw in pre_exec) closes the daemon fd at execve"
+        );
     }
 }

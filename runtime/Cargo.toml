@@ -1,0 +1,43 @@
+# Delphi runtime daemon — Increment 1a: the root-anchor keystone.
+#
+# Builds against the ratified docs/TRUST_MODEL.md as spec. 1a establishes the
+# root-owned approval-socket directory and the privilege-drop seam ONLY — no
+# private channel, PAM, token, sandbox, or execute (those are 1b–1d).
+[package]
+name = "delphi-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The lib carries the testable logic (privilege-drop ordering, anchor establishment).
+[lib]
+name = "delphi_runtime"
+path = "src/lib.rs"
+
+# The bin is the thin root entrypoint systemd starts (delphi-runtimed@.service).
+[[bin]]
+name = "delphi-runtimed"
+path = "src/bin/delphi-runtimed.rs"
+
+[dependencies]
+# Syscall layer (§13.7: reuse the workspace's existing nix 0.30; add the feature
+# gates 1a needs — `user` for set{groups,gid,uid}/geteuid, `fs` for chown/unlink,
+# `process` for fork/execve used by the child-drop path).
+nix = { version = "0.30", features = ["user", "fs", "process", "socket", "signal"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Capability token (1c): HMAC-SHA256, mirroring the proven die-inference token
+# pattern but binding the action digest and minted by the root daemon.
+hmac = "0.12"
+sha2 = { workspace = true }
+# Canonical action digest (1d): the leverage-pass CanonicalHasher (declared-count
+# guard + the no-`..` exhaustive-destructure discipline) is the preview=approval=
+# sandbox=audit binding.
+delphi-hardening = { workspace = true }
+# PAM (1c): pam-client2 exposes a custom ConversationHandler trait so the consent
+# conversation can be routed over the 1b private channel (recon #1 — verified the
+# crate supports a non-tty custom conversation).
+pam-client2 = "0.5"

@@ -577,14 +577,17 @@ mod tests {
     /// except the keep-list, so a non-CLOEXEC daemon fd is CLOSED at the child's
     /// `execve`.
     ///
-    /// Tested by a DIRECT fork+exec of `/bin/sh` — deliberately NOT through bwrap:
-    /// bwrap 0.9.0 closes every inherited fd itself (verified empirically — an
-    /// inherited fd 3/7/50 all fail to reach the jailed command), which would MASK
-    /// whether OUR discipline closed it (the discipline's value is closing daemon fds
-    /// *before* `execve(bwrap)`, so they never reach bwrap's process either — not
-    /// relying on bwrap). The leak target is a FILE: deterministic and parallelism-
-    /// robust (a concurrent fork inheriting the fd writes nothing to it, and a file
-    /// read never blocks on EOF the way a pipe does). No bwrap/root → runs everywhere.
+    /// Tested by a DIRECT fork+exec of `/bin/sh`, exercising `mark_cloexec_except_raw`
+    /// in `pre_exec` exactly as `run_fd_pinned` wires it — rather than through bwrap, a
+    /// confound-prone proxy for the fd-close discipline. Testing the runtime's OWN
+    /// primitive directly is the right design independent of bwrap's fd behaviour, and
+    /// is what makes the discipline load-bearing: bwrap does NOT sanitise inherited fds
+    /// (a non-CLOEXEC fd reaches the jailed command — verified via `/proc/self/fd`), so
+    /// `close_range` in `pre_exec` is the PRIMARY defence, closing daemon fds at
+    /// `execve(bwrap)` before bwrap's process or the jail can see them. The child
+    /// probes its own fd table via `/proc/self/fd/N` (no shell `>&N` redirect quirks)
+    /// and reports to a FILE: deterministic and parallelism-robust. No bwrap/root → it
+    /// runs everywhere.
     #[test]
     fn fd_discipline_closes_a_daemon_fd_at_exec() {
         // Fork+exec /bin/sh with a non-CLOEXEC "daemon" fd open; the child tries to

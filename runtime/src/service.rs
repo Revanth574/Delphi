@@ -41,8 +41,32 @@ use crate::RuntimeError;
 /// Largest private-channel datagram (preview + 32-byte digest prefix).
 const MAX_PRIV_MSG: usize = 8192;
 
+/// A source of unix-seconds time — the seam (like the logind verdict) that keeps the
+/// token TTL a REAL control in the assembled loop.
+///
+/// The service reads it FRESH at mint AND at Present-verify, so the TTL delta is the
+/// real wall-time the AI sat on the token (B1-R2-01: a single snapshotted `now` for
+/// both made the delta structurally zero — tokens never expired). The daemon uses
+/// [`SystemClock`]; tests inject a deterministic clock to exercise expiry without
+/// sleeping.
+pub trait Clock {
+    /// The current time in unix seconds.
+    fn now_unix(&self) -> u64;
+}
+
+/// The production clock — `SystemTime` wall-clock seconds.
+pub struct SystemClock;
+impl Clock for SystemClock {
+    fn now_unix(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
 /// Everything the service loop needs that isn't the AI connection. Borrowed for one
-/// action; the daemon owns the long-lived pieces (key, store, ledger).
+/// action; the daemon owns the long-lived pieces (key, store, ledger, clock).
 pub struct ServiceCtx<'a> {
     /// The daemon's end of the private `SOCK_SEQPACKET` channel to the pinned shell.
     pub channel_fd: RawFd,
@@ -59,8 +83,9 @@ pub struct ServiceCtx<'a> {
     pub store: &'a mut PendingStore,
     /// The one-shot consumption ledger (1d).
     pub ledger: &'a mut ConsumptionLedger,
-    /// Logical now (unix seconds) for token mint/verify/audit.
-    pub now: u64,
+    /// The clock — read FRESH at mint and at Present-verify so the token TTL is a real
+    /// control (B1-R2-01), not a frozen-`now` no-op.
+    pub clock: &'a dyn Clock,
 }
 
 /// The terminal outcome of one serviced action.
@@ -132,7 +157,8 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     if confirm != digest {
         return deny(ai, &id, "shell mint-confirm digest != stored digest");
     }
-    let token = mint(ctx.key, &digest, ctx.now);
+    // Mint at the time of consent (read FRESH — not a frozen snapshot).
+    let token = mint(ctx.key, &digest, ctx.clock.now_unix());
     if let Some(e) = ctx.store.get_mut(&id) {
         e.state = PendingState::Granted;
     }
@@ -143,8 +169,12 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
         Some(pb::ai_to_daemon::Msg::Present(p)) => p,
         other => return Err(RuntimeError::Protocol(format!("expected Present, got {other:?}"))),
     };
+    // Verify at a FRESH clock read — the real wall-time delta since mint is the TTL the
+    // token is checked against (B1-R2-01: an AI that sits on the token past TTL is
+    // rejected). The isolated token-expiry RED now bites the ASSEMBLED loop.
+    let verify_now = ctx.clock.now_unix();
     let outcome = present_and_execute(
-        ctx.store, ctx.ledger, ctx.key, &present.pending_id, &present.token, ctx.now,
+        ctx.store, ctx.ledger, ctx.key, &present.pending_id, &present.token, verify_now,
     );
     let reply = match &outcome {
         Outcome::Completed { pending_id, exit_code } => completed_msg(pending_id, *exit_code),
@@ -189,21 +219,25 @@ pub fn present_and_execute(
         }
         execute_approved(&entry.action, &candidate, key, now, ledger)
     };
-    // B1-04: the store state FOLLOWS the ledger — advance to Consumed ONLY when the
-    // ledger actually consumed (a successful, verified execution). A wrong/forged
-    // token (Unapproved) does NOT consume the ledger, so it must NOT burn the
-    // approval either — the legitimate token can still be presented (the 1c
-    // "failed-verify doesn't consume" precedent). The two never disagree.
+    // B1-04 + B1-R2-03: the store state agrees with the LEDGER on EVERY path. The
+    // ledger (execute_approved) consumes once the token VERIFIES — BEFORE the run — so
+    // a verified-then-execution-failed action HAS consumed the ledger. Matching 1d's
+    // one-shot ("a spawn failure still consumes — one-shot, not one-success"), the
+    // store advances to Consumed for EVERY post-verify outcome (Ok, verified-but-
+    // failed, and AlreadyConsumed — idempotent). ONLY a token that fails verification
+    // (Unapproved) leaves the ledger untouched and the approval Granted (re-presentable
+    // with the right token — the 1c "failed-verify doesn't consume" precedent). Store
+    // and ledger never disagree.
+    if !matches!(result, Err(RuntimeError::Unapproved))
+        && let Some(e) = store.get_mut(pending_id)
+    {
+        e.state = PendingState::Consumed;
+    }
     match result {
-        Ok(output) => {
-            if let Some(e) = store.get_mut(pending_id) {
-                e.state = PendingState::Consumed;
-            }
-            Outcome::Completed { pending_id: pending_id.to_string(), exit_code: output.status.code() }
-        }
+        Ok(output) => Outcome::Completed { pending_id: pending_id.to_string(), exit_code: output.status.code() },
         Err(RuntimeError::Unapproved) => denied("token does not verify against the stored action's digest"),
         Err(RuntimeError::AlreadyConsumed) => denied("approval already consumed (one-shot)"),
-        Err(e) => denied(&format!("execution failed: {e}")),
+        Err(e) => denied(&format!("execution failed (approval consumed — one-shot): {e}")),
     }
 }
 

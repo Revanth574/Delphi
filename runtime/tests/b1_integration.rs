@@ -35,9 +35,11 @@ use delphi_runtime::canonicalize::canonicalize;
 use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec};
 use delphi_runtime::logind::SessionVerdict;
-use delphi_runtime::service::{accept_requester, present_and_execute, serve_one_action, Outcome, ServiceCtx};
+use delphi_runtime::service::{
+    accept_requester, present_and_execute, serve_one_action, Clock, Outcome, ServiceCtx,
+};
 use delphi_runtime::store::{PendingState, PendingStore};
-use delphi_runtime::token::{mint, MintingKey};
+use delphi_runtime::token::{mint, MintingKey, TOKEN_TTL_SECS};
 use delphi_runtime::wire::pb;
 use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 
@@ -63,6 +65,28 @@ impl SessionVerdict for Verdict {
     }
 }
 const PASS: Verdict = Verdict { active: true, remote: false };
+
+/// A fixed-time clock (every read returns the same second).
+struct FixedClock(u64);
+impl Clock for FixedClock {
+    fn now_unix(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A clock that returns a pre-programmed SEQUENCE of times (clamped to the last) —
+/// so the daemon's mint read and its Present-verify read differ deterministically,
+/// without sleeping. The token-expiry RED uses `[mint, mint + TTL + 1]`.
+struct SeqClock {
+    times: Vec<u64>,
+    idx: std::sync::atomic::AtomicUsize,
+}
+impl Clock for SeqClock {
+    fn now_unix(&self) -> u64 {
+        let i = self.idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.times[i.min(self.times.len() - 1)]
+    }
+}
 
 fn bwrap_available() -> bool {
     Command::new("bwrap")
@@ -197,7 +221,7 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
         session_user: &setup.user,
         store: &mut store,
         ledger: &mut ledger,
-        now: NOW,
+        clock: &FixedClock(NOW),
     };
     let outcome = serve_one_action(&mut ai, &mut ctx).expect("serve one action");
 
@@ -208,6 +232,81 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
 
     assert!(matches!(outcome, Outcome::Completed { .. }), "the action must complete: {outcome:?}");
     assert_eq!(marker, "B1-LIVES", "the STORED canonical action executed end-to-end");
+}
+
+// ── B1-R2-01: token TTL is a REAL control in the assembled loop ──────────────
+
+#[test]
+fn b1_token_expiry_blocks_the_assembled_loop() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP b1_token_expiry: requires root");
+        return;
+    }
+    if !bwrap_available() {
+        eprintln!("SKIP b1_token_expiry: requires bwrap + unprivileged userns");
+        return;
+    }
+    let setup = Setup::new("e");
+    let (uid, gid) = setup.ids();
+    let base = PathBuf::from(format!("/run/delphi-b1exp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let result = work.join("result");
+    let exe = write_marker_exe(&work, &result);
+    let exe_str = exe.display().to_string();
+    let work_str = work.display().to_string();
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+    let spec = LaunchSpec {
+        shell_path: &shell_bin,
+        ai_path: &ai_bin,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
+        ai_env: &[
+            ("DELPHI_AI_EXE", &exe_str),
+            ("DELPHI_AI_ARG", "SHOULD-NOT-RUN"),
+            ("DELPHI_AI_BIND_RW", &work_str),
+        ],
+    };
+    let children = launch(&spec).expect("launch");
+    let mut ai = accept_requester(&listener, uid.as_raw()).expect("accept");
+    let mut store = PendingStore::new();
+    let mut ledger = ConsumptionLedger::new();
+    let key = MintingKey::from_bytes(KEY);
+    // The daemon reads the clock at mint (→ NOW) then FRESH at Present-verify (→ past
+    // TTL): the AI sat on the token too long → the verify rejects it. The isolated
+    // expiry RED, now biting the assembled loop.
+    let clock = SeqClock {
+        times: vec![NOW, NOW + TOKEN_TTL_SECS + 1],
+        idx: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut ctx = ServiceCtx {
+        channel_fd: children.daemon_channel.as_raw_fd(),
+        session_verdict: &PASS,
+        key: &key,
+        pam_service: SERVICE,
+        session_user: &setup.user,
+        store: &mut store,
+        ledger: &mut ledger,
+        clock: &clock,
+    };
+    let outcome = serve_one_action(&mut ai, &mut ctx).expect("serve");
+    let _ = waitpid(nix::unistd::Pid::from_raw(children.shell_pid), None);
+    let _ = waitpid(nix::unistd::Pid::from_raw(children.ai_pid), None);
+    let ran = std::fs::read_to_string(&result).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        matches!(outcome, Outcome::Denied { .. }),
+        "RED: an expired token (mint→verify delta > TTL) must be DENIED by the assembled loop: {outcome:?}"
+    );
+    assert!(ran.trim().is_empty(), "expired → nothing executed");
 }
 
 // ── Half (ii): approve-A/execute-B against the assembled present_and_execute ──
@@ -308,6 +407,47 @@ fn b1_swap_after_canonicalize_runs_the_pinned_content() {
 
     assert!(matches!(outcome, Outcome::Completed { .. }), "the pinned action runs: {outcome:?}");
     assert_eq!(ran, "PINNED", "the SEALED/pinned content ran, not the swapped path (swap-proof composes)");
+}
+
+// ── B1-04 / B1-R2-03: store and ledger AGREE — a wrong token doesn't burn it ──
+
+#[test]
+fn b1_wrong_token_does_not_burn_the_approval() {
+    if !bwrap_available() {
+        eprintln!("SKIP b1_wrong_token: requires bwrap + unprivileged userns");
+        return;
+    }
+    let dir = PathBuf::from(format!("/tmp/delphi-b1-burn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = dir.join("res");
+    let exe = write_marker_exe(&dir, &result);
+
+    let key = MintingKey::from_bytes(KEY);
+    let mut store = PendingStore::new();
+    let id = store.next_id();
+    let action = canonicalize(&marker_proposal(&exe, "RIGHT", &dir), id.clone()).unwrap();
+    let digest = canonical_action_digest(&action);
+    store.insert(action);
+    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    let good = mint(&key, &digest, NOW).to_wire();
+    let wrong = mint(&key, &[0xFF; 32], NOW).to_wire(); // a token bound to a different digest
+    let mut ledger = ConsumptionLedger::new();
+
+    // A WRONG token is denied AND does NOT burn the approval (ledger untouched →
+    // store stays Granted, agreeing with the ledger; the 1c precedent).
+    let d = present_and_execute(&mut store, &mut ledger, &key, &id, &wrong, NOW);
+    assert!(matches!(d, Outcome::Denied { .. }), "wrong token denied: {d:?}");
+    assert_eq!(store.get(&id).unwrap().state, PendingState::Granted, "wrong token must NOT burn the approval");
+    assert!(!result.exists(), "denied → nothing executed");
+
+    // The RIGHT token still works (the approval wasn't burned) → store Consumed,
+    // agreeing with the ledger that just consumed.
+    let c = present_and_execute(&mut store, &mut ledger, &key, &id, &good, NOW);
+    assert!(matches!(c, Outcome::Completed { .. }), "the legit token still runs: {c:?}");
+    assert_eq!(store.get(&id).unwrap().state, PendingState::Consumed, "success → store Consumed (agrees with ledger)");
+    assert_eq!(std::fs::read_to_string(&result).unwrap().trim(), "RIGHT");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── B1-02: the shebang interpreter arg REACHES exec (not dropped) ────────────
@@ -524,7 +664,7 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
         session_user: &setup.user,
         store: &mut store,
         ledger: &mut ledger,
-        now: NOW,
+        clock: &FixedClock(NOW),
     };
     let outcome = serve_one_action(&mut ai, &mut ctx).expect("serve");
 

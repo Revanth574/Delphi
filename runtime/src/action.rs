@@ -284,10 +284,17 @@ pub fn canonical_action_digest(action: &PendingAction) -> [u8; 32] {
                 } = sc;
                 // fds are runtime handles; their CONTENT is bound via the digests.
                 let _ = (interpreter_fd, script_memfd);
-                // The script's interpreter object + ITS arg + content, all bound.
-                s.fixed(interpreter_digest)
-                    .field(interpreter_arg.as_deref().unwrap_or("").as_bytes())
-                    .fixed(script_digest);
+                // The script's interpreter object + ITS arg + content, all bound. The
+                // arg's OPTION PRESENCE is encoded explicitly (a presence byte, then the
+                // value) so `None` and `Some("")` — which execute differently
+                // (`interp script` vs `interp "" script`) — get DISTINCT digests
+                // (B1-R2-02: `unwrap_or("")` would collapse them, breaking injectivity).
+                s.fixed(interpreter_digest);
+                match interpreter_arg {
+                    None => s.fixed(&[0u8]),
+                    Some(arg) => s.fixed(&[1u8]).field(arg.as_bytes()),
+                };
+                s.fixed(script_digest);
             }
         });
     h.finish().expect("declared 11 top-level fields, appended 11")
@@ -587,6 +594,9 @@ mod tests {
         };
         assert_ne!(digest(Some("-I")), digest(None), "the interpreter arg is bound by the digest");
         assert_ne!(digest(Some("-I")), digest(Some("-B")), "different args → different digest");
+        // B1-R2-02 injectivity: None and Some("") execute differently (`interp script`
+        // vs `interp "" script`), so their digests MUST differ (explicit presence byte).
+        assert_ne!(digest(None), digest(Some("")), "None and Some(\"\") must NOT collide in the digest");
 
         let mut a = sample();
         a.script = Some(pin(Some("-I")));

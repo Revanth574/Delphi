@@ -26,7 +26,6 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use nix::sys::wait::waitpid;
@@ -36,7 +35,7 @@ use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
 use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec};
 use delphi_runtime::logind::{LogindVerdict, SessionVerdict};
-use delphi_runtime::service::{accept_requester, serve_one_action, ServiceCtx};
+use delphi_runtime::service::{accept_requester, serve_one_action, ServiceCtx, SystemClock};
 use delphi_runtime::store::PendingStore;
 use delphi_runtime::token::MintingKey;
 use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
@@ -102,7 +101,9 @@ fn main() -> Result<()> {
     );
 
     let verdict = logind_verdict(children.shell_pid);
-    let now = unix_now();
+    // Real wall-clock — read fresh at mint and at Present-verify so the token TTL is a
+    // real control (B1-R2-01), not a frozen-`now` no-op.
+    let clock = SystemClock;
 
     // B1: service exactly one action, then exit (B2 loops).
     let mut ai = accept_requester(&listener, user.uid.as_raw()).context("accepting the requester")?;
@@ -114,7 +115,7 @@ fn main() -> Result<()> {
         session_user: &session,
         store: &mut store,
         ledger: &mut ledger,
-        now,
+        clock: &clock,
     };
     let outcome = serve_one_action(&mut ai, &mut ctx).context("servicing the action")?;
     tracing::info!(?outcome, "B1: served one action");
@@ -155,10 +156,6 @@ fn random_key() -> Result<[u8; 32]> {
 
 fn bin_path(env: &str, default: &str) -> PathBuf {
     std::env::var_os(env).map_or_else(|| PathBuf::from(default), PathBuf::from)
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Parse `--session <username>` from the argument iterator.

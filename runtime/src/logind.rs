@@ -53,7 +53,7 @@ pub trait SessionVerdict {
 /// THE DECISION: a session passes the gate iff it is **active AND local**
 /// (not remote). Unit-testable without any live session.
 #[must_use]
-pub fn session_passes_gate(verdict: &impl SessionVerdict) -> bool {
+pub fn session_passes_gate(verdict: &(impl SessionVerdict + ?Sized)) -> bool {
     verdict.is_active() && !verdict.is_remote()
 }
 

@@ -16,4 +16,9 @@ fn main() {
     for artifact in ["bins", "tests"] {
         println!("cargo:rustc-link-arg-{artifact}=-l:libsystemd.so.0");
     }
+
+    // B1: compile the AI↔daemon general-socket wire schema (protobuf, prost).
+    println!("cargo:rerun-if-changed=proto/runtime_wire.proto");
+    prost_build::compile_protos(&["proto/runtime_wire.proto"], &["proto"])
+        .expect("compile runtime_wire.proto");
 }

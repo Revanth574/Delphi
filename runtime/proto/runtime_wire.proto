@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: MIT
+//
+// B1 — the AI↔daemon general-socket wire (docs/TRUST_MODEL.md §4 flow steps 1 & 5).
+//
+// The AI (untrusted, dropped to the session uid) talks to the root daemon over the
+// group-connectable `approve.sock` (SO_PEERCRED-checked). The CONSENT path
+// (preview/PAM/mint) is NOT here — it is the private SOCK_SEQPACKET channel to the
+// shell (§4 line 278: "approve is exposed ONLY on the private channel").
+//
+// THE HALF-(ii) INVARIANT IS SCHEMA-ENFORCED: `Present` carries ONLY a pending_id
+// and a token — NO action fields. The action is fixed at canonicalization, stored
+// under pending_id, and the daemon executes THAT stored object. There is nowhere in
+// `Present` to inject a different action B.
+
+syntax = "proto3";
+
+package delphi.runtime.wire;
+
+enum BindMode {
+  BIND_READ_ONLY = 0;
+  BIND_READ_WRITE = 1;
+}
+
+enum NetPolicy {
+  NET_NONE = 0;
+  NET_FULL = 1;
+}
+
+enum RequiredTier {
+  TIER_AUTONOMOUS = 0;
+  TIER_CONFIRM = 1;
+  TIER_BIOMETRIC = 2;
+  TIER_HARDWARE = 3;
+}
+
+message EnvVar {
+  string key = 1;
+  string value = 2;
+}
+
+message Bind {
+  string path = 1;
+  BindMode mode = 2;
+}
+
+// AI → daemon (step 1): propose an action. The daemon CANONICALIZES this — opens
+// `exe_path`, hashes the bytes read through the held fd, builds the one
+// PendingAction — and stores it under a fresh pending_id. The AI never sees the
+// canonical object or its fds.
+message Propose {
+  repeated string argv = 1;
+  string cwd = 2;
+  repeated EnvVar env_delta = 3;
+  repeated Bind fs_binds = 4;
+  string exe_path = 5;
+  NetPolicy net_policy = 6;
+  uint64 timeout_secs = 7;
+  RequiredTier required_tier = 8;
+}
+
+// daemon → AI (step 1 reply): the action is registered; here is its id — NOT a token.
+message Pending {
+  string pending_id = 1;
+}
+
+// daemon → AI (step 4½): consent granted; here is the digest-bound capability token
+// (its opaque `{issued_at}:{mac_hex}` wire form). Delivered ONLY after the human
+// approved THIS pending_id's action over the private channel.
+message Granted {
+  string pending_id = 1;
+  string token = 2;
+}
+
+// AI → daemon (step 5): present the token to execute. NO action data — the daemon
+// executes the STORED canonical object for `pending_id` and re-verifies the token
+// against THAT object's digest.
+message Present {
+  string pending_id = 1;
+  string token = 2;
+}
+
+// daemon → AI: terminal outcomes.
+message Completed {
+  string pending_id = 1;
+  int32 exit_code = 2;
+}
+
+message Denied {
+  string pending_id = 1;
+  string reason = 2;
+}
+
+// Framed envelopes (one per length-prefixed frame).
+message AiToDaemon {
+  oneof msg {
+    Propose propose = 1;
+    Present present = 2;
+  }
+}
+
+message DaemonToAi {
+  oneof msg {
+    Pending pending = 1;
+    Granted granted = 2;
+    Completed completed = 3;
+    Denied denied = 4;
+  }
+}

@@ -46,15 +46,20 @@ use std::path::PathBuf;
 pub mod action;
 pub mod anchor;
 pub mod audit;
+pub mod canonicalize;
 pub mod channel;
 pub mod execute;
 pub mod fdsec;
+pub mod launcher;
 pub mod logind;
 pub mod pam;
 pub mod pidfd;
 pub mod privdrop;
 pub mod sandbox;
+pub mod service;
+pub mod store;
 pub mod token;
+pub mod wire;
 
 pub use anchor::{bind_approval_socket, ensure_runtime_dir, AnchorPaths};
 pub use channel::approval_socketpair;
@@ -134,4 +139,16 @@ pub enum RuntimeError {
     /// A script missing any of the four seals is refused before any exec path.
     #[error("execution denied: the script content is not fully sealed (need F_SEAL_WRITE|SHRINK|GROW|SEAL) — its content or length could be mutated after approval (TRUST_MODEL.md §3, R4-02)")]
     UnsealedScript,
+
+    /// A wire-protocol fault on the AI↔daemon general socket (B1) — a malformed
+    /// frame, an oversized message, a decode failure, or an unexpected message for
+    /// the current state. Never carries user data.
+    #[error("protocol error on the general socket: {0}")]
+    Protocol(String),
+
+    /// The AI referenced a `pending_id` the daemon has no registered action for
+    /// (B1) — unknown, already consumed, or lost across a daemon restart
+    /// (fail-closed, `docs/TRUST_MODEL.md` §4 failure modes).
+    #[error("no pending action registered for id `{0}` (unknown, consumed, or restarted)")]
+    UnknownPending(String),
 }

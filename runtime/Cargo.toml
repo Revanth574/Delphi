@@ -20,6 +20,16 @@ path = "src/lib.rs"
 name = "delphi-runtimed"
 path = "src/bin/delphi-runtimed.rs"
 
+# B1 minimal sides — daemon-forked children for the integrated end-to-end. NOT the
+# real React-WRY shell / Brain (B2); the thinnest things that drive the real wire.
+[[bin]]
+name = "delphi-minimal-shell"
+path = "src/bin/delphi-minimal-shell.rs"
+
+[[bin]]
+name = "delphi-minimal-ai"
+path = "src/bin/delphi-minimal-ai.rs"
+
 [dependencies]
 # Syscall layer (§13.7: reuse the workspace's existing nix 0.30; add the feature
 # gates 1a needs — `user` for set{groups,gid,uid}/geteuid, `fs` for chown/unlink,
@@ -41,3 +51,10 @@ delphi-hardening = { workspace = true }
 # conversation can be routed over the 1b private channel (recon #1 — verified the
 # crate supports a non-tty custom conversation).
 pam-client2 = "0.5"
+# B1: the AI↔daemon general-socket wire is protobuf (the project's IPC law; B2's
+# real Brain reuses the wire unchanged). prost-generated message types.
+prost = { workspace = true }
+
+[build-dependencies]
+# B1: compile runtime/proto/runtime_wire.proto into Rust types.
+prost-build = "0.13"

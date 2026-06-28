@@ -310,6 +310,99 @@ fn b1_swap_after_canonicalize_runs_the_pinned_content() {
     assert_eq!(ran, "PINNED", "the SEALED/pinned content ran, not the swapped path (swap-proof composes)");
 }
 
+// ── B1-02: the shebang interpreter arg REACHES exec (not dropped) ────────────
+
+#[test]
+fn b1_shebang_interpreter_arg_reaches_exec() {
+    if !bwrap_available() {
+        eprintln!("SKIP b1_shebang_arg: requires bwrap + unprivileged userns");
+        return;
+    }
+    let dir = PathBuf::from(format!("/tmp/delphi-b1-arg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = dir.join("res");
+    // The "interpreter" records its FIRST arg — so if our exec passes the shebang arg,
+    // its $1 is the arg; if dropped, its $1 would be the script fd-path instead.
+    let recorder = dir.join("recorder.sh");
+    std::fs::write(&recorder, format!("#!/bin/sh\necho \"$1\" > {}\n", result.display())).unwrap();
+    std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The action's script: shebang names the recorder + the arg ARGPROOF.
+    let exe = dir.join("act.sh");
+    std::fs::write(&exe, format!("#!{} ARGPROOF\n:\n", recorder.display())).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let key = MintingKey::from_bytes(KEY);
+    let mut store = PendingStore::new();
+    let id = store.next_id();
+    let action = canonicalize(&marker_proposal(&exe, "ignored-argv", &dir), id.clone()).unwrap();
+    let digest = canonical_action_digest(&action);
+    store.insert(action);
+    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    let token = mint(&key, &digest, NOW).to_wire();
+
+    let mut ledger = ConsumptionLedger::new();
+    let outcome = present_and_execute(&mut store, &mut ledger, &key, &id, &token, NOW);
+    let ran = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(matches!(outcome, Outcome::Completed { .. }), "runs: {outcome:?}");
+    assert_eq!(ran, "ARGPROOF", "the shebang interpreter arg reached exec (B1-02), not dropped");
+}
+
+// ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
+
+#[test]
+fn b1_daemon_binary_runs_the_assembled_flow() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP b1_daemon_binary: requires root");
+        return;
+    }
+    if !bwrap_available() {
+        eprintln!("SKIP b1_daemon_binary: requires bwrap + unprivileged userns");
+        return;
+    }
+    let setup = Setup::new("b");
+    // World-accessible staging: the dropped user execs the side bins; the daemon (root)
+    // opens the exe + binds the work dir.
+    let stage = PathBuf::from(format!("/tmp/delphi-b1bin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &stage, "mshell");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &stage, "mai");
+    let result = stage.join("result");
+    let exe = write_marker_exe(&stage, &result);
+
+    // Run the actual delphi-runtimed BINARY — it does anchor + launch + serve itself.
+    let out = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+        .args(["--session", &setup.user])
+        .env("DELPHI_SHELL_BIN", &shell_bin)
+        .env("DELPHI_AI_BIN", &ai_bin)
+        .env("DELPHI_PASSWORD", PASSWORD)
+        .env("DELPHI_AI_EXE", &exe)
+        .env("DELPHI_AI_ARG", "BINARY-FLOW")
+        .env("DELPHI_AI_BIND_RW", &stage)
+        // The compile-time test seam (the binary is built with --features
+        // insecure-test-seams in the lane); WSL has no real logind session.
+        .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1")
+        .output()
+        .expect("run delphi-runtimed");
+
+    let marker = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::remove_dir_all(format!("/run/delphi/{}", setup.user));
+
+    assert!(out.status.success(), "daemon main exited ok; stderr:\n{stderr}");
+    assert!(
+        stdout.contains("DELPHI_RUNTIMED_OUTCOME Completed"),
+        "the BINARY's main RAN the assembled loop to completion (not thread::park); stdout:\n{stdout}"
+    );
+    assert_eq!(marker, "BINARY-FLOW", "the action executed via delphi-runtimed's main");
+}
+
 // ── Half (ii): the launcher's fd-discipline — the AI holds NO channel fd ──────
 
 #[test]

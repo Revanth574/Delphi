@@ -58,3 +58,10 @@ prost = { workspace = true }
 [build-dependencies]
 # B1: compile runtime/proto/runtime_wire.proto into Rust types.
 prost-build = "0.13"
+
+[features]
+# B1 test-only: a logind-verdict override the binary-flow test uses (WSL2 sessions
+# are ephemeral/seatless, so a real `sd_pid_get_session` on the forked shell yields
+# no active session). COMPILE-TIME EXCLUDED from production builds — the seam does
+# not exist in the shipped daemon; the privileged lane builds the test with it.
+insecure-test-seams = []

@@ -159,6 +159,12 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     args.push("--".to_string());
     args.push(format!("/proc/self/fd/{program_fd}"));
     if let Some(script) = script_arg_fd {
+        // The shebang's optional interpreter arg (e.g. `-I`), passed BEFORE the
+        // script exactly as the kernel would — it is part of what executes, bound by
+        // the digest + previewed, so execute == approved (B1-02).
+        if let Some(arg) = action.script.as_ref().and_then(|sp| sp.interpreter_arg.as_deref()) {
+            args.push(arg.to_string());
+        }
         // The sealed script, passed to the pinned interpreter (not exec'd directly).
         args.push(format!("/proc/self/fd/{script}"));
     }
@@ -458,6 +464,7 @@ mod tests {
         action.script = Some(crate::action::ScriptPin {
             interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
             interpreter_digest: sha256(b"interp"),
+            interpreter_arg: None,
             script_memfd: unsealed_memfd(script_src), // NOT sealed
             script_digest: sha256(script_src),
         });
@@ -491,6 +498,7 @@ mod tests {
         action.script = Some(crate::action::ScriptPin {
             interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
             interpreter_digest: sha256(b"interp"),
+            interpreter_arg: None,
             script_memfd: write_sealed_only_memfd(script_src), // ONLY F_SEAL_WRITE
             script_digest: sha256(script_src),
         });
@@ -535,7 +543,7 @@ mod tests {
         // The sanctioned constructor: a FULLY-sealed script memfd (so the exec-time
         // require_fully_sealed check passes on the legitimate path).
         action.script = Some(
-            ScriptPin::sealed(interp_fd, sha256(b"INTERP-V1"), script_src.as_bytes())
+            ScriptPin::sealed(interp_fd, sha256(b"INTERP-V1"), None, script_src.as_bytes())
                 .expect("seal script memfd"),
         );
         let key = MintingKey::from_bytes(KEY);

@@ -189,11 +189,18 @@ pub fn present_and_execute(
         }
         execute_approved(&entry.action, &candidate, key, now, ledger)
     };
-    if let Some(e) = store.get_mut(pending_id) {
-        e.state = PendingState::Consumed;
-    }
+    // B1-04: the store state FOLLOWS the ledger — advance to Consumed ONLY when the
+    // ledger actually consumed (a successful, verified execution). A wrong/forged
+    // token (Unapproved) does NOT consume the ledger, so it must NOT burn the
+    // approval either — the legitimate token can still be presented (the 1c
+    // "failed-verify doesn't consume" precedent). The two never disagree.
     match result {
-        Ok(output) => Outcome::Completed { pending_id: pending_id.to_string(), exit_code: output.status.code() },
+        Ok(output) => {
+            if let Some(e) = store.get_mut(pending_id) {
+                e.state = PendingState::Consumed;
+            }
+            Outcome::Completed { pending_id: pending_id.to_string(), exit_code: output.status.code() }
+        }
         Err(RuntimeError::Unapproved) => denied("token does not verify against the stored action's digest"),
         Err(RuntimeError::AlreadyConsumed) => denied("approval already consumed (one-shot)"),
         Err(e) => denied(&format!("execution failed: {e}")),

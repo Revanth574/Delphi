@@ -69,6 +69,13 @@ pub struct ScriptPin {
     pub interpreter_fd: OwnedFd,
     /// Hash of the bytes read through `interpreter_fd`.
     pub interpreter_digest: [u8; 32],
+    /// The shebang's single optional interpreter argument (e.g. `-I` in
+    /// `#!/usr/bin/python3 -I`), as the kernel parses it: everything after the
+    /// interpreter path, as ONE arg (`None` if absent). It is part of WHAT EXECUTES,
+    /// so it is bound by the digest, rendered in the preview, and passed to the
+    /// interpreter **before** the script — dropping it would run a different command
+    /// than the human approved (B1-02, an approve-X/execute-Y at the flags level).
+    pub interpreter_arg: Option<String>,
     /// The fully-sealed (immutable) script content memfd.
     pub script_memfd: OwnedFd,
     /// Hash of the sealed script content.
@@ -104,18 +111,20 @@ impl ScriptPin {
     /// ```
     /// use delphi_runtime::action::ScriptPin;
     /// let interp = std::fs::File::open("/bin/sh").unwrap().into();
-    /// let pin = ScriptPin::sealed(interp, [0u8; 32], b"#!/bin/sh\n:\n").unwrap();
+    /// let pin = ScriptPin::sealed(interp, [0u8; 32], None, b"#!/bin/sh\n:\n").unwrap();
     /// assert_eq!(pin.script_digest.len(), 32);
     /// ```
     pub fn sealed(
         interpreter_fd: OwnedFd,
         interpreter_digest: [u8; 32],
+        interpreter_arg: Option<String>,
         script_content: &[u8],
     ) -> Result<Self, RuntimeError> {
         let script_memfd = seal_immutable_memfd(script_content)?;
         Ok(Self {
             interpreter_fd,
             interpreter_digest,
+            interpreter_arg,
             script_memfd,
             script_digest: sha256(script_content),
         })
@@ -264,8 +273,21 @@ pub fn canonical_action_digest(action: &PendingAction) -> [u8; 32] {
         .fixed(&[*required_tier as u8])
         .seq(usize::from(script.is_some()), |s| {
             if let Some(sc) = script {
-                // The script's interpreter + content, bound by digest.
-                s.fixed(&sc.interpreter_digest).fixed(&sc.script_digest);
+                // EXHAUSTIVE no-`..` destructure (mirrors the PendingAction guard): a
+                // new ScriptPin field fails to compile here until it is bound.
+                let ScriptPin {
+                    interpreter_fd,
+                    interpreter_digest,
+                    interpreter_arg,
+                    script_memfd,
+                    script_digest,
+                } = sc;
+                // fds are runtime handles; their CONTENT is bound via the digests.
+                let _ = (interpreter_fd, script_memfd);
+                // The script's interpreter object + ITS arg + content, all bound.
+                s.fixed(interpreter_digest)
+                    .field(interpreter_arg.as_deref().unwrap_or("").as_bytes())
+                    .fixed(script_digest);
             }
         });
     h.finish().expect("declared 11 top-level fields, appended 11")
@@ -358,8 +380,9 @@ pub fn preview(action: &PendingAction) -> String {
     let script = match &action.script {
         None => "none".to_string(),
         Some(sp) => format!(
-            "interp:{} content:{}",
+            "interp:{} arg:{} content:{}",
             hex32(&sp.interpreter_digest),
+            sp.interpreter_arg.as_deref().unwrap_or("(none)"),
             hex32(&sp.script_digest)
         ),
     };
@@ -499,6 +522,7 @@ mod tests {
                 a.script = Some(ScriptPin {
                     interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
                     interpreter_digest: [0x01; 32],
+                    interpreter_arg: None,
                     script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
                     script_digest: [0x02; 32],
                 });
@@ -539,5 +563,33 @@ mod tests {
             "no value-derived fingerprint the untrusted requester could dictionary-match \
              (an unkeyed hash of a low-entropy value is an offline oracle)"
         );
+    }
+
+    /// B1-02: the shebang interpreter arg is BOUND by the digest and RENDERED in the
+    /// preview — so what the human approves (preview + digest) includes the
+    /// interpreter flags that affect what executes (isolating the arg: same
+    /// interpreter/script digests, different arg → different action digest).
+    #[test]
+    fn shebang_interpreter_arg_is_bound_and_previewed() {
+        let pin = |arg: Option<&str>| -> ScriptPin {
+            ScriptPin {
+                interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
+                interpreter_digest: [0x11; 32],
+                interpreter_arg: arg.map(String::from),
+                script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
+                script_digest: [0x22; 32],
+            }
+        };
+        let digest = |arg: Option<&str>| {
+            let mut a = sample();
+            a.script = Some(pin(arg));
+            canonical_action_digest(&a)
+        };
+        assert_ne!(digest(Some("-I")), digest(None), "the interpreter arg is bound by the digest");
+        assert_ne!(digest(Some("-I")), digest(Some("-B")), "different args → different digest");
+
+        let mut a = sample();
+        a.script = Some(pin(Some("-I")));
+        assert!(preview(&a).contains("arg:-I"), "the preview renders the interpreter arg");
     }
 }

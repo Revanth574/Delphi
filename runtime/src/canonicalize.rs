@@ -71,6 +71,27 @@ pub fn canonicalize(
         None
     };
 
+    // VALIDATE untrusted wire enums (fail-CLOSED): prost's enum accessors silently
+    // normalize an out-of-range i32 to the default (`required_tier` → the most
+    // permissive AUTONOMOUS) — the opposite of fail-closed. Reject unknown instead.
+    let net_policy = map_net(
+        pb::NetPolicy::try_from(proposal.net_policy)
+            .map_err(|_| RuntimeError::Protocol(format!("invalid net_policy {}", proposal.net_policy)))?,
+    );
+    let required_tier = map_tier(
+        pb::RequiredTier::try_from(proposal.required_tier)
+            .map_err(|_| RuntimeError::Protocol(format!("invalid required_tier {}", proposal.required_tier)))?,
+    );
+    let fs_binds = proposal
+        .fs_binds
+        .iter()
+        .map(|b| {
+            let mode = pb::BindMode::try_from(b.mode)
+                .map_err(|_| RuntimeError::Protocol(format!("invalid bind mode {}", b.mode)))?;
+            Ok((PathBuf::from(&b.path), map_bind_mode(mode)))
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+
     Ok(PendingAction {
         pending_id,
         preview_version: 1,
@@ -83,14 +104,10 @@ pub fn canonicalize(
             .iter()
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect(),
-        fs_binds: proposal
-            .fs_binds
-            .iter()
-            .map(|b| (PathBuf::from(&b.path), map_bind_mode(b.mode())))
-            .collect(),
-        net_policy: map_net(proposal.net_policy()),
+        fs_binds,
+        net_policy,
         timeout: Duration::from_secs(proposal.timeout_secs),
-        required_tier: map_tier(proposal.required_tier()),
+        required_tier,
         script,
     })
 }
@@ -99,12 +116,22 @@ pub fn canonicalize(
 /// script content (`ScriptPin::sealed` applies the full immutability seal set).
 fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
     let line_end = script_bytes.iter().position(|&b| b == b'\n').unwrap_or(script_bytes.len());
+    // Kernel cap (BINPRM_BUF_SIZE): the interpreted `#!` line is bounded; a longer one
+    // is malformed/hostile — reject before parsing.
+    if line_end > 255 {
+        return Err(RuntimeError::Protocol("shebang line exceeds the kernel length cap".into()));
+    }
     let shebang = std::str::from_utf8(&script_bytes[2..line_end])
-        .map_err(|_| RuntimeError::Protocol("non-UTF-8 shebang line".into()))?;
-    let interp_path = shebang
-        .split_whitespace()
+        .map_err(|_| RuntimeError::Protocol("non-UTF-8 shebang line".into()))?
+        .trim();
+    // Kernel semantics: interpreter = the first token; everything after the first
+    // whitespace is ONE optional argument (e.g. `-I` in `#!/usr/bin/python3 -I`).
+    let mut parts = shebang.splitn(2, char::is_whitespace);
+    let interp_path = parts
         .next()
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| RuntimeError::Protocol("empty shebang interpreter".into()))?;
+    let interpreter_arg = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
 
     let mut interp = File::open(interp_path).map_err(|source| RuntimeError::Filesystem {
         op: "open script interpreter",
@@ -120,7 +147,7 @@ fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
     let interpreter_digest = sha256(&interp_bytes);
     let interpreter_fd: OwnedFd = interp.into();
 
-    ScriptPin::sealed(interpreter_fd, interpreter_digest, script_bytes)
+    ScriptPin::sealed(interpreter_fd, interpreter_digest, interpreter_arg, script_bytes)
 }
 
 fn map_bind_mode(m: pb::BindMode) -> BindMode {
@@ -210,6 +237,39 @@ mod tests {
         // `unwrap_err` (which would need the Ok value to be Debug).
         let result = canonicalize(&base_proposal("/no/such/binary"), "act-3".into());
         assert!(matches!(result, Err(RuntimeError::Filesystem { .. })), "missing exe → typed error");
+    }
+
+    /// B1-02: the shebang's optional interpreter arg is parsed + stored (kernel
+    /// semantics — the first token is the interpreter, the rest is ONE arg).
+    #[test]
+    fn canonicalize_parses_the_shebang_interpreter_arg() {
+        let dir = tempdir();
+        let exe = write_exe(&dir, "iso.py", b"#!/usr/bin/python3 -I\nprint(1)\n");
+        let action = canonicalize(&base_proposal(exe.to_str().unwrap()), "act-arg".into()).unwrap();
+        let sp = action.script.as_ref().expect("shebang → ScriptPin");
+        assert_eq!(sp.interpreter_arg.as_deref(), Some("-I"), "the interpreter arg is bound, not dropped");
+
+        // No arg → None.
+        let plain = write_exe(&dir, "plain.sh", b"#!/bin/sh\n:\n");
+        let a2 = canonicalize(&base_proposal(plain.to_str().unwrap()), "act-na".into()).unwrap();
+        assert_eq!(a2.script.as_ref().unwrap().interpreter_arg, None);
+    }
+
+    /// B1-03: an out-of-range wire enum is REJECTED (fail-closed), not normalized to
+    /// the default (required_tier → AUTONOMOUS, the most permissive).
+    #[test]
+    fn out_of_range_wire_enum_is_rejected() {
+        let dir = tempdir();
+        let exe = write_exe(&dir, "tool", b"binary");
+        let mut p = base_proposal(exe.to_str().unwrap());
+        p.required_tier = 99; // not a valid RequiredTier
+        assert!(
+            matches!(canonicalize(&p, "x".into()), Err(RuntimeError::Protocol(_))),
+            "RED: an out-of-range required_tier must be rejected, not normalized to AUTONOMOUS"
+        );
+        let mut p2 = base_proposal(exe.to_str().unwrap());
+        p2.net_policy = 42;
+        assert!(matches!(canonicalize(&p2, "y".into()), Err(RuntimeError::Protocol(_))), "invalid net_policy rejected");
     }
 
     fn tempdir() -> PathBuf {

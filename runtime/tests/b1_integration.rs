@@ -30,7 +30,9 @@ use std::process::{Command, Stdio};
 use nix::sys::wait::waitpid;
 use nix::unistd::{geteuid, Gid, Uid, User};
 
-use delphi_runtime::action::{canonical_action_digest, PendingAction};
+use delphi_runtime::action::{
+    canonical_action_digest, NetPolicy, PendingAction, RequiredTier, ScriptPin,
+};
 use delphi_runtime::canonicalize::canonicalize;
 use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec};
@@ -130,6 +132,24 @@ fn write_marker_exe(dir: &Path, result: &Path) -> PathBuf {
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$1\" > {}\n", result.display())).unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     exe
+}
+
+/// An UNSEALED memfd holding `content` (`MFD_ALLOW_SEALING` but NO seals) — so the
+/// execute-time `require_fully_sealed` check refuses it AFTER the token verified +
+/// the ledger consumed (the verified-then-execution-failed window).
+fn unsealed_memfd(content: &[u8]) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fresh memfd; write content, apply NO seals, wrap once.
+    unsafe {
+        let fd = nix::libc::memfd_create(
+            c"b1-unsealed".as_ptr(),
+            (nix::libc::MFD_CLOEXEC | nix::libc::MFD_ALLOW_SEALING) as nix::libc::c_uint,
+        );
+        assert!(fd >= 0, "memfd_create");
+        let n = nix::libc::write(fd, content.as_ptr().cast(), content.len());
+        assert_eq!(n, content.len() as isize, "write memfd");
+        std::os::fd::OwnedFd::from_raw_fd(fd)
+    }
 }
 
 /// Copy a built bin into `dir` (mode 0755) so the dropped session user can exec it
@@ -448,6 +468,56 @@ fn b1_wrong_token_does_not_burn_the_approval() {
     assert_eq!(store.get(&id).unwrap().state, PendingState::Consumed, "success → store Consumed (agrees with ledger)");
     assert_eq!(std::fs::read_to_string(&result).unwrap().trim(), "RIGHT");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B1-R2-03 (the ACTUAL failure mode): a token that VERIFIES but whose execution
+/// FAILS AFTER the ledger consumes. An UNSEALED ScriptPin reaches `require_fully_sealed`
+/// inside `run_fd_pinned` — AFTER `execute_approved` verified the token + consumed the
+/// ledger — and is refused (UnsealedScript). The store must advance to Consumed,
+/// agreeing with the consumed ledger (1d one-shot: "a spawn failure still consumes").
+/// The wrong-token test covers failed-verify (never the bug); THIS covers verified-
+/// then-failed (the path the R2-03 bug lived on). No bwrap: the seal check precedes the
+/// spawn.
+#[test]
+fn b1_verified_then_execution_failed_consumes_the_approval() {
+    let key = MintingKey::from_bytes(KEY);
+    let mut store = PendingStore::new();
+    let id = store.next_id();
+    let action = PendingAction {
+        pending_id: id.clone(),
+        preview_version: 1,
+        executable_fd: std::fs::File::open("/dev/null").unwrap().into(),
+        executable_digest: [0xAB; 32],
+        argv: vec!["tool".into()],
+        cwd: PathBuf::from("/"),
+        env_delta: vec![],
+        fs_binds: vec![],
+        net_policy: NetPolicy::None,
+        timeout: std::time::Duration::from_secs(30),
+        required_tier: RequiredTier::Biometric,
+        script: Some(ScriptPin {
+            interpreter_fd: std::fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_digest: [0x01; 32],
+            interpreter_arg: None,
+            script_memfd: unsealed_memfd(b"#!/bin/sh\n:\n"), // NOT sealed → run fails AFTER consume
+            script_digest: [0x02; 32],
+        }),
+    };
+    let digest = canonical_action_digest(&action);
+    store.insert(action);
+    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    let token = mint(&key, &digest, NOW).to_wire(); // a VALID token for this exact action
+    let mut ledger = ConsumptionLedger::new();
+
+    let outcome = present_and_execute(&mut store, &mut ledger, &key, &id, &token, NOW);
+    // The token verified + the ledger consumed, then run_fd_pinned refused the unsealed
+    // script → Denied. The store must AGREE with the consumed ledger: Consumed.
+    assert!(matches!(outcome, Outcome::Denied { .. }), "verified-then-failed → Denied: {outcome:?}");
+    assert_eq!(
+        store.get(&id).unwrap().state,
+        PendingState::Consumed,
+        "R2-03: verified-then-execution-failed must advance the store to Consumed (agrees with the ledger)"
+    );
 }
 
 // ── B1-02: the shebang interpreter arg REACHES exec (not dropped) ────────────

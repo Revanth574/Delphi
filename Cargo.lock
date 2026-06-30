@@ -984,6 +984,8 @@ dependencies = [
  "hmac",
  "nix",
  "pam-client2",
+ "prost",
+ "prost-build",
  "sha2",
  "thiserror 2.0.18",
  "tracing",

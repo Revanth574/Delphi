@@ -36,6 +36,16 @@ const en = {
       destKeepLocal: "Keep local",
     },
 
+    // ── PAM consent (B2a R-3): the runtime daemon's approval dialog ─
+    pamConsent: {
+      title: "Approve this action?",
+      body: "The runtime needs your permission to run the action below. Enter your password to approve.",
+      previewLabel: "Delphi will run:",
+      passwordLabel: "Password",
+      allow: "Approve",
+      cancel: "Cancel",
+    },
+
     // ── Dock ────────────────────────────────────
     dock: {
       files: "Files",

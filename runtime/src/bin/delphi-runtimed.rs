@@ -42,10 +42,11 @@ use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 
 const PAM_SERVICE: &str = "delphi-runtime";
 
-/// A fixed active/local verdict (the fail-closed default, or the real query result).
+/// A fixed active/local/seated verdict (the fail-closed default, or the real query result).
 struct FixedVerdict {
     active: bool,
     remote: bool,
+    seated: bool,
 }
 impl SessionVerdict for FixedVerdict {
     fn is_active(&self) -> bool {
@@ -53,6 +54,9 @@ impl SessionVerdict for FixedVerdict {
     }
     fn is_remote(&self) -> bool {
         self.remote
+    }
+    fn is_seated(&self) -> bool {
+        self.seated
     }
 }
 
@@ -138,12 +142,14 @@ fn logind_verdict(shell_pid: i32) -> Box<dyn SessionVerdict> {
             "INSECURE TEST SEAM ACTIVE — logind gate overridden by \
              DELPHI_INSECURE_ASSUME_ACTIVE_SESSION; this MUST NOT appear in production"
         );
-        return Box::new(FixedVerdict { active: true, remote: false });
+        // The seam also asserts `seated` — the B2a gate requires it, so an override that
+        // stopped at active+local would fail the tightened gate on a seatless WSL2.
+        return Box::new(FixedVerdict { active: true, remote: false, seated: true });
     }
     match LogindVerdict::for_pid(shell_pid) {
         Some(v) => Box::new(v),
-        // No logind session for the shell ⇒ fail-closed (not active).
-        None => Box::new(FixedVerdict { active: false, remote: false }),
+        // No logind session for the shell ⇒ fail-closed (not active, not seated).
+        None => Box::new(FixedVerdict { active: false, remote: false, seated: false }),
     }
 }
 

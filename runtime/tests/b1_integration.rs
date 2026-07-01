@@ -57,6 +57,7 @@ const KEY: [u8; 32] = [0x5B; 32];
 struct Verdict {
     active: bool,
     remote: bool,
+    seated: bool,
 }
 impl SessionVerdict for Verdict {
     fn is_active(&self) -> bool {
@@ -65,8 +66,11 @@ impl SessionVerdict for Verdict {
     fn is_remote(&self) -> bool {
         self.remote
     }
+    fn is_seated(&self) -> bool {
+        self.seated
+    }
 }
-const PASS: Verdict = Verdict { active: true, remote: false };
+const PASS: Verdict = Verdict { active: true, remote: false, seated: true };
 
 /// A fixed-time clock (every read returns the same second).
 struct FixedClock(u64);
@@ -725,7 +729,7 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
     let mut ledger = ConsumptionLedger::new();
     let key = MintingKey::from_bytes(KEY);
     // A NON-active session: the logind gate must DENY before PAM/execute.
-    let deny_verdict = Verdict { active: false, remote: false };
+    let deny_verdict = Verdict { active: false, remote: false, seated: false };
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
         session_verdict: &deny_verdict,

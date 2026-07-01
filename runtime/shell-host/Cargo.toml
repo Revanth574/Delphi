@@ -1,0 +1,39 @@
+# Delphi shell host — the raw-WRY (WebKitGTK) native shell child (Increment B2a).
+#
+# DECOUPLED from the Delphi workspace by the empty [workspace] table below: this keeps
+# wry/tao/WebKit's ENTIRE dependency + license tree OUT of the trust-boundary workspace
+# (delphi-runtime), whose deny.toml/CI surface stays small + auditable — every dep there
+# is one the security core rests on. The GUI depends on the boundary (delphi-runtime, by
+# path, for consent_relay::{HostSession, FdChannel}); the boundary stays GUI-free — the
+# right dependency direction (CLAUDE.md §4 dependency DAG; docs/TRUST_MODEL.md B2a).
+#
+# Built + installed to /usr/libexec/delphi-shell for the launcher to exec as shell_path
+# (delphi_runtime::launcher::LaunchSpec::shell_path).
+[package]
+name = "delphi-shell-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# The launcher execs this at /usr/libexec/delphi-shell.
+[[bin]]
+name = "delphi-shell"
+path = "src/main.rs"
+
+[dependencies]
+# The security-critical consent relay lives IN the trust boundary; the host depends on
+# it BY PATH and reuses HostSession + FdChannel unchanged (the state machine, not a copy).
+delphi-runtime = { path = ".." }
+# The raw-WRY (WebKitGTK) surface — proven under WSLg by the de-risking proof.
+wry = "0.55"
+tao = "0.35"
+libc = "0.2"
+# The renderer→native consent message ({kind:"password"|"cancel", value}). serde_json
+# also builds the native→renderer evaluate_script arguments with proper string escaping
+# (so a preview/prompt cannot inject JS).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Own workspace root — decouples this crate (and its GUI dep tree) from the main workspace.
+[workspace]

@@ -5,8 +5,10 @@
 //! The launcher fork-passes the private `SOCK_SEQPACKET` channel onto fd 3 and execs
 //! this binary as `shell_path` (`delphi_runtime::launcher`). The host:
 //!
-//! 1. adopts the channel fd and **CLOEXEC**s it so WebKit's forked subprocesses never
-//!    inherit it (the 1D-03 / WRY-proof fd-containment discipline);
+//! 1. adopts the channel fd and **CLOEXEC**s it — *verified, fail-closed*: the host
+//!    refuses to start WebKit if containment cannot be confirmed (B2A-R2-01), so the
+//!    consent relay is the only path to the channel because WebKit's forked subprocesses
+//!    provably cannot inherit the fd (the 1D-03 / WRY-proof fd-containment discipline);
 //! 2. drives the consent protocol via [`delphi_runtime::consent_relay::HostSession`] —
 //!    the **state machine**, not the de-risking proof's blind relay;
 //! 3. bridges native↔renderer: preview + PAM prompt go native→renderer via
@@ -29,6 +31,7 @@
 //! topology + native↔renderer IPC under WSLg). The **composition** of the security logic
 //! with real rendering runs on the seated lane (where the host actually draws).
 
+use std::io;
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 
@@ -68,9 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(CHANNEL_FD);
 
-    // 2. THE DISCIPLINE (1D-03 at the shell host): CLOEXEC the channel fd so WebKit's
-    //    forked subprocesses do not inherit it (proven by the WRY de-risking proof).
-    set_cloexec(chan_fd);
+    // 2. FAIL-CLOSED CONTAINMENT (1D-03 at the shell host, B2A-R2-01): the channel fd
+    //    MUST be CLOEXEC so WebKit's forked subprocesses cannot inherit it — the consent
+    //    relay is the ONLY path to the channel ONLY IF WebKit does not hold the fd. Set
+    //    it, VERIFY it, and ABORT before starting ANY WebKit if it cannot be confirmed:
+    //    if containment is not PROVABLE, do not create the process that could bypass the
+    //    relay. (Runs before the event loop / window / WebView — no WebKit yet exists.)
+    ensure_channel_contained(chan_fd)?;
 
     let session: SharedSession = Arc::new(Mutex::new(None));
 
@@ -193,15 +200,71 @@ fn shell_url() -> String {
         .unwrap_or_else(|_| "file:///usr/share/delphi/shell/index.html".into())
 }
 
-/// Set `FD_CLOEXEC` on the channel fd so WebKit's forked subprocesses do not inherit it.
-fn set_cloexec(fd: RawFd) {
-    // SAFETY: fcntl F_GETFD/F_SETFD on the launcher's fork-passed channel fd, which this
-    // process owns. CLOEXEC affects only exec (WebKit's subprocess spawns), not this
-    // process's own use of the fd — the proven WRY-proof discipline.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+/// Set `FD_CLOEXEC` on the channel fd and VERIFY it — the fail-closed containment gate
+/// (B2A-R2-01). Returns an error (so `main` aborts before any WebKit is started) if the
+/// flag cannot be read, set, or CONFIRMED set. The consent relay is the only path to the
+/// channel ONLY IF WebKit's subprocesses cannot inherit the fd, so an unprovable
+/// containment must STOP the host, not proceed on a best-effort assumption.
+fn ensure_channel_contained(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl F_GETFD on the launcher's fork-passed channel fd, which this process
+    // owns; reads the descriptor flags or returns -1.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: set FD_CLOEXEC (affects only exec — WebKit subprocess spawns — not this
+    // process's own use of the fd).
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // VERIFY, don't assert: re-read the flags and confirm the bit is ACTUALLY set.
+    // SAFETY: re-read F_GETFD on the same fd.
+    let verified = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if verified < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if verified & libc::FD_CLOEXEC == 0 {
+        return Err(io::Error::other(format!(
+            "FD_CLOEXEC not set on channel fd {fd} after F_SETFD — refusing to start WebKit"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B2A-R2-01: FAIL-CLOSED containment. A fd whose CLOEXEC cannot be set/verified
+    /// (a bad fd → `fcntl` EBADF) makes `ensure_channel_contained` return `Err` → `main`'s
+    /// `?` aborts BEFORE any `WebViewBuilder`, so the host never starts WebKit when the
+    /// channel is not provably contained. This BITES the best-effort version (which
+    /// ignored `fcntl` failures and proceeded into WRY construction anyway).
+    #[test]
+    fn containment_is_fail_closed_when_cloexec_cannot_be_confirmed() {
+        // -1 is never a valid fd: fcntl(F_GETFD) fails with EBADF → Err.
+        assert!(
+            ensure_channel_contained(-1).is_err(),
+            "unprovable containment MUST abort (fail-closed), not proceed into WebKit"
+        );
+    }
+
+    /// The happy path: a real fd is CLOEXEC'd AND the bit is verified set (verify, not
+    /// assert) — proving the gate lets a genuinely-containable fd through.
+    #[test]
+    fn containment_sets_and_verifies_cloexec_on_a_real_fd() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) fills two fds or returns -1.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (r, w) = (fds[0], fds[1]);
+        ensure_channel_contained(r).expect("a valid fd is containable");
+        // SAFETY: confirm FD_CLOEXEC is actually set on the fd now.
+        let flags = unsafe { libc::fcntl(r, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "FD_CLOEXEC must be set");
+        // SAFETY: close both pipe ends.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
         }
     }
 }

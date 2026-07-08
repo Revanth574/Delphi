@@ -126,6 +126,18 @@ fn main() -> Result<()> {
     // A line the binary-flow test can observe to confirm main ran the loops.
     println!("DELPHI_RUNTIMED_OUTCOME {outcome:?}");
 
+    // TERMINAL CONTRACT (B2A-R2-02): the shell interaction is terminal once
+    // serve_one_action returns — release the daemon's channel end BEFORE reaping. This
+    // produces the EOF a shell blocked in its consent read (a gate/PAM denial that never
+    // reached the PAM prompt) dismisses on; without it the shell would WEDGE waiting for a
+    // prompt + an EOF that never come. (ctx borrows only the local store/ledger, not the
+    // channel, so releasing the channel here is sound.)
+    drop(children.daemon_channel);
+
+    // NOTE (lifecycle, lane-dependent): blocking on the shell fits the ONE-SHOT minimal
+    // shell (which exits after mint-confirm, or on the EOF above at denial). The real
+    // LONG-LIVED WRY host does not exit per action — the daemon must not block on it; that
+    // is the lane-dependent half's B2 service loop, where the real host actually runs.
     let _ = waitpid(Pid::from_raw(children.shell_pid), None);
     let _ = waitpid(Pid::from_raw(children.ai_pid), None);
     Ok(())

@@ -1426,6 +1426,20 @@ The spec defines a seven-layer security architecture:
 
 Currently implemented: AES-256-GCM vault (Layer 2 partial), Argon2id key derivation, SHA-256 audit chain (Layer 6 precursor), 4-tier permission model.
 
+### Runtime Trust-Boundary Tracker
+
+The runtime arc (the auth boundary for tool execution — the `runtime/` crate + the decoupled `runtime/shell-host`) is a Phase 3B addition that is **not** among the spec's 18 capabilities or 7 Fortress layers, so it is tracked here rather than forced into either spec-mirror table. Canonical detail lives in `PROGRESS.md`.
+
+| Increment | What | Status |
+|-----------|------|--------|
+| Trust model | `docs/TRUST_MODEL.md` (STOP-POINT-B) | RATIFIED — 6-round Codex → APPROVE (`0065919`) |
+| 1a–1d | anchor + channel + fdsec + pidfd + PAM + token + canonical action + sandbox + execute + audit | BUILT + reviewed + MERGED (`e5f25d5`) |
+| B1 | make 1a–1d run — the launcher + service loops assembling the primitives, minimal sides | BUILT + own-Codex-reviewed (3 rounds) + MERGED (`f5b823d`) |
+| **B2a — WSL2-provable half** | the REAL React-WRY shell's **SECURITY CORE**: R-2 native relay (renderer-cannot-forge), gate-tightening (require a seat), the decoupled WRY host (fail-closed CLOEXEC), the R-3 PAM dialog, the terminal channel contract | **BUILT + Codex-APPROVED (2 rounds, 0 findings) + MERGED (`3e40e22`)** |
+| **B2a — lane-dependent half** | shape-(b) manual-fork launcher restructure (carrying its re-run 1b RED-proofs); real `pam_open_session` provisioning; the gate-POSITIVE; the long-lived-shell lifecycle; the composition (host drawing the real bundle) | **PENDING a real seated lane** — its own recon + build + review. Shape (b) **SETTLED** (forced by source: pam_systemd leader = own pid; logind SESSION_BUSY per leader). |
+
+**The honest boundary (do not lose):** B2a's security property is unit + real-channel proven (both verified-to-bite) and the gate-**negative** is proven on WSL2's real seatless session; the **composition** (host drawing the real bundle), the **gate-positive** (a real seated session passes), and the **long-lived-shell lifecycle** are LANE-DEPENDENT — the security-core **half** is merged, **NOT** B2a complete.
+
 ---
 
 ## Section 12: The Iron Laws of Delphi

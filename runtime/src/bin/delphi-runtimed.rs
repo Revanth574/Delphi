@@ -42,10 +42,11 @@ use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 
 const PAM_SERVICE: &str = "delphi-runtime";
 
-/// A fixed active/local verdict (the fail-closed default, or the real query result).
+/// A fixed active/local/seated verdict (the fail-closed default, or the real query result).
 struct FixedVerdict {
     active: bool,
     remote: bool,
+    seated: bool,
 }
 impl SessionVerdict for FixedVerdict {
     fn is_active(&self) -> bool {
@@ -53,6 +54,9 @@ impl SessionVerdict for FixedVerdict {
     }
     fn is_remote(&self) -> bool {
         self.remote
+    }
+    fn is_seated(&self) -> bool {
+        self.seated
     }
 }
 
@@ -122,6 +126,18 @@ fn main() -> Result<()> {
     // A line the binary-flow test can observe to confirm main ran the loops.
     println!("DELPHI_RUNTIMED_OUTCOME {outcome:?}");
 
+    // TERMINAL CONTRACT (B2A-R2-02): the shell interaction is terminal once
+    // serve_one_action returns — release the daemon's channel end BEFORE reaping. This
+    // produces the EOF a shell blocked in its consent read (a gate/PAM denial that never
+    // reached the PAM prompt) dismisses on; without it the shell would WEDGE waiting for a
+    // prompt + an EOF that never come. (ctx borrows only the local store/ledger, not the
+    // channel, so releasing the channel here is sound.)
+    drop(children.daemon_channel);
+
+    // NOTE (lifecycle, lane-dependent): blocking on the shell fits the ONE-SHOT minimal
+    // shell (which exits after mint-confirm, or on the EOF above at denial). The real
+    // LONG-LIVED WRY host does not exit per action — the daemon must not block on it; that
+    // is the lane-dependent half's B2 service loop, where the real host actually runs.
     let _ = waitpid(Pid::from_raw(children.shell_pid), None);
     let _ = waitpid(Pid::from_raw(children.ai_pid), None);
     Ok(())
@@ -138,12 +154,14 @@ fn logind_verdict(shell_pid: i32) -> Box<dyn SessionVerdict> {
             "INSECURE TEST SEAM ACTIVE — logind gate overridden by \
              DELPHI_INSECURE_ASSUME_ACTIVE_SESSION; this MUST NOT appear in production"
         );
-        return Box::new(FixedVerdict { active: true, remote: false });
+        // The seam also asserts `seated` — the B2a gate requires it, so an override that
+        // stopped at active+local would fail the tightened gate on a seatless WSL2.
+        return Box::new(FixedVerdict { active: true, remote: false, seated: true });
     }
     match LogindVerdict::for_pid(shell_pid) {
         Some(v) => Box::new(v),
-        // No logind session for the shell ⇒ fail-closed (not active).
-        None => Box::new(FixedVerdict { active: false, remote: false }),
+        // No logind session for the shell ⇒ fail-closed (not active, not seated).
+        None => Box::new(FixedVerdict { active: false, remote: false, seated: false }),
     }
 }
 

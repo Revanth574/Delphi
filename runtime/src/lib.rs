@@ -48,6 +48,7 @@ pub mod anchor;
 pub mod audit;
 pub mod canonicalize;
 pub mod channel;
+pub mod consent_relay;
 pub mod execute;
 pub mod fdsec;
 pub mod launcher;

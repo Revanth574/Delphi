@@ -22,8 +22,9 @@
 //! `wsl -u root -- … cargo test -p delphi-runtime --test b1_integration -- --test-threads=1`
 
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -38,12 +39,13 @@ use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec};
 use delphi_runtime::logind::SessionVerdict;
 use delphi_runtime::service::{
-    accept_requester, present_and_execute, serve_one_action, Clock, Outcome, ServiceCtx,
+    accept_requester, present_and_execute, propose_msg, serve_one_action, Clock, Outcome,
+    ServiceCtx,
 };
 use delphi_runtime::store::{PendingState, PendingStore};
 use delphi_runtime::token::{mint, MintingKey, TOKEN_TTL_SECS};
-use delphi_runtime::wire::pb;
-use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
+use delphi_runtime::wire::{pb, write_frame};
+use delphi_runtime::{approval_socketpair, bind_approval_socket, ensure_runtime_dir};
 
 const SERVICE: &str = "delphi-runtime";
 const PAM_FILE: &str = "/etc/pam.d/delphi-runtime";
@@ -57,6 +59,7 @@ const KEY: [u8; 32] = [0x5B; 32];
 struct Verdict {
     active: bool,
     remote: bool,
+    seated: bool,
 }
 impl SessionVerdict for Verdict {
     fn is_active(&self) -> bool {
@@ -65,8 +68,11 @@ impl SessionVerdict for Verdict {
     fn is_remote(&self) -> bool {
         self.remote
     }
+    fn is_seated(&self) -> bool {
+        self.seated
+    }
 }
-const PASS: Verdict = Verdict { active: true, remote: false };
+const PASS: Verdict = Verdict { active: true, remote: false, seated: true };
 
 /// A fixed-time clock (every read returns the same second).
 struct FixedClock(u64);
@@ -725,7 +731,7 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
     let mut ledger = ConsumptionLedger::new();
     let key = MintingKey::from_bytes(KEY);
     // A NON-active session: the logind gate must DENY before PAM/execute.
-    let deny_verdict = Verdict { active: false, remote: false };
+    let deny_verdict = Verdict { active: false, remote: false, seated: false };
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
         session_verdict: &deny_verdict,
@@ -744,4 +750,84 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
 
     assert!(matches!(outcome, Outcome::Denied { .. }), "logind-inactive must DENY: {outcome:?}");
     assert!(!result.exists(), "denied at the gate → nothing executed");
+}
+
+/// A non-blocking channel-read outcome (scaffolding for the terminal-contract test).
+#[derive(Debug)]
+enum Rd {
+    Data,
+    WouldBlock,
+    Eof,
+}
+
+fn nb_read(fd: RawFd) -> Rd {
+    let mut buf = [0u8; 8192];
+    // SAFETY: a non-blocking recv on the borrowed fd — >0 data, 0 = EOF (peer closed), or
+    // -1 with EAGAIN when nothing is queued (so the test never blocks).
+    let n = unsafe { nix::libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), nix::libc::MSG_DONTWAIT) };
+    if n > 0 {
+        Rd::Data
+    } else if n == 0 {
+        Rd::Eof
+    } else {
+        // On Linux EWOULDBLOCK == EAGAIN, so EAGAIN alone covers "nothing queued".
+        let e = nix::errno::Errno::last();
+        assert!(e == nix::errno::Errno::EAGAIN, "unexpected recv errno: {e}");
+        Rd::WouldBlock
+    }
+}
+
+/// B2A-R2-02 (terminal contract, NON-root — the gate-deny path reaches no PAM/anchor):
+/// once serve_one_action reaches a terminal DENIAL, the caller (delphi-runtimed) releasing
+/// the daemon channel produces the EOF a wedged shell dismisses on. PRE-release the shell's
+/// next read WOULD BLOCK (the wedge B2A-R2-02 identified — a prompt + EOF that never come);
+/// POST-release it is EOF → the host's recv_prompt yields None → dismiss (proven in
+/// consent_relay's deny_on_eof test). The pre/post contrast IS the bite: without the
+/// release there is no EOF (the shell wedges); with it, clean dismissal.
+#[test]
+fn terminal_contract_release_produces_eof_no_wedge() {
+    // The private channel (daemon end + shell end) + the AI connection.
+    let (daemon_ch, shell_ch) = approval_socketpair().expect("channel");
+    let (mut ai_client, mut daemon_ai) = UnixStream::pair().expect("ai pair");
+
+    // The AI proposes a benign action; canonicalize opens /bin/true (readable, non-root).
+    let propose = pb::Propose {
+        argv: vec!["true".into()],
+        cwd: "/".into(),
+        env_delta: vec![],
+        fs_binds: vec![pb::Bind { path: "/usr".into(), mode: pb::BindMode::BindReadOnly as i32 }],
+        exe_path: "/bin/true".into(),
+        net_policy: pb::NetPolicy::NetNone as i32,
+        timeout_secs: 30,
+        required_tier: pb::RequiredTier::TierBiometric as i32,
+    };
+    write_frame(&mut ai_client, &propose_msg(propose)).expect("send propose");
+
+    let mut store = PendingStore::new();
+    let mut ledger = ConsumptionLedger::new();
+    let key = MintingKey::from_bytes(KEY);
+    // A NON-active session → the gate denies BEFORE PAM (so no root/PAM is needed).
+    let deny = Verdict { active: false, remote: false, seated: false };
+    let mut ctx = ServiceCtx {
+        channel_fd: daemon_ch.as_raw_fd(),
+        session_verdict: &deny,
+        key: &key,
+        pam_service: SERVICE,
+        session_user: "nobody",
+        store: &mut store,
+        ledger: &mut ledger,
+        clock: &FixedClock(NOW),
+    };
+    let outcome = serve_one_action(&mut daemon_ai, &mut ctx).expect("serve");
+    assert!(matches!(outcome, Outcome::Denied { .. }), "gate must DENY: {outcome:?}");
+
+    let sfd = shell_ch.as_raw_fd();
+    // The preview reached the shell (the approval-request datagram).
+    assert!(matches!(nb_read(sfd), Rd::Data), "shell received the approval request");
+    // PRE-RELEASE: the daemon has NOT closed → the next read WOULD BLOCK (the wedge).
+    assert!(matches!(nb_read(sfd), Rd::WouldBlock), "pre-release: no EOF → the shell would wedge");
+    // THE TERMINAL CONTRACT: delphi-runtimed releases the daemon channel after serve.
+    drop(daemon_ch);
+    // POST-RELEASE: EOF → the host's recv_prompt → None → dismiss (no wedge).
+    assert!(matches!(nb_read(sfd), Rd::Eof), "post-release: EOF → the host dismisses cleanly");
 }

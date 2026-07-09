@@ -17,6 +17,11 @@ members = [
     "delphi-hardening",
     "runtime",
 ]
+# The B2a WRY shell host is a DECOUPLED crate (its own [workspace]) so wry/tao/WebKit's
+# dep+license tree stays OUT of the trust-boundary workspace's auditable deny.toml/CI
+# surface. It depends on delphi-runtime BY PATH for the consent relay (GUI → boundary,
+# never the reverse). Excluded here so this workspace does not try to manage it.
+exclude = ["runtime/shell-host"]
 
 [workspace.package]
 version = "0.1.0"

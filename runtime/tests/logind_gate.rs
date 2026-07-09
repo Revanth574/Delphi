@@ -34,6 +34,9 @@ impl SessionVerdict for FileAssertedVerdict {
     fn is_remote(&self) -> bool {
         fs::read_to_string(&self.path).is_ok_and(|s| s.contains("remote"))
     }
+    fn is_seated(&self) -> bool {
+        fs::read_to_string(&self.path).is_ok_and(|s| s.contains("seated"))
+    }
 }
 
 /// CORRECT: the gate trusts LOGIND. A same-uid process cannot make logind report a
@@ -57,15 +60,74 @@ fn logind_trust_denies_same_uid_forge() {
 fn red_proof_same_uid_signal_trust_lets_forge_succeed() {
     let path = PathBuf::from(format!("/tmp/delphi-forge-session-{}", std::process::id()));
     let _ = fs::remove_file(&path);
-    // The same-uid attacker forges "active + local" by writing the signal it can reach.
-    fs::write(&path, "active").expect("same-uid write to the forgeable signal");
+    // The same-uid attacker forges the FULL verdict (active + local + seated) by writing
+    // the signal it can reach — the B2a seat axis is forgeable too when the source is a
+    // same-uid file, which is precisely why the source must be logind.
+    fs::write(&path, "active seated").expect("same-uid write to the forgeable signal");
     let passed = session_passes_gate(&FileAssertedVerdict { path: path.clone() });
     let _ = fs::remove_file(&path);
     assert!(
         passed,
-        "RED-proof: trusting a same-uid-writable signal lets the attacker forge active-local → \
-         the gate passes. This is exactly why the gate must query logind, not a same-uid signal."
+        "RED-proof: trusting a same-uid-writable signal lets the attacker forge \
+         active-local-seated → the gate passes. This is exactly why the gate must query \
+         logind, not a same-uid signal."
     );
+}
+
+/// Gated-live GATE-NEGATIVE (B2a R3-02 tightening, biting on WSL2): a **real**
+/// active + local but **seatless** session — the kind WSL2 has (`SEAT=-`) — passes the
+/// pre-B2a `active && !remote` gate yet MUST FAIL the tightened `active && !remote &&
+/// seated` gate. The session is found via logind's own `/run/systemd/sessions` registry
+/// and confirmed via the authoritative `sd_session_*` query (not faked). If no such
+/// session exists here (a seated desktop), it documents — the seated **positive** runs
+/// on the real seated lane.
+#[test]
+fn seatless_active_session_fails_the_seated_gate_live() {
+    let Some((id, v)) = active_local_seatless_session() else {
+        eprintln!(
+            "DEFER gate-negative-live: no active+local+seatless session in logind's registry \
+             here. On a seated desktop the seated POSITIVE is the case to prove (real lane)."
+        );
+        return;
+    };
+    // Precondition: this real session passes the PRE-B2a gate (active && !remote)…
+    let old_gate = v.is_active() && !v.is_remote();
+    let new_gate = session_passes_gate(&v);
+    eprintln!(
+        "gate-negative-live BIT: real logind session {id:?} — active={} remote={} seated={} \
+         → OLD gate (active&&!remote)={old_gate}, tightened seated gate={new_gate}",
+        v.is_active(),
+        v.is_remote(),
+        v.is_seated(),
+    );
+    assert!(old_gate, "precondition: a real active+local session passes the OLD gate");
+    // …and MUST fail the tightened seated gate — the bite.
+    assert!(
+        !new_gate,
+        "B2a R3-02: a real active+local but SEATLESS session must FAIL the seated gate \
+         (it passed the pre-B2a active && !remote gate)"
+    );
+}
+
+/// Scan logind's session registry (`/run/systemd/sessions/<id>`) for an active, local,
+/// **seatless** session, confirmed via the authoritative `sd_session_*` query. The `.ref`
+/// lock files and non-session entries are skipped.
+fn active_local_seatless_session() -> Option<(String, LogindVerdict)> {
+    for entry in fs::read_dir("/run/systemd/sessions").ok()?.flatten() {
+        let name = entry.file_name();
+        let id = name.to_string_lossy().into_owned();
+        if id.ends_with(".ref") || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if let Some(v) = LogindVerdict::query(&id)
+            && v.is_active()
+            && !v.is_remote()
+            && !v.is_seated()
+        {
+            return Some((id, v));
+        }
+    }
+    None
 }
 
 /// Gated-live: the direct `sd_session_*` query path works where a real logind

@@ -1001,6 +1001,51 @@ Delphi uses an external second model — Codex CLI, run by the human operator �
 - On APPROVE, merge to main via `git merge --no-ff phase-{N}/sweep-{crate}`; the branch carries the round fix-commits and their regression tests. A sweep that returns APPROVE on round 1 with zero findings has nothing to merge — record the clean result in PROGRESS.md and delete the branch.
 - Every sweep keeps a per-finding ledger (ID, severity, root cause, fix commit) in the merge commit body and a summary in PROGRESS.md, so the full review history is reconstructable from git alone.
 
+### Git history surgery — NEVER rewrite history with a dirty working tree
+
+**The rule: commit or stash before any operation that moves `HEAD`.** `git reset --hard`,
+`rebase`, and the reset-amend-cherry-pick dance used to amend a **non-HEAD** commit all move
+`HEAD`, and `--hard` discards every uncommitted change to a *tracked* file, irreversibly —
+those changes were never in git, so there is no reflog entry, no dangling object, nothing to
+recover from.
+
+Amending a non-HEAD commit is where this bites, because the surgery *requires* moving `HEAD`
+and the natural moment to do it is right after finishing the work that is still uncommitted.
+
+**Recorded because it happened (B2a C1, 2026-07-22).** A `git reset --hard HEAD~1` — to amend
+the commit one below `HEAD` — destroyed three fixture fixes, a new test file's contents, and a
+`PROGRESS.md` rewrite. It was recovered **only because those edits happened to have been made
+by scripted `python` patches that could be re-run**. That is luck, not a property of the
+workflow: hand-edits, or scripts already overwritten, would have been simply gone. **Do not let
+the rule's justification rest on recoverability.**
+
+Procedure for amending a non-HEAD commit:
+
+```bash
+git status --porcelain            # MUST be empty (or stash first: git stash push -u)
+git tag tmp-keep HEAD             # preserve anything above the target
+git reset --hard <target>~1  ...  # only now is --hard safe
+```
+
+### Process failures damage the work — check the tooling before the code
+
+Three failures in the B2a C1 session were **process** failures, not product defects, and each
+was the actor damaging or misreporting the very thing it was working on:
+
+1. **A fabricated test transcript** written into a commit body — a PASS that no run produced.
+2. **Test fixtures deleting the operator's installed `/etc/pam.d/delphi-runtime`** mid-run,
+   whose symptom surfaced far away as unrelated tests reporting "not installed"
+   (`docs/DEFECT_CLASSES.md` Class 16).
+3. **`git reset --hard` with a dirty tree** destroying uncommitted work (above).
+
+**None was caught by self-check.** Each was caught by an EXTERNAL check: the operator noticing
+the transcript, the runner's before/after `md5sum` of the PAM stack, and `git status`. The
+generalisation worth carrying: when a result looks wrong, **suspect the harness, the fixture,
+and the VCS operation before suspecting the code under test** — those failures present as
+product defects, cost the most diagnostic time, and are invisible to the actor that caused
+them. Build the external check (a checksum, a hygiene guard, a status assertion) rather than
+trusting care.
+
 ### Dev environment sync
 
 The canonical source of truth is `origin` (the shared GitHub remote at `https://github.com/Revanth574/Delphi.git`, private). Windows tree and WSL2 mirror BOTH push and pull from origin. The prior pattern of treating Windows as authoritative and rsync'ing Windows → WSL is DEPRECATED — it caused silent `.git` divergence during Task 3A.5 round 6 (see PROGRESS.md history for the rsync-residue stash incident).

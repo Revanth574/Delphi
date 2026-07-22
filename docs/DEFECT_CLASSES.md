@@ -172,6 +172,7 @@ module).
 - **SVC-1** — `SanitizedPrompt`: mintable only from a ZKQP sanitize; the sole constructor of the cloud-egress capability.
 - **SVC-1-R1-1 / -02** — `ConfirmationToken` (HMAC-bound) + `ConfirmationTokenWire` (redacted `Debug`, no `Display`/`Deref`).
 - **F15** — the held directory **handle** as the safe-open trust anchor (a proto-capability for the root-flags invariant).
+- **B2a C1** — `VtName` (`runtime/src/launcher.rs`): a `ttyN` validated by its sole constructor. The invariant is **well-formedness, not secrecy** — the variant of this class where the raw value is not a secret but a string whose malformed form fails SILENTLY downstream (`pam_open_session` SUCCEEDS and registers a `Class=background`, seatless session that the seated gate then denies forever). Proven by three `compile_fail` doctests (external bypasses) + a scoped source audit (module-internal sites) — see class 15 for why both.
 
 **PENDING (teeth):** **`TrustedRoot` for `ValidatedIngestionPath`.** The
 root-handle flags-invariant (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`) is currently
@@ -407,10 +408,108 @@ behavior, not the markers.
   date-scope precision: assert what the detector DOES under a transform, not what the
   Unicode category suggests.
 
+- **B2a C1 — the PAM-03 stack guard, both forms** (`runtime/src/launcher.rs`
+  `open_own_session`). The first guard checked only that `/etc/pam.d/delphi-runtime`
+  EXISTS. It covered "file absent" and missed "file present, `session` group EMPTY" — and
+  the missed form is **worse**, because `pam_open_session` then returns SUCCESS while
+  registering **no logind session at all**: a cleanly-succeeding call that yields nothing,
+  surfacing far away as a shell the seated gate denies forever. (Structurally identical to
+  the `VtName` seatless-string failure in class 5, one level up.) The fix deliberately did
+  NOT grep the config for a `session` line — that would repeat the mistake, covering one
+  form and missing `@include` / `session include` / `substack` / a module that loads and
+  no-ops. Instead it asserts the **OUTCOME**: after a successful `open_session` the pid MUST
+  resolve to a logind session (`logind::session_id_for_pid`). Read what the call DID, not
+  the markers the config carries.
+- **B2a C1 — `build.rs` artifact-kind enumeration.** `cargo:rustc-link-arg-{bins,tests}`
+  covered two artifact kinds; **doctests are neither**, so the first doctest referencing an
+  sd-login symbol failed to link (`undefined symbol: sd_pid_get_session`). Replaced with
+  `cargo:rustc-link-lib`, which attaches to the CRATE — the authoritative-category form that
+  every linking artifact inherits.
+
 **RED-proof shape.** Demonstrate the guard FAILING against the uncovered form before
 broadening it — both instances here actually fired in reality (the residue file
 reached a commit; the stub-grep actually mis-classified). A guard not shown to miss
 the form it missed is unproven.
+
+---
+
+## 15. Self-inspecting guard counts its own assertions  *(new — B2a C1)*
+
+**Description.** A guard that inspects SOURCE TEXT — a grep, a `matches().count()`, a
+`contains()` over the file it lives in or a tree that includes itself — has its own
+assertion literals inside the scope it audits. Two directions, and the second is the class:
+
+*Loud (benign).* The guard's first run reports an inflated count and fails. Self-announcing,
+fixed immediately.
+
+*Silent (the actual defect).* The guard passes initially. Later a contributor adds an
+assertion, comment, or doc example containing the matched literal. The count rises, the test
+fails, and the natural reading is "the guard is stale." The natural fix is to **bump the
+expected value**. The constant now encodes *production sites + the guard's own text*, and a
+genuinely-new production site is absorbed into that slack **silently, while the test stays
+green**. The guard is disarmed by its own maintenance.
+
+**Relationship to Class 14 (sibling, not duplicate).** Both end at "a guard that cannot fire
+against its target is decorative — worse than none, because it is false confidence." They
+differ in the disarming vector: Class 14's guard misses an **uncovered form of the target**;
+this one is disarmed by **edits to the guard itself**. A Class-14 audit ("enumerate the
+forms") would not catch it, because every form IS covered — the *scope* is what is wrong.
+
+**Foreclosing primitive.** **NONE — discipline**, in two parts:
+
+1. **Prefer a mechanism with no self-inspection where one covers the shape.** A
+   `compile_fail` doctest (rustdoc built-in — **no `trybuild` dependency needed**) proves a
+   bypass *cannot be written* from outside the module: compiler-enforced, no count constant,
+   nothing to disarm.
+2. **Where source inspection is unavoidable, scope it to the region under audit**, excluding
+   the assertion's own text, and derive the boundary so it **fails loudly if it stops
+   working** (`split_once(MARKER).expect(..)`, not an offset or an optimistic filter). State
+   in a comment what each unit of the count corresponds to, and name the re-derivation
+   command, so "bump it" requires re-deriving.
+
+**The two mechanisms are COMPLEMENTARY, not ordered** — this is the part worth internalising.
+`compile_fail` is **enumerative**: it catches the shapes you can NAME, from OUTSIDE the
+module. Source inspection is **exhaustive over the module**: it catches ANY new construction
+site or raw-field reader added INSIDE it, whose name is unknowable in advance and where the
+private field is legitimately accessible. Neither subsumes the other; use each for what it
+alone reaches.
+
+**Instances (grounded):**
+- **B2a C1 — the `VtName` class-5 audit** (`runtime/src/launcher.rs`, test
+  `vtname_internal_construction_and_reads_stay_at_the_sanctioned_sites`; cited by stable
+  identifier rather than commit hash, deliberately — the hash is not knowable when the entry
+  lands and a stale one rots). The audit greps its own module via `include_str!` for
+  construction sites (`Self(`) and raw-field readers (`self.0`). First run reported **4
+  constructors instead of 1** — the three extra were the test's own assertion literals.
+  Production counts were independently re-derived as 1 and 2 (`awk` split at `#[cfg(test)]`,
+  then `grep -c`), so the shipped invariant was never violated; the guard was measuring
+  itself. Fixed by scoping to the pre-`#[cfg(test)]` half. Caught on the FIRST run — the loud
+  direction. Filed here because the silent direction was one "just bump it to 4" away.
+- **The same change's remedy split, as the worked example:** three `compile_fail` doctests
+  took over the pub-field / `Deref` / `into_inner` erosions (each RED-proven — introducing
+  the erosion makes the snippet compile and the doctest FAIL), leaving the grep only the two
+  module-internal properties it alone can reach.
+- **Sibling shape (different mechanism, same lesson — a check whose own plumbing decides its
+  verdict):** the `tee`/`grep` exit-code mask, **CLAUDE.md §13.4** — `cmd | tee log` reports
+  `tee`'s status, masking a failed `cmd`. (Classes 7 and 10 are related but distinct: they
+  prescribe the CI **executed-test-count** guard, not the pipe-masking defect.)
+
+**RED-proof shape.** Two parts, both required:
+1. **The guard bites.** It must FAIL against each bypass shape it claims to catch, RED-proven
+   against a deliberately-broken implementation.
+2. **The scoping is necessary and the constant is grounded.** Show the unscoped guard reports
+   a violation that does not exist in production, AND derive the production count by an
+   INDEPENDENT means (a shell `grep -c` over the scoped region) that agrees with the
+   constant. A count-based guard whose constant was never independently derived is unproven.
+
+Disjoint-defect evidence from the C1 instance — the class-5 argument as measurement rather
+than assertion. The two rows that pass behaviourally are the reason structural audits exist:
+
+| Injected defect | Behavioural tests | Structural audit |
+|---|---|---|
+| `new` weakened to "any non-empty string" | **3 FAIL** | passes |
+| field made `pub String` | pass | **FAIL** |
+| `impl Deref for VtName` added | pass | **FAIL** |
 
 ---
 
@@ -432,3 +531,4 @@ the form it missed is unproven.
 | 12. Reject the invalid class | discipline (gate the class, fail-closed) | Discipline |
 | 13. Atomic versioned migration | **DEFERRED** (1 consumer; extract at the 2nd) | Pattern recorded |
 | 14. Guard must cover all forms | discipline (enumerate forms; read behavior, not markers) | Discipline |
+| 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |

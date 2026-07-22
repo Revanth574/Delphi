@@ -211,6 +211,108 @@ RuntimeDirectoryMode=0711
   execs the binary." There is, by construction, no principal below root for a same-uid attacker
   to become.
 
+### R3-01b — the shell's logind session (shape (b): the child opens its own, then execs into the shell)
+
+R3-01 establishes the root daemon; R3-02's gate then demands the *shell* belong to an
+active-local-seated logind session. This subsection specifies how that session comes to
+exist — the lane-dependent half, now closed against real logind (systemd 259, Ubuntu 26.04).
+
+- **Shape (a) is foreclosed; shape (b) is forced.** A parent cannot open a session *on behalf
+  of* a child: `pam_systemd` always makes the **PAM-calling process itself** the session leader
+  (leader == own pid), and logind rejects a second `CreateSession` for an existing leader with
+  `SESSION_BUSY`. So the daemon cannot open the session and hand it down. The session must be
+  opened by the process that will *be* in it — **shape (b)**.
+- **The mechanism.** The root daemon `fork()`s a child. The child, still root, calls
+  `pam_start("delphi-runtime", user, &conv)` → `pam_open_session` (becoming the session
+  **leader**), then drops privileges in the canonical order `setgroups([]) → setgid → setuid`
+  and **`execve`s directly into the shell binary**. Because `execve` preserves the pid, **the
+  session leader, the pidfd-pinned process, and the shell are one and the same pid** (the
+  leader == shell property — see R3-01c).
+- **The daemon is not, and cannot be, the leader — confirmed live.** The production daemon is a
+  root system service (R3-01), in `system.slice`, in no login session; `sd_pid_get_session(
+  daemon_pid)` returns `-ENODATA`. Recon confirmed this holds regardless of the daemon's own
+  cgroup placement: across every variant the daemon's pid did not resolve to the shell's
+  session, while the shell's pid did. This is exactly what shape (b) requires and what makes the
+  `SESSION_BUSY` foreclosure of shape (a) a non-issue — the daemon never tries to own the session.
+
+### R3-01c — leader == shell, not a forked grandchild (Phase D tiebreaker)
+
+The shape-(b) child could either (i) `execve` **into** the shell after `pam_open_session`
+(leader == shell), or (ii) remain as a session-holder and **`fork()` the shell** as a child
+(leader ≠ shell). Session *resolution* works for both — `sd_pid_get_session` resolves by
+**cgroup membership**, so a grandchild shell resolves to the session and passes the gate just as
+the leader does (A-1). The **failure mode** is the tiebreaker.
+
+Recon Phase D killed the session-holder without a clean `pam_close_session`. Under the
+leader ≠ shell topology the result was: the session entered state **`closing`** but did **not**
+tear down; the orphaned shell **survived** (reparented to the user manager — this system runs the
+systemd default `KillUserProcesses=no`) and continued to **cgroup-resolve to the now-`closing`
+session**. `# DECISION:` **choose leader == shell.** Then shell-death *is* session-leader-death
+*is* session teardown — there is no distinct session-holder that can outlive the shell, and no
+orphan window.
+
+**Evidential basis (do not carry silently).** The recon proved leader ≠ shell **end-to-end** (a
+grandchild shell resolves *and* passes the full active-local-seated gate), and has now also
+proved the exact single-process leader == shell sequence — one pid doing `pam_open_session` as
+root → priv-drop → `execve` into the shell. It is **EXERCISED, not assumed**: across three runs
+of the A-2 harness, **nine** independent cross-checks confirmed via **logind** — not via the
+binary's self-report — that `session.Leader` == the running shell pid == the pid
+`sd_pid_get_session` resolves the session from, **all after the `execve`**. The binary reports
+only pid-continuity by construction; the authoritative assertion is external
+(`loginctl show-session -p Leader` + `sd_pid_get_session`).
+
+**What remains outstanding.** A recon proof is not a shipped regression test. The lane-dependent
+build MUST still carry this assertion as its own **RED-first test in the runtime crate** —
+verified to FAIL against a leader ≠ shell (forked-grandchild) implementation and pass against
+leader == shell — so the property cannot silently regress. Two measurement boundaries also do
+not transfer for free: the recon exercised a **stand-in** PAM stack (`/etc/pam.d/delphi-recon`,
+`session required pam_systemd.so`), not the installer-shipped `/etc/pam.d/delphi-runtime` (see
+the PAM-deviation forward obligation above); and the A-2 **lifecycle/refcount** results were
+measured on `class=background` sessions while a production shell is `class=user` (`PAM_TTY` →
+`seat0`). `/run/user/<uid>` is refcounted **per-user, not per-session-class**, so those results
+are expected to carry — that expectation is **reasoned, not measured**.
+
+This choice also **moots an edge the recon did not test:** whether a `closing` session whose VT
+is *foreground* would still report `Active=yes` and thus pass the gate. The recon observed the
+orphaned shell as `Active=no` only because the foreground had returned to the desktop's VT; the
+foreground-`closing` case was not exercised. Under leader == shell no shell can outlive its
+session, so the edge **cannot arise** and needs no separate proof. (Any future variant that
+reintroduces a leader ≠ shell path would owe that proof.)
+
+**Pre-`execve` fd containment is mandatory (FD-01).** Because leader == shell means the *same
+pid* that ran `pam_start`/`pam_open_session` becomes the shell, every fd PAM opened — including
+`pam_systemd`'s D-Bus connection to logind — is live in the process about to `execve`. Any such
+fd not close-on-exec would be **inherited by the shell**: the same relay-bypass class B2A-R2-01
+closed ([`runtime/src/fdsec.rs`](../runtime/src/fdsec.rs) `mark_cloexec_except`,
+`close_range(.., CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE)`), one `execve` away. The launcher
+MUST run the `mark_cloexec_except` allowlist sweep **after the last PAM call that needs those
+descriptors and before the `execve`, preserving only explicitly intended fds**. The allowlist
+MUST be **explicitly enumerated and minimal** — not "whatever happens to be low-numbered." Under
+§4's Reading A, the one descriptor that legitimately survives into the shell is the fork-passed
+private `SOCK_SEQPACKET` consent channel; everything else (PAM/D-Bus, the spawn pipe, any stray
+inherited fd) is swept. This is not optional hardening — under leader == shell it is the identical
+fd-containment property the runtime already enforces on the AI-spawn path, now obligatory on the
+shell-spawn path. (Surfaced by this recon's own Codex gate — FD-01, P1.)
+
+**The session-only PAM deviation is deliberate, stack-specific, and sound only post-`execve`
+(PAM-01/PAM-02/PAM-03).** On the launcher's session path the daemon runs the PAM *session* stack
+(`pam_open_session`) of a **deliberately-selected, validated service** — production's
+`/etc/pam.d/delphi-runtime`, shipped by `installer/`; it MUST NOT fall through to PAM's generic
+`other` stack, since soundness cannot be claimed for a stack that was not deterministically chosen
+(PAM-03). Any deviation stated here is a property of *that specific stack*, not of PAM in general.
+On this path `pam_setcred` is not called (no `pam_authenticate` precedes it — credential
+authentication, including the biometric/TPM tiers, is R3-02's concern, and per R3-02 those tiers
+ride the **same daemon-driven PAM stack** as PAM modules, distinct from this launcher's
+session-only stack). The **omission of a matching `pam_close_session` is sound ONLY
+post-`execve`**: once the session-opening pid has `execve`'d into the shell, leader == shell
+guarantees no process outlives the session to close it, and teardown is by **leader exit** (the
+shell's death is the session's). **Every pre-`execve` failure path is different and MUST
+`pam_close_session` (if the session was opened) + `pam_end` while the handle is still live** —
+this is a production-launcher requirement, not optional (PAM-02). **Forward obligation:**
+re-validate this deviation against the actual `/etc/pam.d/delphi-runtime` stack when `installer/`
+ships it. A leader ≠ shell path would reintroduce both the explicit-close obligation on the
+success path and the orphan window Phase D exhibited.
+
 ### R3-02 — the auth party is the root daemon (PAM), not a substitutable agent
 
 v3 routed consent through a custom polkit action answered by "an active trusted agent." But
@@ -229,10 +331,20 @@ private channel — ambient session agents are removed from the trust chain.** (
   **private `SOCK_SEQPACKET` channel** to the **pinned shell** (R3-03), which displays it and
   returns the user's secret. The granting party is the **root daemon**; there is **no agent
   to register, hence no registration race**.
-- **Active-local-session gate.** Before authenticating, the daemon confirms the approving
-  shell belongs to an **active, local** login session via **systemd-logind**
+- **Active-local-seated gate.** Before authenticating, the daemon confirms the approving
+  shell belongs to an **active, local, seated** login session via **systemd-logind**
   (`sd_pid_get_session` on the shell's pidfd-pinned pid → `sd_session_is_active` +
-  seat/remote check). Absent/inactive/remote → **DENY** (no fail-open — the prototype's ghost).
+  `sd_session_is_remote` + `sd_session_get_seat`). Absent / inactive / remote / **seatless** →
+  **DENY** (no fail-open — the prototype's ghost).
+- **Seat provisioning requires only a real VT (recon-confirmed).** For the shape-(b) child's
+  session to be seated, it is **sufficient** to hand PAM a real virtual terminal via
+  `pam_set_item(PAM_TTY, "ttyN")` — `pam_systemd` derives `XDG_SEAT=seat0` and `XDG_VTNR=N` from
+  the tty *name* itself. Explicitly setting `XDG_SEAT`/`XDG_VTNR` is **redundant** and not
+  required. A session opened with **no** tty is registered `Class=background`, **seatless** —
+  and, notably, still reports `Active=yes`; it is the **seat** axis, not the active axis, that
+  denies it. This is the live confirmation that the B2a seat-tightening is load-bearing: the
+  pre-B2a `active && !remote` gate would have admitted that seatless session; the seated gate
+  correctly denies it.
 - **No replay.** Each high-risk approval forces a **fresh `pam_authenticate`**; there is no
   cached/`_keep` authorization to replay. Biometric/TPM tiers ride the **same daemon-driven
   PAM stack** (a PAM module), not a separate agent.
@@ -240,6 +352,68 @@ private channel — ambient session agents are removed from the trust chain.** (
   the same root launcher, verifying its pidfd/exe/cgroup/unique-bus-name and denying on
   replacement. Rejected: more moving parts — still trusts polkitd plus registration
   ordering — where daemon-owned PAM removes the agent surface entirely.)*
+
+### R3-02a — what makes the active axis satisfiable (the deployment assumption)
+
+R3-02's gate requires the approving shell's session to be **active** — the foreground session on
+its seat. §4 required that without recording what makes it *satisfiable*, or what the axis
+actually means. Both are settled here, the second by **measurement**.
+
+**What `Active` actually encodes — MEASURED, not reasoned.** On the real seated lane, locking the
+session (`loginctl lock-session`) left `Active=yes` and `State=active` **unchanged**; only
+`LockedHint` flipped to `yes`. The gate verdict on a pid in that session was **ALLOW while
+locked**. So `Active` encodes exactly one thing: **this session holds its seat's foreground**. It
+is **necessary but NOT sufficient** for human presence — a locked Delphi screen is an `Active`
+session, and the gate **ALLOWs it**.
+
+> **THE GATE AND PAM ARE NOT REDUNDANT — do not "optimize" one away.**
+> The gate establishes **WHICH SCREEN**: this session holds the seat's foreground, so a consent
+> prompt is being shown where the seat is actually pointing. It says **nothing** about who, or
+> whether anyone, is there.
+> PAM establishes **WHICH HUMAN**: the fresh `pam_authenticate` the consent flow requires (R3-02,
+> "no replay") demands the secret from a person, right now.
+> **The locked-screen case is covered by PAM alone.** Measured above: a locked session is
+> `Active=yes` and passes the gate. If a future change treats `pam_authenticate` as a removable
+> second factor layered on an "already-strict" gate, it removes **the only** control standing
+> between a locked, unattended Delphi screen and a minted consent token. The strictness of the
+> gate does not substitute for it — the two answer different questions, and both are load-bearing.
+
+**The deployment shapes give opposite answers, so the shape must be pinned:**
+
+- **PRIMARY (the assumption).** The Delphi shell is the seat's own session — display-manager-
+  shaped, holding the seat's VT. When the seat is showing Delphi, that session **is** the
+  foreground session, so `Active=yes` and the gate can pass.
+- **SECONDARY (foreclosed).** The shell runs as an extra session alongside another desktop, on its
+  own VT. Recon C.3 measured the consequence: the moment the user returns to their desktop's VT
+  the Delphi session reports `Active=no` and the gate **denies**. In that shape a consent prompt is
+  essentially never approvable.
+
+`# DECISION:` **Delphi deploys in the PRIMARY shape.** The Living Surface **is** the session on its
+seat, not a guest window inside someone else's desktop.
+
+**Product consequence (a security property deciding product scope — not a config gap).** This
+forecloses shipping Delphi as an **application running on an existing desktop**. A future reader
+finding that limitation should know it is a **security-model conflict**, not an unimplemented
+feature or a packaging choice: on someone else's desktop the shell cannot hold the seat's
+foreground, so the active axis denies by construction. Changing it means changing the gate, which
+means re-deriving R3-02.
+
+**A second case where the shape gives the right answer.** If *another user's* session takes the
+seat's foreground, Delphi's session goes `Active=no` and the gate **denies** — correctly: the
+person at the screen is not looking at Delphi, and no consent should be mintable on their behalf.
+The axis is doing its job in both directions.
+
+**The launcher's tty policy follows.** The shell is provisioned on the seat's VT (display-manager
+shape) and `PAM_TTY=ttyN` names that VT — which, per the seat-provisioning simplification in
+R3-02, is the **whole** seat obligation.
+
+**Dev-time condition (documented, NOT relaxed).** Development on a workstation runs the SECONDARY
+shape — the shell is launched from inside an existing desktop session — so a gate-POSITIVE is
+reachable only by switching the seat's foreground to the shell's VT (`chvt`), exactly as the recon
+did. This is a known dev-time condition to work *with*. It is **not** grounds for a dev-only
+relaxation of the seat/active gate: a build- or env-gated bypass of that axis would be the
+stub-shaped false green this arc has refused everywhere else — it would make the tests pass
+without the property holding.
 
 ### R3-03 — the approver subject is a race-free pidfd from the spawn table
 
@@ -284,9 +458,12 @@ ever). `approve` is exposed **only** on the private channel — never on the gen
   fail-closed**. Because the socket lives in the **root-owned** `/run/delphi/%i`, **no
   same-uid impostor can occupy the path during the restart window** (it cannot write the
   directory); the restarted root daemon re-creates the socket and re-spawns shell + AI.
-- **Shell crash:** the daemon sees the **pidfd death** (and EOF on the channel) ⇒ **denies
-  all approvals bound to that pidfd**; it re-spawns the shell with a fresh channel + fresh
-  `PendingAction` ids. A respawned shell cannot complete the prior instance's approval.
+- **Shell crash:** because **leader == shell** (R3-01c), the shell's death *is* the session
+  leader's death *is* the session's teardown — there is no lingering `closing`-state session and
+  no orphaned session member. The daemon sees the **pidfd death** (and EOF on the channel) ⇒
+  **denies all approvals bound to that pidfd**; it re-spawns the shell — which opens a **fresh**
+  logind session — with a fresh channel + fresh `PendingAction` ids. A respawned shell cannot
+  complete the prior instance's approval.
 - **AI-launched-first / ordering:** irrelevant — the daemon controls fd inheritance per-child
   (the AI never gets the fd) **and** the AI is a sibling (cannot ptrace the shell). Before the
   genuine daemon exists there is **no** approval socket and the AI **cannot create one** in

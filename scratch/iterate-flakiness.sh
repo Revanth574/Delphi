@@ -21,6 +21,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/delphi-target}"
 N="${1:-30}"
+# Optional serialised control arm: `--serial` adds --test-threads=1 so the same loop can be
+# run both ways. Parallel is the DEFAULT because that is the configuration the flakiness
+# rule targets; the serial arm exists to attribute failures to interference vs product.
+THREADS=""
+[ "${2:-}" = "--serial" ] && THREADS="--test-threads=1"
 
 command -v cargo >/dev/null || { echo "cargo not found — run UNPRIVILEGED"; exit 1; }
 echo "=== building (unprivileged) ==="
@@ -43,7 +48,7 @@ echo; echo "=== $N iterations, DEFAULT parallelism ==="
 for i in $(seq 1 "$N"); do
   iter_failed=0
   while read -r bin; do
-    out=$(sudo "$bin" --nocapture 2>&1)          # NO --test-threads=1: parallel on purpose
+    out=$(sudo "$bin" --nocapture $THREADS 2>&1)   # parallel by default; $THREADS set by --serial
     echo "$out" >> "$LOG"
     while read -r t; do
       FAILCOUNT["$t"]=$(( ${FAILCOUNT["$t"]:-0} + 1 )); iter_failed=1
@@ -63,12 +68,22 @@ else
 fi
 echo
 echo "SKIPs seen (a SKIP proves nothing):"
-grep -oh "SKIP [a-z0-9_]*" "$LOG" | sort -u | sed 's/^/  /' || echo "  none"
+# Require a real test name after SKIP. The previous regex `SKIP [a-z0-9_]*` also matched
+# the phrase "A SKIP INVALIDATES ..." inside our own skip TEXT — uppercase letters gave a
+# zero-length match, printing a bare "SKIP " that looked like a skip with no reason.
+grep -ohP 'SKIP \K[a-z0-9_]+(?=:)' "$LOG" | sort | uniq -c | sed 's/^/  /' || echo "  none"
 echo
-echo "FD-01 executions reaching the assertion:"
-grep -c "B1-ASSERTION-EXECUTED(FD-01)" "$LOG" | sed 's/^/  markers: /'
-echo "B-1 executions reaching the assertion:"
-grep -c "^B1-ASSERTION-EXECUTED:" "$LOG" | sed 's/^/  markers: /'
+# COUNTING BUG FIXED (found when 34 markers appeared over 30 iterations, which is
+# impossible on its face). EXECUTED_MARKER appears in BOTH the println AND the assertion
+# panic messages, so grep -c counted 2 lines per FAILING execution and 1 per passing one:
+#   15 failures x2 + 4 passes x1 = 34, i.e. only 19 real executions, not 30.
+# Count a substring UNIQUE TO THE PRINTLN instead:
+#   FD-01 println has "exec_done="   ; its panics do not.
+#   B-1   println has "pinned_pid="  ; its panics say "pinned pid" / "pinned", no "=".
+echo "FD-01 executions that REACHED the assertion (unique to the println):"
+grep -c "B1-ASSERTION-EXECUTED(FD-01): shell_pid=.*exec_done=" "$LOG" | sed 's/^/  executions: /'
+echo "B-1 executions that REACHED the assertion:"
+grep -c "^B1-ASSERTION-EXECUTED: pinned_pid=" "$LOG" | sed 's/^/  executions: /'
 echo
 [ -f "$PAMF" ] && PAM_AFTER=$(sudo md5sum "$PAMF" | cut -d' ' -f1) || PAM_AFTER=absent
 if [ "$PAM_BEFORE" = "$PAM_AFTER" ]; then
@@ -77,6 +92,12 @@ else
   echo "!!! PAM STACK CHANGED: before=$PAM_BEFORE after=$PAM_AFTER — any SKIP above is COLLATERAL"
 fi
 echo
-echo "GATE FOR WEAKENING FD-01: it must show 0 failures AND a marker count equal to $runs."
+echo "NOTE ON WHAT THIS MEASURES: binaries run SEQUENTIALLY (no backgrounding), but tests"
+echo "WITHIN each binary run in PARALLEL. Shared state across tests in one binary (the VT,"
+echo "the PAM stack, concurrent useradd/PAM sessions) is therefore in scope. Compare against"
+echo "the serialised control arm to separate harness interference from product behaviour:"
+echo "    bash scratch/iterate-flakiness.sh $N --serial"
+echo
+echo "GATE FOR WEAKENING FD-01: 0 failures AND executions == $runs."
 echo "Anything less means 'fixed' is not yet 'demonstrated stable', and a FAIL under the"
 echo "weaken could not be distinguished from an intermittent failure."

@@ -513,6 +513,50 @@ than assertion. The two rows that pass behaviourally are the reason structural a
 
 ---
 
+## 16. Test fixture mutates shared system state it does not own  *(new — B2a C1)*
+
+**Description.** A fixture that writes a **shared, real system path** and removes it on
+teardown is safe only while that path is *exclusively* test scaffolding. The moment
+production installs the same path, the fixture becomes **destructive**: it clobbers the real
+artifact and DELETES it on drop. The damage is not local — it lands on every later test in
+the run, and on the developer's machine after the run ends. Worse, the symptom appears
+somewhere else entirely: later tests report "not installed" / "misconfigured" and are read
+as *their own* failures, so the diagnosis starts in the wrong place.
+
+The rule, stated so it needs no judgement call: **a test must never delete a system file it
+did not create.** Ownership must be tracked explicitly, not inferred from "the test wrote
+this path, so presumably it owns it".
+
+**Foreclosing primitive.** **NONE — discipline.** Adopt-or-provision: if the path already
+exists, ADOPT it (use it, record that you did not create it); only if absent, PROVISION it
+and record that you did. Teardown removes **only** what teardown's own fixture created. Where
+a test genuinely needs a hostile variant of a shared file, it should use a THROWAWAY name it
+certainly owns (as `scratch/pam-empty-group-probe.sh` does with `delphi-probe-emptygroup`),
+never the production path.
+
+**Instances (grounded):**
+- **B2a C1** — `runtime/tests/b1_integration.rs` and `runtime/tests/end_to_end.rs` wrote and
+  `remove_file`d `/etc/pam.d/delphi-runtime`. Harmless while that file was pure scaffolding.
+  Once C2's real stack was installed there, the first suite to run DELETED the operator's
+  production file mid-run; `leader_is_shell` then SKIPPED on "not installed", and that skip
+  was very nearly read as a B-1 result. It was not — a skip passes under both topologies.
+  Fixed with a `provisioned: bool` on the fixture gating removal.
+- **Adjacent, same family:** the probe script for the empty-`session`-group measurement
+  deliberately used a throwaway service name so it could not damage the very stack it was
+  characterising — the correct shape, arrived at before this defect was found.
+
+**RED-proof shape.** Two parts: (1) with the production artifact present, run the suite and
+show the artifact SURVIVES (pre-fix it is deleted); (2) with it absent, show the fixture
+still provisions and cleans up its own copy, so the fix does not silently disable teardown.
+A test asserting only (2) would pass against the destructive version.
+
+**Cross-cutting note.** This is the second defect this session where a HARNESS damaged or
+misreported the thing it measured — the other being a runner that reported an unavailable
+`sudo` as N *test failures*. Harness defects present as product defects and cost the most
+diagnostic time; treat the test infrastructure as production code for review purposes.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -532,3 +576,4 @@ than assertion. The two rows that pass behaviourally are the reason structural a
 | 13. Atomic versioned migration | **DEFERRED** (1 consumer; extract at the 2nd) | Pattern recorded |
 | 14. Guard must cover all forms | discipline (enumerate forms; read behavior, not markers) | Discipline |
 | 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |
+| 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |

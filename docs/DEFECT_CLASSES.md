@@ -220,7 +220,7 @@ is not sufficient.
 
 **Foreclosing primitive.** Process: run `cargo test --workspace` (not per-crate)
 before declaring a shared-type change done; in CI, fail on an unexpected
-executed-test-count drop (see class 11).
+executed-test-count drop (see class 10).
 
 **Instances (grounded):**
 - **FORT-R1-04 downstream** (`e7fdbb0`) — redacting `FortressError`'s `Display` was correct, but `die-inference`'s `InferenceError` doctest + unit test and `die-orchestrator`'s `all_downstream_errors_convert` asserted the credential name *survives* the `#[from]` conversion (the very leak R1-04 closed). The fortress-only per-crate audits never compiled those consumers; the full-workspace pre-merge run caught it.

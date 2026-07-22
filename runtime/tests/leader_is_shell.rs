@@ -573,12 +573,31 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     );
     let got: Vec<i32> = fds.iter().map(|(n, _)| *n).collect();
     let want = vec![0, 1, 2, SHELL_CHANNEL_FD];
+
+    // The EXTRAS are the finding. Report them with their link targets, never as a count:
+    // "an extra fd survived" and "PAM's D-Bus descriptor survived" are DIFFERENT CLAIMS, and
+    // only the second proves the property FD-01 exists to protect. A count cannot tell them
+    // apart, so the assertion prints the resolved targets and flags socket-shaped ones —
+    // `pam_systemd`'s connection to logind appears as `socket:[NNNN]`.
+    let extras: Vec<&(i32, String)> =
+        fds.iter().filter(|(n, _)| !want.contains(n)).collect();
+    let socket_shaped: Vec<&&(i32, String)> = extras
+        .iter()
+        .filter(|(_, t)| t.starts_with("socket:") || t.starts_with("anon_inode:"))
+        .collect();
+
     assert_eq!(
         got, want,
-        "{EXECUTED_MARKER}(FD-01): the shell inherited fds {fds:?} but the allowlist is \
-         {want:?} (stdio + SHELL_CHANNEL_FD). Any extra descriptor rode through the `execve` \
-         — if it is PAM's D-Bus connection to logind, that is the B2A-R2-01 relay-bypass class \
-         reopened one exec away (§4 FD-01, P1). Check the sweep still runs AFTER \
-         `open_own_session`."
+        "{EXECUTED_MARKER}(FD-01): fd containment VIOLATED.\n\
+         \x20 full table : {fds:?}\n\
+         \x20 allowlist  : {want:?} (stdio + SHELL_CHANNEL_FD)\n\
+         \x20 EXTRAS     : {extras:?}\n\
+         \x20 socket-shaped extras (PAM/D-Bus candidates): {socket_shaped:?}\n\
+         Any descriptor in EXTRAS rode through the `execve`. If a socket-shaped one is \
+         present it is very likely `pam_systemd`'s D-Bus connection to logind — that is the \
+         B2A-R2-01 relay-bypass class reopened one exec away (§4 FD-01, P1), and it is the \
+         specific claim this test is for. Extras that are NOT socket-shaped still fail the \
+         allowlist but prove a WEAKER claim: something leaked, not that the PAM descriptor \
+         did. Check that `mark_cloexec_except_raw` still runs AFTER `open_own_session`."
     );
 }

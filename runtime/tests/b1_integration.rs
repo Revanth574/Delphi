@@ -123,6 +123,8 @@ fn bwrap_available() -> bool {
 /// A throwaway PAM user with a known password + the PAM service file; torn down on drop.
 struct Setup {
     user: String,
+    /// True only if THIS test created the PAM file; gates removal on drop (Class 16).
+    provisioned: bool,
 }
 impl Setup {
     fn new(tag: &str) -> Self {
@@ -132,8 +134,17 @@ impl Setup {
         let mut ch = Command::new("chpasswd").stdin(Stdio::piped()).spawn().unwrap();
         ch.stdin.take().unwrap().write_all(format!("{user}:{PASSWORD}").as_bytes()).unwrap();
         assert!(ch.wait().unwrap().success());
-        std::fs::write(PAM_FILE, PAM_STACK).unwrap();
-        Self { user }
+        // ADOPT an operator-installed stack; only PROVISION one if absent (defect Class 16).
+        // These fixtures used to write this path unconditionally and remove_file it on drop —
+        // harmless while it was scaffolding, DESTRUCTIVE once production installed the same
+        // path. A test must never delete a system file it did not create.
+        let provisioned = if std::path::Path::new(PAM_FILE).exists() {
+            false
+        } else {
+            std::fs::write(PAM_FILE, PAM_STACK).unwrap();
+            true
+        };
+        Self { user, provisioned }
     }
     fn ids(&self) -> (Uid, Gid) {
         let u = User::from_name(&self.user).unwrap().unwrap();
@@ -142,7 +153,10 @@ impl Setup {
 }
 impl Drop for Setup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(PAM_FILE);
+        // Remove ONLY a file this test created; an operator-installed stack is left alone.
+        if self.provisioned {
+            let _ = std::fs::remove_file(PAM_FILE);
+        }
         let _ = Command::new("userdel").arg(&self.user).status();
     }
 }

@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-//! **B-1 — the leader == shell regression test** (`docs/TRUST_MODEL.md` §4, R3-01c).
+//! **Properties of the restructured shell child** (`docs/TRUST_MODEL.md` §4).
+//!
+//! Two tests sharing one harness, because both need the same expensive setup (root, the
+//! installed PAM stack, a real VT, and a launch through the real `fork_shell`):
+//!
+//! * `session_leader_is_the_shell_itself_r3_01c` — **B-1**, leader == shell (R3-01c).
+//! * `shell_inherits_only_the_allowlisted_fds_fd_01` — **FD-01**, fd containment through
+//!   the restructured child, which no existing test covers.
+//!
+//! # B-1 — the leader == shell regression test (§4 R3-01c)
 //!
 //! The recon PROVED leader == shell nine times over on the seated lane. A recon proof is
 //! not a shipped regression test: §4 R3-01c's "What remains outstanding" clause requires
@@ -86,7 +95,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
+use delphi_runtime::launcher::{launch, LaunchSpec, VtName, SHELL_CHANNEL_FD};
 use delphi_runtime::logind::session_id_for_pid;
 use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 use nix::sys::signal::{kill, Signal};
@@ -107,14 +116,30 @@ struct Setup {
 }
 
 impl Setup {
-    fn new() -> Self {
-        let user = format!("delphi-b1-{}", std::process::id());
+    /// `tag` MUST be unique per test in this binary.
+    ///
+    /// Both tests here previously derived the SAME name from `std::process::id()`. Under
+    /// `--test-threads=1` the first test's teardown can lose its race to reap the account
+    /// (bounded wait expires, `userdel` fails, the account leaks) — and the second test's
+    /// `useradd` then fails, panicking in `Setup::new` BEFORE any marker is printed. That is
+    /// not a precondition skip and not an assertion failure: it is FIXTURE COLLISION, and it
+    /// presents as a bare panic easily misread as the test's own verdict. Observed exactly
+    /// once, as FD-01 "failing" with no `B1-ASSERTION-EXECUTED(FD-01)` line at all.
+    fn new(tag: &str) -> Self {
+        let user = format!("delphi-{tag}-{}", std::process::id());
+        // A previous run that failed to reap may have leaked this exact account; clear it so
+        // a stale leftover cannot fail an otherwise-valid run.
+        let _ = Command::new("userdel").args(["-r", &user]).status();
         let ok = Command::new("useradd")
             .args(["-M", "-s", "/usr/sbin/nologin", &user])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "useradd {user} failed (this test needs to create a throwaway user)");
+        assert!(
+            ok,
+            "useradd {user} failed — this is FIXTURE SETUP, not a verdict on the property \
+             under test. Check for a leaked delphi-* account from an earlier run."
+        );
         Self { user }
     }
 
@@ -307,7 +332,7 @@ fn session_leader_is_the_shell_itself_r3_01c() {
         return;
     }
 
-    let setup = Setup::new();
+    let setup = Setup::new("b1");
     let (uid, gid) = setup.ids();
 
     let base = PathBuf::from(format!("/run/delphi-b1leader-{}", std::process::id()));
@@ -425,5 +450,135 @@ fn session_leader_is_the_shell_itself_r3_01c() {
         "{EXECUTED_MARKER}: session {session}'s leader is {leader} but the daemon pinned \
          {pinned_pid}. (Equal under both topologies, so a failure here is a DIFFERENT \
          regression from the grandchild one above.)"
+    );
+}
+
+/// **FD-01 — the shell inherits EXACTLY the allowlist, nothing else.**
+///
+/// # Why re-running `sibling_fd_theft` does not replace this
+///
+/// `sibling_fd_theft` imports only `approval_socketpair`, `drop_privileges` and
+/// `RealPrivDropOps`, then hand-rolls its child (`be_the_shell`: `dup2`/`prctl`/`pause`).
+/// **It never calls `launch()` or `fork_shell`.** It proves the *primitive* in an isolated
+/// context the shape-(b) restructure never touched, so a green run there says nothing about
+/// the launcher's actual pre-`execve` sequence.
+///
+/// The restructured child does `dup2` -> stdio policy -> `pam_start`/`open_session` (opening
+/// PAM's D-Bus connection to logind AND `sd_pid_get_session`'s cgroup descriptors) -> **then**
+/// sweeps -> priv-drops -> `execve`. The ORDERING is the property, and FD-01 (P1) exists
+/// because a PAM/D-Bus fd riding into the shell recreates the B2A-R2-01 relay-bypass one exec
+/// away. Nothing exercised that ordering.
+///
+/// # WEAKEN (RED-proof) — NOT YET RUN
+///
+/// In `shell_child_become`, move the `mark_cloexec_except_raw` block to **before** the
+/// `open_own_session(spec)` call: the sweep then precedes PAM, PAM's descriptors are never
+/// marked, and they survive the `execve`. This test must FAIL with extra fds listed, and PASS
+/// on restore. Until that is done this test is written but UNPROVEN — it has passed on correct
+/// code, which a vacuous test also does.
+#[test]
+fn shell_inherits_only_the_allowlisted_fds_fd_01() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP shell_inherits_only_the_allowlisted_fds: requires root. A SKIP PROVES NOTHING.");
+        return;
+    }
+    if !std::path::Path::new(PAM_FILE).exists() {
+        eprintln!(
+            "SKIP shell_inherits_only_the_allowlisted_fds: {PAM_FILE} not installed — and \
+             WITHOUT IT PAM OPENS NO DESCRIPTORS, so this test would pass VACUOUSLY."
+        );
+        return;
+    }
+    let stack = std::fs::read_to_string(PAM_FILE).unwrap_or_default();
+    if !stack.lines().any(|l| l.trim_start().starts_with("session")) {
+        eprintln!(
+            "SKIP shell_inherits_only_the_allowlisted_fds: {PAM_FILE} has no `session` group, \
+             so pam_systemd never runs and opens no D-Bus fd — the leak this test hunts cannot \
+             occur and it would pass VACUOUSLY."
+        );
+        return;
+    }
+    let vt = test_vt();
+    if !vt.exists_on_system() {
+        eprintln!("SKIP shell_inherits_only_the_allowlisted_fds: /dev/{} absent.", vt.as_pam_tty());
+        return;
+    }
+
+    let setup = Setup::new("fd01");
+    let (uid, gid) = setup.ids();
+    let base = PathBuf::from(format!("/run/delphi-fd01-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let Some(shell_bin) = build_sleeper(&work) else {
+        eprintln!("SKIP shell_inherits_only_the_allowlisted_fds: no working `cc`.");
+        return;
+    };
+    let shell_bin = shell_bin.canonicalize().expect("canonical sleeper path");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+
+    let spec = LaunchSpec {
+        shell_path: &shell_bin,
+        ai_path: &ai_bin,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        tty: &vt,
+        shell_env: &[],
+        ai_env: &[],
+    };
+    let children = launch(&spec).expect("launch shell + AI");
+    let shell_pid = children.shell_pid;
+
+    // Wait for the execve — inspecting earlier would read the PRE-sweep fd table and fail
+    // for the wrong reason.
+    let mut exec_done = false;
+    for _ in 0..50 {
+        if std::fs::read_link(format!("/proc/{shell_pid}/exe")).is_ok_and(|p| p == shell_bin) {
+            exec_done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+
+    let mut fds: Vec<(i32, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{shell_pid}/fd")) {
+        for e in entries.flatten() {
+            if let Ok(n) = e.file_name().to_string_lossy().parse::<i32>() {
+                let target = std::fs::read_link(e.path())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".into());
+                fds.push((n, target));
+            }
+        }
+    }
+    fds.sort_by_key(|(n, _)| *n);
+
+    for pid in pids_owned_by(uid) {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+    let _ = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None);
+    let _ = nix::sys::wait::waitpid(Pid::from_raw(children.ai_pid), None);
+    drop(children.daemon_channel);
+    let _ = std::fs::remove_dir_all(&base);
+
+    println!("{EXECUTED_MARKER}(FD-01): shell_pid={shell_pid} exec_done={exec_done} fds={fds:?}");
+
+    assert!(
+        exec_done,
+        "{EXECUTED_MARKER}(FD-01): the sleeper never reached its execve, so the fd table read \
+         would be the PRE-sweep one. Treat this run as VOID, not an fd-containment verdict."
+    );
+    let got: Vec<i32> = fds.iter().map(|(n, _)| *n).collect();
+    let want = vec![0, 1, 2, SHELL_CHANNEL_FD];
+    assert_eq!(
+        got, want,
+        "{EXECUTED_MARKER}(FD-01): the shell inherited fds {fds:?} but the allowlist is \
+         {want:?} (stdio + SHELL_CHANNEL_FD). Any extra descriptor rode through the `execve` \
+         — if it is PAM's D-Bus connection to logind, that is the B2A-R2-01 relay-bypass class \
+         reopened one exec away (§4 FD-01, P1). Check the sweep still runs AFTER \
+         `open_own_session`."
     );
 }

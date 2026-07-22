@@ -71,6 +71,8 @@ fn skip_if_not_root(name: &str) -> bool {
 /// down on drop.
 struct Setup {
     user: String,
+    /// True only if THIS test created the PAM file; gates removal on drop (Class 16).
+    provisioned: bool,
 }
 
 impl Setup {
@@ -95,9 +97,17 @@ impl Setup {
             .write_all(format!("{user}:{PASSWORD}").as_bytes())
             .expect("write chpasswd");
         assert!(ch.wait().expect("chpasswd wait").success(), "chpasswd");
-        std::fs::write(UNIT_PAM, "auth required pam_unix.so\naccount required pam_unix.so\n")
-            .expect("install pam service");
-        Self { user }
+        // ADOPT an operator-installed stack; only PROVISION one if absent (Class 16).
+        // This file was the THIRD copy of the write-and-delete pattern; the first fix missed
+        // it, so it kept deleting the operator's real /etc/pam.d/delphi-runtime.
+        let provisioned = if std::path::Path::new(UNIT_PAM).exists() {
+            false
+        } else {
+            std::fs::write(UNIT_PAM, "auth required pam_unix.so\naccount required pam_unix.so\n")
+                .expect("install pam service");
+            true
+        };
+        Self { user, provisioned }
     }
 
     fn ids(&self) -> (Uid, Gid) {
@@ -108,7 +118,10 @@ impl Setup {
 
 impl Drop for Setup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(UNIT_PAM);
+        // Remove ONLY a file this test created; an operator-installed stack is left alone.
+        if self.provisioned {
+            let _ = std::fs::remove_file(UNIT_PAM);
+        }
         let _ = Command::new("userdel").arg(&self.user).status();
     }
 }

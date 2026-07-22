@@ -310,7 +310,41 @@ shell's death is the session's). **Every pre-`execve` failure path is different 
 `pam_close_session` (if the session was opened) + `pam_end` while the handle is still live** —
 this is a production-launcher requirement, not optional (PAM-02). **Forward obligation:**
 re-validate this deviation against the actual `/etc/pam.d/delphi-runtime` stack when `installer/`
-ships it. A leader ≠ shell path would reintroduce both the explicit-close obligation on the
+ships it. *(C1 note: the stack now exists at `installer/pam/delphi-runtime` — the
+minimal three lines `auth`/`account` `pam_unix.so` + `session required pam_systemd.so`. The
+re-validation is against THAT file.)*
+
+**PAM-03, second form — an incomplete stack is more dangerous than a missing one.** The
+launcher's existence check (`access(F_OK)`) covers "no stack" but **cannot see** "stack present,
+`session` group empty." In that case `pam_open_session` returns **SUCCESS while registering no
+logind session at all** — the shell then resolves to no session and the seated gate denies every
+consent forever, with the symptom arbitrarily far from the cause. This is structurally the same
+silent failure `VtName` exists to prevent (a cleanly-succeeding call yielding a seatless/absent
+session), one level up. The launcher therefore also asserts the **outcome**: after a successful
+`open_session` the pid MUST resolve to a logind session (`logind::session_id_for_pid`).
+Deliberately NOT a config grep — following `@include` / `session include` / `substack` would mean
+writing a PAM parser in a forked pre-`execve` child, and a grep for a `session` line would repeat
+the very covers-one-form-misses-others mistake it is fixing.
+
+**`pam_faillock` — the tension is RECORDED, the decision is DEFERRED (do not re-derive this from
+scratch).** Adding `auth required pam_faillock.so` (brute-force lockout on the consent prompt) is
+a genuine trade-off with arguments on both sides, and someone will propose it later:
+
+- **FOR.** R3-02a makes it sharp: a **locked** session is `Active=yes` and **passes the gate**
+  (measured). PAM is therefore *the only control* standing between a locked, unattended Delphi
+  screen and a minted consent token. Lockout is the standard defense against repeated guessing at
+  exactly that screen.
+- **AGAINST.** On this system consent gates **all** privileged action, so lockout is a
+  **denial-of-consent** vector: an attacker who can reach the prompt (or merely trigger failed
+  attempts) can lock the legitimate user out of approving anything — converting a confidentiality
+  control into an availability failure against the user's own machine, which cuts against Iron
+  Law #1 (user sovereignty) and #3 (graceful degradation).
+
+`# DECISION:` **not in the minimal stack.** It ships as its own change with its own review, where
+the lockout parameters (`deny`, `unlock_time`, whether the *root daemon's* own retries count) can
+be reasoned about explicitly. Recording the tension here so the next reader inherits the analysis
+rather than rediscovering it — and so a future "obviously we should add faillock" is met with the
+availability counter-argument, not just adopted. A leader ≠ shell path would reintroduce both the explicit-close obligation on the
 success path and the orphan window Phase D exhibited.
 
 ### R3-02 — the auth party is the root daemon (PAM), not a substitutable agent

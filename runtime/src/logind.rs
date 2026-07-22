@@ -106,19 +106,51 @@ impl LogindVerdict {
     /// it. `None` if the pid has no logind session.
     #[must_use]
     pub fn for_pid(pid: i32) -> Option<Self> {
-        let mut sess: *mut c_char = std::ptr::null_mut();
-        // SAFETY: `sess` receives a malloc'd C string on success (rc >= 0); we copy it
-        // out and free it.
-        let rc = unsafe { sd_pid_get_session(pid, &mut sess) };
-        if rc < 0 || sess.is_null() {
-            return None;
-        }
-        // SAFETY: `sess` is a valid C string allocated by libsystemd.
-        let owned = unsafe { CStr::from_ptr(sess) }.to_str().ok().map(str::to_owned);
-        // SAFETY: free the libsystemd-allocated string exactly once.
-        unsafe { nix::libc::free(sess.cast()) };
-        Self::query(&owned?)
+        Self::query(&session_id_for_pid(pid)?)
     }
+}
+
+/// The logind session id `pid` belongs to, or `None` if it belongs to none.
+///
+/// # Resolution is by CGROUP MEMBERSHIP, not leadership (§4 R3-01c, A-1)
+///
+/// `sd_pid_get_session` answers "which session's cgroup contains this pid" — so it
+/// resolves for a session **leader** and for any descendant alike. That property is what
+/// makes this function usable as the *non-circular first half* of the leader==shell
+/// assertion: resolve the session by membership (which succeeds under BOTH the
+/// leader==shell and the leader≠shell topology), then compare that session's `Leader` to
+/// the shell's pid to discriminate them. Resolving *by* leadership would make the
+/// assertion vacuous — it would find only the session it was about to prove.
+///
+/// # Why this is public API and not a test helper
+///
+/// Two production callers: the launcher's post-`pam_open_session` outcome check
+/// ([`crate::launcher`] — "did a session actually get registered?"), and the B-1
+/// leader==shell regression test. The `-ENODATA` case is the one that matters: a
+/// `pam_open_session` that "succeeded" against an **empty session group** registers no
+/// session at all, and this is the call that sees it.
+///
+/// # Examples
+///
+/// ```
+/// use delphi_runtime::logind::session_id_for_pid;
+/// // Pid 1 (the init system) is never in a login session.
+/// assert!(session_id_for_pid(1).is_none());
+/// ```
+#[must_use]
+pub fn session_id_for_pid(pid: i32) -> Option<String> {
+    let mut sess: *mut c_char = std::ptr::null_mut();
+    // SAFETY: `sess` receives a malloc'd C string on success (rc >= 0); we copy it
+    // out and free it. A negative rc (e.g. -ENODATA, "no session") leaves it untouched.
+    let rc = unsafe { sd_pid_get_session(pid, &mut sess) };
+    if rc < 0 || sess.is_null() {
+        return None;
+    }
+    // SAFETY: `sess` is a valid C string allocated by libsystemd.
+    let owned = unsafe { CStr::from_ptr(sess) }.to_str().ok().map(str::to_owned);
+    // SAFETY: free the libsystemd-allocated string exactly once.
+    unsafe { nix::libc::free(sess.cast()) };
+    owned
 }
 
 /// Whether `session` is attached to a seat. `sd_session_get_seat` returns a non-negative

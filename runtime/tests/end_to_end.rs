@@ -42,6 +42,13 @@ use delphi_runtime::{approval_socketpair, bind_approval_socket, drop_privileges,
 
 const SERVICE: &str = "delphi-runtime";
 const UNIT_PAM: &str = "/etc/pam.d/delphi-runtime";
+/// The REAL production stack (`installer/pam/delphi-runtime`), not a stand-in.
+///
+/// The former two-line fixture had `auth` + `account` but **no `session` group**, so
+/// `pam_open_session` registered no logind session — under which B-1's leader==shell
+/// assertion fails for BOTH topologies (FAIL/FAIL), exactly as non-discriminating as the
+/// PASS/PASS a skipped test gives. A populated `session` group is a B-1 PRECONDITION.
+const PAM_STACK: &str = include_str!("../../installer/pam/delphi-runtime");
 const PASSWORD: &str = "Delphi1dCapstone!";
 const NOW: u64 = 1_000;
 
@@ -65,7 +72,7 @@ impl Setup {
         let mut ch = Command::new("chpasswd").stdin(Stdio::piped()).spawn().unwrap();
         ch.stdin.take().unwrap().write_all(format!("{user}:{PASSWORD}").as_bytes()).unwrap();
         assert!(ch.wait().unwrap().success());
-        std::fs::write(UNIT_PAM, "auth required pam_unix.so\naccount required pam_unix.so\n").unwrap();
+        std::fs::write(UNIT_PAM, PAM_STACK).unwrap();
         Self { user }
     }
     fn ids(&self) -> (Uid, Gid) {

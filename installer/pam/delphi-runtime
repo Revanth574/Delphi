@@ -1,0 +1,29 @@
+# /etc/pam.d/delphi-runtime — the Delphi runtime daemon's PAM stack.
+#
+# DELIBERATELY SELECTED AND MINIMAL (docs/TRUST_MODEL.md §4 R3-01c, PAM-03): the
+# soundness claimed for the session-only deviation is a property of THIS stack, not of
+# PAM in general. The launcher REFUSES to run if this file is absent rather than let
+# libpam fall through to the generic `other` stack, whose contents are a deployment
+# accident (pam_deny on a hardened host, pam_permit on a permissive one).
+#
+# ONE service name serves TWO management groups — do not split them without re-deriving §4:
+#   auth + account -> runtime/src/service.rs  authenticate_over_channel  (consent, R3-02)
+#   session        -> runtime/src/launcher.rs open_own_session           (shape (b), R3-01b/c)
+#
+# Every line below is load-bearing; see the per-line rationale in §4 / PROGRESS.md.
+
+# R3-02: a FRESH pam_authenticate against /etc/shadow per high-risk approval (no replay).
+# pam_unix is the module that reads shadow. `required` rather than `sufficient` so that a
+# module added above this line later cannot silently short-circuit the check.
+auth       required   pam_unix.so
+
+# service.rs calls pam_acct_mgmt immediately after authenticate; without an account group
+# that call has nothing to run. Catches expired/locked accounts — a disabled user must not
+# be able to mint consent tokens.
+account    required   pam_unix.so
+
+# THE LOAD-BEARING LINE. Registers the logind session and derives XDG_SEAT=seat0 /
+# XDG_VTNR=N from PAM_TTY — which per §4 R3-02 is the WHOLE seat obligation. Without it
+# pam_open_session still "succeeds" but registers NO session, and the seated gate then
+# denies every consent forever. This is the omission the two-line test stand-in had.
+session    required   pam_systemd.so

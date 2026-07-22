@@ -33,7 +33,7 @@ use nix::unistd::{Pid, User};
 
 use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
 use delphi_runtime::execute::ConsumptionLedger;
-use delphi_runtime::launcher::{launch, LaunchSpec};
+use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
 use delphi_runtime::logind::{LogindVerdict, SessionVerdict};
 use delphi_runtime::service::{accept_requester, serve_one_action, ServiceCtx, SystemClock};
 use delphi_runtime::store::PendingStore;
@@ -85,12 +85,24 @@ fn main() -> Result<()> {
 
     let shell_bin = bin_path("DELPHI_SHELL_BIN", "/usr/libexec/delphi-shell");
     let ai_bin = bin_path("DELPHI_AI_BIN", "/usr/libexec/delphi-ai");
+    // The seat's VT the shell is provisioned on (§4 R3-02a PRIMARY). Deliberately has NO
+    // default: which VT the seat holds is a deployment fact, and silently guessing one would
+    // either collide with another session's VT or open a SEATLESS session that the
+    // active-local-seated gate then denies forever — the exact silent failure `VtName`
+    // exists to make loud. The operator states it (the unit file's `Environment=`).
+    // VT ALLOCATION POLICY (choosing a free VT) is out of scope here: the launcher takes
+    // what its caller supplies.
+    let vt = std::env::var("DELPHI_SHELL_VT")
+        .context("`DELPHI_SHELL_VT` is not set; it must name the seat's virtual terminal \
+                  (e.g. `tty1`) — see TRUST_MODEL.md §4 R3-02a")?;
+    let tty = VtName::new(&vt).with_context(|| format!("`DELPHI_SHELL_VT={vt}`"))?;
     let spec = LaunchSpec {
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid: user.uid,
         gid: user.gid,
         socket_path: &paths.socket,
+        tty: &tty,
         // The children inherit the daemon's env; no per-child overrides needed.
         shell_env: &[],
         ai_env: &[],

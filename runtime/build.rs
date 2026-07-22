@@ -10,12 +10,20 @@
 //! and no dev package required. The symbols are verified present via `nm -D`.
 
 fn main() {
-    // `-l:libsystemd.so.0` links the exact runtime soname (the GNU linker resolves
-    // it from the default library search path). Applied to every final artifact
-    // that links (the lib rlib itself is not linked).
-    for artifact in ["bins", "tests"] {
-        println!("cargo:rustc-link-arg-{artifact}=-l:libsystemd.so.0");
-    }
+    // Link the exact runtime soname (no unversioned `.so`, so no `libsystemd-dev`).
+    //
+    // `rustc-link-lib` rather than the former `rustc-link-arg-{bins,tests}` pair: a
+    // per-artifact-kind ENUMERATION covers the kinds it names and silently misses the
+    // rest — DOCTESTS are neither `bins` nor `tests`, so the first doctest to reference
+    // an sd-login symbol failed to link with `undefined symbol: sd_pid_get_session`.
+    // That is `docs/DEFECT_CLASSES.md` class 14 (a guard/flag covering some forms of its
+    // target, not all) living in the build script. `rustc-link-lib` is the
+    // authoritative-category form: it attaches to the CRATE, so every artifact that
+    // links the crate — bins, tests, benches, examples AND doctests — inherits it.
+    //
+    // `dylib:+verbatim=` passes the filename through untouched, which is what allows the
+    // versioned soname (a plain `-l systemd` would demand the unversioned dev symlink).
+    println!("cargo:rustc-link-lib=dylib:+verbatim=libsystemd.so.0");
 
     // B1: compile the AI↔daemon general-socket wire schema (protobuf, prost).
     println!("cargo:rerun-if-changed=proto/runtime_wire.proto");

@@ -152,4 +152,18 @@ pub enum RuntimeError {
     /// (fail-closed, `docs/TRUST_MODEL.md` §4 failure modes).
     #[error("no pending action registered for id `{0}` (unknown, consumed, or restarted)")]
     UnknownPending(String),
+
+    /// A launch precondition supplied by the operator is malformed (C1 — e.g. a
+    /// `PAM_TTY` that is not a well-formed `ttyN`).
+    ///
+    /// Distinct from [`RuntimeError::Syscall`]: nothing was attempted. The input was
+    /// refused *before* the syscall, so the failure surfaces as a loud "launch refused"
+    /// at its cause rather than as a silently degraded session at some later gate
+    /// (`docs/TRUST_MODEL.md` §4 R3-02 — a malformed tty opens a cleanly-registered but
+    /// SEATLESS session that the active-local-seated gate then denies forever).
+    #[error("launch refused — invalid configuration: {what}")]
+    Config {
+        /// What was wrong, and what the valid form is.
+        what: &'static str,
+    },
 }

@@ -489,6 +489,20 @@ alone reaches.
   took over the pub-field / `Deref` / `into_inner` erosions (each RED-proven — introducing
   the erosion makes the snippet compile and the doctest FAIL), leaving the grep only the two
   module-internal properties it alone can reach.
+- **B2a C1, SECOND INSTANCE — a reporting regex matching its author's own prose**
+  (`scratch/iterate-flakiness.sh`). The flakiness runner summarised skips with
+  `grep -oh "SKIP [a-z0-9_]*"`. The test files' skip MESSAGES contain the sentence *"A SKIP
+  INVALIDATES A WEAKEN/RESTORE RUN"* — written by the same author, in the same change. The
+  uppercase `I` fell outside `[a-z0-9_]`, so the pattern matched zero characters and emitted
+  a bare `SKIP ` with no test name: a **skip with no reason**, which is precisely the
+  unreadable output the marker discipline exists to prevent. Fixed by requiring a real test
+  name (`SKIP \K[a-z0-9_]+(?=:)`).
+  **Why this instance matters more than its size:** it shows the class is NOT limited to
+  `include_str!` source audits. It generalises to **any grep over text the author also
+  wrote** — reporting layers, CI log scrapers, doc-lint scripts. The audited corpus need not
+  be source code; it need only overlap with the matcher's own vocabulary. And it appeared in
+  the REPORTING LAYER OF THE TOOL BUILT TO MEASURE THIS CLASS, which is the sharpest
+  available demonstration that noticing the class does not immunise you against it.
 - **Sibling shape (different mechanism, same lesson — a check whose own plumbing decides its
   verdict):** the `tee`/`grep` exit-code mask, **CLAUDE.md §13.4** — `cmd | tee log` reports
   `tee`'s status, masking a failed `cmd`. (Classes 7 and 10 are related but distinct: they

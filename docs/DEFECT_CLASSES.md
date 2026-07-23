@@ -503,6 +503,21 @@ alone reaches.
   be source code; it need only overlap with the matcher's own vocabulary. And it appeared in
   the REPORTING LAYER OF THE TOOL BUILT TO MEASURE THIS CLASS, which is the sharpest
   available demonstration that noticing the class does not immunise you against it.
+
+- **THREE self-corrupting-measurement defects in ONE tool** (`scratch/iterate-flakiness.sh`,
+  the flakiness runner). Grouped because the pattern is the point: (1) the marker **counting
+  bug** — `grep -c` over a string appearing in both the `println` and the panic, so failures
+  counted double (34 markers over 30 iterations); (2) this entry's **blank-SKIP regex**
+  matching the author's own prose; (3) **`--nocapture` interleaving** under parallel execution
+  splitting `test NAME ... FAILED` lines so the per-line grep misses them, potentially
+  *manufacturing* apparent non-executions from real failures. Each is a check whose own
+  plumbing decided its verdict; each was caught only by an EXTERNAL cross-check (an impossible
+  total, a bare token, an arithmetic that did not close). **The tool exists to measure exactly
+  this class and exhibited three instances of it** — the strongest statement available that a
+  class is not neutralised by awareness, only by an independent check outside the measured
+  artifact. Generalisation for any measurement harness: its output is a *claim*, owed the same
+  adversarial scrutiny as the product it measures (Iron Law #15 clause 5 — a harness *number*
+  is evidence only when shown to mean what it says).
 - **Sibling shape (different mechanism, same lesson — a check whose own plumbing decides its
   verdict):** the `tee`/`grep` exit-code mask, **CLAUDE.md §13.4** — `cmd | tee log` reports
   `tee`'s status, masking a failed `cmd`. (Classes 7 and 10 are related but distinct: they

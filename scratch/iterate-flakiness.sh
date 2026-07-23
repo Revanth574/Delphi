@@ -26,6 +26,10 @@ N="${1:-30}"
 # rule targets; the serial arm exists to attribute failures to interference vs product.
 THREADS=""
 [ "${2:-}" = "--serial" ] && THREADS="--test-threads=1"
+# ARM label derived from the flag that will actually reach the binary — never hardcoded,
+# since a summary string claiming the wrong arm is the same self-misreport class this
+# tool has already exhibited three times.
+if [ -n "$THREADS" ]; then ARM="SERIAL (--test-threads=1)"; else ARM="PARALLEL (default threads)"; fi
 
 command -v cargo >/dev/null || { echo "cargo not found — run UNPRIVILEGED"; exit 1; }
 echo "=== building (unprivileged) ==="
@@ -45,16 +49,17 @@ PAMF=/etc/pam.d/delphi-runtime
 # iterations is worth keeping. Overwritten each invocation.
 LOG="$PWD/scratch/iterate-flakiness.last.log"; : > "$LOG"
 declare -A FAILCOUNT
+TOTAL_FAIL=0   # plain counter: ${#FAILCOUNT[@]} is itself unbound-under-set-u when empty
 runs=0; iters_with_failure=0
 
-echo; echo "=== $N iterations, DEFAULT parallelism ==="
+echo; echo "=== $N iterations, $ARM ==="
 for i in $(seq 1 "$N"); do
   iter_failed=0
   while read -r bin; do
     out=$(sudo "$bin" --nocapture $THREADS 2>&1)   # parallel by default; $THREADS set by --serial
     echo "$out" >> "$LOG"
     while read -r t; do
-      FAILCOUNT["$t"]=$(( ${FAILCOUNT["$t"]:-0} + 1 )); iter_failed=1
+      FAILCOUNT["$t"]=$(( ${FAILCOUNT["$t"]:-0} + 1 )); TOTAL_FAIL=$((TOTAL_FAIL+1)); iter_failed=1
     done < <(echo "$out" | grep -oP '^test \K[a-z0-9_]+(?= \.\.\. FAILED)')
   done <<< "$LIST"
   runs=$((runs+1)); [ "$iter_failed" -eq 1 ] && iters_with_failure=$((iters_with_failure+1))
@@ -62,10 +67,11 @@ for i in $(seq 1 "$N"); do
 done
 echo; echo
 
-echo "════════ RESULTS over $runs iterations (parallel) ════════"
-if [ ${#FAILCOUNT[@]} -eq 0 ]; then
+echo "════════ RESULTS over $runs iterations, $ARM ════════"
+if [ "$TOTAL_FAIL" -eq 0 ]; then
   echo "NO FAILURES in any iteration."
 else
+  # Safe to expand the map here: TOTAL_FAIL>0 guarantees >=1 key was assigned.
   echo "per-test failure counts (test: failures/$runs):"
   for t in "${!FAILCOUNT[@]}"; do printf '  %-55s %d/%d\n' "$t" "${FAILCOUNT[$t]}" "$runs"; done
 fi
@@ -120,11 +126,17 @@ else
   echo "!!! PAM STACK CHANGED: before=$PAM_BEFORE after=$PAM_AFTER — any SKIP above is COLLATERAL"
 fi
 echo
-echo "NOTE ON WHAT THIS MEASURES: binaries run SEQUENTIALLY (no backgrounding), but tests"
-echo "WITHIN each binary run in PARALLEL. Shared state across tests in one binary (the VT,"
-echo "the PAM stack, concurrent useradd/PAM sessions) is therefore in scope. Compare against"
-echo "the serialised control arm to separate harness interference from product behaviour:"
-echo "    bash scratch/iterate-flakiness.sh $N --serial"
+if [ -z "$THREADS" ]; then
+  echo "NOTE ($ARM): binaries run SEQUENTIALLY (no backgrounding), but tests WITHIN each"
+  echo "binary run in PARALLEL. Shared state (the VT, the PAM stack, concurrent useradd/PAM"
+  echo "sessions) is in scope. Compare against the serialised control arm to separate harness"
+  echo "interference from product behaviour:"
+  echo "    bash scratch/iterate-flakiness.sh $N --serial"
+else
+  echo "NOTE ($ARM): tests within each binary run ONE AT A TIME — no within-binary shared-state"
+  echo "interference and no --nocapture interleaving. These counts are the AUTHORITATIVE arm; a"
+  echo "failure here is product behaviour, and a parallel-only failure is interference."
+fi
 echo
 echo "════════ VERDICT (fixed denominator: executions, not iterations) ════════"
 if [ "$FD01_FAIL" -eq 0 ] && [ "$FD01_EXEC" -eq "$runs" ]; then

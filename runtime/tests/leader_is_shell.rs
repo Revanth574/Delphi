@@ -92,6 +92,7 @@
 //! leg 3 below an exact path comparison rather than an interpreter-resolution guess (a
 //! `#!/bin/sh` script would make `/proc/<pid>/exe` resolve to the interpreter).
 
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -457,54 +458,63 @@ fn session_leader_is_the_shell_itself_r3_01c() {
     );
 }
 
-/// **FD-01 — the shell inherits EXACTLY the allowlist, nothing else.**
+/// **FD-01 — the sweep contains the DAEMON's own inherited fds** (§4, R3-01c FD-01).
 ///
-/// # Why re-running `sibling_fd_theft` does not replace this
+/// # What this proves, and what CHANGED after the first draft proved nothing
 ///
-/// `sibling_fd_theft` imports only `approval_socketpair`, `drop_privileges` and
-/// `RealPrivDropOps`, then hand-rolls its child (`be_the_shell`: `dup2`/`prctl`/`pause`).
-/// **It never calls `launch()` or `fork_shell`.** It proves the *primitive* in an isolated
-/// context the shape-(b) restructure never touched, so a green run there says nothing about
-/// the launcher's actual pre-`execve` sequence.
+/// The first draft asserted "PAM's D-Bus fd does not survive the `execve`" and tried to
+/// prove it by moving the sweep to *before* `open_own_session` (so PAM's fd would be opened
+/// after the sweep and ride the exec). It **passed under that weaken** — PASS/PASS, worthless.
+/// The null result was itself the finding: under that weaken, `pam_start`, `pam_open_session`
+/// (pam_systemd's sd-bus connection) AND `sd_pid_get_session` all open fds *after* the sweep,
+/// yet NONE survived — because **libsystemd/libpam CLOEXEC or close every fd they open**. The
+/// sweep's ordering-after-PAM is therefore not the containment for PAM's fds; the stack
+/// provides that (see `docs/TRUST_MODEL.md` §4 FD-01, amended).
 ///
-/// The restructured child does `dup2` -> stdio policy -> `pam_start`/`open_session` (opening
-/// PAM's D-Bus connection to logind AND `sd_pid_get_session`'s cgroup descriptors) -> **then**
-/// sweeps -> priv-drops -> `execve`. The ORDERING is the property, and FD-01 (P1) exists
-/// because a PAM/D-Bus fd riding into the shell recreates the B2A-R2-01 relay-bypass one exec
-/// away. Nothing exercised that ordering.
+/// The sweep's **load-bearing** role is a DIFFERENT fd class: the daemon's OWN inherited fds
+/// — the approval-socket listener, the daemon end of the consent channel, the spawn pipe —
+/// which have **no self-containment discipline** (a plain `socketpair`/`pipe` is not CLOEXEC
+/// unless someone sets it). One of those riding the `execve` into the shell is exactly the
+/// B2A-R2-01 relay-bypass class. So this test injects a proxy for them and proves the sweep
+/// closes it.
 ///
-/// # WEAKEN (RED-proof) — NOT YET RUN
+/// # The injection (both operator additions)
 ///
-/// In `shell_child_become`, move the `mark_cloexec_except_raw` block to **before** the
-/// `open_own_session(spec)` call: the sweep then precedes PAM, PAM's descriptors are never
-/// marked, and they survive the `execve`. This test must FAIL with extra fds listed, and PASS
-/// on restore. Until that is done this test is written but UNPROVEN — it has passed on correct
-/// code, which a vacuous test also does.
+/// A **non-CLOEXEC socket** is opened (non-CLOEXEC) in the test process
+/// before `launch()`. `launch()` forks from THIS process, so the child inherits it; the
+/// production sweep marks every fd >= 3 outside the allowlist CLOEXEC, so it must be gone
+/// after the `execve`. A **socket** specifically, because that is the shape the daemon's real
+/// inherited fds take. Rust opens all fds CLOEXEC by default, which would make the injection
+/// vacuous — so the test **asserts the fd is open AND non-CLOEXEC in the parent immediately
+/// before `launch()`** (addition 1). And "injected fd ABSENT in the child under the weaken"
+/// is treated as **VOID, not pass** (the injection failed to inherit) — the run prints
+/// `injected_in_child` so the operator can apply that rule.
+///
+/// # WEAKEN (RED-proof) — remove the sweep ENTIRELY
+///
+/// In `shell_child_become`, no-op the `mark_cloexec_except_raw` block (the marked FD-01
+/// WEAKEN banner). With no sweep, the injected non-CLOEXEC socket survives the `execve` and
+/// this test FAILS (extra fd listed); restore the sweep and it PASSES. Run serially
+/// (`--test-threads=1`) — FD-01 was shown stable serially, flaky only under within-binary
+/// parallelism.
 #[test]
 fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     if geteuid().as_raw() != 0 {
-        eprintln!("SKIP shell_inherits_only_the_allowlisted_fds: requires root. A SKIP PROVES NOTHING.");
+        eprintln!("SKIP fd01: requires root. A SKIP PROVES NOTHING.");
         return;
     }
     if !std::path::Path::new(PAM_FILE).exists() {
-        eprintln!(
-            "SKIP shell_inherits_only_the_allowlisted_fds: {PAM_FILE} not installed — and \
-             WITHOUT IT PAM OPENS NO DESCRIPTORS, so this test would pass VACUOUSLY."
-        );
+        eprintln!("SKIP fd01: {PAM_FILE} not installed. A SKIP PROVES NOTHING.");
         return;
     }
     let stack = std::fs::read_to_string(PAM_FILE).unwrap_or_default();
     if !stack.lines().any(|l| l.trim_start().starts_with("session")) {
-        eprintln!(
-            "SKIP shell_inherits_only_the_allowlisted_fds: {PAM_FILE} has no `session` group, \
-             so pam_systemd never runs and opens no D-Bus fd — the leak this test hunts cannot \
-             occur and it would pass VACUOUSLY."
-        );
+        eprintln!("SKIP fd01: {PAM_FILE} has no `session` group. A SKIP PROVES NOTHING.");
         return;
     }
     let vt = test_vt();
     if !vt.exists_on_system() {
-        eprintln!("SKIP shell_inherits_only_the_allowlisted_fds: /dev/{} absent.", vt.as_pam_tty());
+        eprintln!("SKIP fd01: /dev/{} absent.", vt.as_pam_tty());
         return;
     }
 
@@ -517,11 +527,40 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
     let Some(shell_bin) = build_sleeper(&work) else {
-        eprintln!("SKIP shell_inherits_only_the_allowlisted_fds: no working `cc`.");
+        eprintln!("SKIP fd01: no working `cc`.");
         return;
     };
     let shell_bin = shell_bin.canonicalize().expect("canonical sleeper path");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+
+    // ── THE INJECTION: a non-CLOEXEC SOCKET, inherited across launch()'s fork ──
+    // A socketpair (not a pipe/file) because that is the shape of the daemon's real inherited
+    // fds — the approval listener and the consent channel are sockets. Use the socket's OWN fd
+    // number (dynamic), NOT a fixed dup2 target: a fixed number could clobber an fd the cargo
+    // harness already holds — the harness-self-corruption class this arc keeps hitting. Rust
+    // opens all fds CLOEXEC by default, so clear it explicitly; that non-CLOEXEC state is what
+    // makes the socket inherit across the fork+execve, and is exactly the "no self-containment"
+    // property the daemon's real inherited fds have (unlike libsystemd's, which self-CLOEXEC).
+    let (inj_a, _inj_b) = std::os::unix::net::UnixStream::pair().expect("inject socketpair");
+    let injected_fd = inj_a.as_raw_fd();
+    assert!(
+        injected_fd > SHELL_CHANNEL_FD,
+        "fd01 SETUP: injected fd {injected_fd} collides with the allowlist/channel — VOID"
+    );
+    let cur = unsafe { nix::libc::fcntl(injected_fd, nix::libc::F_GETFD) };
+    assert!(cur >= 0, "fd01 SETUP: injected fd {injected_fd} not open — VOID");
+    unsafe { nix::libc::fcntl(injected_fd, nix::libc::F_SETFD, cur & !nix::libc::FD_CLOEXEC) };
+
+    // ADDITION 1 — prove the injection SETUP before launch(): OPEN and NON-CLOEXEC, or it would
+    // not inherit and the test would go vacuous the same way the first draft did. Rust's
+    // default-CLOEXEC is exactly this trap.
+    let flags = unsafe { nix::libc::fcntl(injected_fd, nix::libc::F_GETFD) };
+    assert!(flags >= 0, "fd01 SETUP: injected fd {injected_fd} is not open before launch — VOID");
+    assert!(
+        flags & nix::libc::FD_CLOEXEC == 0,
+        "fd01 SETUP: injected fd {injected_fd} is still CLOEXEC before launch — it would not \
+         inherit and the test would be VACUOUS."
+    );
 
     let spec = LaunchSpec {
         shell_path: &shell_bin,
@@ -536,8 +575,6 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     let children = launch(&spec).expect("launch shell + AI");
     let shell_pid = children.shell_pid;
 
-    // Wait for the execve — inspecting earlier would read the PRE-sweep fd table and fail
-    // for the wrong reason.
     let mut exec_done = false;
     for _ in 0..50 {
         if std::fs::read_link(format!("/proc/{shell_pid}/exe")).is_ok_and(|p| p == shell_bin) {
@@ -559,6 +596,7 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
         }
     }
     fds.sort_by_key(|(n, _)| *n);
+    let injected_in_child = fds.iter().any(|(n, _)| *n == injected_fd);
 
     for pid in pids_owned_by(uid) {
         let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
@@ -566,42 +604,34 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     let _ = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None);
     let _ = nix::sys::wait::waitpid(Pid::from_raw(children.ai_pid), None);
     drop(children.daemon_channel);
+    drop(inj_a); // keep the injected socket alive until AFTER the child was inspected
     let _ = std::fs::remove_dir_all(&base);
 
-    println!("{EXECUTED_MARKER}(FD-01): shell_pid={shell_pid} exec_done={exec_done} fds={fds:?}");
+    println!(
+        "{EXECUTED_MARKER}(FD-01): shell_pid={shell_pid} exec_done={exec_done}          injected_fd={injected_fd} injected_in_child={injected_in_child} fds={fds:?}"
+    );
 
     assert!(
         exec_done,
-        "{EXECUTED_MARKER}(FD-01): the sleeper never reached its execve, so the fd table read \
-         would be the PRE-sweep one. Treat this run as VOID, not an fd-containment verdict."
+        "{EXECUTED_MARKER}(FD-01): the sleeper never reached its execve; the fd table read would          be PRE-sweep. VOID, not an fd-containment verdict."
     );
+
+    // VOID GUARD (addition 1, second half): under the WEAKEN the injected fd must be PRESENT
+    // (that is the bite). If it is ABSENT here, decide which case: production sweep removed it
+    // (correct PASS), or the injection never inherited (VOID). We cannot know the topology from
+    // inside the test — but the parent-side non-CLOEXEC assertion above means inheritance was
+    // guaranteed at fork, so ABSENCE can only be the sweep. Under the weaken (no sweep) absence
+    // would contradict that guarantee → the operator reads `injected_in_child=false` on the
+    // WEAKEN run as VOID. The assertion below is the PRODUCTION property.
+    let want: Vec<i32> = vec![0, 1, 2, SHELL_CHANNEL_FD];
     let got: Vec<i32> = fds.iter().map(|(n, _)| *n).collect();
-    let want = vec![0, 1, 2, SHELL_CHANNEL_FD];
-
-    // The EXTRAS are the finding. Report them with their link targets, never as a count:
-    // "an extra fd survived" and "PAM's D-Bus descriptor survived" are DIFFERENT CLAIMS, and
-    // only the second proves the property FD-01 exists to protect. A count cannot tell them
-    // apart, so the assertion prints the resolved targets and flags socket-shaped ones —
-    // `pam_systemd`'s connection to logind appears as `socket:[NNNN]`.
-    let extras: Vec<&(i32, String)> =
-        fds.iter().filter(|(n, _)| !want.contains(n)).collect();
-    let socket_shaped: Vec<&&(i32, String)> = extras
-        .iter()
-        .filter(|(_, t)| t.starts_with("socket:") || t.starts_with("anon_inode:"))
-        .collect();
-
+    let extras: Vec<&(i32, String)> = fds.iter().filter(|(n, _)| !want.contains(n)).collect();
     assert_eq!(
         got, want,
         "{EXECUTED_MARKER}(FD-01): fd containment VIOLATED.\n\
-         \x20 full table : {fds:?}\n\
-         \x20 allowlist  : {want:?} (stdio + SHELL_CHANNEL_FD)\n\
-         \x20 EXTRAS     : {extras:?}\n\
-         \x20 socket-shaped extras (PAM/D-Bus candidates): {socket_shaped:?}\n\
-         Any descriptor in EXTRAS rode through the `execve`. If a socket-shaped one is \
-         present it is very likely `pam_systemd`'s D-Bus connection to logind — that is the \
-         B2A-R2-01 relay-bypass class reopened one exec away (§4 FD-01, P1), and it is the \
-         specific claim this test is for. Extras that are NOT socket-shaped still fail the \
-         allowlist but prove a WEAKER claim: something leaked, not that the PAM descriptor \
-         did. Check that `mark_cloexec_except_raw` still runs AFTER `open_own_session`."
+         \x20 child fds : {fds:?}\n\
+         \x20 allowlist : {want:?} (stdio + SHELL_CHANNEL_FD)\n\
+         \x20 EXTRAS    : {extras:?}\n\
+         The injected non-CLOEXEC SOCKET (fd {injected_fd}) — a proxy for the daemon's own          inherited fds (approval listener, consent channel, spawn pipe) — SURVIVED the execve          into the shell. The sweep did not contain it. That is the B2A-R2-01 relay-bypass          class: an inherited daemon fd one exec away from the shell (§4 FD-01). If          injected_in_child=true above, this is the injected fd; restore the          `mark_cloexec_except_raw` sweep in `shell_child_become`."
     );
 }

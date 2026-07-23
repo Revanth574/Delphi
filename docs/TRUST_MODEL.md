@@ -294,6 +294,37 @@ inherited fd) is swept. This is not optional hardening — under leader == shell
 fd-containment property the runtime already enforces on the AI-spawn path, now obligatory on the
 shell-spawn path. (Surfaced by this recon's own Codex gate — FD-01, P1.)
 
+**What the sweep actually contains — corrected by test, with the PAM claim demoted (FD-01
+amendment, 2026-07-22).** The paragraph above named *PAM's D-Bus fd* as the thing riding the
+`execve`. A regression test built to prove exactly that (`runtime/tests/leader_is_shell.rs`,
+`shell_inherits_only_the_allowlisted_fds_fd_01`) established otherwise, and the correction is
+load-bearing:
+
+- **PAM-fd containment is provided by the STACK, not by our sweep — on the current stack.** The
+  test's first weaken moved the sweep to *before* `open_own_session`, so `pam_start`,
+  `pam_open_session` (pam_systemd's sd-bus connection) and `sd_pid_get_session` all open their fds
+  *after* the sweep. The child's post-`execve` fd table was nonetheless **identical** — none
+  survived. The only explanation: **libsystemd/libpam open their fds `SOCK_CLOEXEC`/`O_CLOEXEC`
+  and/or close them before returning.** So on this stack the sweep's *ordering-after-PAM* is **not
+  demonstrably load-bearing** for PAM's own descriptors. **This is a property of THIS stack at THIS
+  version, established empirically — NOT a guarantee.** The ordering requirement is **retained as
+  defense-in-depth** against that property changing on a libsystemd/libpam upgrade, a different
+  libc, or a future PAM module that does not self-CLOEXEC. A future reader must not read "not
+  load-bearing" as "removable": remove it and a stack that stops self-containing silently
+  reintroduces the relay-bypass.
+
+- **The PRIMARY, load-bearing claim is the DAEMON's own inherited fds.** The approval-socket
+  listener, the daemon end of the consent channel, and the spawn pipe are plain sockets/pipes with
+  **no self-containment discipline** — nothing sets them `CLOEXEC` unless the sweep does. One of
+  *those* riding the `execve` into the shell is the actual B2A-R2-01 relay-bypass instance the
+  sweep exists to prevent. The FD-01 test proves this directly: it injects a **non-CLOEXEC socket**
+  (the shape of those real fds) into the process that `launch()` forks from, asserts it is open and
+  non-CLOEXEC immediately before the fork (so the injection cannot go vacuous the way Rust's
+  default-CLOEXEC would make it), and checks it is **gone** from the shell's fd table after the
+  `execve`. Its weaken is *removing the sweep entirely*; restored, the injected fd is contained.
+  PAM-fd containment is demoted to "the stack provides it"; the sweep's proven job is the daemon's
+  own fds.
+
 **The session-only PAM deviation is deliberate, stack-specific, and sound only post-`execve`
 (PAM-01/PAM-02/PAM-03).** On the launcher's session path the daemon runs the PAM *session* stack
 (`pam_open_session`) of a **deliberately-selected, validated service** — production's

@@ -160,7 +160,10 @@ impl Drop for Setup {
     /// failed silently and leaked a system account per run (two accumulated, uid 1001/1002,
     /// removed by hand). Diagnosis: the holders were not stuck — they exited on their own
     /// moments later — so cleanup was merely running too early. Hence a bounded wait for the
-    /// account to be free, `-r` to take the home directory, and the status is CHECKED.
+    /// account to be free, and the status is CHECKED. No `-r`: the account is created with
+    /// `useradd -M` (no home, no mail spool), so `userdel -r` only prints
+    /// `mail spool ... not found` / `home directory ... not found` on a SUCCESS exit —
+    /// expected-error noise that buries the real failures it sits next to.
     fn drop(&mut self) {
         let uid = User::from_name(&self.user).ok().flatten().map(|u| u.uid);
 
@@ -188,10 +191,10 @@ impl Drop for Setup {
             }
         }
 
-        match Command::new("userdel").args(["-r", &self.user]).status() {
+        match Command::new("userdel").arg(&self.user).status() {
             Ok(st) if st.success() => {}
             Ok(st) => eprintln!(
-                "WARN: `userdel -r {}` exited {st} — THE ACCOUNT MAY HAVE LEAKED. Check \
+                "WARN: `userdel {}` exited {st} — THE ACCOUNT MAY HAVE LEAKED. Check \
                  `getent passwd | grep delphi-b1` and remove it by hand.",
                 self.user
             ),

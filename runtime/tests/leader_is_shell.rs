@@ -128,8 +128,12 @@ impl Setup {
     fn new(tag: &str) -> Self {
         let user = format!("delphi-{tag}-{}", std::process::id());
         // A previous run that failed to reap may have leaked this exact account; clear it so
-        // a stale leftover cannot fail an otherwise-valid run.
-        let _ = Command::new("userdel").args(["-r", &user]).status();
+        // a stale leftover cannot fail an otherwise-valid run. GUARD on existence first: an
+        // unconditional `userdel` prints `userdel: user '...' does not exist` on the common
+        // (clean) path, and expected-error noise buries the real failures it sits next to.
+        if User::from_name(&user).ok().flatten().is_some() {
+            let _ = Command::new("userdel").args(["-r", &user]).status();
+        }
         let ok = Command::new("useradd")
             .args(["-M", "-s", "/usr/sbin/nologin", &user])
             .status()

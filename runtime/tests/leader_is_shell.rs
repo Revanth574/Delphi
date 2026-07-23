@@ -2,12 +2,15 @@
 
 //! **Properties of the restructured shell child** (`docs/TRUST_MODEL.md` §4).
 //!
-//! Two tests sharing one harness, because both need the same expensive setup (root, the
+//! Three tests sharing one harness, because each needs the same expensive setup (root, the
 //! installed PAM stack, a real VT, and a launch through the real `fork_shell`):
 //!
 //! * `session_leader_is_the_shell_itself_r3_01c` — **B-1**, leader == shell (R3-01c).
 //! * `shell_inherits_only_the_allowlisted_fds_fd_01` — **FD-01**, fd containment through
 //!   the restructured child, which no existing test covers.
+//! * `shell_child_drops_to_the_session_user_b3` — **B-3 / B′**, the privilege-drop EFFECT on
+//!   the manual-fork path (the *order* is unit-proven on the function; nothing asserted the
+//!   effect on `fork_shell` until this test).
 //!
 //! # B-1 — the leader == shell regression test (§4 R3-01c)
 //!
@@ -636,5 +639,142 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
          \x20 allowlist : {want:?} (stdio + SHELL_CHANNEL_FD)\n\
          \x20 EXTRAS    : {extras:?}\n\
          The injected non-CLOEXEC SOCKET (fd {injected_fd}) — a proxy for the daemon's own          inherited fds (approval listener, consent channel, spawn pipe) — SURVIVED the execve          into the shell. The sweep did not contain it. That is the B2A-R2-01 relay-bypass          class: an inherited daemon fd one exec away from the shell (§4 FD-01). If          injected_in_child=true above, this is the injected fd; restore the          `mark_cloexec_except_raw` sweep in `shell_child_become`."
+    );
+}
+
+/// Read the `Uid:` / `Gid:` / `Groups:` fields from `/proc/<pid>/status`. `Uid:`/`Gid:` each
+/// carry four values (real, effective, saved, fs); `Groups:` carries the supplementary set.
+fn proc_status_ids(pid: i32) -> Option<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let field = |prefix: &str| -> Vec<u32> {
+        status
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .map(|l| l.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect())
+            .unwrap_or_default()
+    };
+    Some((field("Uid:"), field("Gid:"), field("Groups:")))
+}
+
+/// **B-3 / B′ — the manual-fork shell child actually DROPS PRIVILEGES** (§4 R3-01).
+///
+/// # The gap this closes
+///
+/// The privilege drop moved from a `Command`/`pre_exec` closure to inline manual-fork code in
+/// `shell_child_become`. The ORDER (`setgroups([]) → setgid → setuid`) is unit-proven on
+/// `drop_privileges` via a mock seam (`drops_in_canonical_..._order`), but that tests the
+/// FUNCTION, not the `fork_shell` call site. Nothing asserted the EFFECT on the path: that the
+/// resulting shell runs as the session `(uid, gid)` with **no supplementary groups**. A
+/// `launch()`-traversing test is the only thing that exercises the restructured drop.
+///
+/// # What is asserted (post-`execve`, from `/proc/<shell_pid>/status`)
+///
+/// * `Uid:` all four fields == the session uid — `setuid` dropped real/effective/saved/fs.
+/// * `Gid:` all four == the session gid — `setgid` did likewise.
+/// * `Groups:` empty — `setgroups([])` cleared the root supplementary set.
+///
+/// The uid check is the primary discriminator; gid and groups cover the other two syscalls.
+///
+/// # WEAKEN (RED-proof)
+///
+/// In `shell_child_become`, delete/no-op the `drop_privileges(&RealPrivDropOps, ...)` block.
+/// The shell then `execve`s **as root** — `Uid:` becomes `0 0 0 0` — and this test FAILS.
+/// Restore the call and it PASSES. Run serially (`--test-threads=1`).
+#[test]
+fn shell_child_drops_to_the_session_user_b3() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP b3: requires root. A SKIP PROVES NOTHING.");
+        return;
+    }
+    if !std::path::Path::new(PAM_FILE).exists() {
+        eprintln!("SKIP b3: {PAM_FILE} not installed. A SKIP PROVES NOTHING.");
+        return;
+    }
+    let stack = std::fs::read_to_string(PAM_FILE).unwrap_or_default();
+    if !stack.lines().any(|l| l.trim_start().starts_with("session")) {
+        eprintln!("SKIP b3: {PAM_FILE} has no `session` group. A SKIP PROVES NOTHING.");
+        return;
+    }
+    let vt = test_vt();
+    if !vt.exists_on_system() {
+        eprintln!("SKIP b3: /dev/{} absent.", vt.as_pam_tty());
+        return;
+    }
+
+    let setup = Setup::new("b3");
+    let (uid, gid) = setup.ids();
+    let base = PathBuf::from(format!("/run/delphi-b3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let Some(shell_bin) = build_sleeper(&work) else {
+        eprintln!("SKIP b3: no working `cc`.");
+        return;
+    };
+    let shell_bin = shell_bin.canonicalize().expect("canonical sleeper path");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+
+    let spec = LaunchSpec {
+        shell_path: &shell_bin,
+        ai_path: &ai_bin,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        tty: &vt,
+        shell_env: &[],
+        ai_env: &[],
+    };
+    let children = launch(&spec).expect("launch shell + AI");
+    let shell_pid = children.shell_pid;
+
+    let mut exec_done = false;
+    for _ in 0..50 {
+        if std::fs::read_link(format!("/proc/{shell_pid}/exe")).is_ok_and(|p| p == shell_bin) {
+            exec_done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    let ids = proc_status_ids(shell_pid);
+
+    for pid in pids_owned_by(uid) {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+    let _ = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None);
+    let _ = nix::sys::wait::waitpid(Pid::from_raw(children.ai_pid), None);
+    drop(children.daemon_channel);
+    let _ = std::fs::remove_dir_all(&base);
+
+    println!("{EXECUTED_MARKER}(B3): shell_pid={shell_pid} exec_done={exec_done} ids={ids:?}");
+
+    assert!(
+        exec_done,
+        "{EXECUTED_MARKER}(B3): the sleeper never reached its execve; /proc/status would be \
+         PRE-drop. VOID, not a privilege-drop verdict."
+    );
+    let (uids, gids, groups) =
+        ids.expect("{EXECUTED_MARKER}(B3): /proc/<shell_pid>/status unreadable — VOID");
+    let (want_u, want_g) = (uid.as_raw(), gid.as_raw());
+
+    // PRIMARY discriminator: setuid dropped every uid field. Root (0 0 0 0) fails this.
+    assert!(
+        uids.len() == 4 && uids.iter().all(|&u| u == want_u),
+        "{EXECUTED_MARKER}(B3): shell did NOT drop uid — /proc/status Uid: {uids:?}, want all \
+         == {want_u}. Uid `0 0 0 0` means `drop_privileges` did not run in the manual-fork \
+         child: the shell execs as ROOT. Restore the `drop_privileges` call in \
+         `shell_child_become`."
+    );
+    assert!(
+        gids.len() == 4 && gids.iter().all(|&g| g == want_g),
+        "{EXECUTED_MARKER}(B3): shell did NOT drop gid — /proc/status Gid: {gids:?}, want all == {want_g}."
+    );
+    // setgroups([]) cleared the root supplementary set.
+    assert!(
+        groups.is_empty(),
+        "{EXECUTED_MARKER}(B3): shell retained supplementary groups {groups:?} — setgroups([]) \
+         did not run. A same-uid attacker inheriting root's supplementary groups is a \
+         privilege the drop is supposed to remove."
     );
 }

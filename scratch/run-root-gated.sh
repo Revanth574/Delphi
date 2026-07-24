@@ -52,6 +52,20 @@ source "$(dirname "$0")/lib-run-sweep.sh"
 sweep_stale_run_delphi_dirs
 echo
 
+# Heal a systemd_smoke run SIGKILLed inside its backup→restore window: that would leave the
+# TEST's binary at /usr/libexec/delphi-runtimed and the operator's REAL one at the fixed
+# .smoke-bak, silently. Restore it BEFORE snapshotting the baseline, so ART_BEFORE is the true
+# state and a heal is not misread as a mid-run artifact change — and so the systemd-not-booted
+# case (where systemd_smoke SKIPs and never self-heals) is still covered. systemd_smoke.rs's
+# restore_stale_backup() is AUTHORITATIVE (it also protects a direct `cargo test systemd_smoke`);
+# this is the runner's pre-snapshot mirror. Same self-healing shape as the /run sweep above.
+SMOKE_BAK=/usr/libexec/delphi-runtimed.smoke-bak
+if sudo test -e "$SMOKE_BAK"; then
+  echo "healing a prior interrupted systemd_smoke run: restoring /usr/libexec/delphi-runtimed from $SMOKE_BAK"
+  sudo mv -f "$SMOKE_BAK" /usr/libexec/delphi-runtimed
+  echo
+fi
+
 # ── CLASS 16 / 17: the operator-installed artifacts must SURVIVE the suite ──────────────
 # The PAM stack was NOT the only installer-owned path a fixture deleted — systemd_smoke.rs
 # was deleting /usr/libexec/delphi-runtimed (Class 16, on a SIBLING path). A survival check

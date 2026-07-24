@@ -82,9 +82,12 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════════════
 copy_fd() {   # fd dest mode
     local fd="$1" dest="$2" mode="$3"
-    cat <&"$fd" > "$dest" || refuse "failed writing $dest"
-    chown root:root "$dest"
-    chmod "$mode" "$dest"
+    # `install` from the BOUND fd (`/proc/self/fd/$fd`) — reads the same inode the fstat check
+    # trusted (TOCTOU-free: verified `install /proc/self/fd/$fd` gets the original after a path
+    # swap), and sets owner+mode ATOMICALLY (no `cat >` umask window where the dest is briefly
+    # world-readable-but-wrong-mode). The DEST dir is root-owned (see the `install -d` below),
+    # so no attacker can pre-plant a symlink at `$dest` for `install` to follow.
+    install -o root -g root -m "$mode" "/proc/self/fd/$fd" "$dest" || refuse "failed installing $dest"
 }
 
 install -d -m 0755 /usr/libexec

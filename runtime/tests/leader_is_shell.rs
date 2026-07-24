@@ -251,6 +251,44 @@ fn pids_executing(target: &std::path::Path) -> Vec<i32> {
     out
 }
 
+/// Robustly reap the launched children — **BOUNDED so it can never hang the harness.**
+///
+/// DEMONSTRATED FAILURE (B-3 weaken, 2026-07-23). The earlier teardown killed only
+/// `pids_owned_by(session_uid)` and then `waitpid(shell_pid, None)`. With the B-3 weaken's
+/// `drop_privileges` no-op'd the shell keeps **root** (uid 0), so it is NOT in
+/// `pids_owned_by(session_uid)`, is never signalled, and the unbounded `waitpid` blocks
+/// forever on the `pause()`ing root sleeper — hanging the whole harness with no verdict. This
+/// helper fixes all three defects that surfaced:
+///
+/// 1. **Kill by PID DIRECTLY** (`shell_pid`, `ai_pid`), not only by session uid — a
+///    non-dropped (root) shell is signalled regardless of its uid. `pids_owned_by(uid)` is
+///    *also* signalled, to catch a reparented session-uid grandchild (B-1 weaken).
+/// 2. **Bounded wait** — `WNOHANG` poll with `SIGKILL` escalation after ~1s, giving up after
+///    ~3s. A stuck child becomes a reaped child, never a hung harness.
+///
+/// The caller prints its `EXECUTED_MARKER` line *before* calling this, so the verdict data is
+/// emitted even if reaping is slow. Note: a `Ctrl-C` before this runs still leaks a root
+/// sleeper — that is inherent to `Ctrl-C` (no Drop runs) and is documented, not fixable here.
+fn reap_children(shell_pid: i32, ai_pid: i32, uid: Uid) {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    for pid in [shell_pid, ai_pid].into_iter().chain(pids_owned_by(uid)) {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+    for pid in [shell_pid, ai_pid] {
+        let p = Pid::from_raw(pid);
+        for i in 0..60 {
+            match waitpid(p, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {}
+                _ => break, // reaped, or ECHILD (already gone) — either way, done
+            }
+            if i == 20 {
+                let _ = kill(p, Signal::SIGKILL); // escalate after ~1s of SIGTERM
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 /// Build the `pause()` sleeper used as the shell under test. See the module docs for why
 /// this is not `delphi-minimal-shell`.
 fn build_sleeper(dir: &std::path::Path) -> Option<PathBuf> {
@@ -397,19 +435,15 @@ fn session_leader_is_the_shell_itself_r3_01c() {
     // LEG 3: who is ACTUALLY executing the shell binary, from procfs (independent source).
     let executors = pids_executing(&shell_bin);
 
-    // Tear down before asserting, so a failing run cannot leave a session or account behind.
-    for pid in pids_owned_by(uid) {
-        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-    }
-    let _ = nix::sys::wait::waitpid(Pid::from_raw(pinned_pid), None);
-    let _ = nix::sys::wait::waitpid(Pid::from_raw(children.ai_pid), None);
-    drop(children.daemon_channel);
-    let _ = std::fs::remove_dir_all(&base);
-
+    // Marker BEFORE teardown: the measurement is captured above, so emit the verdict data now
+    // — a slow/edge-case teardown must never hide it (the B-3 hang lesson).
     println!(
         "{EXECUTED_MARKER}: pinned_pid={pinned_pid} session={session:?} leader={leader:?} \
          executing_shell={executors:?}"
     );
+    reap_children(pinned_pid, children.ai_pid, uid);
+    drop(children.daemon_channel);
+    let _ = std::fs::remove_dir_all(&base);
 
     let session = session.unwrap_or_else(|| {
         panic!(
@@ -604,18 +638,15 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     fds.sort_by_key(|(n, _)| *n);
     let injected_in_child = fds.iter().any(|(n, _)| *n == injected_fd);
 
-    for pid in pids_owned_by(uid) {
-        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-    }
-    let _ = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None);
-    let _ = nix::sys::wait::waitpid(Pid::from_raw(children.ai_pid), None);
+    // Marker BEFORE teardown (the B-3 hang lesson) — the fd table is captured above.
+    println!(
+        "{EXECUTED_MARKER}(FD-01): shell_pid={shell_pid} exec_done={exec_done} \
+         injected_fd={injected_fd} injected_in_child={injected_in_child} fds={fds:?}"
+    );
+    reap_children(shell_pid, children.ai_pid, uid);
     drop(children.daemon_channel);
     drop(inj_a); // keep the injected socket alive until AFTER the child was inspected
     let _ = std::fs::remove_dir_all(&base);
-
-    println!(
-        "{EXECUTED_MARKER}(FD-01): shell_pid={shell_pid} exec_done={exec_done}          injected_fd={injected_fd} injected_in_child={injected_in_child} fds={fds:?}"
-    );
 
     assert!(
         exec_done,
@@ -739,15 +770,12 @@ fn shell_child_drops_to_the_session_user_b3() {
     }
     let ids = proc_status_ids(shell_pid);
 
-    for pid in pids_owned_by(uid) {
-        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-    }
-    let _ = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None);
-    let _ = nix::sys::wait::waitpid(Pid::from_raw(children.ai_pid), None);
+    // Marker BEFORE teardown — this is the test whose weaken (shell keeps ROOT) demonstrated
+    // the hang, so emitting the verdict data before reaping is not optional here.
+    println!("{EXECUTED_MARKER}(B3): shell_pid={shell_pid} exec_done={exec_done} ids={ids:?}");
+    reap_children(shell_pid, children.ai_pid, uid);
     drop(children.daemon_channel);
     let _ = std::fs::remove_dir_all(&base);
-
-    println!("{EXECUTED_MARKER}(B3): shell_pid={shell_pid} exec_done={exec_done} ids={ids:?}");
 
     assert!(
         exec_done,

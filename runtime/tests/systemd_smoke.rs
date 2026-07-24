@@ -30,6 +30,11 @@ const BIN_SRC: &str = env!("CARGO_BIN_EXE_delphi-runtimed");
 /// Where the shipped unit's `ExecStart=` expects the binary.
 const INSTALLED_BIN: &str = "/usr/libexec/delphi-runtimed";
 const INSTALLED_UNIT: &str = "/etc/systemd/system/delphi-runtimed@.service";
+/// FIXED-name backup of a displaced operator binary. Fixed (not pid-suffixed) so there is
+/// never more than one and never any "which one is the real binary" ambiguity: if it exists,
+/// a prior run was interrupted inside its backup→restore window and this IS the operator's
+/// real binary. `restore_stale_backup` heals that before this run touches anything.
+const BIN_BACKUP: &str = "/usr/libexec/delphi-runtimed.smoke-bak";
 
 fn systemd_booted() -> bool {
     Path::new("/run/systemd/system").exists()
@@ -46,16 +51,65 @@ fn sh(program: &str, args: &[&str]) -> std::process::Output {
 struct Teardown {
     user: String,
     instance: String,
+    /// True when this run RENAMED an operator binary aside to `BIN_BACKUP` (restore it on
+    /// drop). False when it PROVISIONED `INSTALLED_BIN` where none existed (just remove our
+    /// copy). The word `provisioned` also lets the fixture-hygiene audit see the ownership
+    /// gate on this fixture.
+    bin_provisioned: bool,
 }
 
 impl Drop for Teardown {
     fn drop(&mut self) {
         let _ = sh("systemctl", &["stop", &self.instance]);
+        // The /etc unit path is TEST-OWNED (the installer ships the unit to
+        // /usr/lib/systemd/system/), so removing it destroys no operator artifact — see the
+        // path list in fixture_hygiene.rs.
         let _ = std::fs::remove_file(INSTALLED_UNIT);
+        // Remove OUR fresh binary copy, then restore the operator's if we displaced one. Both
+        // steps are best-effort; a SIGKILL between them leaves the operator's real binary at
+        // BIN_BACKUP, which the NEXT run's `restore_stale_backup` heals (fixed-name backup).
         let _ = std::fs::remove_file(INSTALLED_BIN);
+        if !self.bin_provisioned
+            && let Err(e) = std::fs::rename(BIN_BACKUP, INSTALLED_BIN)
+        {
+            eprintln!(
+                "WARN: could not restore operator daemon binary {INSTALLED_BIN} from \
+                 {BIN_BACKUP}: {e} — the real binary is at {BIN_BACKUP}; re-run this test \
+                 or installer/install.sh to restore it"
+            );
+        }
         let _ = sh("systemctl", &["daemon-reload"]);
         let _ = sh("userdel", &[&self.user]);
         let _ = std::fs::remove_dir_all(format!("/run/delphi/{}", self.user));
+    }
+}
+
+/// CRASH-SAFETY — self-heal a prior run SIGKILLed inside its backup→restore window.
+///
+/// The backup→restore dance means that between the backup rename and the restore rename,
+/// `INSTALLED_BIN` is the TEST's binary (or absent) while the operator's real binary sits at
+/// the FIXED `BIN_BACKUP`. A kill there would otherwise leave the WRONG binary silently at the
+/// production path — a presence check passes; only an md5 comparison after a completed run
+/// catches it. That is worse than the loud deletion this fixture replaced, so it must not be
+/// left to chance. This runs BEFORE this run's own backup: if `BIN_BACKUP` exists, the prior
+/// run did not finish, so restore it (atomic rename), OVERWRITING whatever wrong binary sits
+/// at `INSTALLED_BIN`. Fixed backup name ⇒ at most one, no ambiguity. systemd_smoke is
+/// root + serial-only, so the fixed name cannot collide with a concurrent run (which would
+/// already collide on `INSTALLED_BIN` itself). Edge: if the operator REINSTALLED between the
+/// interruption and now, this restores the slightly-older-but-valid backup — still strictly
+/// better than a silent wrong binary.
+fn restore_stale_backup() {
+    if Path::new(BIN_BACKUP).exists() {
+        match std::fs::rename(BIN_BACKUP, INSTALLED_BIN) {
+            Ok(()) => eprintln!(
+                "systemd_smoke: healed a prior interrupted run — restored {INSTALLED_BIN} \
+                 from the stale {BIN_BACKUP}"
+            ),
+            Err(e) => eprintln!(
+                "WARN: stale {BIN_BACKUP} present (prior interrupted run) but restore failed: \
+                 {e} — the real binary is at {BIN_BACKUP}"
+            ),
+        }
     }
 }
 
@@ -103,10 +157,29 @@ fn shipped_unit_produces_root_owned_anchor_on_systemd() {
         String::from_utf8_lossy(&added.stderr)
     );
 
-    let _guard = Teardown { user: user.clone(), instance: instance.clone() };
+    std::fs::create_dir_all("/usr/libexec").expect("ensure /usr/libexec");
+
+    // CRASH-SAFETY FIRST: heal any prior run killed inside its backup→restore window before
+    // this run reads or moves anything (else this run could back up the WRONG binary).
+    restore_stale_backup();
+
+    // Class 16/17 — an installer may already own INSTALLED_BIN. Displace it (rename aside to
+    // the FIXED BIN_BACKUP) so the smoke test still runs against the FRESH build, and arm the
+    // teardown to RESTORE it, never delete it. Only when nothing was present do we
+    // provision-and-remove. The prior version unconditionally copied over and then
+    // remove_file'd this path, deleting the operator's installed daemon binary mid-run — the
+    // exact Class-16 shape, one path over from the PAM stack, that fixture_hygiene.rs now
+    // guards for every operator-owned path.
+    let bin_provisioned = if Path::new(INSTALLED_BIN).exists() {
+        std::fs::rename(INSTALLED_BIN, BIN_BACKUP).expect("back up operator daemon binary");
+        false
+    } else {
+        true
+    };
+
+    let _guard = Teardown { user: user.clone(), instance: instance.clone(), bin_provisioned };
 
     // Install the SHIPPED unit + the built binary at the unit's ExecStart path.
-    std::fs::create_dir_all("/usr/libexec").expect("ensure /usr/libexec");
     std::fs::copy(BIN_SRC, INSTALLED_BIN).expect("install daemon binary");
     std::fs::set_permissions(INSTALLED_BIN, std::fs::Permissions::from_mode(0o755))
         .expect("chmod daemon binary");

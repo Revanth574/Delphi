@@ -52,16 +52,60 @@ source "$(dirname "$0")/lib-run-sweep.sh"
 sweep_stale_run_delphi_dirs
 echo
 
-# CLASS 16 PART 1: the operator-installed stack must SURVIVE the suite. Recording the
-# before-state makes a deletion visible immediately, at its cause, instead of surfacing
-# later as unrelated tests reporting "not installed".
-PAMF=/etc/pam.d/delphi-runtime
-if [ -f "$PAMF" ]; then
-  PAM_BEFORE=$(sudo md5sum "$PAMF" | cut -d' ' -f1)
-  echo "PAM stack present before run (md5 $PAM_BEFORE)"
+# Heal a systemd_smoke run SIGKILLed inside its backup→restore window: that would leave the
+# TEST's binary at /usr/libexec/delphi-runtimed and the operator's REAL one at the fixed
+# .smoke-bak, silently. Restore it BEFORE snapshotting the baseline, so ART_BEFORE is the true
+# state and a heal is not misread as a mid-run artifact change — and so the systemd-not-booted
+# case (where systemd_smoke SKIPs and never self-heals) is still covered. systemd_smoke.rs's
+# restore_stale_backup() is AUTHORITATIVE (it also protects a direct `cargo test systemd_smoke`);
+# this is the runner's pre-snapshot mirror. Same self-healing shape as the /run sweep above.
+SMOKE_BAK=/usr/libexec/delphi-runtimed.smoke-bak
+if sudo test -e "$SMOKE_BAK"; then
+  echo "healing a prior interrupted systemd_smoke run: restoring /usr/libexec/delphi-runtimed from $SMOKE_BAK"
+  sudo mv -f "$SMOKE_BAK" /usr/libexec/delphi-runtimed
+  echo
+fi
+
+# ── CLASS 16 / 17: the operator-installed artifacts must SURVIVE the suite ──────────────
+# The PAM stack was NOT the only installer-owned path a fixture deleted — systemd_smoke.rs
+# was deleting /usr/libexec/delphi-runtimed (Class 16, on a SIBLING path). A survival check
+# written for ONE path (the old PAM-only md5) is itself the Class-17 mistake: it cannot see
+# the same defect one path over. So this checks EVERY path the installer writes. Extend this
+# list the moment installer/install.sh writes a NEW path — same discipline as
+# runtime/tests/fixture_hygiene.rs's SHARED_SYSTEM_PATHS.
+ARTIFACTS=(
+  /etc/pam.d/delphi-runtime
+  /usr/libexec/delphi-runtimed
+  /usr/libexec/delphi-shell
+  /usr/libexec/delphi-minimal-ai
+  /usr/lib/systemd/system/delphi-runtimed@.service
+)
+declare -A ART_BEFORE ART_AFTER
+snapshot() {   # $1 = name of assoc array to populate
+  local -n _arr="$1"; local p
+  for p in "${ARTIFACTS[@]}"; do
+    if [ -f "$p" ]; then _arr["$p"]=$(sudo md5sum "$p" 2>/dev/null | cut -d' ' -f1); else _arr["$p"]=absent; fi
+  done
+}
+snapshot ART_BEFORE
+echo "installer-owned artifacts before the run:"
+for p in "${ARTIFACTS[@]}"; do printf '  %-52s %s\n' "$p" "${ART_BEFORE[$p]}"; done
+[ "${ART_BEFORE[/etc/pam.d/delphi-runtime]}" = absent ] && \
+  echo "  WARNING: PAM stack absent — root-gated tests will SKIP. Run installer/install.sh."
+echo
+
+# ── GAP 1: the live 'who-touches-it' probe (auditd). If absent, say so LOUDLY — a green ──
+# before/after md5 detects a NET change but NOT the actor, and the same green md5 already
+# failed twice to settle the PAM disappearance. Do not let its absence pass silently.
+AUDIT=0
+if command -v auditctl >/dev/null 2>&1 && sudo auditctl -s >/dev/null 2>&1; then
+  for p in "${ARTIFACTS[@]}"; do sudo auditctl -w "$p" -p wa -k delphiartifact >/dev/null 2>&1; done
+  AUDIT=1
+  echo "auditd watch ARMED on all installer-owned paths (key: delphiartifact)."
 else
-  PAM_BEFORE=absent
-  echo "PAM stack ABSENT before run — install it, or root-gated tests will skip."
+  echo "!!! auditd/auditctl NOT available — the live 'who-deletes-it' probe did NOT run."
+  echo "!!! The before/after md5 below sees a NET change but CANNOT name the actor."
+  echo "!!! To actually probe: sudo apt-get install -y auditd && re-run this script."
 fi
 echo
 
@@ -84,14 +128,59 @@ while read -r bin; do
   echo
 done < "$LIST"
 
-echo "════════════════════════════════════════"
-if [ -f "$PAMF" ]; then PAM_AFTER=$(sudo md5sum "$PAMF" | cut -d' ' -f1); else PAM_AFTER=absent; fi
-if [ "$PAM_BEFORE" = "$PAM_AFTER" ]; then
-  echo "PAM stack SURVIVED unchanged (md5 $PAM_AFTER) — Class 16 part 1 OK"
+# ── GAP 3: b1_daemon_binary SKIPs without the seam (a SKIP proves nothing). Build the ────
+# feature binary and RUN it, so the assembled daemon flow actually COUNTS. With the seam
+# compiled in + DELPHI_INSECURE_ASSUME_ACTIVE_SESSION set, the gate is bypassed and the flow
+# runs to `Completed` deterministically on any root+bwrap host (seating-independent).
+echo "──────── b1_daemon_binary (--features insecure-test-seams — making the SKIP COUNT) ────────"
+FEATBIN=$(cargo test -p delphi-runtime --test b1_integration --features insecure-test-seams \
+          --no-run --message-format=json 2>/dev/null \
+          | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | grep '/deps/b1_integration' | head -1)
+if [ -z "$FEATBIN" ]; then
+  echo "  BUILD FAILED for the --features insecure-test-seams binary"; fail=$((fail+1))
 else
-  echo "!!! PAM STACK CHANGED: before=$PAM_BEFORE after=$PAM_AFTER"
-  echo "!!! A fixture deleted or rewrote an operator-installed system file (defect Class 16)."
-  echo "!!! Any later SKIP on \"not installed\" in this run is COLLATERAL, not a result."
+  fout=$(sudo "$FEATBIN" b1_daemon_binary_runs_the_assembled_flow --nocapture --test-threads=1 2>&1); frc=$?
+  echo "$fout" | grep -E "^test result:|DELPHI_RUNTIMED_OUTCOME|SKIP |FAILED" || true
+  if [ "$frc" -ne 0 ] || echo "$fout" | grep -q "SKIP b1_daemon_binary"; then
+    echo "  ^^ b1_daemon_binary did NOT positively COMPLETE (SKIP or fail) — the feature run is"
+    echo "     REQUIRED for the daemon flow to count; a SKIP is not a pass (Iron Law #15)."
+    fail=$((fail+1))
+  fi
+fi
+echo
+
+echo "════════════════════════════════════════"
+# CLASS 16/17 net-survival verdict across ALL installer-owned paths.
+snapshot ART_AFTER
+changed=0
+for p in "${ARTIFACTS[@]}"; do
+  if [ "${ART_BEFORE[$p]}" != "${ART_AFTER[$p]}" ]; then
+    echo "!!! ARTIFACT CHANGED: $p  before=${ART_BEFORE[$p]}  after=${ART_AFTER[$p]}"
+    changed=$((changed+1))
+  fi
+done
+if [ "$changed" -eq 0 ]; then
+  echo "ALL installer-owned artifacts SURVIVED unchanged — Class 16/17 property OK"
+  echo "  (includes /usr/libexec/delphi-runtimed — the file systemd_smoke.rs was deleting;"
+  echo "   an unchanged md5 confirms backup-and-restore restored the ORIGINAL, not a copy.)"
+else
+  echo "!!! $changed installer-owned artifact(s) changed — a fixture destroyed/rewrote an"
+  echo "!!! operator file mid-run (defect Class 16/17). Any later \"not installed\" SKIP is COLLATERAL."
   fail=$((fail+1))
 fi
+
+# Read back + disarm the audit watch (the actor, if anything touched a watched path).
+if [ "$AUDIT" = 1 ]; then
+  echo
+  echo "=== audit events on installer-owned paths (the ACTOR — proctitle/comm/pid) ==="
+  sudo ausearch -k delphiartifact -i 2>/dev/null \
+    | grep -iE "type=(SYSCALL|PATH).*(unlink|rename|delete|open.*O_TRUNC)|comm=|proctitle=|exe=" \
+    | tail -60 || echo "  (no write/delete events recorded — nothing modified a watched path)"
+  for p in "${ARTIFACTS[@]}"; do sudo auditctl -W "$p" -p wa -k delphiartifact >/dev/null 2>&1; done
+else
+  echo
+  echo "NOTE: no audit trail this run (auditd absent). If any artifact changed above, the actor"
+  echo "      was NOT captured — install auditd and re-run to name it."
+fi
+
 if [ "$fail" -eq 0 ]; then echo "ALL BINARIES EXITED 0"; else echo "$fail FAILURE(S) — check names above"; fi

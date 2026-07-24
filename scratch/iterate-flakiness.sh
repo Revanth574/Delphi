@@ -40,6 +40,12 @@ LIST=$(cargo test -p delphi-runtime --test leader_is_shell \
 echo "$LIST" | sed 's/^/  /'
 sudo -v || { echo "CANNOT OBTAIN SUDO — nothing run; NOT a test result."; exit 2; }
 
+# Sweep stale /run/delphi-* dirs from any prior killed run BEFORE this run starts —
+# see scratch/lib-run-sweep.sh. This script's own iteration loops are the most likely
+# source of orphaned dirs if a run is interrupted mid-iteration.
+source "$(dirname "$0")/lib-run-sweep.sh"
+sweep_stale_run_delphi_dirs
+
 PAMF=/etc/pam.d/delphi-runtime
 [ -f "$PAMF" ] && PAM_BEFORE=$(sudo md5sum "$PAMF" | cut -d' ' -f1) || PAM_BEFORE=absent
 [ "$PAM_BEFORE" = absent ] && echo "WARNING: PAM stack absent — root-gated tests will SKIP and prove nothing."

@@ -29,6 +29,11 @@ BIN=$(cargo test -p delphi-runtime --test b1_integration --no-run --message-form
 echo "  $BIN"
 sudo -v || { echo "CANNOT OBTAIN SUDO — nothing run; NOT a test result."; exit 2; }
 
+# Sweep stale /run/delphi-* dirs from any prior killed run BEFORE this run starts —
+# see scratch/lib-run-sweep.sh.
+source "$(dirname "$0")/lib-run-sweep.sh"
+sweep_stale_run_delphi_dirs
+
 LOG="$PWD/scratch/iterate-b1.last.log"; : > "$LOG"
 PAMF=/etc/pam.d/delphi-runtime
 [ -f "$PAMF" ] && PAM_BEFORE=$(sudo md5sum "$PAMF" | cut -d' ' -f1) || PAM_BEFORE=absent

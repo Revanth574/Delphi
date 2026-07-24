@@ -45,6 +45,13 @@ if ! sudo -v; then
 fi
 echo
 
+# Sweep stale /run/delphi-* dirs from any prior killed run BEFORE this run starts —
+# see scratch/lib-run-sweep.sh. Prevents the accumulate-until-full-tmpfs failure mode
+# (measured: 113 dirs, an hour of misattribution) rather than diagnosing it again.
+source "$(dirname "$0")/lib-run-sweep.sh"
+sweep_stale_run_delphi_dirs
+echo
+
 # CLASS 16 PART 1: the operator-installed stack must SURVIVE the suite. Recording the
 # before-state makes a deletion visible immediately, at its cause, instead of surfacing
 # later as unrelated tests reporting "not installed".

@@ -34,18 +34,20 @@ PAMF=/etc/pam.d/delphi-runtime
 [ -f "$PAMF" ] && PAM_BEFORE=$(sudo md5sum "$PAMF" | cut -d' ' -f1) || PAM_BEFORE=absent
 
 declare -A FAILCOUNT
+TOTAL_FAIL=0   # plain counter: ${#FAILCOUNT[@]} is itself unbound-under-set-u when empty
 echo; echo "== $N iterations, $ARM =="
 for i in $(seq 1 "$N"); do
   out=$(sudo "$BIN" --nocapture $THREADS 2>&1)
   printf '\n===== iteration %d =====\n%s\n' "$i" "$out" >> "$LOG"
-  while read -r t; do FAILCOUNT["$t"]=$(( ${FAILCOUNT["$t"]:-0} + 1 )); done \
-    < <(echo "$out" | grep -oP '^test \K[a-z0-9_]+(?= \.\.\. FAILED)')
+  while read -r t; do
+    FAILCOUNT["$t"]=$(( ${FAILCOUNT["$t"]:-0} + 1 )); TOTAL_FAIL=$((TOTAL_FAIL+1))
+  done < <(echo "$out" | grep -oP '^test \K[a-z0-9_]+(?= \.\.\. FAILED)')
   printf '\riteration %d/%d' "$i" "$N"
 done
 echo; echo
 
 echo "════════ per-test failures over $N iterations, $ARM ════════"
-if [ ${#FAILCOUNT[@]} -eq 0 ] 2>/dev/null; then
+if [ "$TOTAL_FAIL" -eq 0 ]; then
   echo "  NO FAILURES in any iteration."
 else
   for t in "${!FAILCOUNT[@]}"; do printf '  %-52s %d/%d\n' "$t" "${FAILCOUNT[$t]}" "$N"; done

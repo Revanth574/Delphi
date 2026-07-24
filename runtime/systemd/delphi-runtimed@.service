@@ -15,6 +15,29 @@ Documentation=file:///usr/share/doc/delphi/TRUST_MODEL.md
 Type=simple
 # NO User=, NO DynamicUser= → the daemon runs as root → /run/delphi/%i is root:root.
 ExecStart=/usr/libexec/delphi-runtimed --session %i
+
+# ── C2 deployment configuration ──────────────────────────────────────────────
+# DELPHI_SHELL_VT — the seat's virtual terminal the shell is provisioned on (§4
+# R3-02a: PAM_TTY=ttyN is the whole seat obligation). `tty3` is a DEPLOYMENT-CONFIG
+# value for THIS box — tty2 holds GNOME here, tty3 is free. It is NOT a VT-allocation
+# policy: choosing a free VT programmatically was deferred out of C1 and is deliberately
+# NOT settled by this default. An operator on another box edits this line. Absent it,
+# the daemon refuses to launch (no default — a silently-guessed VT would collide or open
+# a SEATLESS session the gate denies forever).
+Environment=DELPHI_SHELL_VT=tty3
+# DELPHI_AI_BIN — the AI the daemon spawns. There is NO real Brain binary yet
+# (Capability #2 is partial; the Brain is unwired). The production path
+# /usr/libexec/delphi-ai is left EMPTY on purpose, so a deployment MISSING this override
+# fails LOUDLY at ENOENT instead of silently running scaffolding. This override points at
+# the visible B1 scaffold under its OWN name — it is NOT the Brain, and installing it at
+# the Brain's address would be the stub-at-the-real-address lie this project refuses.
+Environment=DELPHI_AI_BIN=/usr/libexec/delphi-minimal-ai
+# The daemon logs under this identifier; the shell inherits its stdout/stderr, so shell
+# diagnostics appear here too (launcher.rs stdio policy). Fully SEPARATING shell output
+# from daemon output is a shell-side concern (the shell reopening its own stream), not the
+# unit's — deferred, not solved by this line.
+SyslogIdentifier=delphi-runtimed
+
 RuntimeDirectory=delphi/%i
 RuntimeDirectoryMode=0711
 # Optional hardening (anchor holds regardless — /run is root-only): keep the

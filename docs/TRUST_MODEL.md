@@ -345,6 +345,16 @@ ships it. *(C1 note: the stack now exists at `installer/pam/delphi-runtime` — 
 minimal three lines `auth`/`account` `pam_unix.so` + `session required pam_systemd.so`. The
 re-validation is against THAT file.)*
 
+*(C2 note — the obligation is NARROWED, NOT closed. `installer/install.sh` now ships this stack
+to `/etc/pam.d/delphi-runtime`, and the runtime tests run against the installed real stack. The
+**success path is validated** against it: B-1 (leader==shell teardown by leader exit), B-3
+(privilege drop), and FD-01 all pass with the session opened on the real stack. But the
+**PAM-02 pre-`execve` unwind paths** — `pam_close_session` (if the session was opened) + `pam_end`
+while the handle is live, on a failure BEFORE `execve` — are exercised by **no test** against the
+real stack; the tests reach only the success path. So the deviation is **partially discharged
+against the real stack, NOT closed**: the pre-`execve` failure-unwind behaviour on this specific
+stack remains unproven.)*
+
 **PAM-03, second form — an incomplete stack is more dangerous than a missing one.** The
 launcher's existence check (`access(F_OK)`) covers "no stack" but **cannot see** "stack present,
 `session` group empty." In that case `pam_open_session` returns **SUCCESS while registering no

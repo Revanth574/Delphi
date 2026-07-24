@@ -55,3 +55,4 @@ Desktop.ini
 *.pem
 *.key
 credentials.json
+installer/staging/

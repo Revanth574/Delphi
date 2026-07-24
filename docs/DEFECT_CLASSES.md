@@ -573,6 +573,18 @@ never the production path.
 - **Adjacent, same family:** the probe script for the empty-`session`-group measurement
   deliberately used a throwaway service name so it could not damage the very stack it was
   characterising — the correct shape, arrived at before this defect was found.
+- **B2a lane close-out — the FOURTH deleter, on a DIFFERENT path (`systemd_smoke.rs`).** After
+  the three PAM copies were fixed, `systemd_smoke.rs` was found unconditionally `remove_file`-ing
+  `/usr/libexec/delphi-runtimed` — the operator's installed *daemon binary* — in its `Drop`
+  teardown, having `std::fs::copy`'d over it with no existence check. It deleted the installed
+  daemon binary mid-session; the surviving-unit asymmetry pinpointed it (the test installs its
+  unit to `/etc/systemd/system/` while `install.sh` ships to `/usr/lib/systemd/system/`, so the
+  operator's unit survived while the shared binary path died). Fixed with **backup-and-restore**
+  (rename the operator's binary aside, install the fresh build, restore on teardown) rather than
+  adopt-or-provision, because a smoke test must run against the *fresh* build, not adopt a
+  possibly-stale installed one. **This is why Class 17 exists** (see below): the original
+  `fixture_hygiene.rs` guard watched only the PAM path, so it was blind to the identical shape on
+  the binary path.
 
 **RED-proof shape.** Two parts: (1) with the production artifact present, run the suite and
 show the artifact SURVIVES (pre-fix it is deleted); (2) with it absent, show the fixture
@@ -617,11 +629,24 @@ next copy fails loudly rather than shipping green (Class 15's `fixture_hygiene` 
   `scratch/iterate-b1.sh` was then written by copying the pattern **without** the fix, and
   crashed on its first empty-`FAILCOUNT` (clean) run. Fixed — but it should have been caught by
   grepping `FAILCOUNT` across `scratch/` when the first fix landed.
+- **The finder-guard ITSELF was scoped to one instance-path (B2a lane close-out).** The sharpest
+  instance of this class: `fixture_hygiene.rs`, the Class-16 finder-guard, hard-coded a *single*
+  `SHARED_SYSTEM_PATH = /etc/pam.d/delphi-runtime`. So when the write-and-delete shape reappeared
+  on `/usr/libexec/delphi-runtimed` (`systemd_smoke.rs`, see Class 16), the guard could not see it
+  — a finder that finds only the *path* it was born on is the Class-14 "covers-one-form" mistake
+  reproduced in the very mechanism meant to foreclose it. Fixed by generalizing the guard to a
+  **list** of operator-owned paths (`SHARED_SYSTEM_PATHS`), matching `remove_file` of a shared
+  const *or* literal, with the discipline note "extend this list the moment a fixture writes a NEW
+  installer-owned path." RED-proven: the generalized guard fires naming `systemd_smoke.rs` against
+  the pre-fix code, and passes after — with zero false positives on `leader_is_shell.rs`, which
+  references the PAM path but never `remove_file`s it (it removes only test-owned `/run` dirs).
 
 **RED-proof shape.** The finder-guard must FIRE against an un-fixed copy before it is fixed —
-`fixture_hygiene.rs` naming `pam_interposition.rs` is the reference. A "fix" with no finder and
-no cross-tree grep is unproven: it is the count of instances you *remembered*, not the count
-that *exist*.
+`fixture_hygiene.rs` naming `pam_interposition.rs` (and later `systemd_smoke.rs`) is the
+reference. A "fix" with no finder and no cross-tree grep is unproven: it is the count of
+instances you *remembered*, not the count that *exist*. And a finder-guard must be scoped to the
+**shape across all paths**, not the one path it was written for — else it becomes the next Class-17
+instance itself.
 
 ---
 

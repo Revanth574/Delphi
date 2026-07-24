@@ -46,13 +46,40 @@ fn sh(program: &str, args: &[&str]) -> std::process::Output {
 struct Teardown {
     user: String,
     instance: String,
+    /// Class 16/17: NEVER delete the operator's installed daemon binary. If one was present
+    /// at `INSTALLED_BIN` when the test started, it is renamed aside and RESTORED here; only
+    /// the test's own fresh copy is removed. `None` means none was present.
+    bin_backup: Option<PathBuf>,
+    /// True only when THIS test wrote `INSTALLED_BIN` where none existed — nothing to restore,
+    /// removing our copy is correct. (Redundant with `bin_backup.is_none()`, kept explicit so
+    /// the adopt-or-provision contract is legible and the fixture-hygiene audit sees it.)
+    bin_provisioned: bool,
 }
 
 impl Drop for Teardown {
     fn drop(&mut self) {
         let _ = sh("systemctl", &["stop", &self.instance]);
+        // The /etc unit path is TEST-OWNED (the installer ships the unit to
+        // /usr/lib/systemd/system/), so removing it destroys no operator artifact — see the
+        // path list in fixture_hygiene.rs.
         let _ = std::fs::remove_file(INSTALLED_UNIT);
+        // Remove OUR fresh binary copy, then restore the operator's if we displaced one.
         let _ = std::fs::remove_file(INSTALLED_BIN);
+        match &self.bin_backup {
+            Some(bak) => {
+                if let Err(e) = std::fs::rename(bak, INSTALLED_BIN) {
+                    eprintln!(
+                        "WARN: could not restore operator daemon binary {INSTALLED_BIN} from \
+                         {}: {e} — restore it by re-running installer/install.sh",
+                        bak.display()
+                    );
+                }
+            }
+            None => debug_assert!(
+                self.bin_provisioned,
+                "no backup means this test provisioned INSTALLED_BIN itself"
+            ),
+        }
         let _ = sh("systemctl", &["daemon-reload"]);
         let _ = sh("userdel", &[&self.user]);
         let _ = std::fs::remove_dir_all(format!("/run/delphi/{}", self.user));
@@ -103,10 +130,31 @@ fn shipped_unit_produces_root_owned_anchor_on_systemd() {
         String::from_utf8_lossy(&added.stderr)
     );
 
-    let _guard = Teardown { user: user.clone(), instance: instance.clone() };
+    std::fs::create_dir_all("/usr/libexec").expect("ensure /usr/libexec");
+
+    // Class 16/17 — an installer may already own INSTALLED_BIN. Displace it (rename aside) so
+    // the smoke test still runs against the FRESH build, and arm the teardown to RESTORE it,
+    // never delete it. Only when nothing was present do we provision-and-remove. The prior
+    // version unconditionally copied over and then remove_file'd this path, deleting the
+    // operator's installed daemon binary mid-run — the exact Class-16 shape, one path over
+    // from the PAM stack, that fixture_hygiene.rs now guards for every operator-owned path.
+    let (bin_backup, bin_provisioned) = if Path::new(INSTALLED_BIN).exists() {
+        let bak = PathBuf::from(format!("{INSTALLED_BIN}.smoke-bak.{}", std::process::id()));
+        let _ = std::fs::remove_file(&bak); // clear a leftover from an aborted run
+        std::fs::rename(INSTALLED_BIN, &bak).expect("back up operator daemon binary");
+        (Some(bak), false)
+    } else {
+        (None, true)
+    };
+
+    let _guard = Teardown {
+        user: user.clone(),
+        instance: instance.clone(),
+        bin_backup,
+        bin_provisioned,
+    };
 
     // Install the SHIPPED unit + the built binary at the unit's ExecStart path.
-    std::fs::create_dir_all("/usr/libexec").expect("ensure /usr/libexec");
     std::fs::copy(BIN_SRC, INSTALLED_BIN).expect("install daemon binary");
     std::fs::set_permissions(INSTALLED_BIN, std::fs::Permissions::from_mode(0o755))
         .expect("chmod daemon binary");

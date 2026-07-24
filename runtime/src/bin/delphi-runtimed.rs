@@ -96,18 +96,15 @@ fn main() -> Result<()> {
         .context("`DELPHI_SHELL_VT` is not set; it must name the seat's virtual terminal \
                   (e.g. `tty1`) — see TRUST_MODEL.md §4 R3-02a")?;
     let tty = VtName::new(&vt).with_context(|| format!("`DELPHI_SHELL_VT={vt}`"))?;
-    // B2A-C-R1-02: `VtName::new` proves only the *form* `ttyN` — it does NOT prove `/dev/ttyN`
-    // exists on THIS host. A syntactically-valid but absent VT (a deployment typo like `tty63`
-    // on a host with only `tty1`-`tty6`) would otherwise reach `pam_open_session` and become the
-    // same silent "session opens but the gate denies forever" failure `VtName` exists to make
-    // loud. Refuse at startup instead — the production path is the ONLY place this can be
-    // checked (all other `exists_on_system` callers are test-only).
-    anyhow::ensure!(
-        tty.exists_on_system(),
-        "`DELPHI_SHELL_VT={vt}` names /dev/{vt}, which is not a character device on this host \
-         (a deployment typo, or a VT that does not exist here). Set it to the seat's real VT — \
-         see TRUST_MODEL.md §4 R3-02a."
-    );
+    // NO `/dev/ttyN`-existence preflight here — DELIBERATELY (B2A-C-R2-02, reverting the
+    // round-1 B2A-C-R1-02 addition). The launch path never OPENS the tty device: it passes
+    // `ttyN` as `PAM_TTY` (a string), and `pam_systemd` derives the seat from the tty NAME, not
+    // by opening `/dev/ttyN` (see `launcher.rs` `set_tty` — the only use). So device-node
+    // presence is the WRONG predicate: it does not validate seating, and it would FALSELY
+    // refuse startup on minimal images / containers that do not populate `/dev/tty1..63` even
+    // though the VT name is valid for PAM/logind. The real defense against a wrong VT is the
+    // consent-time active-local-SEATED gate (§4 R3-02), which denies a session that did not
+    // seat — a runtime check on the authority, not a startup guess from the local /dev layout.
     let spec = LaunchSpec {
         shell_path: &shell_bin,
         ai_path: &ai_bin,

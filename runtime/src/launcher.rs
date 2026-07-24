@@ -921,25 +921,6 @@ mod tests {
         }
     }
 
-    /// **B2A-C-R1-02 — `exists_on_system` reports a PRESENT VT truthfully.** The daemon's new
-    /// startup check keys on this to refuse a VT whose `/dev/ttyN` is absent.
-    ///
-    /// HONEST LIMITATION (recorded, not hidden): the *absent* case — the one the daemon's check
-    /// actually acts on — CANNOT be regression-tested on a full-`devtmpfs` host, where all
-    /// `/dev/tty1..63` nodes exist even when unused (measured 2026-07-24: 63/63 present on this
-    /// box). So the check is INERT here and LOAD-BEARING only on minimal/container deploys that
-    /// do not pre-create every VT node. This test proves the present-path wiring; it does NOT
-    /// (cannot, here) prove the check bites an absent VT. A biting test needs a host with a
-    /// genuine gap in `/dev/ttyN`.
-    #[test]
-    fn vtname_exists_on_system_reports_present_vt_b2a_c_r1_02() {
-        // tty1's device node is present on essentially every Linux host with a console.
-        assert!(
-            VtName::new("tty1").unwrap().exists_on_system(),
-            "tty1's /dev node should be a character device on this host"
-        );
-    }
-
     /// This module's own source, for the class-5 accessor audit below.
     const SELF_SRC: &str = include_str!("launcher.rs");
 

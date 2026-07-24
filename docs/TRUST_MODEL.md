@@ -294,6 +294,37 @@ inherited fd) is swept. This is not optional hardening — under leader == shell
 fd-containment property the runtime already enforces on the AI-spawn path, now obligatory on the
 shell-spawn path. (Surfaced by this recon's own Codex gate — FD-01, P1.)
 
+**What the sweep actually contains — corrected by test, with the PAM claim demoted (FD-01
+amendment, 2026-07-22).** The paragraph above named *PAM's D-Bus fd* as the thing riding the
+`execve`. A regression test built to prove exactly that (`runtime/tests/leader_is_shell.rs`,
+`shell_inherits_only_the_allowlisted_fds_fd_01`) established otherwise, and the correction is
+load-bearing:
+
+- **PAM-fd containment is provided by the STACK, not by our sweep — on the current stack.** The
+  test's first weaken moved the sweep to *before* `open_own_session`, so `pam_start`,
+  `pam_open_session` (pam_systemd's sd-bus connection) and `sd_pid_get_session` all open their fds
+  *after* the sweep. The child's post-`execve` fd table was nonetheless **identical** — none
+  survived. The only explanation: **libsystemd/libpam open their fds `SOCK_CLOEXEC`/`O_CLOEXEC`
+  and/or close them before returning.** So on this stack the sweep's *ordering-after-PAM* is **not
+  demonstrably load-bearing** for PAM's own descriptors. **This is a property of THIS stack at THIS
+  version, established empirically — NOT a guarantee.** The ordering requirement is **retained as
+  defense-in-depth** against that property changing on a libsystemd/libpam upgrade, a different
+  libc, or a future PAM module that does not self-CLOEXEC. A future reader must not read "not
+  load-bearing" as "removable": remove it and a stack that stops self-containing silently
+  reintroduces the relay-bypass.
+
+- **The PRIMARY, load-bearing claim is the DAEMON's own inherited fds.** The approval-socket
+  listener, the daemon end of the consent channel, and the spawn pipe are plain sockets/pipes with
+  **no self-containment discipline** — nothing sets them `CLOEXEC` unless the sweep does. One of
+  *those* riding the `execve` into the shell is the actual B2A-R2-01 relay-bypass instance the
+  sweep exists to prevent. The FD-01 test proves this directly: it injects a **non-CLOEXEC socket**
+  (the shape of those real fds) into the process that `launch()` forks from, asserts it is open and
+  non-CLOEXEC immediately before the fork (so the injection cannot go vacuous the way Rust's
+  default-CLOEXEC would make it), and checks it is **gone** from the shell's fd table after the
+  `execve`. Its weaken is *removing the sweep entirely*; restored, the injected fd is contained.
+  PAM-fd containment is demoted to "the stack provides it"; the sweep's proven job is the daemon's
+  own fds.
+
 **The session-only PAM deviation is deliberate, stack-specific, and sound only post-`execve`
 (PAM-01/PAM-02/PAM-03).** On the launcher's session path the daemon runs the PAM *session* stack
 (`pam_open_session`) of a **deliberately-selected, validated service** — production's
@@ -310,7 +341,51 @@ shell's death is the session's). **Every pre-`execve` failure path is different 
 `pam_close_session` (if the session was opened) + `pam_end` while the handle is still live** —
 this is a production-launcher requirement, not optional (PAM-02). **Forward obligation:**
 re-validate this deviation against the actual `/etc/pam.d/delphi-runtime` stack when `installer/`
-ships it. A leader ≠ shell path would reintroduce both the explicit-close obligation on the
+ships it. *(C1 note: the stack now exists at `installer/pam/delphi-runtime` — the
+minimal three lines `auth`/`account` `pam_unix.so` + `session required pam_systemd.so`. The
+re-validation is against THAT file.)*
+
+*(C2 note — the obligation is NARROWED, NOT closed. `installer/install.sh` now ships this stack
+to `/etc/pam.d/delphi-runtime`, and the runtime tests run against the installed real stack. The
+**success path is validated** against it: B-1 (leader==shell teardown by leader exit), B-3
+(privilege drop), and FD-01 all pass with the session opened on the real stack. But the
+**PAM-02 pre-`execve` unwind paths** — `pam_close_session` (if the session was opened) + `pam_end`
+while the handle is live, on a failure BEFORE `execve` — are exercised by **no test** against the
+real stack; the tests reach only the success path. So the deviation is **partially discharged
+against the real stack, NOT closed**: the pre-`execve` failure-unwind behaviour on this specific
+stack remains unproven.)*
+
+**PAM-03, second form — an incomplete stack is more dangerous than a missing one.** The
+launcher's existence check (`access(F_OK)`) covers "no stack" but **cannot see** "stack present,
+`session` group empty." In that case `pam_open_session` returns **SUCCESS while registering no
+logind session at all** — the shell then resolves to no session and the seated gate denies every
+consent forever, with the symptom arbitrarily far from the cause. This is structurally the same
+silent failure `VtName` exists to prevent (a cleanly-succeeding call yielding a seatless/absent
+session), one level up. The launcher therefore also asserts the **outcome**: after a successful
+`open_session` the pid MUST resolve to a logind session (`logind::session_id_for_pid`).
+Deliberately NOT a config grep — following `@include` / `session include` / `substack` would mean
+writing a PAM parser in a forked pre-`execve` child, and a grep for a `session` line would repeat
+the very covers-one-form-misses-others mistake it is fixing.
+
+**`pam_faillock` — the tension is RECORDED, the decision is DEFERRED (do not re-derive this from
+scratch).** Adding `auth required pam_faillock.so` (brute-force lockout on the consent prompt) is
+a genuine trade-off with arguments on both sides, and someone will propose it later:
+
+- **FOR.** R3-02a makes it sharp: a **locked** session is `Active=yes` and **passes the gate**
+  (measured). PAM is therefore *the only control* standing between a locked, unattended Delphi
+  screen and a minted consent token. Lockout is the standard defense against repeated guessing at
+  exactly that screen.
+- **AGAINST.** On this system consent gates **all** privileged action, so lockout is a
+  **denial-of-consent** vector: an attacker who can reach the prompt (or merely trigger failed
+  attempts) can lock the legitimate user out of approving anything — converting a confidentiality
+  control into an availability failure against the user's own machine, which cuts against Iron
+  Law #1 (user sovereignty) and #3 (graceful degradation).
+
+`# DECISION:` **not in the minimal stack.** It ships as its own change with its own review, where
+the lockout parameters (`deny`, `unlock_time`, whether the *root daemon's* own retries count) can
+be reasoned about explicitly. Recording the tension here so the next reader inherits the analysis
+rather than rediscovering it — and so a future "obviously we should add faillock" is met with the
+availability counter-argument, not just adopted. A leader ≠ shell path would reintroduce both the explicit-close obligation on the
 success path and the orphan window Phase D exhibited.
 
 ### R3-02 — the auth party is the root daemon (PAM), not a substitutable agent

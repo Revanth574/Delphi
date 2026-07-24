@@ -172,6 +172,7 @@ module).
 - **SVC-1** — `SanitizedPrompt`: mintable only from a ZKQP sanitize; the sole constructor of the cloud-egress capability.
 - **SVC-1-R1-1 / -02** — `ConfirmationToken` (HMAC-bound) + `ConfirmationTokenWire` (redacted `Debug`, no `Display`/`Deref`).
 - **F15** — the held directory **handle** as the safe-open trust anchor (a proto-capability for the root-flags invariant).
+- **B2a C1** — `VtName` (`runtime/src/launcher.rs`): a `ttyN` validated by its sole constructor. The invariant is **well-formedness, not secrecy** — the variant of this class where the raw value is not a secret but a string whose malformed form fails SILENTLY downstream (`pam_open_session` SUCCEEDS and registers a `Class=background`, seatless session that the seated gate then denies forever). Proven by three `compile_fail` doctests (external bypasses) + a scoped source audit (module-internal sites) — see class 15 for why both.
 
 **PENDING (teeth):** **`TrustedRoot` for `ValidatedIngestionPath`.** The
 root-handle flags-invariant (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`) is currently
@@ -220,7 +221,7 @@ is not sufficient.
 
 **Foreclosing primitive.** Process: run `cargo test --workspace` (not per-crate)
 before declaring a shared-type change done; in CI, fail on an unexpected
-executed-test-count drop (see class 11).
+executed-test-count drop (see class 10).
 
 **Instances (grounded):**
 - **FORT-R1-04 downstream** (`e7fdbb0`) — redacting `FortressError`'s `Display` was correct, but `die-inference`'s `InferenceError` doctest + unit test and `die-orchestrator`'s `all_downstream_errors_convert` asserted the credential name *survives* the `#[from]` conversion (the very leak R1-04 closed). The fortress-only per-crate audits never compiled those consumers; the full-workspace pre-merge run caught it.
@@ -407,10 +408,220 @@ behavior, not the markers.
   date-scope precision: assert what the detector DOES under a transform, not what the
   Unicode category suggests.
 
+- **B2a C1 — the PAM-03 stack guard, both forms** (`runtime/src/launcher.rs`
+  `open_own_session`). The first guard checked only that `/etc/pam.d/delphi-runtime`
+  EXISTS. It covered "file absent" and missed "file present, `session` group EMPTY" — and
+  the missed form is **worse**, because `pam_open_session` then returns SUCCESS while
+  registering **no logind session at all**: a cleanly-succeeding call that yields nothing,
+  surfacing far away as a shell the seated gate denies forever. (Structurally identical to
+  the `VtName` seatless-string failure in class 5, one level up.) The fix deliberately did
+  NOT grep the config for a `session` line — that would repeat the mistake, covering one
+  form and missing `@include` / `session include` / `substack` / a module that loads and
+  no-ops. Instead it asserts the **OUTCOME**: after a successful `open_session` the pid MUST
+  resolve to a logind session (`logind::session_id_for_pid`). Read what the call DID, not
+  the markers the config carries.
+- **B2a C1 — `build.rs` artifact-kind enumeration.** `cargo:rustc-link-arg-{bins,tests}`
+  covered two artifact kinds; **doctests are neither**, so the first doctest referencing an
+  sd-login symbol failed to link (`undefined symbol: sd_pid_get_session`). Replaced with
+  `cargo:rustc-link-lib`, which attaches to the CRATE — the authoritative-category form that
+  every linking artifact inherits.
+
 **RED-proof shape.** Demonstrate the guard FAILING against the uncovered form before
 broadening it — both instances here actually fired in reality (the residue file
 reached a commit; the stub-grep actually mis-classified). A guard not shown to miss
 the form it missed is unproven.
+
+---
+
+## 15. Self-inspecting guard counts its own assertions  *(new — B2a C1)*
+
+**Description.** A guard that inspects SOURCE TEXT — a grep, a `matches().count()`, a
+`contains()` over the file it lives in or a tree that includes itself — has its own
+assertion literals inside the scope it audits. Two directions, and the second is the class:
+
+*Loud (benign).* The guard's first run reports an inflated count and fails. Self-announcing,
+fixed immediately.
+
+*Silent (the actual defect).* The guard passes initially. Later a contributor adds an
+assertion, comment, or doc example containing the matched literal. The count rises, the test
+fails, and the natural reading is "the guard is stale." The natural fix is to **bump the
+expected value**. The constant now encodes *production sites + the guard's own text*, and a
+genuinely-new production site is absorbed into that slack **silently, while the test stays
+green**. The guard is disarmed by its own maintenance.
+
+**Relationship to Class 14 (sibling, not duplicate).** Both end at "a guard that cannot fire
+against its target is decorative — worse than none, because it is false confidence." They
+differ in the disarming vector: Class 14's guard misses an **uncovered form of the target**;
+this one is disarmed by **edits to the guard itself**. A Class-14 audit ("enumerate the
+forms") would not catch it, because every form IS covered — the *scope* is what is wrong.
+
+**Foreclosing primitive.** **NONE — discipline**, in two parts:
+
+1. **Prefer a mechanism with no self-inspection where one covers the shape.** A
+   `compile_fail` doctest (rustdoc built-in — **no `trybuild` dependency needed**) proves a
+   bypass *cannot be written* from outside the module: compiler-enforced, no count constant,
+   nothing to disarm.
+2. **Where source inspection is unavoidable, scope it to the region under audit**, excluding
+   the assertion's own text, and derive the boundary so it **fails loudly if it stops
+   working** (`split_once(MARKER).expect(..)`, not an offset or an optimistic filter). State
+   in a comment what each unit of the count corresponds to, and name the re-derivation
+   command, so "bump it" requires re-deriving.
+
+**The two mechanisms are COMPLEMENTARY, not ordered** — this is the part worth internalising.
+`compile_fail` is **enumerative**: it catches the shapes you can NAME, from OUTSIDE the
+module. Source inspection is **exhaustive over the module**: it catches ANY new construction
+site or raw-field reader added INSIDE it, whose name is unknowable in advance and where the
+private field is legitimately accessible. Neither subsumes the other; use each for what it
+alone reaches.
+
+**Instances (grounded):**
+- **B2a C1 — the `VtName` class-5 audit** (`runtime/src/launcher.rs`, test
+  `vtname_internal_construction_and_reads_stay_at_the_sanctioned_sites`; cited by stable
+  identifier rather than commit hash, deliberately — the hash is not knowable when the entry
+  lands and a stale one rots). The audit greps its own module via `include_str!` for
+  construction sites (`Self(`) and raw-field readers (`self.0`). First run reported **4
+  constructors instead of 1** — the three extra were the test's own assertion literals.
+  Production counts were independently re-derived as 1 and 2 (`awk` split at `#[cfg(test)]`,
+  then `grep -c`), so the shipped invariant was never violated; the guard was measuring
+  itself. Fixed by scoping to the pre-`#[cfg(test)]` half. Caught on the FIRST run — the loud
+  direction. Filed here because the silent direction was one "just bump it to 4" away.
+- **The same change's remedy split, as the worked example:** three `compile_fail` doctests
+  took over the pub-field / `Deref` / `into_inner` erosions (each RED-proven — introducing
+  the erosion makes the snippet compile and the doctest FAIL), leaving the grep only the two
+  module-internal properties it alone can reach.
+- **B2a C1, SECOND INSTANCE — a reporting regex matching its author's own prose**
+  (`scratch/iterate-flakiness.sh`). The flakiness runner summarised skips with
+  `grep -oh "SKIP [a-z0-9_]*"`. The test files' skip MESSAGES contain the sentence *"A SKIP
+  INVALIDATES A WEAKEN/RESTORE RUN"* — written by the same author, in the same change. The
+  uppercase `I` fell outside `[a-z0-9_]`, so the pattern matched zero characters and emitted
+  a bare `SKIP ` with no test name: a **skip with no reason**, which is precisely the
+  unreadable output the marker discipline exists to prevent. Fixed by requiring a real test
+  name (`SKIP \K[a-z0-9_]+(?=:)`).
+  **Why this instance matters more than its size:** it shows the class is NOT limited to
+  `include_str!` source audits. It generalises to **any grep over text the author also
+  wrote** — reporting layers, CI log scrapers, doc-lint scripts. The audited corpus need not
+  be source code; it need only overlap with the matcher's own vocabulary. And it appeared in
+  the REPORTING LAYER OF THE TOOL BUILT TO MEASURE THIS CLASS, which is the sharpest
+  available demonstration that noticing the class does not immunise you against it.
+
+- **THREE self-corrupting-measurement defects in ONE tool** (`scratch/iterate-flakiness.sh`,
+  the flakiness runner). Grouped because the pattern is the point: (1) the marker **counting
+  bug** — `grep -c` over a string appearing in both the `println` and the panic, so failures
+  counted double (34 markers over 30 iterations); (2) this entry's **blank-SKIP regex**
+  matching the author's own prose; (3) **`--nocapture` interleaving** under parallel execution
+  splitting `test NAME ... FAILED` lines so the per-line grep misses them, potentially
+  *manufacturing* apparent non-executions from real failures. Each is a check whose own
+  plumbing decided its verdict; each was caught only by an EXTERNAL cross-check (an impossible
+  total, a bare token, an arithmetic that did not close). **The tool exists to measure exactly
+  this class and exhibited three instances of it** — the strongest statement available that a
+  class is not neutralised by awareness, only by an independent check outside the measured
+  artifact. Generalisation for any measurement harness: its output is a *claim*, owed the same
+  adversarial scrutiny as the product it measures (Iron Law #15 clause 5 — a harness *number*
+  is evidence only when shown to mean what it says).
+- **Sibling shape (different mechanism, same lesson — a check whose own plumbing decides its
+  verdict):** the `tee`/`grep` exit-code mask, **CLAUDE.md §13.4** — `cmd | tee log` reports
+  `tee`'s status, masking a failed `cmd`. (Classes 7 and 10 are related but distinct: they
+  prescribe the CI **executed-test-count** guard, not the pipe-masking defect.)
+
+**RED-proof shape.** Two parts, both required:
+1. **The guard bites.** It must FAIL against each bypass shape it claims to catch, RED-proven
+   against a deliberately-broken implementation.
+2. **The scoping is necessary and the constant is grounded.** Show the unscoped guard reports
+   a violation that does not exist in production, AND derive the production count by an
+   INDEPENDENT means (a shell `grep -c` over the scoped region) that agrees with the
+   constant. A count-based guard whose constant was never independently derived is unproven.
+
+Disjoint-defect evidence from the C1 instance — the class-5 argument as measurement rather
+than assertion. The two rows that pass behaviourally are the reason structural audits exist:
+
+| Injected defect | Behavioural tests | Structural audit |
+|---|---|---|
+| `new` weakened to "any non-empty string" | **3 FAIL** | passes |
+| field made `pub String` | pass | **FAIL** |
+| `impl Deref for VtName` added | pass | **FAIL** |
+
+---
+
+## 16. Test fixture mutates shared system state it does not own  *(new — B2a C1)*
+
+**Description.** A fixture that writes a **shared, real system path** and removes it on
+teardown is safe only while that path is *exclusively* test scaffolding. The moment
+production installs the same path, the fixture becomes **destructive**: it clobbers the real
+artifact and DELETES it on drop. The damage is not local — it lands on every later test in
+the run, and on the developer's machine after the run ends. Worse, the symptom appears
+somewhere else entirely: later tests report "not installed" / "misconfigured" and are read
+as *their own* failures, so the diagnosis starts in the wrong place.
+
+The rule, stated so it needs no judgement call: **a test must never delete a system file it
+did not create.** Ownership must be tracked explicitly, not inferred from "the test wrote
+this path, so presumably it owns it".
+
+**Foreclosing primitive.** **NONE — discipline.** Adopt-or-provision: if the path already
+exists, ADOPT it (use it, record that you did not create it); only if absent, PROVISION it
+and record that you did. Teardown removes **only** what teardown's own fixture created. Where
+a test genuinely needs a hostile variant of a shared file, it should use a THROWAWAY name it
+certainly owns (as `scratch/pam-empty-group-probe.sh` does with `delphi-probe-emptygroup`),
+never the production path.
+
+**Instances (grounded):**
+- **B2a C1** — `runtime/tests/b1_integration.rs` and `runtime/tests/end_to_end.rs` wrote and
+  `remove_file`d `/etc/pam.d/delphi-runtime`. Harmless while that file was pure scaffolding.
+  Once C2's real stack was installed there, the first suite to run DELETED the operator's
+  production file mid-run; `leader_is_shell` then SKIPPED on "not installed", and that skip
+  was very nearly read as a B-1 result. It was not — a skip passes under both topologies.
+  Fixed with a `provisioned: bool` on the fixture gating removal.
+- **Adjacent, same family:** the probe script for the empty-`session`-group measurement
+  deliberately used a throwaway service name so it could not damage the very stack it was
+  characterising — the correct shape, arrived at before this defect was found.
+
+**RED-proof shape.** Two parts: (1) with the production artifact present, run the suite and
+show the artifact SURVIVES (pre-fix it is deleted); (2) with it absent, show the fixture
+still provisions and cleans up its own copy, so the fix does not silently disable teardown.
+A test asserting only (2) would pass against the destructive version.
+
+**Cross-cutting note.** This is the second defect this session where a HARNESS damaged or
+misreported the thing it measured — the other being a runner that reported an unavailable
+`sudo` as N *test failures*. Harness defects present as product defects and cost the most
+diagnostic time; treat the test infrastructure as production code for review purposes.
+
+---
+
+## 17. Defect propagated by copy — fix the PATTERN, not the instance  *(new — B2a)*
+
+**Description.** A defect that exists as a **repeated shape** across sibling files/functions
+is not fixed by patching the instances you happened to look at — the copies you did not open
+still carry the original shape. The fix feels done (the instances you saw are green) while the
+defect is still shipping in a sibling. This is distinct from Class 14 (a *guard* that misses a
+*form* of its target): here it is a *fix* that misses a *copy* of the defect.
+
+**The reliable check:** before declaring a copy-shaped defect fixed, **`grep` for the shape**
+and confirm every match is handled — do not fix by memory of where you have seen it. Where the
+shape is enumerable, the *right* remedy is a **guard that finds ALL instances** (so a future
+copy is caught mechanically), not a hand-patch of the ones in view. `runtime/tests/fixture_
+hygiene.rs` is the exemplar: it greps the whole `tests/` dir for the write-and-delete shape and
+fails naming any file that carries it — which is exactly how the third copy was caught.
+
+**Foreclosing primitive.** **NONE — discipline + (where enumerable) a finder-guard.** When you
+fix instance N of a repeated shape: (1) `grep` the pattern across the tree; (2) fix every hit,
+not just the reported one; (3) where feasible, add a guard that *enumerates* the shape so the
+next copy fails loudly rather than shipping green (Class 15's `fixture_hygiene` is the model).
+
+**Instances (grounded, both B2a this session):**
+- **The THIRD PAM deleter** — after `b1_integration.rs` and `end_to_end.rs` were fixed to
+  adopt-or-provision `/etc/pam.d/delphi-runtime`, `pam_interposition.rs` still carried the
+  write-and-delete shape and kept deleting the operator's installed stack. Caught only when
+  `fixture_hygiene.rs` (a finder-guard) was written and **RED-fired naming
+  `pam_interposition.rs`** — i.e. the guard, not the hand-fix, found the third copy. (Class 16.)
+- **The `FAILCOUNT`-unbound bug copied into a sibling script** — `scratch/iterate-flakiness.sh`
+  had the `${#FAILCOUNT[@]}`-under-`set -u` bug fixed (plain `TOTAL_FAIL` counter);
+  `scratch/iterate-b1.sh` was then written by copying the pattern **without** the fix, and
+  crashed on its first empty-`FAILCOUNT` (clean) run. Fixed — but it should have been caught by
+  grepping `FAILCOUNT` across `scratch/` when the first fix landed.
+
+**RED-proof shape.** The finder-guard must FIRE against an un-fixed copy before it is fixed —
+`fixture_hygiene.rs` naming `pam_interposition.rs` is the reference. A "fix" with no finder and
+no cross-tree grep is unproven: it is the count of instances you *remembered*, not the count
+that *exist*.
 
 ---
 
@@ -432,3 +643,6 @@ the form it missed is unproven.
 | 12. Reject the invalid class | discipline (gate the class, fail-closed) | Discipline |
 | 13. Atomic versioned migration | **DEFERRED** (1 consumer; extract at the 2nd) | Pattern recorded |
 | 14. Guard must cover all forms | discipline (enumerate forms; read behavior, not markers) | Discipline |
+| 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |
+| 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |
+| 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |

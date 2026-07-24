@@ -55,3 +55,5 @@ Desktop.ini
 *.pem
 *.key
 credentials.json
+installer/staging/
+scratch/iterate-b1.last.log

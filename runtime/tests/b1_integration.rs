@@ -36,7 +36,7 @@ use delphi_runtime::action::{
 };
 use delphi_runtime::canonicalize::canonicalize;
 use delphi_runtime::execute::ConsumptionLedger;
-use delphi_runtime::launcher::{launch, LaunchSpec};
+use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
 use delphi_runtime::logind::SessionVerdict;
 use delphi_runtime::service::{
     accept_requester, present_and_execute, propose_msg, serve_one_action, Clock, Outcome,
@@ -47,8 +47,24 @@ use delphi_runtime::token::{mint, MintingKey, TOKEN_TTL_SECS};
 use delphi_runtime::wire::{pb, write_frame};
 use delphi_runtime::{approval_socketpair, bind_approval_socket, ensure_runtime_dir};
 
+/// The VT these B1 specs hand PAM as `PAM_TTY`. B1's assertions are about the fd discipline,
+/// the wire, and the token — not about seating — but `LaunchSpec` now requires a validated
+/// [`VtName`], so they supply a well-formed one. Whether `/dev/tty1` is actually the seat's
+/// foreground is the *lane's* concern (§4 R3-02a), not these tests'.
+fn test_vt() -> &'static VtName {
+    static VT: std::sync::OnceLock<VtName> = std::sync::OnceLock::new();
+    VT.get_or_init(|| VtName::new("tty1").expect("tty1 is a well-formed VT name"))
+}
+
 const SERVICE: &str = "delphi-runtime";
 const PAM_FILE: &str = "/etc/pam.d/delphi-runtime";
+/// The REAL production stack (`installer/pam/delphi-runtime`), not a stand-in.
+///
+/// The former two-line fixture had `auth` + `account` but **no `session` group**, so
+/// `pam_open_session` registered no logind session — under which B-1's leader==shell
+/// assertion fails for BOTH topologies (FAIL/FAIL), exactly as non-discriminating as the
+/// PASS/PASS a skipped test gives. A populated `session` group is a B-1 PRECONDITION.
+const PAM_STACK: &str = include_str!("../../installer/pam/delphi-runtime");
 const PASSWORD: &str = "Delphi-B1-Spine!";
 const NOW: u64 = 1_000;
 const KEY: [u8; 32] = [0x5B; 32];
@@ -107,6 +123,8 @@ fn bwrap_available() -> bool {
 /// A throwaway PAM user with a known password + the PAM service file; torn down on drop.
 struct Setup {
     user: String,
+    /// True only if THIS test created the PAM file; gates removal on drop (Class 16).
+    provisioned: bool,
 }
 impl Setup {
     fn new(tag: &str) -> Self {
@@ -116,8 +134,17 @@ impl Setup {
         let mut ch = Command::new("chpasswd").stdin(Stdio::piped()).spawn().unwrap();
         ch.stdin.take().unwrap().write_all(format!("{user}:{PASSWORD}").as_bytes()).unwrap();
         assert!(ch.wait().unwrap().success());
-        std::fs::write(PAM_FILE, "auth required pam_unix.so\naccount required pam_unix.so\n").unwrap();
-        Self { user }
+        // ADOPT an operator-installed stack; only PROVISION one if absent (defect Class 16).
+        // These fixtures used to write this path unconditionally and remove_file it on drop —
+        // harmless while it was scaffolding, DESTRUCTIVE once production installed the same
+        // path. A test must never delete a system file it did not create.
+        let provisioned = if std::path::Path::new(PAM_FILE).exists() {
+            false
+        } else {
+            std::fs::write(PAM_FILE, PAM_STACK).unwrap();
+            true
+        };
+        Self { user, provisioned }
     }
     fn ids(&self) -> (Uid, Gid) {
         let u = User::from_name(&self.user).unwrap().unwrap();
@@ -126,7 +153,10 @@ impl Setup {
 }
 impl Drop for Setup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(PAM_FILE);
+        // Remove ONLY a file this test created; an operator-installed stack is left alone.
+        if self.provisioned {
+            let _ = std::fs::remove_file(PAM_FILE);
+        }
         let _ = Command::new("userdel").arg(&self.user).status();
     }
 }
@@ -225,6 +255,7 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
         uid,
         gid,
         socket_path: &paths.socket,
+        tty: test_vt(),
         shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
         ai_env: &[
             ("DELPHI_AI_EXE", &exe_str),
@@ -293,6 +324,7 @@ fn b1_token_expiry_blocks_the_assembled_loop() {
         uid,
         gid,
         socket_path: &paths.socket,
+        tty: test_vt(),
         shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
         ai_env: &[
             ("DELPHI_AI_EXE", &exe_str),
@@ -570,6 +602,23 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 #[test]
 fn b1_daemon_binary_runs_the_assembled_flow() {
+    // FEATURE PRECONDITION — this test runs the REAL daemon BINARY, whose production logind gate
+    // the `insecure-test-seams` seam (`DELPHI_INSECURE_ASSUME_ACTIVE_SESSION`) bypasses. Without
+    // that feature COMPILED INTO the binary, the seam is inert, the real gate runs, and the
+    // test's `tty1` session (NOT the seat's foreground here) is correctly DENIED — a fail-closed
+    // gate doing its job, NOT a defect. The direct-serve tests (`b1_happy_path` etc.) don't need
+    // this: they inject a mock `&PASS` verdict into `serve_one_action`. Declare the requirement
+    // as a skip (like the root/bwrap guards) so an omitted `--features` is a legible SKIP, not a
+    // confusing FAIL. `cfg!` reflects the same cargo build that produced the daemon binary.
+    if !cfg!(feature = "insecure-test-seams") {
+        eprintln!(
+            "SKIP b1_daemon_binary: requires `--features insecure-test-seams` (the gate-bypass \
+             seam the real daemon binary needs in the test env). Run: `cargo test -p \
+             delphi-runtime --features insecure-test-seams --test b1_integration`. Without it the \
+             real gate correctly DENIES the non-foreground tty1 session — not a defect."
+        );
+        return;
+    }
     if geteuid().as_raw() != 0 {
         eprintln!("SKIP b1_daemon_binary: requires root");
         return;
@@ -599,6 +648,9 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
         .env("DELPHI_AI_EXE", &exe)
         .env("DELPHI_AI_ARG", "BINARY-FLOW")
         .env("DELPHI_AI_BIND_RW", &stage)
+        // `DELPHI_SHELL_VT` has no default (§4 R3-02a — guessing a VT is either a collision
+        // or a silently SEATLESS session), so the daemon requires it.
+        .env("DELPHI_SHELL_VT", "tty1")
         // The compile-time test seam (the binary is built with --features
         // insecure-test-seams in the lane); WSL has no real logind session.
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1")
@@ -644,6 +696,7 @@ fn b1_launcher_keeps_the_channel_out_of_the_ai() {
         uid,
         gid,
         socket_path: &paths.socket,
+        tty: test_vt(),
         shell_env: &[],
         ai_env: &[],
     };
@@ -718,6 +771,7 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
         uid,
         gid,
         socket_path: &paths.socket,
+        tty: test_vt(),
         shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
         ai_env: &[
             ("DELPHI_AI_EXE", &exe_str),

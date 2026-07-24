@@ -33,7 +33,7 @@ use nix::unistd::{Pid, User};
 
 use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
 use delphi_runtime::execute::ConsumptionLedger;
-use delphi_runtime::launcher::{launch, LaunchSpec};
+use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
 use delphi_runtime::logind::{LogindVerdict, SessionVerdict};
 use delphi_runtime::service::{accept_requester, serve_one_action, ServiceCtx, SystemClock};
 use delphi_runtime::store::PendingStore;
@@ -85,12 +85,33 @@ fn main() -> Result<()> {
 
     let shell_bin = bin_path("DELPHI_SHELL_BIN", "/usr/libexec/delphi-shell");
     let ai_bin = bin_path("DELPHI_AI_BIN", "/usr/libexec/delphi-ai");
+    // The seat's VT the shell is provisioned on (§4 R3-02a PRIMARY). Deliberately has NO
+    // default: which VT the seat holds is a deployment fact, and silently guessing one would
+    // either collide with another session's VT or open a SEATLESS session that the
+    // active-local-seated gate then denies forever — the exact silent failure `VtName`
+    // exists to make loud. The operator states it (the unit file's `Environment=`).
+    // VT ALLOCATION POLICY (choosing a free VT) is out of scope here: the launcher takes
+    // what its caller supplies.
+    let vt = std::env::var("DELPHI_SHELL_VT")
+        .context("`DELPHI_SHELL_VT` is not set; it must name the seat's virtual terminal \
+                  (e.g. `tty1`) — see TRUST_MODEL.md §4 R3-02a")?;
+    let tty = VtName::new(&vt).with_context(|| format!("`DELPHI_SHELL_VT={vt}`"))?;
+    // NO `/dev/ttyN`-existence preflight here — DELIBERATELY (B2A-C-R2-02, reverting the
+    // round-1 B2A-C-R1-02 addition). The launch path never OPENS the tty device: it passes
+    // `ttyN` as `PAM_TTY` (a string), and `pam_systemd` derives the seat from the tty NAME, not
+    // by opening `/dev/ttyN` (see `launcher.rs` `set_tty` — the only use). So device-node
+    // presence is the WRONG predicate: it does not validate seating, and it would FALSELY
+    // refuse startup on minimal images / containers that do not populate `/dev/tty1..63` even
+    // though the VT name is valid for PAM/logind. The real defense against a wrong VT is the
+    // consent-time active-local-SEATED gate (§4 R3-02), which denies a session that did not
+    // seat — a runtime check on the authority, not a startup guess from the local /dev layout.
     let spec = LaunchSpec {
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid: user.uid,
         gid: user.gid,
         socket_path: &paths.socket,
+        tty: &tty,
         // The children inherit the daemon's env; no per-child overrides needed.
         shell_env: &[],
         ai_env: &[],
@@ -105,6 +126,25 @@ fn main() -> Result<()> {
     );
 
     let verdict = logind_verdict(children.shell_pid);
+    // B2A-C-R3-02: surface a false startup verdict LOUDLY — but do NOT abort. For a valid
+    // `ttyN` the session is always SEATED (pam_systemd seats any valid VT), so the only axis
+    // that can be false here is ACTIVE — which is DYNAMIC (it tracks which VT holds the seat's
+    // foreground). Aborting on it would false-positive on the dev SECONDARY shape (§4 R3-02a,
+    // where a gate-POSITIVE is reached only by `chvt` to the shell's VT) and on any boot where
+    // the shell's VT is not yet the foreground (a race). The consent GATE re-checks this
+    // per-request (`service.rs` `session_passes_gate`); the warning just makes a misconfigured
+    // `DELPHI_SHELL_VT` visible at STARTUP instead of only in a denied action's reason. Under
+    // the insecure test seam the verdict passes, so this is silent in the binary-flow test.
+    if !delphi_runtime::logind::session_passes_gate(verdict.as_ref()) {
+        tracing::warn!(
+            shell_pid = children.shell_pid,
+            vt = %vt,
+            "shell session is NOT active-local-seated at startup — every consent will be DENIED \
+             until it becomes so. If this persists, check DELPHI_SHELL_VT names the seat's \
+             FOREGROUND VT (§4 R3-02a PRIMARY shape). NOT aborting: the `active` axis is dynamic \
+             (foreground), not a static config error — the gate re-checks it per request."
+        );
+    }
     // Real wall-clock — read fresh at mint and at Present-verify so the token TTL is a
     // real control (B1-R2-01), not a frozen-`now` no-op.
     let clock = SystemClock;

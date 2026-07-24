@@ -42,6 +42,13 @@ use delphi_runtime::{approval_socketpair, bind_approval_socket, drop_privileges,
 
 const SERVICE: &str = "delphi-runtime";
 const UNIT_PAM: &str = "/etc/pam.d/delphi-runtime";
+/// The REAL production stack (`installer/pam/delphi-runtime`), not a stand-in.
+///
+/// The former two-line fixture had `auth` + `account` but **no `session` group**, so
+/// `pam_open_session` registered no logind session — under which B-1's leader==shell
+/// assertion fails for BOTH topologies (FAIL/FAIL), exactly as non-discriminating as the
+/// PASS/PASS a skipped test gives. A populated `session` group is a B-1 PRECONDITION.
+const PAM_STACK: &str = include_str!("../../installer/pam/delphi-runtime");
 const PASSWORD: &str = "Delphi1dCapstone!";
 const NOW: u64 = 1_000;
 
@@ -56,6 +63,8 @@ fn bwrap_available() -> bool {
 /// PAM service + a throwaway user with a known password; torn down on drop.
 struct Setup {
     user: String,
+    /// True only if THIS test created the PAM file; gates removal on drop (Class 16).
+    provisioned: bool,
 }
 impl Setup {
     fn new() -> Self {
@@ -65,8 +74,17 @@ impl Setup {
         let mut ch = Command::new("chpasswd").stdin(Stdio::piped()).spawn().unwrap();
         ch.stdin.take().unwrap().write_all(format!("{user}:{PASSWORD}").as_bytes()).unwrap();
         assert!(ch.wait().unwrap().success());
-        std::fs::write(UNIT_PAM, "auth required pam_unix.so\naccount required pam_unix.so\n").unwrap();
-        Self { user }
+        // ADOPT an operator-installed stack; only PROVISION one if absent (defect Class 16).
+        // These fixtures used to write this path unconditionally and remove_file it on drop —
+        // harmless while it was scaffolding, DESTRUCTIVE once production installed the same
+        // path. A test must never delete a system file it did not create.
+        let provisioned = if std::path::Path::new(UNIT_PAM).exists() {
+            false
+        } else {
+            std::fs::write(UNIT_PAM, PAM_STACK).unwrap();
+            true
+        };
+        Self { user, provisioned }
     }
     fn ids(&self) -> (Uid, Gid) {
         let u = User::from_name(&self.user).unwrap().unwrap();
@@ -75,7 +93,10 @@ impl Setup {
 }
 impl Drop for Setup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(UNIT_PAM);
+        // Remove ONLY a file this test created; an operator-installed stack is left alone.
+        if self.provisioned {
+            let _ = std::fs::remove_file(UNIT_PAM);
+        }
         let _ = Command::new("userdel").arg(&self.user).status();
     }
 }

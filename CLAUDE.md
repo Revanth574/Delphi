@@ -990,6 +990,8 @@ Delphi uses an external second model — Codex CLI, run by the human operator �
 2. APPROVE → proceed to merge. REVISE / FAIL → continue.
 3. Claude Code fixes **every** finding at its root cause (Iron Law #8) — no workarounds, no scope creep into adjacent issues.
 4. Each fix ships a regression test verified to **fail against the pre-fix code** and pass after. A test that passes against buggy code is worse than no test (Task 3A.6 Round 3 caught exactly this — a descendant-survival test that passed for the wrong reason because the backgrounded process inherited the capture pipes).
+   **A single green run cannot see NON-DETERMINISM — this is a known gap in the review protocol, not merely a property of one test.** Codex reviews a diff and a test run; a test that fails 1 run in 10 presents as green and passes review invisibly. This is not hypothetical: `terminal_contract_release_produces_eof_no_wedge` (~7-10% failure rate under parallel execution, measured 3/30 at `d57442e`) landed inside the **Codex-APPROVED** B2a WSL2-provable half (`3e40e22`) and was found only when a later session happened to run the suite repeatedly. **Therefore:** any test whose outcome depends on file descriptors, `fork`/subprocess lifetime, sockets, timing, or cross-test shared state MUST be run **repeatedly (>=30 iterations) under the DEFAULT parallel settings** before it is offered to review — not once, and not only under `--test-threads=1`, which is precisely the configuration that hides interference. Report the iteration count and the failure count, not "tests pass." A flaky test is strictly worse than a failing one: it trains the reader to re-run until green.
+   **CARVE-OUT — `fork`+PAM (or `fork`+any non-async-signal-safe child) tests are SERIAL-ONLY; their ≥30 run is `--test-threads=1`, and that is NOT the hiding configuration for them.** The default-parallel rule above assumes parallel execution stresses the *product*. For a test that `fork()`s and then does non-async-signal-safe work in the child (PAM, allocation, D-Bus — e.g. `runtime/tests/leader_is_shell.rs`'s B-1/FD-01/B-3), the parallel test runner is itself a **multithreaded parent**, and forking PAM from a multithreaded parent is the hazard `launcher.rs`'s standing constraint documents — the child can deadlock on an allocator lock a non-surviving thread held. **Production (`delphi-runtimed`) is single-threaded, so it never has this hazard;** the parallel FAILURES are therefore a *harness artifact of the test runner*, not product flakiness — measured 2026-07-23: B-1/FD-01/B-3 fail ~20/30 under parallel (ALL failures pre-`execve` child death, ZERO real property violations) and **0/30 under `--test-threads=1`**. For these tests the SERIAL ≥30 run is authoritative: it matches production's single-threaded fork parent while still catching within-test races (timing, `/proc`, PAM/logind). Distinguish this honestly per Iron Law #15 clause 5 — a parallel failure is a harness artifact ONLY when SHOWN to be pre-`execve` child death with no real violation (read the failing lines; do not assume). This also retroactively explains the earlier FD-01 "15/30 parallel, 0/30 serial" result, which was imprecisely attributed to "shared VT/PAM state" — the sharp cause is fork+PAM from a multithreaded parent. **Sibling mechanism (same carve-out, different plumbing) — CONCURRENT PAM SESSIONS ON A SHARED VT.** `b1_integration`'s `b1_daemon_binary_runs_the_assembled_flow` runs the daemon as a SINGLE-threaded subprocess (so NOT the multithreaded-fork hazard), yet fails 30/30 parallel / 0/30 serial with VARYING reasons (`pam_open_session failed`, `logind: session not active+local`, `PAM authentication failed`) — a race among all `b1_integration` tests opening PAM sessions on the SAME `tty1` under parallel execution (measured 2026-07-24). Production runs ONE daemon per session on its OWN seat's VT, never N contending on one — so this too is a test-harness artifact, serial-only, not a product defect. The general rule: a test that opens a PAM/logind session (by fork+PAM OR by spawning a PAM-using subprocess on a shared VT) is SERIAL-ONLY; its parallel failures are contention the harness creates and production forecloses.
 5. One focused commit per round, with the verbatim Codex finding IDs in the body. Carried-forward noise (Cargo.lock, PROGRESS.md) defers to a final cleanup commit so each round's diff stays narrow and auditable.
 6. Claude Code prepares the next round's prompt (scoped to the new fix commit) and STOPS for the operator to re-run Codex.
 
@@ -999,6 +1001,51 @@ Delphi uses an external second model — Codex CLI, run by the human operator �
 - A REVISE / FAIL verdict at the 3-round budget boundary escalates to an explicit human decision — *merge-with-documented-risk* vs. *extend the budget* — and does NOT auto-stretch to another round. Record the decision in the merge commit body and PROGRESS.md.
 - On APPROVE, merge to main via `git merge --no-ff phase-{N}/sweep-{crate}`; the branch carries the round fix-commits and their regression tests. A sweep that returns APPROVE on round 1 with zero findings has nothing to merge — record the clean result in PROGRESS.md and delete the branch.
 - Every sweep keeps a per-finding ledger (ID, severity, root cause, fix commit) in the merge commit body and a summary in PROGRESS.md, so the full review history is reconstructable from git alone.
+
+### Git history surgery — NEVER rewrite history with a dirty working tree
+
+**The rule: commit or stash before any operation that moves `HEAD`.** `git reset --hard`,
+`rebase`, and the reset-amend-cherry-pick dance used to amend a **non-HEAD** commit all move
+`HEAD`, and `--hard` discards every uncommitted change to a *tracked* file, irreversibly —
+those changes were never in git, so there is no reflog entry, no dangling object, nothing to
+recover from.
+
+Amending a non-HEAD commit is where this bites, because the surgery *requires* moving `HEAD`
+and the natural moment to do it is right after finishing the work that is still uncommitted.
+
+**Recorded because it happened (B2a C1, 2026-07-22).** A `git reset --hard HEAD~1` — to amend
+the commit one below `HEAD` — destroyed three fixture fixes, a new test file's contents, and a
+`PROGRESS.md` rewrite. It was recovered **only because those edits happened to have been made
+by scripted `python` patches that could be re-run**. That is luck, not a property of the
+workflow: hand-edits, or scripts already overwritten, would have been simply gone. **Do not let
+the rule's justification rest on recoverability.**
+
+Procedure for amending a non-HEAD commit:
+
+```bash
+git status --porcelain            # MUST be empty (or stash first: git stash push -u)
+git tag tmp-keep HEAD             # preserve anything above the target
+git reset --hard <target>~1  ...  # only now is --hard safe
+```
+
+### Process failures damage the work — check the tooling before the code
+
+Three failures in the B2a C1 session were **process** failures, not product defects, and each
+was the actor damaging or misreporting the very thing it was working on:
+
+1. **A fabricated test transcript** written into a commit body — a PASS that no run produced.
+2. **Test fixtures deleting the operator's installed `/etc/pam.d/delphi-runtime`** mid-run,
+   whose symptom surfaced far away as unrelated tests reporting "not installed"
+   (`docs/DEFECT_CLASSES.md` Class 16).
+3. **`git reset --hard` with a dirty tree** destroying uncommitted work (above).
+
+**None was caught by self-check.** Each was caught by an EXTERNAL check: the operator noticing
+the transcript, the runner's before/after `md5sum` of the PAM stack, and `git status`. The
+generalisation worth carrying: when a result looks wrong, **suspect the harness, the fixture,
+and the VCS operation before suspecting the code under test** — those failures present as
+product defects, cost the most diagnostic time, and are invisible to the actor that caused
+them. Build the external check (a checksum, a hygiene guard, a status assertion) rather than
+trusting care.
 
 ### Dev environment sync
 
@@ -1437,7 +1484,7 @@ The runtime arc (the auth boundary for tool execution — the `runtime/` crate +
 | B1 | make 1a–1d run — the launcher + service loops assembling the primitives, minimal sides | BUILT + own-Codex-reviewed (3 rounds) + MERGED (`f5b823d`) |
 | **B2a — WSL2-provable half** | the REAL React-WRY shell's **SECURITY CORE**: R-2 native relay (renderer-cannot-forge), gate-tightening (require a seat), the decoupled WRY host (fail-closed CLOEXEC), the R-3 PAM dialog, the terminal channel contract | **BUILT + Codex-APPROVED (2 rounds, 0 findings) + MERGED (`3e40e22`)** |
 | **B2a — lane-dependent half: RECON** | seated lane provisioned (Ubuntu 26.04, systemd 259, seat0). A-1 (resolution is by **cgroup membership**, not leadership → the launcher must fork the shell directly, never via the systemd user manager; **`PAM_TTY=ttyN` is the whole seat obligation**); the first **gate-POSITIVE**; **R3-01c leader == shell PROVEN 9x** (independent logind cross-check); A-2.1–A-2.4 lifecycle/refcount | **COMPLETE + Codex-gated (3 rounds) + §4 amended.** FD-01 (P1) changed the DESIGN: mandatory pre-`execve` `close_range` sweep (same relay-bypass class as B2A-R2-01). Carries 4 honesty items + a scope boundary (measured on `class=background`; production is `class=user` — reasoned, not measured). |
-| **B2a — lane-dependent half: BUILD** | shape-(b) manual-fork launcher restructure (carrying its re-run 1b sibling-fd-theft + fd-discipline/privdrop RED-proofs); the **RED-first leader == shell regression test** (must FAIL against a forked-grandchild impl); real `pam_open_session` provisioning against the installer-shipped `/etc/pam.d/delphi-runtime`; the long-lived-shell lifecycle; the composition (host drawing the real bundle) | **NOT STARTED** — its own build + Codex review. Shape (b) **SETTLED**; leader == shell **DECIDED + recon-proven**. |
+| **B2a — lane-dependent half: BUILD** | shape-(b) manual-fork launcher restructure (carrying its re-run 1b sibling-fd-theft + fd-discipline/privdrop RED-proofs); the **RED-first leader == shell regression test** (must FAIL against a forked-grandchild impl); real `pam_open_session` provisioning against the installer-shipped `/etc/pam.d/delphi-runtime`; the long-lived-shell lifecycle; the composition (host drawing the real bundle) | **CORE BUILT + PROVEN, awaiting Codex; composition + gate-POSITIVE + long-lived-shell lifecycle still PENDING.** DONE: C1 shape-(b) restructure; **three regression tests RED-proven to bite AND stable-serially (30/30)** — B-1 leader==shell (`70c82fa`), FD-01 inherited-fd containment (`5f0f6e0`, re-aimed after the first passed under its own weaken), B-3/B′ privdrop effect (`6be542e`); `reap_children` teardown fix (`66f543f`); **C2 install** (`5283fbf`) — real WRY host at `/usr/libexec/delphi-shell`, unit `DELPHI_SHELL_VT`/`DELPHI_AI_BIN`, PAM stack; **`systemd_smoke` PASSES** (prediction confirmed: anchor persists, daemon survives the headless-shell outcome — confirms binary-spawnable + anchor property, NOT that the shell renders). These three tests are **SERIAL-ONLY** (fork+PAM; parallel = the multithreaded-parent hazard `launcher.rs` documents — CLAUDE.md §6 carve-out). PENDING: the **composition** (WRY host drawing the real bundle through the consent path), the **gate-POSITIVE via the real shell**, the **long-lived-shell lifecycle** (B1 still services one action then exits), and the increment's **Codex review** (named areas: `open_own_session` raw-pointer lifecycle; the fork+PAM single-threaded-parent constraint, now with live evidence; the C2 install surface). §4 forward obligation partially discharged (success path only). |
 
 **The honest boundary (do not lose):** B2a's security property is unit + real-channel proven (both verified-to-bite); the gate-**negative** is proven on WSL2's real seatless session and the gate-**positive** is now proven on a real seated lane. The lane-dependent **RECON** is COMPLETE (R3-01c leader == shell proven 9x; findings landed in `docs/TRUST_MODEL.md` §4). The lane-dependent **BUILD** — the manual-fork restructure, the RED-first leader==shell regression test, the long-lived-shell lifecycle, and the composition — is **NOT STARTED**. A recon proof is **not** a shipped regression test: the security-core **half** is merged and the recon is closed, **NOT** B2a complete.
 
@@ -1507,6 +1554,18 @@ The runtime arc (the auth boundary for tool execution — the `runtime/` crate +
     **Correct:** "To read the user's emails, Delphi checks available interfaces in this order: (1) if the user has configured IMAP credentials in Fortress, use IMAP directly; (2) if they have Gmail API credentials configured, use the Gmail API; (3) if they have only a browser session, use Chromium DevTools Protocol to read the DOM of the Gmail tab; (4) if none of the above, tell the user which interface they can set up for better results and fall back to DOM scraping as a last resort. Log which interface was used so the user can see it."
 
 14. **Capabilities must not retreat from the North Star.** Every new capability and architectural decision is measured against the vision: does this preserve, advance, or retreat from "an OS that operates the user's tools on their behalf to accomplish any task while preserving user sovereignty?" Decisions that preserve or advance are evaluated on their own merits. Decisions that retreat require explicit justification and acknowledgment. This law is intentionally narrower than "must advance the North Star." Infrastructure work (security, performance, accessibility, testing, refactoring) qualifies as non-retreat. The bar is to avoid drift, not to require every commit to be visionary. (See the "Delphi Vision and Architecture" section near the top of this file for the full North Star statement and the three-component architecture this law protects.)
+
+15. **The test is the adversary, not the gate.** A test exists to attack the product, not to certify it. When a test fails, **the product is wrong until proven otherwise.**
+
+    1. **Never weaken an assertion to obtain green** — not the threshold, not the scope of the claim, not the strictness of the comparison. If an assertion appears too strong, that is a finding to be **argued and recorded** (about the product, or about the spec the assertion encodes), never an edit made to clear a red. **The discriminating check, because intent is unknowable but this is not: would you make this same edit if the test were passing?** If no, you are clearing a red, not fixing a claim.
+
+    2. **A test must fail for the reason it names.** Green is not evidence; green from a test never proven to bite is decorative. Every security-relevant assertion owes a verified **weaken/restore**, and both outcomes must discriminate — **PASS/PASS and FAIL/FAIL are equally worthless.** Grounded: B-1's first draft asserted only `leader == pinned_pid`, which is true under BOTH topologies, so it PASSED under the weaken (the R2-03 mis-aimed-RED shape); the discriminating leg was "which pid is actually executing the shell binary". A skipped test gives PASS/PASS; a session-less PAM stack gives FAIL/FAIL. **A third case is equally worthless and is not covered by the first two: an INTERMITTENT result.** A test that fails 1 run in 10 cannot distinguish "the property is violated" from "this run was unlucky" — see the non-determinism rule in the Codex round-loop (Section 6), which requires ≥30 parallel iterations before such a test is offered as evidence.
+
+    3. **Narrowing to measure precisely is not weakening.** Removing a dependency that *invalidates* the measurement is required; relaxing the claim so failure disappears is forbidden. The discriminating question: **does the property still fail if violated?** If yes you narrowed; if no you weakened. Record the reason either way. Grounded: FD-01 and B-1 replaced `delphi-minimal-shell` with a `pause()` sleeper. That is NARROWING — the minimal shell was dying on a protocol EOF before the measurement, so the test was measuring a corpse; the sleeper removed a dependency irrelevant to the property. The assertions did not move. Contrast the forbidden edit available at the same moment: widening the fd allowlist so the extra descriptors stop failing FD-01.
+
+    4. **The test encodes the threat, not the input space.** Rigour is adversarial, not exhaustive — one assertion that catches the attack beats a hundred that catch typos.
+
+    5. **Suspect the harness before the code, but never let that become the default explanation for a red. The harness is guilty only when SHOWN to be.** Grounded both ways: three harness defects in one session were real (a fabricated transcript, fixtures deleting the operator's installed PAM stack, `git reset --hard` destroying uncommitted work — see "Process failures damage the work" in Section 6), AND a plausible harness explanation for FD-01's failures was killed on inspection (fds opened by other threads after `fork` cannot appear in the child, whose fd table is a snapshot taken at `fork`). **The asymmetry that keeps clause 5 honest: "the harness did it" must be demonstrated with the same evidence a product defect would need. An undemonstrated harness excuse is how a real defect gets shipped green.**
 
 ---
 

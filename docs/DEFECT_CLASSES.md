@@ -586,6 +586,45 @@ diagnostic time; treat the test infrastructure as production code for review pur
 
 ---
 
+## 17. Defect propagated by copy — fix the PATTERN, not the instance  *(new — B2a)*
+
+**Description.** A defect that exists as a **repeated shape** across sibling files/functions
+is not fixed by patching the instances you happened to look at — the copies you did not open
+still carry the original shape. The fix feels done (the instances you saw are green) while the
+defect is still shipping in a sibling. This is distinct from Class 14 (a *guard* that misses a
+*form* of its target): here it is a *fix* that misses a *copy* of the defect.
+
+**The reliable check:** before declaring a copy-shaped defect fixed, **`grep` for the shape**
+and confirm every match is handled — do not fix by memory of where you have seen it. Where the
+shape is enumerable, the *right* remedy is a **guard that finds ALL instances** (so a future
+copy is caught mechanically), not a hand-patch of the ones in view. `runtime/tests/fixture_
+hygiene.rs` is the exemplar: it greps the whole `tests/` dir for the write-and-delete shape and
+fails naming any file that carries it — which is exactly how the third copy was caught.
+
+**Foreclosing primitive.** **NONE — discipline + (where enumerable) a finder-guard.** When you
+fix instance N of a repeated shape: (1) `grep` the pattern across the tree; (2) fix every hit,
+not just the reported one; (3) where feasible, add a guard that *enumerates* the shape so the
+next copy fails loudly rather than shipping green (Class 15's `fixture_hygiene` is the model).
+
+**Instances (grounded, both B2a this session):**
+- **The THIRD PAM deleter** — after `b1_integration.rs` and `end_to_end.rs` were fixed to
+  adopt-or-provision `/etc/pam.d/delphi-runtime`, `pam_interposition.rs` still carried the
+  write-and-delete shape and kept deleting the operator's installed stack. Caught only when
+  `fixture_hygiene.rs` (a finder-guard) was written and **RED-fired naming
+  `pam_interposition.rs`** — i.e. the guard, not the hand-fix, found the third copy. (Class 16.)
+- **The `FAILCOUNT`-unbound bug copied into a sibling script** — `scratch/iterate-flakiness.sh`
+  had the `${#FAILCOUNT[@]}`-under-`set -u` bug fixed (plain `TOTAL_FAIL` counter);
+  `scratch/iterate-b1.sh` was then written by copying the pattern **without** the fix, and
+  crashed on its first empty-`FAILCOUNT` (clean) run. Fixed — but it should have been caught by
+  grepping `FAILCOUNT` across `scratch/` when the first fix landed.
+
+**RED-proof shape.** The finder-guard must FIRE against an un-fixed copy before it is fixed —
+`fixture_hygiene.rs` naming `pam_interposition.rs` is the reference. A "fix" with no finder and
+no cross-tree grep is unproven: it is the count of instances you *remembered*, not the count
+that *exist*.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -606,3 +645,4 @@ diagnostic time; treat the test infrastructure as production code for review pur
 | 14. Guard must cover all forms | discipline (enumerate forms; read behavior, not markers) | Discipline |
 | 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |
 | 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |
+| 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |

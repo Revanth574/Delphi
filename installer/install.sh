@@ -33,16 +33,22 @@ refuse() { echo "REFUSING (no system change made): $1"; exit 1; }
 # files) a regular file. Catches a substituted inode owned by another user, or a symlink to a
 # non-regular target, on the actual inode the fd is bound to.
 fstat_trust() {   # fd path kind(dir|file)
-    local fd="$1" path="$2" kind="$3" owner mode ftype
+    local fd="$1" path="$2" kind="$3" owner mode
     owner=$(stat -L -c '%u' "/proc/self/fd/$fd") || refuse "cannot fstat $path"
     mode=$(stat  -L -c '%a' "/proc/self/fd/$fd")
-    ftype=$(stat -L -c '%F' "/proc/self/fd/$fd")
     [ "$owner" = "0" ] || [ "$owner" = "$trusted_uid" ] || \
         refuse "$path resolves to an inode owned by uid $owner (not root or the installing user $trusted_uid) — a different local user may have swapped it"
     [ $(( 0$mode & 022 )) -eq 0 ] || \
         refuse "$path resolves to a group/other-writable inode (mode $mode) — another user could swap it"
-    [ "$kind" != "file" ] || [ "$ftype" = "regular file" ] || \
-        refuse "$path resolves to a $ftype, not a regular file"
+    # LOCALE-INDEPENDENT type check (B2A-C-R3-01): `stat -c %F` returns TRANSLATED text under a
+    # non-`C` LANG (e.g. "reguläre Datei"), so comparing it to the literal "regular file" would
+    # FALSELY refuse a correct build on a translated locale. `test -f`/`-d` on the bound fd is a
+    # stat syscall (machine-readable, locale-independent) and still checks the bound inode.
+    if [ "$kind" = "file" ]; then
+        [ -f "/proc/self/fd/$fd" ] || refuse "$path does not resolve to a regular file"
+    else
+        [ -d "/proc/self/fd/$fd" ] || refuse "$path does not resolve to a directory"
+    fi
 }
 
 # RESIDUAL (documented, not hidden): bash cannot `openat(STAGE_FD, f)`, so the file opens below

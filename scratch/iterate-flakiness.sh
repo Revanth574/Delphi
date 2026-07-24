@@ -33,7 +33,7 @@ if [ -n "$THREADS" ]; then ARM="SERIAL (--test-threads=1)"; else ARM="PARALLEL (
 
 command -v cargo >/dev/null || { echo "cargo not found — run UNPRIVILEGED"; exit 1; }
 echo "=== building (unprivileged) ==="
-LIST=$(cargo test -p delphi-runtime --test leader_is_shell --test b1_integration \
+LIST=$(cargo test -p delphi-runtime --test leader_is_shell \
         --no-run --message-format=json 2>/dev/null \
        | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | grep '/deps/')
 [ -n "$LIST" ] || { echo "BUILD FAILED"; exit 1; }
@@ -93,11 +93,17 @@ echo
 # prints the marker in its panic) is not double-counted. This is the denominator: "0
 # failures" is NOT a sufficient gate on its own, because 30 NON-executions also yield 0
 # failures. The gate needs executions == $runs too.
+# Count each of the THREE leader_is_shell tests by a substring UNIQUE TO ITS PRINTLN
+# (never the panic messages, which repeat the marker and would double-count a failure).
 FD01_EXEC=$(grep -c "B1-ASSERTION-EXECUTED(FD-01): shell_pid=.*exec_done=" "$LOG")
 B1_EXEC=$(grep -c "^B1-ASSERTION-EXECUTED: pinned_pid=" "$LOG")
+B3_EXEC=$(grep -c "B1-ASSERTION-EXECUTED(B3): shell_pid=.*exec_done=" "$LOG")
 FD01_FAIL=${FAILCOUNT[shell_inherits_only_the_allowlisted_fds_fd_01]:-0}
+B1_FAIL=${FAILCOUNT[session_leader_is_the_shell_itself_r3_01c]:-0}
+B3_FAIL=${FAILCOUNT[shell_child_drops_to_the_session_user_b3]:-0}
+echo "B-1  : reached assertion $B1_EXEC/$runs, failed $B1_FAIL"
 echo "FD-01: reached assertion $FD01_EXEC/$runs, failed $FD01_FAIL"
-echo "B-1  : reached assertion $B1_EXEC/$runs"
+echo "B-3  : reached assertion $B3_EXEC/$runs, failed $B3_FAIL"
 
 # THE 11-NON-EXECUTION CHECK (needs no new run — reads this run's persisted log).
 # Hypothesis on file: useradd loses the /etc/passwd lock under parallel fixture setup and
@@ -138,29 +144,30 @@ else
   echo "failure here is product behaviour, and a parallel-only failure is interference."
 fi
 echo
-echo "════════ VERDICT (fixed denominator: executions, not iterations) ════════"
-if [ "$FD01_FAIL" -eq 0 ] && [ "$FD01_EXEC" -eq "$runs" ]; then
-  echo "0 failures / $runs executions."
-  if [ -n "$THREADS" ]; then
-    echo "  -> SERIAL and clean: FD-01 is stable serially. If the PARALLEL arm showed"
-    echo "     failures, interference is CONFIRMED and the weaken proceeds SERIALLY."
+echo "════════ STABILITY VERDICT — each of the 3 tests: 0 failures AND executions == $runs ═══"
+# The gate is per-test and uses the EXECUTION denominator, not the iteration count: 30
+# non-executions also yield 0 failures, so 'executions == runs' is what proves the test
+# actually reached its assertion every time (the FD-01-saga lesson).
+stable=1
+check() { # name exec fail
+  if [ "$3" -eq 0 ] && [ "$2" -eq "$runs" ]; then
+    echo "  PASS  $1 — 0 failures, $2/$runs executions"
   else
-    echo "  -> PARALLEL and clean: no interference observed; weaken may proceed."
+    echo "  FAIL  $1 — $3 failures, $2/$runs executions (need 0 failures AND $runs executions)"
+    stable=0
   fi
-elif [ "$FD01_FAIL" -eq 0 ] && [ "$FD01_EXEC" -lt "$runs" ]; then
-  echo "0 failures BUT only $FD01_EXEC/$runs executions."
-  echo "  -> The non-execution defect is NOT parallelism-specific if this is the serial arm."
-  echo "     Still BLOCKED — different cause. Do not weaken; fix the non-execution first."
-elif [ "$FD01_FAIL" -gt 0 ] && [ "$FD01_EXEC" -ge 20 ]; then
-  echo "$FD01_FAIL failures over $FD01_EXEC executions."
-  echo "  -> If this is the SERIAL arm, the allowlist violation is REAL PRODUCT behaviour,"
-  echo "     not interference. Iron Law #15 clause 1 is LIVE: the forbidden move is widening"
-  echo "     the allowlist; the required move is the fd-list loop -> why the extras appear ->"
-  echo "     if real, change the LAUNCHER. Next step: capture the fd list."
+}
+check "B-1  " "$B1_EXEC"   "$B1_FAIL"
+check "FD-01" "$FD01_EXEC" "$FD01_FAIL"
+check "B-3  " "$B3_EXEC"   "$B3_FAIL"
+echo
+if [ "$stable" -eq 1 ]; then
+  echo "STABLE: all three tests reached their assertion every iteration and never failed"
+  echo "under $ARM. This is the >=30-iteration run the re-aimed/new tests owed, and it also"
+  echo "exercises the reap_children teardown under repetition."
 else
-  echo "$FD01_FAIL failures over only $FD01_EXEC/$runs executions — nothing localised."
-  echo "  -> Fix the non-execution defect FIRST; the failure rate is against a broken"
-  echo "     denominator until then."
+  echo "NOT STABLE: at least one test failed or under-executed. A failure is a real defect to"
+  echo "diagnose (Iron Law #15 clause 1 — do NOT weaken the assertion); an execution < $runs is"
+  echo "a fixture/harness problem to diagnose (panic before the println, e.g. useradd lock"
+  echo "contention). Do NOT declare stable until every test is 0-failures / $runs-executions."
 fi
-echo "Anything less means 'fixed' is not yet 'demonstrated stable', and a FAIL under the"
-echo "weaken could not be distinguished from an intermittent failure."

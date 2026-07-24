@@ -367,6 +367,17 @@ Deliberately NOT a config grep — following `@include` / `session include` / `s
 writing a PAM parser in a forked pre-`execve` child, and a grep for a `session` line would repeat
 the very covers-one-form-misses-others mistake it is fixing.
 
+**Provenance, worth keeping durable: this finding came from a PROBE, not an inference.**
+`scratch/pam-empty-group-probe.sh` asked the question directly — build a throwaway PAM service
+with an empty `session` group, call `pam_open_session` against it, and read what comes back —
+rather than reasoning from a symptom toward a hypothesis about what PAM *might* do. Contrast the
+same session's other misattributions (a stray fixture-owned PAM deleter, a doubled failure
+marker, `--nocapture` interleaving, a full `/tmp` tmpfs, `b1_daemon_binary`'s feature gating):
+every one of those was eventually SETTLED by reading an actual message or running an actual
+check, never by reasoning further from the outside. The generalization: when a system's behavior
+under an edge condition is uncertain, write the two-line script that puts the system in that
+condition and reads the result, before spending an hour inferring what it probably does.
+
 **`pam_faillock` — the tension is RECORDED, the decision is DEFERRED (do not re-derive this from
 scratch).** Adding `auth required pam_faillock.so` (brute-force lockout on the consent prompt) is
 a genuine trade-off with arguments on both sides, and someone will propose it later:

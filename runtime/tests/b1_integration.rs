@@ -602,6 +602,23 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 #[test]
 fn b1_daemon_binary_runs_the_assembled_flow() {
+    // FEATURE PRECONDITION — this test runs the REAL daemon BINARY, whose production logind gate
+    // the `insecure-test-seams` seam (`DELPHI_INSECURE_ASSUME_ACTIVE_SESSION`) bypasses. Without
+    // that feature COMPILED INTO the binary, the seam is inert, the real gate runs, and the
+    // test's `tty1` session (NOT the seat's foreground here) is correctly DENIED — a fail-closed
+    // gate doing its job, NOT a defect. The direct-serve tests (`b1_happy_path` etc.) don't need
+    // this: they inject a mock `&PASS` verdict into `serve_one_action`. Declare the requirement
+    // as a skip (like the root/bwrap guards) so an omitted `--features` is a legible SKIP, not a
+    // confusing FAIL. `cfg!` reflects the same cargo build that produced the daemon binary.
+    if !cfg!(feature = "insecure-test-seams") {
+        eprintln!(
+            "SKIP b1_daemon_binary: requires `--features insecure-test-seams` (the gate-bypass \
+             seam the real daemon binary needs in the test env). Run: `cargo test -p \
+             delphi-runtime --features insecure-test-seams --test b1_integration`. Without it the \
+             real gate correctly DENIES the non-foreground tty1 session — not a defect."
+        );
+        return;
+    }
     if geteuid().as_raw() != 0 {
         eprintln!("SKIP b1_daemon_binary: requires root");
         return;

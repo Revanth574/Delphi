@@ -16,27 +16,64 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
 STAGE="installer/staging"
-for b in delphi-runtimed delphi-shell delphi-minimal-ai; do
-    [ -f "$STAGE/$b" ] || { echo "MISSING $STAGE/$b — run installer/build.sh (UNPRIVILEGED) first"; exit 1; }
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# PRE-FLIGHT — ALL checks BEFORE any system mutation (B2A-C-R1-04: the earlier version ran
+# the delphi-ai guard AFTER copying the binaries, leaving a partially-updated system on the
+# guarded path). Nothing below this block writes; nothing above it does either.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+# B2A-C-R1-03: this phase runs as ROOT and copies files the UNPRIVILEGED build produced.
+# If any source (a staged binary, the unit, the PAM file) — or a directory on the way to it —
+# is writable by a user OTHER than root or the person who invoked sudo, that user can swap the
+# file between `build.sh` and `sudo install.sh` and get attacker-controlled code installed and
+# executed as root. Refuse any source that is not trust-tight. `SUDO_UID` is the human who ran
+# sudo; if run as raw root it is unset and only root-owned sources are trusted.
+trusted_uid="${SUDO_UID:-0}"
+refuse() { echo "REFUSING (no system change made): $1"; exit 1; }
+trust_source() {
+    local f="$1" owner mode
+    [ -e "$f" ] || refuse "$f is missing — run installer/build.sh (UNPRIVILEGED) first"
+    owner=$(stat -c '%u' "$f") || refuse "cannot stat $f"
+    mode=$(stat -c '%a' "$f")  || refuse "cannot stat $f"
+    # Owner must be root or the invoking (sudo) user.
+    [ "$owner" = "0" ] || [ "$owner" = "$trusted_uid" ] || \
+        refuse "$f is owned by uid $owner (not root or the installing user $trusted_uid) — a different local user could have planted it"
+    # No group- or other-write bit (octal 022): another user could swap it before the root copy.
+    [ $(( 0$mode & 022 )) -eq 0 ] || \
+        refuse "$f is group/other-writable (mode $mode) — another user could swap it before the root copy"
+}
+
+# EVERYTHING is copied from the single staging dir (build.sh stages the binaries AND the
+# unit + PAM there, tight), so this is the ONLY source tree to trust-check — never the
+# group-writable repo checkout. The containing dir matters too: a writable dir lets a
+# different user replace a file inside it even if the file itself is tight.
+trust_source "$STAGE"
+for f in delphi-runtimed delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam; do
+    trust_source "$STAGE/$f"
 done
 
+# B2A-C-R1-04: the Brain's address MUST stay empty. Check it BEFORE any mutation, so the
+# refusal leaves the system entirely unchanged (fail-closed), not partially installed.
+if [ -e /usr/libexec/delphi-ai ]; then
+    echo "REFUSING (no system change made): /usr/libexec/delphi-ai exists but must stay EMPTY"
+    echo "  (no real Brain yet — a stub at the real address is the lie this refuses)."
+    echo "  Remove it by hand if it is stale: rm /usr/libexec/delphi-ai"
+    exit 1
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# MUTATE — only reached when every pre-flight check above passed.
+# ══════════════════════════════════════════════════════════════════════════════════════
 install -d -m 0755 /usr/libexec
 install -o root -g root -m 0755 "$STAGE/delphi-runtimed"    /usr/libexec/delphi-runtimed
 install -o root -g root -m 0755 "$STAGE/delphi-shell"       /usr/libexec/delphi-shell
 install -o root -g root -m 0755 "$STAGE/delphi-minimal-ai"  /usr/libexec/delphi-minimal-ai
 
-# The Brain's address stays empty ON PURPOSE (see header). Refuse to proceed if some
-# earlier run left a binary there — a stub at the real address is exactly the lie refused.
-if [ -e /usr/libexec/delphi-ai ]; then
-    echo "REFUSING: /usr/libexec/delphi-ai exists but must stay EMPTY (no real Brain yet)."
-    echo "Remove it by hand if it is stale: rm /usr/libexec/delphi-ai"
-    exit 1
-fi
-
 install -d -m 0755 /usr/lib/systemd/system
-install -o root -g root -m 0644 runtime/systemd/delphi-runtimed@.service \
+install -o root -g root -m 0644 "$STAGE/delphi-runtimed@.service" \
     /usr/lib/systemd/system/delphi-runtimed@.service
-install -o root -g root -m 0644 installer/pam/delphi-runtime /etc/pam.d/delphi-runtime
+install -o root -g root -m 0644 "$STAGE/delphi-runtime.pam" /etc/pam.d/delphi-runtime
 
 systemctl daemon-reload
 

@@ -25,6 +25,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::unistd::{Gid, Pid, Uid};
 use pam_client2::conv_null::Conversation as NullConv;
@@ -38,6 +39,16 @@ use crate::RuntimeError;
 /// Where the forked shell finds its private-channel fd (the launcher dups the
 /// channel onto this number; the shell reads `DELPHI_CHANNEL_FD` to confirm).
 pub const SHELL_CHANNEL_FD: RawFd = 3;
+
+/// The forked shell child's WRITE end of the setup-sync pipe (P1 / B2A-C-R1-01). The child
+/// publishes it as the FIRST thing it does after `fork`; every [`child_diag`] then writes one
+/// failure byte here before `_exit`, so a pre-`execve` failure reaches the parent's
+/// [`wait_for_child_setup`]. On a SUCCESSFUL `execve` the fd is CLOEXEC-closed, so the parent
+/// reads EOF instead. `-1` in the parent, which never touches this — it reads the pipe's READ
+/// end directly. A `static` (not a threaded parameter) so that EVERY `child_bail`/`child_fail`
+/// call site signals without plumbing the fd through all of them; sound because the child is
+/// single-threaded post-`fork` and `fork` gives it a private copy of the static.
+static CHILD_SYNC_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// A validated Linux virtual-terminal name (`ttyN`) — the **sole** input deciding whether
 /// the shell's session is SEATED (§4 R3-02: `PAM_TTY=ttyN` is the *whole* seat obligation,
@@ -232,20 +243,64 @@ pub fn launch(spec: &LaunchSpec) -> Result<Children, RuntimeError> {
 fn fork_shell(spec: &LaunchSpec, shell_end: &OwnedFd) -> Result<i32, RuntimeError> {
     let chan_raw = shell_end.as_raw_fd();
 
-    // SAFETY: manual fork. The parent path only records the pid. The child path runs the
-    // sequence documented above and NEVER returns to Rust caller code — every exit is an
+    // ── SETUP-SYNC PIPE (P1 / B2A-C-R1-01) ──────────────────────────────────────────────
+    // The manual fork's parent arm cannot see a child-side setup failure the way the old
+    // `Command::spawn`/`pre_exec` path could (a failed `pre_exec` made `spawn()` return `Err`).
+    // Restore that propagation: the child writes ONE byte to `sync_w` on any pre-`execve`
+    // failure (via `child_diag`); a SUCCESSFUL `execve` CLOEXEC-closes `sync_w`, so the parent
+    // reads EOF. `pipe2(O_CLOEXEC)` is REQUIRED — plain `pipe()` is NOT close-on-exec (verified
+    // against nix 0.30 source: it calls raw `libc::pipe`), and a non-CLOEXEC write end would
+    // ride the `execve` into the shell so the parent's read would block forever.
+    let (sync_r, sync_w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(|source| {
+        RuntimeError::Syscall { op: "pipe2 (shell setup-sync)", source }
+    })?;
+
+    // SAFETY: manual fork. The parent path records the pid and reads the sync pipe; the child
+    // path publishes the sync fd and runs the never-returning sequence — every child exit is an
     // `_exit(2)` (never `panic!`/`return`, which would unwind into a forked copy of the
     // daemon's stack and run its destructors twice).
     match unsafe { nix::unistd::fork() }.map_err(|source| RuntimeError::Syscall {
         op: "fork (shell, shape (b))",
         source,
     })? {
-        nix::unistd::ForkResult::Parent { child } => Ok(child.as_raw()),
+        nix::unistd::ForkResult::Parent { child } => {
+            drop(sync_w); // the parent holds ONLY the read end
+            wait_for_child_setup(sync_r, child)
+        }
         nix::unistd::ForkResult::Child => {
+            drop(sync_r); // the child holds ONLY the write end
+            // Publish the write end so every `child_diag` can signal a failure. In the daemon
+            // (and the tests' launch caller) fd 3 is already held, so `pipe2` returns fds > 3
+            // and `sync_w` never collides with the `dup2(chan, SHELL_CHANNEL_FD)` below; the
+            // debug_assert is the tripwire if that ever stops holding.
+            let raw = sync_w.as_raw_fd();
+            debug_assert!(raw > SHELL_CHANNEL_FD, "setup-sync fd {raw} collides with the channel fd");
+            // `forget` the OwnedFd so its Drop does not close the raw fd we now rely on; the
+            // kernel reclaims it on `execve` (CLOEXEC) or `_exit`.
+            std::mem::forget(sync_w);
+            CHILD_SYNC_FD.store(raw, Ordering::SeqCst);
             // Diverges: either it becomes the shell, or it `_exit`s non-zero.
             shell_child_become(spec, chan_raw)
         }
     }
+}
+
+/// Parent side of the setup-sync pipe (P1 / B2A-C-R1-01): block until the child either
+/// `execve`s (the write end CLOEXEC-closes → EOF → the shell started) or writes a failure byte
+/// then `_exit`s (→ the child died in its pre-`execve` setup). On failure, **reap the child**
+/// (so it is not a zombie) and return [`RuntimeError::ShellSetupFailed`] rather than the false
+/// `Ok` with a dead shell that this whole mechanism exists to prevent.
+fn wait_for_child_setup(sync_r: OwnedFd, child: Pid) -> Result<i32, RuntimeError> {
+    let mut byte = [0u8; 1];
+    // SAFETY: single-byte read on the owned read end; the fd is valid for the call. Blocks
+    // until the write end delivers a byte (failure) or closes (EOF = successful execve).
+    let n = unsafe { nix::libc::read(sync_r.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+    if n == 0 {
+        return Ok(child.as_raw()); // EOF: the write end closed on a successful `execve`.
+    }
+    // n >= 1 (a failure byte) or n < 0 (read error): the child did NOT become the shell.
+    let _ = nix::sys::wait::waitpid(child, None);
+    Err(RuntimeError::ShellSetupFailed)
 }
 
 /// THE SHELL CHILD (shape (b)) — runs in the forked child, never returns.
@@ -619,6 +674,19 @@ fn child_diag(what: &str) {
         nix::libc::write(2, what.as_ptr().cast(), what.len());
         nix::libc::write(2, b"\n".as_ptr().cast(), 1);
     }
+    // P1 / B2A-C-R1-01: signal the PARENT that this child died pre-`execve`. One byte on the
+    // setup-sync write end; the parent's blocking read returns it instead of the EOF a
+    // successful `execve` would deliver. Guarded on `>= 0` so it is a no-op in the parent (or
+    // before the child publishes the fd). The fd is still open — CLOEXEC only closes it on
+    // `execve`, which by definition has not happened on any failure path.
+    let sfd = CHILD_SYNC_FD.load(Ordering::SeqCst);
+    if sfd >= 0 {
+        // SAFETY: one-byte write on the sync write end; return value ignored (a failed signal
+        // must not change the exit path).
+        unsafe {
+            nix::libc::write(sfd, b"x".as_ptr().cast(), 1);
+        }
+    }
 }
 
 /// Diverge from a child failure with **no** live PAM session to unwind.
@@ -729,6 +797,18 @@ pub fn fork_grandchild_then_exec(spec: &LaunchSpec) -> ! {
         Err(_) => child_bail("fork grandchild (weaken twin)"),
         Ok(nix::unistd::ForkResult::Child) => exec_shell_in_place(spec),
         Ok(nix::unistd::ForkResult::Parent { child }) => {
+            // B2A-C-R1-01: the holder MUST close its copy of the setup-sync write end. The
+            // grandchild's `execve` CLOEXEC-closes ITS copy, but the parent's
+            // `wait_for_child_setup` reads EOF only when ALL copies are closed — without this
+            // it would HANG under the B-1 weaken (leader != shell). Closing here lets the
+            // grandchild's `execve` deliver EOF so the parent returns `Ok(holder_pid)` and B-1
+            // can measure the leader != shell topology. This coupling exists ONLY because the
+            // weaken twin mirrors the production child; production never forks here.
+            let sfd = CHILD_SYNC_FD.swap(-1, Ordering::SeqCst);
+            if sfd >= 0 {
+                // SAFETY: closing the holder's own copy of the sync write end.
+                unsafe { nix::libc::close(sfd) };
+            }
             // Hold the session open for as long as the shell runs, then exit with its status
             // — without this the holder would exit immediately and orphan the shell at once.
             let mut status: nix::libc::c_int = 0;
@@ -784,6 +864,81 @@ fn priv_to_io(e: RuntimeError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **B2A-C-R1-01 regression — the setup-sync mechanism DISCRIMINATES failure from success.**
+    ///
+    /// Codex round 1: the manual fork's parent arm returned `Ok` immediately, so a child that
+    /// died in its pre-`execve` setup left `launch()` returning a false `Ok` with a dead shell.
+    /// The fix is the setup-sync pipe read by [`wait_for_child_setup`]. This proves the read
+    /// distinguishes the two cases — it FAILS against any inversion of the EOF-vs-byte logic.
+    ///
+    /// Non-root and fork-safe: the child does ONLY async-signal-safe work (`write` / `_exit` /
+    /// `execv`), no allocation, no lock, so forking from the multithreaded test runner is sound.
+    #[test]
+    fn setup_sync_reports_child_failure_and_success_b2a_c_r1_01() {
+        use nix::fcntl::OFlag;
+        use nix::unistd::{fork, pipe2, ForkResult};
+
+        // FAILURE: the child writes one byte then `_exit` — the parent MUST see `Err`.
+        {
+            let (r, w) = pipe2(OFlag::O_CLOEXEC).expect("pipe2");
+            let wfd = w.as_raw_fd(); // captured before fork; child touches only raw libc
+            // SAFETY: fork; child path is async-signal-safe only and diverges via `_exit`.
+            match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => unsafe {
+                    nix::libc::write(wfd, b"x".as_ptr().cast(), 1);
+                    nix::libc::_exit(0);
+                },
+                ForkResult::Parent { child } => {
+                    drop(w);
+                    let res = wait_for_child_setup(r, child);
+                    assert!(res.is_err(), "a child that writes a failure byte must yield Err");
+                }
+            }
+        }
+        // SUCCESS: the child `execve`s `/bin/true`; the CLOEXEC write end closes → the parent
+        // reads EOF → `Ok`.
+        {
+            let (r, w) = pipe2(OFlag::O_CLOEXEC).expect("pipe2");
+            // SAFETY: fork; child `execv`s (async-signal-safe) or `_exit`s.
+            match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => unsafe {
+                    let path = c"/bin/true";
+                    let argv = [path.as_ptr(), std::ptr::null()];
+                    nix::libc::execv(path.as_ptr(), argv.as_ptr());
+                    nix::libc::_exit(127); // only reached if execv failed
+                },
+                ForkResult::Parent { child } => {
+                    drop(w);
+                    let res = wait_for_child_setup(r, child);
+                    assert!(res.is_ok(), "a child that execve's must yield Ok (EOF via CLOEXEC)");
+                    // `wait_for_child_setup`'s success path does not reap (production pins the
+                    // long-lived shell by pidfd); reap `/bin/true` here so the test leaks no
+                    // zombie.
+                    let _ = nix::sys::wait::waitpid(child, None);
+                }
+            }
+        }
+    }
+
+    /// **B2A-C-R1-02 — `exists_on_system` reports a PRESENT VT truthfully.** The daemon's new
+    /// startup check keys on this to refuse a VT whose `/dev/ttyN` is absent.
+    ///
+    /// HONEST LIMITATION (recorded, not hidden): the *absent* case — the one the daemon's check
+    /// actually acts on — CANNOT be regression-tested on a full-`devtmpfs` host, where all
+    /// `/dev/tty1..63` nodes exist even when unused (measured 2026-07-24: 63/63 present on this
+    /// box). So the check is INERT here and LOAD-BEARING only on minimal/container deploys that
+    /// do not pre-create every VT node. This test proves the present-path wiring; it does NOT
+    /// (cannot, here) prove the check bites an absent VT. A biting test needs a host with a
+    /// genuine gap in `/dev/ttyN`.
+    #[test]
+    fn vtname_exists_on_system_reports_present_vt_b2a_c_r1_02() {
+        // tty1's device node is present on essentially every Linux host with a console.
+        assert!(
+            VtName::new("tty1").unwrap().exists_on_system(),
+            "tty1's /dev node should be a character device on this host"
+        );
+    }
 
     /// This module's own source, for the class-5 accessor audit below.
     const SELF_SRC: &str = include_str!("launcher.rs");

@@ -166,4 +166,16 @@ pub enum RuntimeError {
         /// What was wrong, and what the valid form is.
         what: &'static str,
     },
+
+    /// The forked shell child died during its pre-`execve` setup (`dup2` / stdio / PAM /
+    /// FD-01 sweep / privilege-drop / `execve`) instead of becoming the shell. The manual
+    /// fork has no `Command::spawn` to surface this, so the launcher reads a setup-sync pipe
+    /// and returns this rather than a false `Ok` with a dead shell (§4 R3-01b; B2A-C-R1-01).
+    /// The specific failing step is written to the daemon's journal by the child's
+    /// `write(2)` diagnostic (`delphi-runtimed: shell child failed before execve: …`).
+    #[error(
+        "shell child failed its pre-execve setup (see the daemon journal for the step: \
+         `shell child failed before execve: …`)"
+    )]
+    ShellSetupFailed,
 }

@@ -806,3 +806,64 @@ fn shell_child_drops_to_the_session_user_b3() {
          privilege the drop is supposed to remove."
     );
 }
+
+/// **B2A-C-R1-01 end-to-end — `launch()` RETURNS `Err` when the shell child dies pre-`execve`.**
+///
+/// The unit test `setup_sync_reports_child_failure_and_success_b2a_c_r1_01` proves the sync
+/// MECHANISM; this proves the whole `launch()` path: point `shell_path` at a non-existent
+/// binary so the child completes dup2/stdio/PAM/sweep/priv-drop and then FAILS at `execve`
+/// (ENOENT) → `child_bail` → sync byte → the parent must return `Err`, not a false `Ok` with a
+/// dead shell (the Codex round-1 P1 regression). RED-proof: against the pre-fix launcher (which
+/// returned `Ok` immediately after `fork`) this asserts `Err` and FAILS.
+#[test]
+fn launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP launch_returns_err_when_shell_child_fails: requires root (PAM). A SKIP PROVES NOTHING.");
+        return;
+    }
+    if !std::path::Path::new(PAM_FILE).exists() {
+        eprintln!("SKIP launch_returns_err_when_shell_child_fails: {PAM_FILE} not installed.");
+        return;
+    }
+    let stack = std::fs::read_to_string(PAM_FILE).unwrap_or_default();
+    if !stack.lines().any(|l| l.trim_start().starts_with("session")) {
+        eprintln!("SKIP launch_returns_err_when_shell_child_fails: {PAM_FILE} has no `session` group.");
+        return;
+    }
+    let vt = test_vt();
+    if !vt.exists_on_system() {
+        eprintln!("SKIP launch_returns_err_when_shell_child_fails: /dev/{} absent.", vt.as_pam_tty());
+        return;
+    }
+
+    let setup = Setup::new("p1");
+    let (uid, gid) = setup.ids();
+    let base = PathBuf::from(format!("/run/delphi-p1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // A shell path that does not exist → the child reaches `execve` and fails ENOENT.
+    let missing_shell = work.join("does-not-exist-shell");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+
+    let spec = LaunchSpec {
+        shell_path: &missing_shell,
+        ai_path: &ai_bin,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        tty: &vt,
+        shell_env: &[],
+        ai_env: &[],
+    };
+    let result = launch(&spec);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        result.is_err(),
+        "B2A-C-R1-01: launch() MUST return Err when the shell child dies before execve (a \
+         missing shell binary → ENOENT at execve). Pre-fix it returned Ok with a dead shell."
+    );
+}

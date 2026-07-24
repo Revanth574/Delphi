@@ -294,13 +294,37 @@ fn reap_children(shell_pid: i32, ai_pid: i32, uid: Uid) {
 fn build_sleeper(dir: &std::path::Path) -> Option<PathBuf> {
     let src = dir.join("sleeper.c");
     let bin = dir.join("sleeper");
-    std::fs::write(&src, "#include <unistd.h>\nint main(void){ pause(); return 0; }\n").ok()?;
-    let ok = Command::new("cc")
-        .args([src.to_str()?, "-o", bin.to_str()?])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    ok.then_some(bin)
+    // PRECISE DIAGNOSTIC (was: any failure → an imprecise "no working cc" SKIP that lied when
+    // cc was in fact present and working). Each failure mode now prints its ACTUAL cause, so a
+    // SKIP names WHY — write-fail vs cc-spawn-fail (with PATH) vs compile-fail (with cc's
+    // stderr) — instead of blaming a toolchain that may be fine.
+    if let Err(e) = std::fs::write(
+        &src,
+        "#include <unistd.h>\nint main(void){ pause(); return 0; }\n",
+    ) {
+        eprintln!("build_sleeper: cannot write {}: {e}", src.display());
+        return None;
+    }
+    match Command::new("cc").args([src.to_str()?, "-o", bin.to_str()?]).output() {
+        Ok(o) if o.status.success() => Some(bin),
+        Ok(o) => {
+            eprintln!(
+                "build_sleeper: `cc` ran but exited {} — NOT a missing toolchain. stderr:\n{}\nstdout:\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout),
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "build_sleeper: cannot SPAWN `cc`: {e} — PATH={:?}, cwd={:?}",
+                std::env::var("PATH").unwrap_or_default(),
+                std::env::current_dir(),
+            );
+            None
+        }
+    }
 }
 
 /// The VT handed to PAM as `PAM_TTY`. Overridable because VT availability is a property of
@@ -393,7 +417,8 @@ fn session_leader_is_the_shell_itself_r3_01c() {
     std::fs::create_dir_all(&work).unwrap();
     let Some(shell_bin) = build_sleeper(&work) else {
         eprintln!(
-            "SKIP session_leader_is_the_shell: no working `cc` to build the pause() sleeper. \
+            "SKIP session_leader_is_the_shell: build_sleeper failed — SEE ITS DIAGNOSTIC ABOVE \
+             for the ACTUAL cause (write / cc-spawn / cc-compile); it is NOT necessarily a \
              A SKIP INVALIDATES A WEAKEN/RESTORE RUN."
         );
         return;
@@ -567,7 +592,7 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
     let Some(shell_bin) = build_sleeper(&work) else {
-        eprintln!("SKIP fd01: no working `cc`.");
+        eprintln!("SKIP fd01: build_sleeper failed — see its diagnostic above for the ACTUAL cause.");
         return;
     };
     let shell_bin = shell_bin.canonicalize().expect("canonical sleeper path");
@@ -741,7 +766,7 @@ fn shell_child_drops_to_the_session_user_b3() {
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
     let Some(shell_bin) = build_sleeper(&work) else {
-        eprintln!("SKIP b3: no working `cc`.");
+        eprintln!("SKIP b3: build_sleeper failed — see its diagnostic above for the ACTUAL cause.");
         return;
     };
     let shell_bin = shell_bin.canonicalize().expect("canonical sleeper path");

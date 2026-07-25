@@ -33,8 +33,17 @@ UNIT_REL=usr/lib/systemd/system/delphi-runtimed@.service
 run_preflight() {   # perturbation-code
     local perturb="$1" tmp
     tmp="$(mktemp -d)"
-    mkdir -p "$tmp/installer/staging/shell/assets"
+    mkdir -p "$tmp/installer/staging/shell/assets" "$tmp/fakebin"
     ln -s "$REAL" "$tmp/installer/p3-preflight.sh"
+    # aa-status reads GLOBAL kernel state, which a mount namespace cannot fake. Stub it so
+    # the pre-flight's LOGIC is exercised (same technique as the systemctl stub in the
+    # tree-install suite). The default stub reports the profile LOADED; the not-loaded leg
+    # gets its own refusal case below, so both branches are covered.
+    cat > "$tmp/fakebin/aa-status" <<'AASTUB'
+#!/bin/bash
+echo '{"profiles":{"delphi-shell":"unconfined"}}'
+AASTUB
+    chmod 0755 "$tmp/fakebin/aa-status"
     # Staged bundle (the freshness reference).
     printf '<!doctype html><script src="./assets/app-AAAA.js"></script>\n' \
         > "$tmp/installer/staging/shell/index.html"
@@ -43,7 +52,7 @@ run_preflight() {   # perturbation-code
     unshare -rm bash -c '
         set -u
         tmp="$1"; perturb="$2"
-        for d in /usr/libexec /usr/share /etc/pam.d /usr/lib/systemd/system; do
+        for d in /usr/libexec /usr/share /etc/pam.d /usr/lib/systemd/system /etc/apparmor.d; do
             mkdir -p "$d"; mount -t tmpfs none "$d" || exit 97
         done
         mkdir -p /usr/lib/systemd/system /usr/share/delphi/shell/assets
@@ -53,6 +62,11 @@ run_preflight() {   # perturbation-code
             printf "clean-binary-%s\n" "$b" > "/usr/libexec/$b"; chmod 0755 "/usr/libexec/$b"
         done
         printf "pam\n" > /etc/pam.d/delphi-runtime
+        # The AppArmor profile the shell host needs for userns (GTK/glycin). Present-and-
+        # loaded cannot be simulated inside the namespace (aa-status reads the real kernel
+        # state), so the VALID fixture provides the file; the "loaded" leg of [3b/7] is
+        # exercised on the real system, not here.
+        printf "profile stub\n" > /etc/apparmor.d/delphi-shell
 
         # Installed bundle == staged bundle (fresh).
         cp -r "$tmp/installer/staging/shell/." /usr/share/delphi/shell/
@@ -68,6 +82,7 @@ Environment=DELPHI_AI_BIND_RW=/tmp
 UNIT
         rm -f /tmp/delphi-p3-marker
 
+        export PATH="$tmp/fakebin:$PATH"
         eval "$perturb"
 
         bash "$tmp/installer/p3-preflight.sh" > "$tmp/out.log" 2>&1
@@ -138,6 +153,16 @@ expect_refusal "absolute asset URLs in the installed index.html (vite base regre
 expect_refusal "missing shell bundle" \
     'rm -rf /usr/share/delphi/shell' \
     "index.html is ABSENT"
+
+# The profile FILE existing is not enough — an unloaded profile does nothing, and its mere
+# presence on disk is exactly the thing that reads as protection while providing none.
+expect_refusal "AppArmor profile present but NOT loaded" \
+    'printf "%s\n" "#!/bin/bash" "echo {}" > "$tmp/fakebin/aa-status"; chmod 0755 "$tmp/fakebin/aa-status"' \
+    "is NOT loaded"
+
+expect_refusal "AppArmor profile absent while userns is restricted" \
+    'rm -f /etc/apparmor.d/delphi-shell' \
+    "ABSENT while the userns restriction is enforcing"
 
 expect_refusal "Brain address occupied" \
     'printf "stub\n" > /usr/libexec/delphi-ai' \

@@ -650,6 +650,63 @@ instance itself.
 
 ---
 
+## 18. The verification loop mutates the thing under test  *(new — B2a composition)*
+
+**Description.** A verification procedure — a weaken/restore cycle, a bisect, a
+before/after comparison — runs a command that **mutates the artifact it is
+measuring**. The damage then surfaces as a **failing test**, so it is read as a
+product defect and diagnosed as one. The actor cannot see it: from inside the loop
+the red looks exactly like the red you were hunting.
+
+This is the generalisation of two incidents that were first recorded separately as
+VCS accidents. They are not about `git` — `git` is merely the sharpest available
+instrument. The invariant they share:
+
+> **A verification loop must not run commands that can mutate the thing under
+> test.** Measurement is read-only; the only writes a verification loop may make
+> are the deliberate, named perturbation (the weaken) and its exact inverse.
+
+The two properties that make this class expensive are worth naming, because they
+are why it costs more diagnostic time than the defects it hides:
+
+1. **The damage is silent at the moment it happens** — a destructive command
+   succeeds quietly; nothing reports "you just deleted the change you are testing".
+2. **The damage is loud in the wrong place** — it re-emerges as a red, attributed
+   to the product, one or more steps downstream of its cause.
+
+**Foreclosing primitive.** **NONE — discipline, plus an external check.**
+Before any step of a verification loop that moves `HEAD`, discards changes, or
+rewrites files: **`git status --porcelain` must be empty, or the work must be
+committed or stashed first.** Prefer perturbations that are *exactly invertible in
+the editor* (edit → run → edit back) over any that route through `git` at all. When
+a restore *does* go through `git`, **verify the restore by reading the diff, not by
+observing the test go green** — a green after a botched restore and a green after a
+correct one are indistinguishable.
+
+**Instances (grounded):**
+- **`git reset --hard HEAD~1` with a dirty tree (B2a C1, 2026-07-22)** — run to
+  amend a non-`HEAD` commit; destroyed three fixture fixes, a new test file's
+  contents, and a `PROGRESS.md` rewrite. Recovered **only** because those edits
+  happened to have been made by scripted `python` patches that could be re-run.
+  That is luck, not a property of the workflow. (See §6 "Git history surgery".)
+- **`git checkout -- src/app.tsx` mid-weaken-loop (P2, 2026-07-25)** — run to undo a
+  weaken, on a file whose P2 mount edit was still **uncommitted**. It reverted the
+  file to `HEAD`, i.e. to the *pre-P2* state, discarding the change under test. The
+  following "restore" run was red **because the mount was gone**, not because a test
+  had broken — the loop reported a product failure it had itself caused. Caught by
+  reading `git diff`, not by the test result.
+
+**RED-proof shape.** This class is a *process* defect, so its proof is procedural
+rather than a test: after any restore step, the restored artifact must be shown
+**byte-identical to its pre-weaken state** (`git diff --stat` empty for a committed
+baseline, or an explicit content check for uncommitted work) *before* the restored
+run's result is believed. A restore verified only by "the test is green again" is
+unproven — that is precisely the observation a destroyed change can also produce.
+Note the asymmetry with Class 16: there a *fixture* mutated shared state it did not
+own; here the *verification procedure itself* mutates the code under test.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -671,3 +728,4 @@ instance itself.
 | 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |
 | 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |
 | 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |
+| 18. Verification loop mutates its subject | discipline (clean tree before destructive steps; verify the RESTORE by diff, never by green) | Discipline |

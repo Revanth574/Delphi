@@ -35,15 +35,14 @@ run_preflight() {   # perturbation-code
     tmp="$(mktemp -d)"
     mkdir -p "$tmp/installer/staging/shell/assets" "$tmp/fakebin"
     ln -s "$REAL" "$tmp/installer/p3-preflight.sh"
-    # aa-status reads GLOBAL kernel state, which a mount namespace cannot fake. Stub it so
-    # the pre-flight's LOGIC is exercised (same technique as the systemctl stub in the
-    # tree-install suite). The default stub reports the profile LOADED; the not-loaded leg
-    # gets its own refusal case below, so both branches are covered.
-    cat > "$tmp/fakebin/aa-status" <<'AASTUB'
-#!/bin/bash
-echo '{"profiles":{"delphi-shell":"unconfined"}}'
-AASTUB
-    chmod 0755 "$tmp/fakebin/aa-status"
+    # NO aa-status STUB — deliberately, and this absence is load-bearing.
+    # An earlier version stubbed aa-status to report the profile loaded. The REAL tool answers
+    # an unprivileged caller with "You do not have enough privilege to read the profile set",
+    # so the stub was MORE CAPABLE THAN THE TOOL IT STOOD IN FOR: it made a registry-based
+    # check look correct when that check could never work in production, and the suite
+    # certified it. (docs/DEFECT_CLASSES.md class 19 — the conclusion was about the apparatus.)
+    # The pre-flight now probes the kernel-applied EXEC LABEL instead, which needs no
+    # privilege and no stub. Do not reintroduce one.
     # Staged bundle (the freshness reference).
     printf '<!doctype html><script src="./assets/app-AAAA.js"></script>\n' \
         > "$tmp/installer/staging/shell/index.html"
@@ -62,10 +61,9 @@ AASTUB
             printf "clean-binary-%s\n" "$b" > "/usr/libexec/$b"; chmod 0755 "/usr/libexec/$b"
         done
         printf "pam\n" > /etc/pam.d/delphi-runtime
-        # The AppArmor profile the shell host needs for userns (GTK/glycin). Present-and-
-        # loaded cannot be simulated inside the namespace (aa-status reads the real kernel
-        # state), so the VALID fixture provides the file; the "loaded" leg of [3b/7] is
-        # exercised on the real system, not here.
+        # The AppArmor profile the shell host needs for userns (GTK/glycin). Only its
+        # PRESENCE can be represented here; whether it is ATTACHED comes from real kernel
+        # policy, which a mount namespace does not virtualise — see the PASS-case note.
         printf "profile stub\n" > /etc/apparmor.d/delphi-shell
 
         # Installed bundle == staged bundle (fresh).
@@ -108,7 +106,7 @@ expect_refusal() {   # description  perturbation  expected-substring
 # [3b/7] probes the AppArmor label the KERNEL applies at execve. A mount namespace does not
 # virtualise AppArmor policy, and the profile attaches by PATH to a real ELF, so a stub
 # cannot carry the delphi-shell label here. That one check therefore CANNOT pass inside the
-# namespace, and pretending otherwise is what the removed aa-status stub did.
+# namespace, and pretending otherwise is what the (now removed) aa-status stub did.
 #
 # So the assertion is: EVERY OTHER precondition passes, and the ONLY refusal is the
 # exec-label one. That still cannot be satisfied by a script that always refuses (it would

@@ -334,6 +334,53 @@ mod tests {
         }
     }
 
+    // ── The `http::Uri` shape the IPC path REQUIRES (see the wry hazard below) ─────────
+    //
+    // wry 0.55.1's IPC handler is NOT hardened: `webkitgtk/mod.rs:648` builds the request as
+    //   Request::builder().uri(webview.uri().unwrap().to_string()).body(..).unwrap()
+    // so if the PAGE'S OWN URL does not parse as an `http::Uri`, the `.unwrap()` panics inside
+    // a `connect_script_message_received` callback — across FFI, giving "thread caused
+    // non-unwinding panic. aborting." and SIGABRT. MEASURED: every `window.ipc.postMessage`
+    // from a `file://` page aborts the host.
+    //
+    // (wry's CUSTOM-PROTOCOL path, by contrast, has zero unwraps and calls
+    // `request.finish_error(..)` on a bad build — the hazard is specific to the IPC path.)
+    //
+    // These tests pin the shape the host must serve from. They are cheap, and they exist
+    // because the alternative is re-diagnosing a SIGABRT in an FFI callback.
+
+    /// The URL form the host serves MUST parse as an `http::Uri` — an authority component is
+    /// what makes it parse. This is the positive leg.
+    #[test]
+    fn shell_url_form_parses_as_http_uri() {
+        for url in [
+            "delphi://shell/index.html",
+            "delphi://shell/assets/index-DhCw579K.js",
+            "delphi://shell/",
+        ] {
+            assert!(
+                url.parse::<wry::http::Uri>().is_ok(),
+                "{url} must parse as http::Uri or wry's IPC path SIGABRTs on postMessage"
+            );
+        }
+    }
+
+    /// The negative leg, and the reason the authority is not optional: a scheme with an EMPTY
+    /// authority is exactly what `file:///…` is, and it is what reproduces the abort. If this
+    /// ever starts passing, the hazard has moved and the positive leg alone would not notice.
+    #[test]
+    fn empty_authority_urls_do_not_parse_and_would_abort_the_ipc_path() {
+        for url in [
+            "file:///usr/share/delphi/shell/index.html",
+            "delphi:///index.html",
+        ] {
+            assert!(
+                url.parse::<wry::http::Uri>().is_err(),
+                "{url} unexpectedly parses — the wry IPC hazard this pins has changed shape"
+            );
+        }
+    }
+
     /// The renderer→native direction: the serde tag/field names the React dialog posts must
     /// deserialize. `#[serde(tag = "kind", rename_all = "lowercase")]` renames VARIANTS only,
     /// so the `value` FIELD keeps its name — that asymmetry is exactly the kind of thing a

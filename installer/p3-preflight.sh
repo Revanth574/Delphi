@@ -37,7 +37,7 @@ echo
 # ── 1. The installed artifacts ────────────────────────────────────────────────────────
 echo "[1/7] installed artifacts"
 for p in /usr/libexec/delphi-runtimed /usr/libexec/delphi-shell /usr/libexec/delphi-minimal-ai \
-         /etc/pam.d/delphi-runtime "$UNIT"; do
+         /etc/pam.d/delphi-runtime /etc/apparmor.d/delphi-shell "$UNIT"; do
     if [ -e "$p" ]; then ok "$p"; else refuse "$p is ABSENT — run: sudo bash installer/install.sh"; fi
 done
 if [ -f "$SHELL_DIR/index.html" ]; then
@@ -107,6 +107,27 @@ for b in /usr/libexec/delphi-runtimed /usr/libexec/delphi-shell /usr/libexec/del
         note "rebuild WITHOUT --features insecure-test-seams: bash installer/build.sh"
     fi
 done
+
+# ── 3b. The userns capability the shell host needs to RENDER ──────────────────────────
+# Ubuntu 24.04+ denies unprivileged user namespaces to UNPROFILED processes
+# (kernel.apparmor_restrict_unprivileged_userns=1). GTK3 on this distro loads images via
+# glycin, whose loader runs under bwrap and REQUIRES a userns — so without the profile every
+# themed-icon load fails, the image-missing fallback fails too, and gtkiconhelper.c:495
+# ASSERTS, SIGABRT'ing the shell AFTER GTK init succeeds. "Started" would look fine.
+echo
+echo "[3b/7] shell-host userns capability (GTK/glycin prerequisite)"
+if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != "1" ]; then
+    ok "kernel.apparmor_restrict_unprivileged_userns is not enforcing — profile not required here"
+elif [ ! -e /etc/apparmor.d/delphi-shell ]; then
+    refuse "/etc/apparmor.d/delphi-shell ABSENT while the userns restriction is enforcing"
+    note "the shell will SIGABRT on its first themed-icon load — after GTK init reports ok"
+elif aa-status --json 2>/dev/null | grep -q '"delphi-shell"' || \
+     grep -qs delphi-shell /sys/kernel/security/apparmor/profiles 2>/dev/null; then
+    ok "profile delphi-shell is LOADED into the kernel"
+else
+    refuse "/etc/apparmor.d/delphi-shell exists but is NOT loaded — the file alone does nothing"
+    note "load it: sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
+fi
 
 # ── 4. Unit configuration ─────────────────────────────────────────────────────────────
 echo

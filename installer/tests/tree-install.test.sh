@@ -48,13 +48,22 @@ make_sandbox() {
     done
     printf 'unit-stub\n' > "$tmp/installer/staging/delphi-runtimed@.service"
     printf 'pam-stub\n'  > "$tmp/installer/staging/delphi-runtime.pam"
+    # The AppArmor profile is a required staged artifact; a REAL one (not a stub), because
+    # install.sh runs apparmor_parser on it and a malformed profile must not pass here.
+    cp "$REPO/installer/apparmor/delphi-shell" "$tmp/installer/staging/delphi-shell.apparmor"
     chmod 0755 "$tmp/installer/staging" "$tmp/installer/staging"/delphi-*
     chmod 0644 "$tmp/installer/staging/delphi-runtimed@.service" \
-               "$tmp/installer/staging/delphi-runtime.pam"
+               "$tmp/installer/staging/delphi-runtime.pam" \
+               "$tmp/installer/staging/delphi-shell.apparmor"
 
     # systemctl does not work in the namespace; the installer calls it for daemon-reload.
     printf '#!/bin/bash\nexit 0\n' > "$tmp/fakebin/systemctl"
     chmod 0755 "$tmp/fakebin/systemctl"
+    # apparmor_parser cannot load into the kernel from inside the namespace; stub it so the
+    # INSTALL path is exercised. Profile VALIDITY is covered separately and for real by
+    # installer/tests/apparmor-profile.test.sh (`apparmor_parser -QK`, unprivileged).
+    printf '#!/bin/bash\nexit 0\n' > "$tmp/fakebin/apparmor_parser"
+    chmod 0755 "$tmp/fakebin/apparmor_parser"
 
     echo "$tmp"
 }
@@ -66,7 +75,7 @@ run_installer() {
     unshare -rm bash -c '
         set -u
         tmp="$1"
-        for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d; do
+        for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d /etc/apparmor.d; do
             mkdir -p "$d"
             mount -t tmpfs none "$d" || exit 97
         done
@@ -186,7 +195,7 @@ stage_valid_tree "$tmp/installer/staging"
 unshare -rm bash -c '
     set -u
     tmp="$1"
-    for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d; do
+    for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d /etc/apparmor.d; do
         mkdir -p "$d"; mount -t tmpfs none "$d" || exit 97
     done
     export PATH="$tmp/fakebin:$PATH"
@@ -216,7 +225,7 @@ leftover_case() {   # description  setup-cmds  expected-log-substring
     unshare -rm bash -c '
         set -u
         tmp="$1"; setup="$2"
-        for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d; do
+        for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d /etc/apparmor.d; do
             mkdir -p "$d"; mount -t tmpfs none "$d" || exit 97
         done
         export PATH="$tmp/fakebin:$PATH"

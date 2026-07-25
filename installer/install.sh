@@ -68,7 +68,7 @@ fstat_trust "$STAGE_FD" "$STAGE" dir
 # Each staged file: bind its inode + fstat-trust it. build.sh stages the binaries AND the unit
 # + PAM here (tight), so this ONE dir is the only source — never the group-writable repo tree.
 declare -A FD
-for f in delphi-runtimed delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam; do
+for f in delphi-runtimed delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam delphi-shell.apparmor; do
     exec {fd}< "$STAGE/$f" || refuse "cannot open $STAGE/$f — run installer/build.sh first"
     fstat_trust "$fd" "$STAGE/$f" file
     FD[$f]=$fd
@@ -177,6 +177,28 @@ copy_fd "${FD[delphi-minimal-ai]}"  /usr/libexec/delphi-minimal-ai  0755
 install -d -m 0755 /usr/lib/systemd/system
 copy_fd "${FD[delphi-runtimed@.service]}" /usr/lib/systemd/system/delphi-runtimed@.service 0644
 copy_fd "${FD[delphi-runtime.pam]}"       /etc/pam.d/delphi-runtime                        0644
+
+# ── AppArmor profile for the shell host ──────────────────────────────────────────────
+# ⚠ THIS IS NOT A CONFINEMENT MEASURE AND CONFINES NOTHING. A file in /etc/apparmor.d/
+# named after a component LOOKS like hardening; this one provides none. `flags=(unconfined)`
+# permits every access. Its ONLY effect is to give the host a NAMED profile, which exempts
+# it from kernel.apparmor_restrict_unprivileged_userns=1 — the sysctl that denies user
+# namespaces to UNPROFILED processes. Without that exemption, glycin's bwrap image loader
+# cannot start, every GTK3 themed-icon load fails, the `image-missing` fallback fails too,
+# and gtkiconhelper.c:495 ASSERTS — SIGABRT'ing the shell.
+#
+# THE RENDERER REMAINS UNCONFINED. delphi-shell embeds WebKitGTK and hosts the UNTRUSTED
+# renderer (docs/TRUST_MODEL.md). This profile adds NOTHING to the controls on it: the
+# security property is enforced natively (fail-closed CLOEXEC channel containment before any
+# WebKit exists; the consent relay's renderer-cannot-forge keystone; the mint-confirm sent
+# from the host's own held digest). Do not read this file's existence as sandboxing.
+# A genuinely confining profile is a recorded follow-up increment, not this.
+install -d -m 0755 /etc/apparmor.d
+copy_fd "${FD[delphi-shell.apparmor]}"    /etc/apparmor.d/delphi-shell                     0644
+if command -v apparmor_parser >/dev/null 2>&1; then
+    apparmor_parser -r -W /etc/apparmor.d/delphi-shell || \
+        echo "WARNING: apparmor_parser could not load /etc/apparmor.d/delphi-shell — the shell will abort on its first themed-icon load until this is resolved."
+fi
 
 # ── The shell bundle TREE (P1) — mutate, via a two-rename replace ─────────────────────
 # `install` replaces ONE file atomically; a TREE has no atomic equivalent. So build the new

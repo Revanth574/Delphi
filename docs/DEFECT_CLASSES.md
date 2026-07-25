@@ -724,6 +724,47 @@ own; here the *verification procedure itself* mutates the code under test.
 
 ---
 
+## 19. Comparing runs taken with DIFFERENT INSTRUMENTS  *(new — B2a composition)*
+
+**Description.** Two runs are compared to locate a difference in the system, but the
+**measurement apparatus** changed between them — a different trace filter, log level,
+build flag, timeout, or environment. The delta observed is then **the observer's own
+change**, attributed to the system. This is the sibling of class 18: there the
+verification loop *mutated* its subject; here it *re-instruments* between
+observations. Both corrupt the result while looking like a clean experiment, and both
+produce a confident, wrong, **publishable-looking** conclusion.
+
+> **The rule: when comparing runs, the instrument is part of the experiment.**
+> Change exactly one thing — and it must not be the instrument.
+
+**Foreclosing primitive.** **NONE — discipline.** Pin the instrument first and record
+it beside the result (the exact filter/flags), so a later comparison can see whether it
+matches. When a comparison produces a surprising result, **re-run the baseline under the
+new instrument before believing the delta** — the cheapest possible check, and the one
+that reverses this class every time.
+
+**Instances (grounded — both in a single afternoon's diagnosis, both one commit from
+being recorded as findings):**
+- **"The consent dialog triggers the icon load."** Runs traced with `-e trace=openat`
+  showed **0** icon-theme lookups for the none / approval-only / approval+prompt modes,
+  while the earlier baseline (traced `openat,newfstatat`) showed 6. GTK **stats** icon
+  directories rather than opening them, so the filter — not the dialog — produced the
+  difference. Under the matched instrument all three modes show the **same 6**: the
+  dialog is irrelevant.
+- **"It is WebKit-specific."** With the same truncated filter a bare `GtkWindow` showed
+  no sized-category lookups, implying the WebView was responsible. Under
+  `openat,newfstatat` the bare window shows the **same 6** — it is GTK3 window creation,
+  and WebKit is irrelevant. Had this stood, the fix would have been aimed at the wrong
+  component entirely.
+
+**RED-proof shape.** Procedural, like class 18: before accepting a difference between
+two runs, **re-run the earlier configuration under the later instrument** and confirm
+the delta survives. If it vanishes, the instrument was the variable. Record the
+instrument string (e.g. the full `strace -e trace=…` expression) next to each result so
+the comparison is auditable after the fact rather than reconstructed from memory.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -746,3 +787,4 @@ own; here the *verification procedure itself* mutates the code under test.
 | 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |
 | 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |
 | 18. Verification loop mutates its subject | discipline (clean tree before destructive steps; verify the RESTORE by diff, never by green) | Discipline |
+| 19. Runs compared under different instruments | discipline (pin + record the instrument; re-run the baseline under the new one before believing a delta) | Discipline |

@@ -74,12 +74,17 @@ cp -r shell/dist "$STAGE/shell"
 # one trust-tight source.
 cp -f runtime/systemd/delphi-runtimed@.service "$STAGE/delphi-runtimed@.service"
 cp -f installer/pam/delphi-runtime            "$STAGE/delphi-runtime.pam"
+# The AppArmor profile for the shell host. NOT A CONFINEMENT MEASURE — see the long header
+# in the file itself. It exists solely so the host is a NAMED profile and thus exempt from
+# kernel.apparmor_restrict_unprivileged_userns=1, which otherwise denies the user namespace
+# glycin's bwrap image loader needs and makes GTK3 abort on the first themed-icon load.
+cp -f installer/apparmor/delphi-shell         "$STAGE/delphi-shell.apparmor"
 
 # Tighten perms explicitly (covers a pre-existing group-writable staging dir/file that umask
 # alone would not fix, since umask only affects NEWLY created inodes).
 chmod 0755 "$STAGE"
 chmod 0755 "$STAGE"/delphi-runtimed "$STAGE"/delphi-shell "$STAGE"/delphi-minimal-ai
-chmod 0644 "$STAGE"/delphi-runtimed@.service "$STAGE"/delphi-runtime.pam
+chmod 0644 "$STAGE"/delphi-runtimed@.service "$STAGE"/delphi-runtime.pam "$STAGE"/delphi-shell.apparmor
 # The bundle tree: dirs traversable, files read-only. Same no-group/other-write requirement
 # as the binaries — `install.sh` refuses a group/other-writable source inode.
 chmod 0755 "$STAGE/shell"

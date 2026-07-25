@@ -713,6 +713,20 @@ correct one are indistinguishable.
   had broken — the loop reported a product failure it had itself caused. Caught by
   reading `git diff`, not by the test result.
 
+- **A patch script that AssertionError'd partway, reported as done (B2a composition, 2026-07-25).**
+  A Python patch was to make three edits to a test file. The first succeeded in memory; a
+  later `assert old in s` failed, so the interpreter exited **before its trailing
+  `open(p,"w").write(s)`** — writing **nothing**. The visible output still showed the earlier
+  step's `print("patched")`, the suite still went green (the change was inert), and the commit
+  message went on to assert "The stub is removed, not repaired." **It was not removed.** Caught
+  only by grepping the **committed** file (`git show HEAD:… | grep -c`) rather than trusting the
+  run. Same shape as the `git checkout` instance above: a **partially-failed tool operation
+  reported as its intended state**, with the damage surfacing far from its cause — here as a
+  false claim in the audit trail rather than as a red.
+  **The rule both instances share: verify the ARTIFACT, not the operation's apparent success.**
+  A tool printing progress, exiting 0, or leaving a green suite is not evidence that the
+  intended change is in the file. Grep the file; diff the commit.
+
 **RED-proof shape.** This class is a *process* defect, so its proof is procedural
 rather than a test: after any restore step, the restored artifact must be shown
 **byte-identical to its pre-weaken state** (`git diff --stat` empty for a committed
@@ -765,6 +779,58 @@ the comparison is auditable after the fact rather than reconstructed from memory
 
 ---
 
+## 20. A correctly-biting test in a NON-REPRESENTATIVE environment  *(new — B2a composition)*
+
+**Description.** A test is written well: it is RED-proven, its weaken/restore
+discriminates, its assertion names a real property. And it certifies **the wrong
+thing**, because the environment it runs in **does not implement the mechanism the
+property depends on**. Nothing about the test is sloppy; the green is simply
+evidence about the harness rather than about production.
+
+This is **distinct from the vacuous-test failure** (class 15 clause 2 — a test never
+proven to bite). That test's green means nothing because it cannot fail. *This*
+test's green means something — just not what the reader takes it to mean. And it is
+distinct from class 19, where the instrument **changed between runs**; here a single
+consistent instrument is **incapable of observing the property at all**.
+
+> **The discriminating question: does the test environment IMPLEMENT the mechanism
+> the property depends on?**
+> If it does not, the green is **evidence about the test environment, not about
+> production** — no matter how rigorously the test bites.
+
+**Foreclosing primitive.** **NONE — discipline.** For any property that depends on a
+platform mechanism (module loading, origin/CORS rules, process sandboxing, kernel
+policy, real IPC transports), name the mechanism explicitly and check the harness
+implements it before trusting a green. Where it does not, say so **in the test
+file**, scope the test's claim down to what the harness *can* see, and prove the
+real property against the real component.
+
+**Instances (grounded):**
+- **`shell/src/__tests__/file-protocol-load.test.ts` (P1).** It built through the real
+  vite config, resolved every emitted asset with browser semantics, executed the
+  bundle, asserted React mounted — and was **verified to bite** (`base:"/"` → 2 failed,
+  `base:"./"` → 3 passed). It certified that the bundle loads over `file://`. **It does
+  not.** jsdom has **no module loader, no origins and no CORS**, so the test injected
+  the emitted module as a *classic script* — a narrowing that was documented, and that
+  turned out to remove the very mechanism the production failure lives in. Real WebKit
+  **never fetches an external `<script type="module">` from a `file://` page** (opaque
+  origin), so the bundle never executes and the page is blank. The `base:"./"` fix
+  remains correct; the *claim the green supported* did not transfer.
+- **Sibling, same session:** the `aa-status` stub that was **more capable than the tool
+  it stood in for** — the suite proved a registry check "works" while the real tool
+  returns a permission error to any unprivileged caller. Same shape at the tooling
+  layer: the harness implemented a mechanism production does not have.
+
+**RED-proof shape.** The property must be proven against the **real component in the
+real environment**, with the harness test demoted to what it can honestly observe.
+For P1 that means the ladder (`scratch/file-protocol-ladder.py` → a committed
+shell-host test): the **real** `delphi-shell` binary, **real** WebKitGTK, the **real**
+scheme, using the only machine-checkable signal the host offers
+(`{"kind":"cancel"}` → `process::exit(0)`, so *exit 0 = the page executed*). A green
+there is evidence about production because production is what ran.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -788,3 +854,4 @@ the comparison is auditable after the fact rather than reconstructed from memory
 | 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |
 | 18. Verification loop mutates its subject | discipline (clean tree before destructive steps; verify the RESTORE by diff, never by green) | Discipline |
 | 19. Runs compared under different instruments | discipline (pin + record the instrument; re-run the baseline under the new one before believing a delta) | Discipline |
+| 20. Correct test, non-representative environment | discipline (name the mechanism the property needs; prove it against the real component) | Discipline |

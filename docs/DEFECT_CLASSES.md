@@ -641,6 +641,23 @@ next copy fails loudly rather than shipping green (Class 15's `fixture_hygiene` 
   the pre-fix code, and passes after — with zero false positives on `leader_is_shell.rs`, which
   references the PAM path but never `remove_file`s it (it removes only test-owned `/run` dirs).
 
+- **AppArmor userns gate — the SAME gate, a DIFFERENT door (B2a composition, 2026-07-25).** Two
+  expensive instances on one box, months apart, both rooted in
+  `kernel.apparmor_restrict_unprivileged_userns=1`:
+  1. **Earlier in the arc:** a test failed with `bwrap: execvp permission denied`. Two diagnoses
+     were wrong; `dmesg | grep apparmor` gave ground truth (`profile="bwrap" ... DENIED`). Fixed by
+     disabling the `bwrap-userns-restrict` profile — i.e. **bwrap confined by its OWN profile**.
+  2. **This session:** the WRY shell host aborts because *glycin*'s bwrap-sandboxed image loader
+     cannot create a userns — the **CALLER has no profile at all**, and an unprofiled process is
+     denied userns creation under the same sysctl.
+  The first remedy could not cover the second: it addressed the door (`bwrap`'s own profile), not
+  the gate (the sysctl's treatment of *every* userns creator). **The class lesson: when a fix
+  targets one actor's confinement, enumerate the OTHER actors subject to the same control before
+  declaring the class closed** — here, "what else on this box creates a userns, and what is ITS
+  profile?" would have surfaced the caller-side case immediately. `dmesg | grep -i apparmor` (and
+  `/proc/self/attr/current` + `unshare -r`) is the ground-truth probe for this class; reasoning
+  about it has now failed twice.
+
 **RED-proof shape.** The finder-guard must FIRE against an un-fixed copy before it is fixed —
 `fixture_hygiene.rs` naming `pam_interposition.rs` (and later `systemd_smoke.rs`) is the
 reference. A "fix" with no finder and no cross-tree grep is unproven: it is the count of

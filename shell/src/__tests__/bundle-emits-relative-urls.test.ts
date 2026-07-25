@@ -2,58 +2,37 @@
 /**
  * @vitest-environment node
  *
- * NOT jsdom, deliberately — and this is a harness fix, not a convenience. The suite-wide
- * `environment: "jsdom"` (shell/vite.config.ts) installs jsdom's `TextEncoder`, whose
- * `Uint8Array` comes from a different realm, so esbuild's startup invariant
- * `new TextEncoder().encode("") instanceof Uint8Array` is FALSE and esbuild — hence vite's
- * `build()`, which this test drives — throws at import time. That red is an environment
- * artifact, not the property under test, so it is fixed here rather than worked around.
- * This file needs no ambient DOM: it constructs its own `JSDOM` instance explicitly.
+ * NOT jsdom, deliberately: the suite-wide jsdom environment installs a `TextEncoder` whose
+ * `Uint8Array` is cross-realm, so esbuild's startup invariant fails and vite's `build()` —
+ * which this test drives — throws at import. This file constructs its own JSDOM explicitly.
  */
-// P1 (B2a composition) — the built bundle must LOAD AND EXECUTE over `file://`.
+// P1 — the built bundle must emit RELATIVE asset URLs.
 //
-// WHY THIS TEST EXISTS. The WRY shell host loads the shell as a `file://` document:
-// `runtime/shell-host/src/main.rs:200` defaults `shell_url()` to
-// `file:///usr/share/delphi/shell/index.html`. Vite's DEFAULT `base` is `/`, which emits
-// `<script src="/assets/index-<hash>.js">` — an ABSOLUTE path that, from a `file://`
-// document, resolves to `file:///assets/index-<hash>.js` (the filesystem root), which does
-// not exist. WebKit then renders an empty `<div id="root">`: no error, no console message
-// reaching the host, and `window.__delphiConsent` never registers — so the host's
-// `window.__delphiConsent&&…` guard (`main.rs:192`) silently no-ops.
+// ⚠ READ THIS BEFORE TRUSTING A GREEN HERE. ⚠
 //
-// That is a FOURTH silent failure mode of the composition, alongside the unmounted dialog,
-// a name mismatch, and a missing bundle. All four present as "nothing happens". This test
-// is the one that bites for THIS one.
+// An earlier version of this file claimed to prove that the bundle LOADS over `file://`. It
+// was rigorous — built through the real vite config, resolved every asset with browser
+// semantics, executed the bundle, asserted React mounted, and was verified to bite
+// (`base:"/"` → red, `base:"./"` → green). IT CERTIFIED SOMETHING FALSE. Real WebKit refuses
+// to fetch an external `<script type="module">` from a `file://` page (opaque origin), so in
+// production the bundle never executed and the window was BLANK.
 //
-// WHAT IT ASSERTS, AND WHY IN THIS SHAPE:
+// The reason the green meant nothing: **jsdom has no module loader, no origins and no CORS.**
+// So the test injected the emitted module as a CLASSIC script — a documented narrowing that
+// happened to remove the exact mechanism the production failure lives in. That is
+// `docs/DEFECT_CLASSES.md` class 20: a correctly-biting test in a non-representative
+// environment, whose green is evidence about the harness rather than about production.
 //
-//  1. It BUILDS via vite's Node API rather than reading a pre-existing `dist/`. This is
-//     load-bearing for the weaken: if the test read a stale `dist/`, reverting `base` in
-//     `vite.config.ts` would NOT turn it red until someone happened to rebuild. Building
-//     in-test makes the config the thing under test.
+// WHAT THIS FILE NOW CLAIMS, and nothing more:
+//   1. the emitted asset URLs are RELATIVE — required under ANY scheme, and the one property
+//      jsdom can see honestly;
+//   2. GIVEN execution, the bundle parses and mounts React — a real check that the bundle is
+//      not broken, and explicitly NOT a claim that it will be loaded.
 //
-//  2. It resolves each referenced asset with `new URL(src, documentUrl)` — exactly the
-//     browser's resolution against a `file://` document URL — and requires the resolved
-//     file to exist. This is the base-path discriminator.
-//
-//  3. It then EXECUTES the resolved bundle and asserts React mounted into `#root`.
-//     "The files landed at the right paths" is precisely the check that passes while the
-//     page is blank, so existence alone is not the claim.
-//
-// NARROWING (Iron Law #15 clause 3), stated rather than hidden: jsdom does NOT execute
-// `<script type="module">` — PROBED, not assumed: a module script left `#root` empty while
-// an identical classic script ran. So this test executes the emitted bundle as a CLASSIC
-// script in the jsdom window instead of letting jsdom fetch it. That removes a dependency
-// (jsdom's missing ESM support) that would otherwise INVALIDATE the measurement — a naive
-// `JSDOM.fromFile` test is red under BOTH base settings, i.e. FAIL/FAIL, which discriminates
-// nothing. The claim is not relaxed: the bundle still has to parse, run, and mount React, and
-// still fails if any of that is violated. Executing as a classic script is sound here because
-// the emitted entry chunk has zero top-level `import`/`export` and zero `import.meta`
-// (verified against the build output); if that ever stops being true this test will fail
-// loudly at parse time rather than silently degrade.
-//
-// WHAT IT DOES NOT PROVE: this is jsdom, not WebKit. It proves module-URL resolution,
-// execution, and mount. Real-WebKit rendering through the consent path is P3.
+// WHAT PROVES THE REAL PROPERTY: `runtime/shell-host/tests/real_webkit_load.rs` — the real
+// host binary, real WebKitGTK, the real custom scheme, with machine-checkable signals. That
+// is where "an external ES module executes" and "postMessage reaches native" are asserted,
+// because that is where production runs.
 
 import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -100,14 +79,14 @@ function resolveFromDocument(ref: string): string {
   return fileURLToPath(new URL(ref, documentUrl));
 }
 
-describe("built bundle over file:// (P1 — the WRY host's load path)", () => {
+describe("built bundle emits relative asset URLs (P1 — necessary, not sufficient)", () => {
   it("references at least one script and one stylesheet", () => {
     // Guards the test itself: if the build stopped emitting assets, the assertions below
     // would vacuously pass over an empty list.
     expect(referencedAssets().length).toBeGreaterThanOrEqual(2);
   });
 
-  it("resolves every referenced asset to a file that exists, from a file:// document", () => {
+  it("emits only RELATIVE asset URLs (required under any scheme)", () => {
     const missing = referencedAssets()
       .map((ref) => ({ ref, resolved: resolveFromDocument(ref) }))
       .filter(({ resolved }) => !existsSync(resolved));
@@ -122,7 +101,7 @@ describe("built bundle over file:// (P1 — the WRY host's load path)", () => {
     ).toEqual([]);
   });
 
-  it("executes the emitted bundle and mounts React into #root", async () => {
+  it("GIVEN execution, the bundle parses and mounts React (NOT a loading claim)", async () => {
     const scriptRef = referencedAssets().find((u) => u.endsWith(".js"));
     expect(scriptRef, "the built document references no .js bundle").toBeDefined();
 

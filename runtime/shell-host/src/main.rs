@@ -31,14 +31,163 @@
 //! topology + native↔renderer IPC under WSLg). The **composition** of the security logic
 //! with real rendering runs on the seated lane (where the host actually draws).
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use delphi_runtime::consent_relay::{FdChannel, HostSession};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tao::platform::unix::WindowExtUnix;
 use wry::WebViewBuilderExtUnix;
+
+/// The custom scheme the bundle is served over.
+///
+/// **`file://` is not usable and this is not a style choice** — two independent, measured
+/// failures rule it out:
+///
+/// 1. WebKit refuses to fetch an **external `<script type="module">`** from a `file://` page
+///    (opaque origin). Vite emits exactly that, so the bundle never executed and the window
+///    was blank — with no error reaching the daemon and `window.__delphiConsent` never
+///    registering.
+/// 2. **Every `window.ipc.postMessage` aborted the host.** wry 0.55.1's IPC path
+///    (`webkitgtk/mod.rs:648`) does `Request::builder().uri(webview.uri().unwrap()...).unwrap()`,
+///    and `file:///…` is not a valid `http::Uri` (scheme, empty authority), so the unwrap
+///    panics across an FFI callback → SIGABRT. Not fixed upstream as of 0.55.1 (latest).
+///
+/// wry registers custom schemes as **secure** (`register_uri_scheme_as_secure`), which gives
+/// the non-opaque origin (1), and the **authority component is mandatory** for (2) — pinned
+/// by `shell_url_form_parses_as_http_uri` / `empty_authority_urls_do_not_parse_…`.
+const SCHEME: &str = "delphi";
+/// The authority. NOT decorative: `delphi:///index.html` reproduces the SIGABRT.
+const AUTHORITY: &str = "shell";
+/// Where the installed bundle lives; overridable for development.
+const DEFAULT_BUNDLE_ROOT: &str = "/usr/share/delphi/shell";
+/// Depth bound on the snapshot walk, mirroring the installer's tree discipline.
+const MAX_BUNDLE_DEPTH: usize = 4;
+
+/// One snapshotted file: the exact bytes served and the Content-Type served with them.
+struct Asset {
+    bytes: Vec<u8>,
+    mime: &'static str,
+}
+
+/// The bundle, read ONCE at startup and served by **exact key lookup**.
+///
+/// # Why a snapshot rather than per-request filesystem reads
+///
+/// The handler takes a URI from the **untrusted renderer** and must not turn it into a
+/// filesystem read. A snapshot forecloses that class **by construction rather than by a
+/// check**: there is no path resolution at request time, so there is nothing to get wrong.
+/// `..` is not *rejected* — it is simply a key that does not exist. This also removes the
+/// TOCTOU a per-request read would keep (content could be swapped between requests) and
+/// mirrors the host's existing discipline of doing dangerous work once, early, before any
+/// WebKit process exists (see `ensure_channel_contained`).
+type Bundle = HashMap<String, Asset>;
+
+/// Content-Type by extension — an **allowlist**, and load-bearing rather than cosmetic:
+/// WebKit **refuses to execute a module served with the wrong Content-Type**, which would
+/// reproduce the blank page with a different cause. An unknown extension is refused at
+/// snapshot time so a future asset type fails LOUDLY at startup, not silently in the browser.
+fn mime_for(name: &str) -> Option<&'static str> {
+    match name.rsplit_once('.').map(|(_, e)| e) {
+        Some("html") => Some("text/html"),
+        Some("js") => Some("text/javascript"),
+        Some("css") => Some("text/css"),
+        _ => None,
+    }
+}
+
+/// Read the bundle into memory, hashing each entry, and **fail closed on empty or partial**.
+///
+/// A host that starts with a partial snapshot serves a broken page — the same silent-failure
+/// family as the blank-window cases. So every read error, unknown media type, over-deep entry
+/// and non-regular entry is an error, and a bundle without `/index.html` is an error. This
+/// runs BEFORE the WebView is constructed, so a failure means no WebKit is ever started.
+fn snapshot_bundle(root: &Path) -> io::Result<Bundle> {
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Bundle) -> io::Result<()> {
+        if depth > MAX_BUNDLE_DEPTH {
+            return Err(io::Error::other(format!(
+                "bundle tree deeper than {MAX_BUNDLE_DEPTH} at {prefix}"
+            )));
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key = format!("{prefix}/{name}");
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                walk(&entry.path(), &key, depth + 1, out)?;
+            } else if ty.is_file() {
+                let mime = mime_for(&name).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "{key}: unsupported media type. Refusing rather than guessing — a wrong \
+                         Content-Type makes WebKit silently decline to execute a module."
+                    ))
+                })?;
+                let bytes = std::fs::read(entry.path())?;
+                out.insert(key, Asset { bytes, mime });
+            } else {
+                // Symlinks and anything else: the installer already refuses them in the
+                // staged tree; refuse here too rather than following one at runtime.
+                return Err(io::Error::other(format!(
+                    "{key}: not a regular file or directory"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    let mut bundle = Bundle::new();
+    walk(root, "", 0, &mut bundle)?;
+
+    if bundle.is_empty() {
+        return Err(io::Error::other(format!(
+            "bundle at {} is EMPTY — refusing to start WebKit with nothing to serve",
+            root.display()
+        )));
+    }
+    if !bundle.contains_key("/index.html") {
+        return Err(io::Error::other(format!(
+            "bundle at {} has no /index.html — refusing to start WebKit with a partial bundle",
+            root.display()
+        )));
+    }
+    Ok(bundle)
+}
+
+/// Emit the audit line tying this running shell to the exact bytes it will serve.
+///
+/// Answerable from the RUNTIME, not only from the pre-flight: given a journal for a session,
+/// a reader can say which bundle that shell actually had in memory. Logged once, at startup.
+fn log_bundle_digest(root: &Path, bundle: &Bundle) {
+    let mut keys: Vec<&String> = bundle.keys().collect();
+    keys.sort();
+    let mut tree = Sha256::new();
+    for k in &keys {
+        let asset = &bundle[*k];
+        let digest = Sha256::digest(&asset.bytes);
+        // Injective: length-prefix each part so distinct key/content splits cannot alias.
+        tree.update((k.len() as u64).to_le_bytes());
+        tree.update(k.as_bytes());
+        tree.update(digest);
+        eprintln!(
+            "[delphi-shell] bundle asset {k} sha256={:x} bytes={} type={}",
+            digest,
+            asset.bytes.len(),
+            asset.mime
+        );
+    }
+    eprintln!(
+        "[delphi-shell] bundle snapshot root={} entries={} tree-sha256={:x}",
+        root.display(),
+        keys.len(),
+        tree.finalize()
+    );
+}
 
 /// The fixed fd the launcher dups the private channel onto
 /// (`delphi_runtime::launcher::SHELL_CHANNEL_FD`).
@@ -79,6 +228,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    relay. (Runs before the event loop / window / WebView — no WebKit yet exists.)
     ensure_channel_contained(chan_fd)?;
 
+    // 2b. SNAPSHOT THE BUNDLE — before any WebKit exists, and FAIL CLOSED.
+    //     Read once, with the host's own authority, at a known-good moment. If the bundle is
+    //     empty, partial, or unreadable this returns Err and `?` aborts here, so no WebView is
+    //     ever constructed: a host that starts on a partial snapshot would serve a broken page
+    //     with no error anywhere, which is the failure family this whole increment chased.
+    let bundle_root = std::env::var("DELPHI_BUNDLE_ROOT")
+        .unwrap_or_else(|_| DEFAULT_BUNDLE_ROOT.to_string());
+    let bundle_root = std::path::PathBuf::from(bundle_root);
+    let bundle = snapshot_bundle(&bundle_root).map_err(|e| {
+        format!("refusing to start: bundle snapshot failed at {}: {e}", bundle_root.display())
+    })?;
+    log_bundle_digest(&bundle_root, &bundle);
+
     let session: SharedSession = Arc::new(Mutex::new(None));
 
     // 3. Build the surface (the real React bundle; the consent UI renders on request).
@@ -91,6 +253,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc_session = Arc::clone(&session);
     let webview = wry::WebViewBuilder::new()
         .with_url(shell_url())
+        // Serve the snapshot. The closure owns the bundle; NOTHING here touches the
+        // filesystem, so a renderer-supplied URI cannot become a file read.
+        .with_custom_protocol(SCHEME.to_string(), move |_id, request| {
+            serve(&bundle, request.uri().path())
+        })
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             on_ipc(&ipc_session, chan_fd, &req.into_body());
         })
@@ -194,10 +361,47 @@ fn inject(method: &str, arg: Option<serde_json::Value>) -> String {
     }
 }
 
-/// The URL the host loads (the built React shell bundle). Overridable for dev/install.
+/// The URL the host loads. Served by [`serve`] from the startup snapshot, over the custom
+/// scheme — see [`SCHEME`] for why `file://` is unusable.
 fn shell_url() -> String {
-    std::env::var("DELPHI_SHELL_URL")
-        .unwrap_or_else(|_| "file:///usr/share/delphi/shell/index.html".into())
+    std::env::var("DELPHI_SHELL_URL").unwrap_or_else(|_| default_shell_url())
+}
+
+/// The URL the host loads when nothing overrides it — i.e. in production.
+///
+/// Extracted so it is testable INDEPENDENTLY of `DELPHI_SHELL_URL`. The integration tests set
+/// that variable, so they cannot see a regression in this default: reverting it to `file://`
+/// left all of them green. This is the only thing that pins production's scheme.
+fn default_shell_url() -> String {
+    format!("{SCHEME}://{AUTHORITY}/index.html")
+}
+
+/// Answer one custom-protocol request from the snapshot.
+///
+/// **EXACT KEY LOOKUP — deliberately not a path operation.** No joining, no normalisation, no
+/// canonicalisation, and no filesystem access. `/../../etc/shadow` is not *rejected*; it is a
+/// key that is not in the map, so it 404s like any other miss. That is the whole point of the
+/// snapshot design: the traversal class is foreclosed by construction, not by a check that
+/// could be written wrong.
+///
+/// `/` is the one alias, spelled out as a named case rather than derived by path arithmetic.
+fn serve(bundle: &Bundle, path: &str) -> wry::http::Response<Cow<'static, [u8]>> {
+    let key = if path == "/" { "/index.html" } else { path };
+    match bundle.get(key) {
+        Some(asset) => wry::http::Response::builder()
+            .status(200)
+            .header(wry::http::header::CONTENT_TYPE, asset.mime)
+            .body(Cow::Owned(asset.bytes.clone()))
+            .unwrap_or_else(|_| not_found()),
+        None => not_found(),
+    }
+}
+
+fn not_found() -> wry::http::Response<Cow<'static, [u8]>> {
+    wry::http::Response::builder()
+        .status(404)
+        .body(Cow::Borrowed(&b""[..]))
+        .expect("a 404 with an empty body always builds")
 }
 
 /// Set `FD_CLOEXEC` on the channel fd and VERIFY it — the fail-closed containment gate
@@ -348,6 +552,20 @@ mod tests {
     //
     // These tests pin the shape the host must serve from. They are cheap, and they exist
     // because the alternative is re-diagnosing a SIGABRT in an FFI callback.
+
+    /// PRODUCTION uses the custom scheme. Pinned separately from the integration tests,
+    /// which override `DELPHI_SHELL_URL` and therefore cannot see this regress — measured:
+    /// reverting the default to `file://` left every integration test green.
+    #[test]
+    fn the_default_url_is_the_custom_scheme_not_file() {
+        let url = default_shell_url();
+        assert_eq!(url, "delphi://shell/index.html");
+        assert!(!url.starts_with("file:"), "file:// is unusable — see SCHEME's docs");
+        assert!(
+            url.parse::<wry::http::Uri>().is_ok(),
+            "the default must parse as http::Uri or wry's IPC path SIGABRTs"
+        );
+    }
 
     /// The URL form the host serves MUST parse as an `http::Uri` — an authority component is
     /// what makes it parse. This is the positive leg.

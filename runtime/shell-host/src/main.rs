@@ -267,4 +267,90 @@ mod tests {
             libc::close(w);
         }
     }
+
+    // ── The native→renderer CONTRACT golden (P2) ──────────────────────────────────────
+    //
+    // WHY THESE EXIST. Before P2 there was NO test of `inject` at all: the six edges of the
+    // host↔renderer contract were verified only by READING both sides. A rename here — or a
+    // changed serde tag on `RendererMsg` — would break the composition SILENTLY, because
+    // `inject`'s `window.__delphiConsent&&…` guard turns an unknown surface into a no-op and
+    // a bad method name into a TypeError that only reaches the host's stderr.
+    //
+    // THE OTHER END: `shell/src/__tests__/app-consent-contract.test.tsx` evaluates these
+    // exact strings against the mounted React app. The two ends are kept in step by these
+    // goldens; see the CLASS-17 RESIDUAL noted at that file's `HOST_INJECT` constant, which
+    // states plainly what this pair does NOT protect against.
+
+    /// The approval-request injection, byte-for-byte. Mirrored at
+    /// `shell/src/__tests__/app-consent-contract.test.tsx` (`HOST_INJECT.onApprovalRequest`).
+    #[test]
+    fn inject_approval_request_is_byte_exact() {
+        assert_eq!(
+            inject(
+                "onApprovalRequest",
+                Some(serde_json::json!({ "preview": "rm demo.txt" })),
+            ),
+            r#"window.__delphiConsent&&window.__delphiConsent.onApprovalRequest({"preview":"rm demo.txt"});"#,
+        );
+    }
+
+    /// The PAM-prompt injection, byte-for-byte. Mirrored at
+    /// `shell/src/__tests__/app-consent-contract.test.tsx` (`HOST_INJECT.onPasswordPrompt`).
+    #[test]
+    fn inject_password_prompt_is_byte_exact() {
+        assert_eq!(
+            inject(
+                "onPasswordPrompt",
+                Some(serde_json::json!({ "prompt": "Password:" })),
+            ),
+            r#"window.__delphiConsent&&window.__delphiConsent.onPasswordPrompt({"prompt":"Password:"});"#,
+        );
+    }
+
+    /// The deny/dismiss injection (no argument), byte-for-byte. Mirrored at
+    /// `shell/src/__tests__/app-consent-contract.test.tsx` (`HOST_INJECT.onDenied`).
+    #[test]
+    fn inject_denied_is_byte_exact() {
+        assert_eq!(
+            inject("onDenied", None),
+            "window.__delphiConsent&&window.__delphiConsent.onDenied();",
+        );
+    }
+
+    /// The `&&` guard is the SILENT-FAILURE mechanism the composition has to respect: when
+    /// `window.__delphiConsent` is absent (the dialog not mounted, or the bundle not loaded),
+    /// the injected script must evaluate to a harmless no-op rather than throwing. Pinning it
+    /// documents WHY an unmounted dialog produces "nothing happens" instead of an error.
+    #[test]
+    fn inject_is_guarded_so_an_unregistered_surface_is_a_no_op() {
+        for script in [
+            inject("onDenied", None),
+            inject("onApprovalRequest", Some(serde_json::json!({ "preview": "x" }))),
+        ] {
+            assert!(
+                script.starts_with("window.__delphiConsent&&"),
+                "every injection must be guarded; got: {script}"
+            );
+        }
+    }
+
+    /// The renderer→native direction: the serde tag/field names the React dialog posts must
+    /// deserialize. `#[serde(tag = "kind", rename_all = "lowercase")]` renames VARIANTS only,
+    /// so the `value` FIELD keeps its name — that asymmetry is exactly the kind of thing a
+    /// reading-based check gets wrong, so it is pinned against real JSON.
+    #[test]
+    fn renderer_messages_parse_from_the_shapes_the_dialog_posts() {
+        // Mirrors shell/src/consent/pam-consent-dialog.tsx:76 and :82.
+        match serde_json::from_str::<RendererMsg>(r#"{"kind":"password","value":"hunter2"}"#)
+            .expect("the dialog's password shape must parse")
+        {
+            RendererMsg::Password { value } => assert_eq!(value, "hunter2"),
+            RendererMsg::Cancel => panic!("parsed as Cancel"),
+        }
+        assert!(matches!(
+            serde_json::from_str::<RendererMsg>(r#"{"kind":"cancel"}"#)
+                .expect("the dialog's cancel shape must parse"),
+            RendererMsg::Cancel
+        ));
+    }
 }

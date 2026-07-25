@@ -116,17 +116,55 @@ done
 # ASSERTS, SIGABRT'ing the shell AFTER GTK init succeeds. "Started" would look fine.
 echo
 echo "[3b/7] shell-host userns capability (GTK/glycin prerequisite)"
+# DETECTION NOTE — why this reads the EXEC LABEL and not the profile registry.
+# `aa-status` and /sys/kernel/security/apparmor/profiles are BOTH root-only ("You do not
+# have enough privilege to read the profile set" / Permission denied), so a registry check
+# in an unprivileged pre-flight is UNFALSIFIABLE: it reports "not loaded" whether or not the
+# profile is loaded. The first version of this check did exactly that and produced a FALSE
+# REFUSAL on a correctly-installed system.
+#
+# The label the kernel applies at `execve` is readable by the process owner, and it answers a
+# STRICTER question than the registry does: not "is a profile named delphi-shell loaded"
+# but "does THIS binary actually get it". fd 3 is deliberately left closed so the host's
+# fail-closed containment check aborts it immediately — it never reaches GTK and never opens
+# a window.
+shell_exec_label() {
+    local pid lbl="" i
+    /usr/libexec/delphi-shell >/dev/null 2>&1 &
+    pid=$!
+    # Poll: right after fork the child still carries the PARENT's label; the profile is
+    # applied at execve, so retry until it appears or the process is gone.
+    for i in $(seq 1 40); do
+        lbl=$(tr -d '\0' < "/proc/$pid/attr/current" 2>/dev/null)
+        case "$lbl" in *delphi-shell*) break ;; esac
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    kill -9 "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    printf '%s' "$lbl"
+}
+
 if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != "1" ]; then
     ok "kernel.apparmor_restrict_unprivileged_userns is not enforcing — profile not required here"
 elif [ ! -e /etc/apparmor.d/delphi-shell ]; then
     refuse "/etc/apparmor.d/delphi-shell ABSENT while the userns restriction is enforcing"
     note "the shell will SIGABRT on its first themed-icon load — after GTK init reports ok"
-elif aa-status --json 2>/dev/null | grep -q '"delphi-shell"' || \
-     grep -qs delphi-shell /sys/kernel/security/apparmor/profiles 2>/dev/null; then
-    ok "profile delphi-shell is LOADED into the kernel"
+elif [ ! -x /usr/libexec/delphi-shell ]; then
+    refuse "cannot probe the exec label — /usr/libexec/delphi-shell is not executable"
 else
-    refuse "/etc/apparmor.d/delphi-shell exists but is NOT loaded — the file alone does nothing"
-    note "load it: sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
+    _lbl="$(shell_exec_label)"
+    case "$_lbl" in
+        *delphi-shell*)
+            ok "profile is LOADED and ATTACHED (exec label: $_lbl)" ;;
+        "")
+            refuse "could not read the exec label — cannot confirm the profile is attached"
+            note "verify by hand: sudo aa-status | grep delphi-shell" ;;
+        *)
+            refuse "/etc/apparmor.d/delphi-shell exists but is NOT attached (exec label: $_lbl)"
+            note "the file alone does nothing — load it:"
+            note "  sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell" ;;
+    esac
 fi
 
 # ── 4. Unit configuration ─────────────────────────────────────────────────────────────

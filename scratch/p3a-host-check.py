@@ -114,15 +114,35 @@ def main() -> int:
     except ConnectionResetError:
         print("RESULT: channel reset — the host exited.")
 
-    # A Cancel exits the host, which is the other proof of the same round trip.
+    # ── SHELL LIFETIME — "started" is NOT "survived" ─────────────────────────────────
+    # Conflating the two produced a false success once already. Exit statuses that matter:
+    #   0    Cancel taken (main.rs:144 process::exit(0)) — a genuine round-trip proof
+    #   101  Rust panic — GTK init failed, no display
+    #   -6   SIGABRT — the host DIED DURING RENDERING (GTK asserts when a themed-icon load
+    #        fails: gtkiconhelper.c:495 `assertion failed (error == NULL)`, reached via the
+    #        image-missing.png FALLBACK after some earlier lookup missed). Whether anything
+    #        rendered before the abort is UNKNOWN, so this can never support a render claim.
     time.sleep(0.5)
     rc = proc.poll()
     if rc == 0:
         print("RESULT: host exited 0 => Cancel path taken (main.rs:144 process::exit(0)).")
         print("        => the renderer received the injection, rendered, and posted back.")
         verdict = 0
+    elif rc == -6:
+        print("RESULT: host ABORTED (SIGABRT) — it did NOT survive rendering.")
+        print("        Almost certainly the GTK icon-loader assertion. Whether the preview")
+        print("        ever drew is UNKNOWN: this run CANNOT support a rendering claim.")
+        print("        Re-run with GTK_DEBUG=icontheme to see which lookup missed:")
+        print("            GTK_DEBUG=icontheme python3 scratch/p3a-host-check.py")
+        verdict = 1
+    elif rc == 101:
+        print("RESULT: host panicked (101) — GTK init failed; no usable display.")
+        verdict = 1
     elif rc is not None:
-        print(f"host exited with status {rc}")
+        print(f"RESULT: host exited with status {rc} (not a recognised outcome).")
+        verdict = 1
+    else:
+        print("host still running (did not exit) — no round trip observed.")
 
     if proc.poll() is None:
         proc.terminate()
@@ -133,6 +153,10 @@ def main() -> int:
     daemon_end.close()
 
     print()
+    if verdict == 0 and rc == -6:
+        # Belt and braces: a round trip observed but an aborted host is still not a clean
+        # pass, and must never be summarised as one.
+        verdict = 1
     if verdict == 0:
         print("── P3a-1: the host↔renderer contract HOLDS under real WebKit ──")
         print("   Proven: bundle loads over file://, window.__delphiConsent registers under")

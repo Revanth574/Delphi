@@ -1,0 +1,86 @@
+merge(runtime): Class-16 fixture-deleter fix + hygiene-guard generalization + runner hardening + composition scope
+
+Merges phase-3b/fix-class16-systemd-smoke into main. Test files, scripts, and
+docs only — no production code, no fortress/orchestrator/ssi — so no Codex
+security review is required (§6/§8).
+
+Resolves the missing-files discrepancy from the B2a lane close-out (the
+operator's daemon binary and PAM stack were absent despite being installed) and
+closes the three verification gaps found on the first fully-green root-gated run.
+
+What this branch does:
+
+- CLASS-16 ROOT CAUSE + FIX. systemd_smoke.rs's teardown unconditionally
+  remove_file'd /usr/libexec/delphi-runtimed, deleting the operator's installed
+  daemon binary mid-run — the Class-16 shape (fixture deletes an operator-owned
+  system file), recurring one path over from the three PAM copies already fixed,
+  and therefore a Class-17 instance. The surviving-unit asymmetry pinpointed it:
+  systemd_smoke installs its unit to /etc/systemd/system/ while install.sh ships
+  to /usr/lib/systemd/system/, so the operator's unit survived while the shared
+  binary path died. Fixed with backup-and-restore (rename the operator's binary
+  aside, install the fresh build, restore on teardown) — faithful to the smoke
+  test's fresh-build intent AND Class-16-safe. INODE-PROVEN, not just md5: the
+  audit trace showed inode 2518618 renamed out to the backup, the test's own
+  copy (inode 2518637) created then unlinked, then inode 2518618 renamed back —
+  the same file object restored (a matching hash alone is also consistent with a
+  re-copy; a preserved inode is not).
+
+- THE FIX'S OWN NEW RISK, ALSO CLOSED. Between the backup rename and the restore
+  rename, INSTALLED_BIN is the test's binary while the operator's real one sits
+  at the backup; a SIGKILL there would leave the wrong binary silently at the
+  production path (worse than the loud deletion it replaced — and if built
+  --features insecure-test-seams, would strand the gate-bypass daemon in
+  production). Closed with a FIXED-name backup (…/delphi-runtimed.smoke-bak, so
+  there is never a "which one is real" ambiguity) plus restore_stale_backup() at
+  test startup — a SINGLE atomic rename(2), crash-safe at every interruption
+  point — that heals any prior interrupted run before doing anything else. The
+  runner mirrors the heal before its baseline snapshot. Same self-healing shape
+  as the /run stale-dir sweep.
+
+- HYGIENE-GUARD GENERALIZATION (the Class-17 root fix). fixture_hygiene.rs
+  watched only ONE shared path (/etc/pam.d/delphi-runtime), so it was blind to
+  the identical shape on the binary path — a finder-guard that finds only the
+  path it was born on is the covers-one-form mistake reproduced in the mechanism
+  meant to foreclose it. Generalized to a LIST of operator-owned paths (PAM
+  stack, daemon binary, installer unit path), matching remove_file of a shared
+  const OR literal. RED-proven: it FAILS naming systemd_smoke.rs against the
+  pre-fix code and PASSES after, with zero false positives on the four correctly
+  written fixtures (leader_is_shell references the PAM path but only removes
+  test-owned /run dirs).
+
+- RUNNER HARDENING (scratch/run-root-gated.sh) — three gaps closed:
+  * the survival check is generalized from PAM-only to ALL installer-owned
+    artifacts (the Class-17 fix for the runner's own guard), with before/after
+    md5 across every path;
+  * a --features insecure-test-seams invocation RUNS
+    b1_daemon_binary_runs_the_assembled_flow so the assembled daemon flow COUNTS
+    (Completed) instead of SKIPping (a SKIP is not a pass — Iron Law #15);
+  * an auditd watch on all installer-owned paths names the actor if any is
+    touched, or LOUDLY announces when auditd is absent — so a green md5 can never
+    again silently stand as the answer.
+
+- PAM DISAPPEARANCE — PROBED, not assumed. Exhaustive evidence (every removal
+  syscall in runtime/ traced to /run or /tmp; every scratch/installer rm/mv
+  traced): the ONLY deleters of an installer-owned path are the three
+  provisioned-gated PAM fixtures (correct) and systemd_smoke's now-fixed
+  handling. With auditd armed, a full root-gated run recorded ZERO delete events
+  on /etc/pam.d/delphi-runtime — a probed negative, the suite exonerated. Two
+  honest scope-limits: PAM was present throughout so only the adopt path was
+  exercised (the provision-then-remove path never fired), and the first-absence
+  trigger from the earlier session remains unexplained. What is proven is "the
+  suite does not delete an operator-installed stack," not "the suite never
+  removes PAM under any starting state."
+
+- COMPOSITION SCOPE (nothing built). PROGRESS.md scopes the next increment (the
+  WRY host drawing the real React bundle through the consent path) as P1–P5 —
+  what each proves, what it unblocks, what stays uncovered, which steps need
+  root — grounded in file:line. Key findings: host and React dialog each
+  implement the exact window.__delphiConsent / window.ipc contract and are
+  independently unit-proven but never composed; the bundle is neither built nor
+  installed; PamConsentDialog is defined but never mounted. The composition's own
+  Codex review scope is named up front, and P4 (long-lived shell) is flagged as
+  a separable B2-loop increment carrying the Codex-R4 logind_verdict staleness
+  item.
+
+Corpus: docs/DEFECT_CLASSES.md gains the fourth Class-16 deleter and the Class-17
+"finder-guard scoped to one path" instance.

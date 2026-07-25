@@ -101,10 +101,32 @@ echo
 echo "── OBSERVED ──"
 echo "outcome line:   $(grep -o 'DELPHI_RUNTIMED_OUTCOME.*' "$LOG" | head -1)"
 echo "deny reason:    $(grep -oE 'logind: [^"]*|PAM authentication failed|mint-confirm[^"]*' "$LOG" | head -1)"
+
+# ── SHELL LIFETIME — "started" is NOT "survived" ─────────────────────────────────────
+# This distinction cost a false success once already: the run reported "GTK INIT: ok" while
+# the shell had aborted during rendering, because init and survival were conflated. The
+# launcher's setup-sync pipe answers "did execve succeed", not "is the shell alive" (it is
+# CLOEXEC, so it closes on a SUCCESSFUL execve and the parent records success immediately).
+# So the shell's death after that point is invisible to the daemon's success path and must be
+# detected here, from its output.
+shell_ok=1
 if grep -q "Failed to initialize gtk backend" "$LOG"; then
-    echo "GTK INIT:       PANICKED — the host had no usable display (horn 1)."
+    echo "GTK init:       PANICKED — no usable display (horn 1). Did you use \`sudo -E\`?"
+    shell_ok=0
 else
-    echo "GTK INIT:       ok (no panic) — the host got a display."
+    echo "GTK init:       ok — the host got a display and initialized GTK."
+fi
+if grep -qE "Bail out!|Gtk:ERROR|GLib.*assertion failed" "$LOG"; then
+    echo "shell SURVIVED: NO — the shell ABORTED after init:"
+    grep -oE "Gtk:ERROR:[^ ]*:[a-z_]+: assertion failed[^C]*" "$LOG" | head -1 | sed 's/^/                /'
+    echo "                => whether anything RENDERED is UNKNOWN. A criterion requiring the"
+    echo "                   shell to render is UNMET, not met."
+    shell_ok=0
+elif pgrep -f /usr/libexec/delphi-shell >/dev/null 2>&1; then
+    echo "shell SURVIVED: yes (still running)"
+else
+    echo "shell SURVIVED: exited without an abort signature (expected — the daemon reaps it"
+    echo "                after the terminal contract releases the channel)."
 fi
 if [ -e "$MARKER" ]; then
     echo "marker:         PRESENT — the action EXECUTED (gate passed, PAM passed, mint ok)"
@@ -114,6 +136,13 @@ else
 fi
 echo "seat0 ActiveSession after: $(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null)"
 echo
-echo "Full log kept at $LOG"
+if [ "$shell_ok" -eq 0 ]; then
+    echo "⚠ THE RUN IS NOT A CLEAN PASS: the shell did not survive. Do not record a rendering"
+    echo "  claim from this run. To find WHICH icon lookup missed (GTK falls back to"
+    echo "  image-missing.png, and it is the FALLBACK's load that asserts), re-run with:"
+    echo "      GTK_DEBUG=icontheme   (add it to the daemon's env)"
+fi
+chmod a+r "$LOG" 2>/dev/null   # readable for diagnosis; mktemp made it root-only 0600
+echo "Full log kept at $LOG (made world-readable for diagnosis)"
 [ -e "$MARKER" ] && echo "NOTE: remove $MARKER before any subsequent run."
 exit 0

@@ -332,3 +332,83 @@ fn bundle_without_index_refuses_to_start() {
         "a bundle without index.html must make the host refuse to start, got {outcome:?}"
     );
 }
+
+/// Locate a REAL vite-emitted bundle: the installed one, else the staged one.
+fn real_bundle_root() -> Option<PathBuf> {
+    for p in [
+        PathBuf::from("/usr/share/delphi/shell"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../installer/staging/shell"),
+    ] {
+        if p.join("index.html").is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// **THE REAL BUNDLE, END TO END UNDER REAL WEBKIT.**
+///
+/// Every other case here uses a hand-written page. This one runs **vite's actual output** —
+/// the real 260 kB React bundle, the real content-hashed asset names, the real `crossorigin`
+/// module tag and stylesheet link — through the real host over the real scheme.
+///
+/// It answers two questions that unit tests structurally cannot:
+///
+///  1. **Does vite's `base: "./"` resolve correctly under the custom scheme?** `./assets/x.js`
+///     from `delphi://shell/index.html` must resolve to `delphi://shell/assets/x.js` and hit
+///     the snapshot key `/assets/x.js`. "Should" is what the preceding five silent failures
+///     had in common, so this is measured rather than reasoned.
+///  2. **Does the real bundle actually execute and mount React under WebKit?** jsdom could
+///     never answer this (class 20).
+///
+/// THE SIGNAL IS P2's MOUNT: `window.__delphiConsent` is registered by `PamConsentDialog`,
+/// which only exists once React has mounted the real app. So the probe polls for it and posts
+/// cancel when it appears — meaning `Executed` proves module resolution AND execution AND
+/// React mount AND the consent surface registering, under REAL rendering.
+///
+/// It does NOT prove the dialog draws legible content — that needs eyes on a window, and
+/// remains outstanding.
+#[test]
+fn the_real_vite_bundle_executes_and_registers_the_consent_surface() {
+    if !preconditions_met() {
+        return;
+    }
+    let Some(src) = real_bundle_root() else {
+        eprintln!(
+            "SKIP the_real_vite_bundle_…: no built bundle found. Run installer/build.sh (or \
+             install) — this case is the only one that exercises vite's ACTUAL output."
+        );
+        return;
+    };
+
+    let d = std::env::temp_dir().join(format!("delphi-realbundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("assets")).expect("mkdir");
+    for entry in std::fs::read_dir(src.join("assets")).expect("read assets") {
+        let e = entry.expect("entry");
+        std::fs::copy(e.path(), d.join("assets").join(e.file_name())).expect("copy asset");
+    }
+    let index = std::fs::read_to_string(src.join("index.html")).expect("read index");
+    // Poll for the surface P2 mounts, then signal. Appended, so vite's own tags are untouched.
+    let probe = format!(
+        r#"<script>
+(function poll(n) {{
+  if (window.__delphiConsent) {{ {CANCEL_JS} return; }}
+  if (n > 0) setTimeout(function () {{ poll(n - 1); }}, 50);
+}})(160);
+</script>"#
+    );
+    let injected = match index.rfind("</body>") {
+        Some(i) => format!("{}{}{}", &index[..i], probe, &index[i..]),
+        None => format!("{index}{probe}"),
+    };
+    std::fs::write(d.join("index.html"), injected).expect("write index");
+
+    assert_eq!(
+        run_host_with_bundle(URL, &d),
+        Outcome::Executed,
+        "the REAL vite bundle did not register window.__delphiConsent. Either its module did \
+         not resolve/execute under the custom scheme, or React did not mount — both present as \
+         a BLANK window with no error anywhere."
+    );
+}

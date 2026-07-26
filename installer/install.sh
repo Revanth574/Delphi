@@ -269,4 +269,4 @@ ls -l /usr/libexec/delphi-runtimed /usr/libexec/delphi-shell /usr/libexec/delphi
 echo "Brain address intentionally absent: $(ls /usr/libexec/delphi-ai 2>&1)"
 echo "PAM stack: $(ls -l /etc/pam.d/delphi-runtime)"
 echo "shell bundle: $(find "$CUR" -type f | wc -l) files under $CUR"
-echo "  the host loads: file://$CUR/index.html"
+echo "  the host serves it over: delphi://shell/index.html (from its startup snapshot)"

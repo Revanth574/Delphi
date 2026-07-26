@@ -831,6 +831,61 @@ there is evidence about production because production is what ran.
 
 ---
 
+## 21. A warning banner is not an enforcement mechanism  *(new — B2a composition)*
+
+**Description.** A test harness, probe, or demo renders something that **looks
+authentic** — most sharply, a credential prompt — and relies on **text** to stop the
+human from treating it as real. It does not stop them. A dialog that presents as the
+system's own password field will receive the system's own password, regardless of
+what is written above it, because the person is responding to the interface, not
+reading the terms of the experiment.
+
+The failure is not carelessness on the reader's part. An authentic-looking prompt is
+*designed* to elicit the credential; a paragraph of warning text competes with that
+design and loses. Treating the warning as the control confuses **documentation** with
+**enforcement** — the same confusion as a comment that says "do not call this
+concurrently" standing in for a mutex.
+
+> **If a probe can receive a real credential, assume it will. Design so that it
+> cannot be the thing that matters, rather than asking the human not to supply it.**
+
+**Foreclosing primitive.** **NONE — discipline, with three concrete requirements for
+any interactive probe that renders a credential-shaped field:**
+
+1. **Prefill a sentinel** (e.g. `DUMMY-DO-NOT-USE`) so the field is never empty and
+   inviting, **or reject any input that is not the sentinel** — an enforcement point,
+   not a request.
+2. **Never persist what is received.** Report a **length or a hash**, never the value;
+   never write it to a log, a file, an argv, or an environment variable. This is the
+   property that determines whether an incident is *"a secret crossed a socket into a
+   process"* or *"a secret is on disk"* — a large difference in blast radius.
+3. **State the residual honestly.** Even with (1) and (2), a credential typed into the
+   probe has entered a process's memory. That is a rotation-worthy event, and the probe
+   should say so **before** the interaction, not after.
+
+**Instances (grounded):**
+- **`scratch/p3a-host-check.py` (P3a-1, 2026-07-25).** The probe drove the REAL consent
+  dialog — the real preview, the real PAM-prompt label, the real password field — to
+  prove the renderer→native round trip under real WebKit. It carried a banner stating
+  plainly that nothing authenticates the value and that a throwaway string should be
+  used. **The operator entered their real password**, because the dialog was
+  indistinguishable from the production one, which is precisely what the test was
+  demonstrating. Mitigating factors held, and they held **by design rather than by
+  luck**: the probe reports only `len(data)` and never the bytes, so the value reached
+  a process's memory and a socket but **never disk** — confirmed by grepping the run
+  log, which contained only the prompt label, the banner text, and the byte count.
+  Rotation was still the correct response.
+
+**RED-proof shape.** Two parts, because the class has a design half and a hygiene half.
+(a) **Design:** inspect the probe for an enforcement point — a prefilled sentinel or a
+non-sentinel rejection. Prose in the banner does not satisfy it. (b) **Hygiene:** assert
+mechanically that no received byte is written anywhere — grep the probe for any use of
+the received buffer other than `len()`/hash, and grep a real run's artifacts for the
+value. A probe that passes (b) but fails (a) is one confused human away from an
+incident; a probe that fails (b) has already had one.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -855,3 +910,4 @@ there is evidence about production because production is what ran.
 | 18. Verification loop mutates its subject | discipline (clean tree before destructive steps; verify the RESTORE by diff, never by green) | Discipline |
 | 19. Runs compared under different instruments | discipline (pin + record the instrument; re-run the baseline under the new one before believing a delta) | Discipline |
 | 20. Correct test, non-representative environment | discipline (name the mechanism the property needs; prove it against the real component) | Discipline |
+| 21. Warning banner as enforcement | discipline (sentinel prefill or non-sentinel rejection; never persist the value; state the residual up front) | Discipline |

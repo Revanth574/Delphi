@@ -58,7 +58,7 @@ fi
 # window.__delphiConsent never registers, the host's guarded injections no-op, and the user
 # sees NOTHING with no error anywhere.
 echo
-echo "[2/7] bundle freshness (installed vs staged)"
+echo "[2/7] freshness — bundle AND binaries (installed vs staged)"
 if [ ! -d "$STAGE_DIR/shell/assets" ]; then
     refuse "$STAGE_DIR/shell/assets missing — run: bash installer/build.sh (unprivileged)"
 elif [ ! -d "$SHELL_DIR/assets" ]; then
@@ -80,14 +80,50 @@ else
         note "fix: bash installer/build.sh && sudo bash installer/install.sh"
     fi
 fi
-# The file:// base fix must be present in what is actually INSTALLED, not just in the repo.
+# ── HOST BINARY freshness — the gap that let a STALE host run under a FRESH bundle ────
+# The bundle was hash-checked from the start; the BINARY was not. So an install that updated
+# /usr/share/delphi/shell while leaving an older /usr/libexec/delphi-shell in place passed
+# every check and then behaved like the old code — which is exactly what happened when the
+# custom-scheme host had been built but not yet installed. Same treatment as the bundle:
+# compare installed content against staged content.
+if [ ! -f "$STAGE_DIR/delphi-shell" ]; then
+    refuse "$STAGE_DIR/delphi-shell missing — run: bash installer/build.sh (unprivileged)"
+elif [ ! -f /usr/libexec/delphi-shell ]; then
+    refuse "/usr/libexec/delphi-shell missing — run: sudo bash installer/install.sh"
+else
+    staged_bin=$(sha256sum "$STAGE_DIR/delphi-shell" | cut -d' ' -f1)
+    inst_bin=$(sha256sum /usr/libexec/delphi-shell | cut -d' ' -f1)
+    if [ "$staged_bin" = "$inst_bin" ]; then
+        ok "installed delphi-shell matches staging (${inst_bin:0:16}…)"
+    else
+        refuse "installed /usr/libexec/delphi-shell DIFFERS from staging — it is STALE"
+        note "staged:    ${staged_bin:0:16}…"
+        note "installed: ${inst_bin:0:16}…"
+        note "a stale host runs old code against a fresh bundle, silently."
+        note "fix: sudo bash installer/install.sh"
+    fi
+fi
+# Same for the daemon and the AI scaffold — a stale daemon is the same failure one layer up.
+for b in delphi-runtimed delphi-minimal-ai; do
+    if [ -f "$STAGE_DIR/$b" ] && [ -f "/usr/libexec/$b" ]; then
+        if [ "$(sha256sum "$STAGE_DIR/$b" | cut -d' ' -f1)" = "$(sha256sum "/usr/libexec/$b" | cut -d' ' -f1)" ]; then
+            ok "installed $b matches staging"
+        else
+            refuse "installed /usr/libexec/$b DIFFERS from staging — it is STALE"
+            note "fix: sudo bash installer/install.sh"
+        fi
+    fi
+done
+
+# The relative-asset-URL requirement must hold in what is actually INSTALLED, not just the repo.
 if [ -f "$SHELL_DIR/index.html" ]; then
     if grep -qE '(src|href)="\./' "$SHELL_DIR/index.html"; then
-        ok "installed index.html uses RELATIVE asset URLs (file:// safe)"
+        ok "installed index.html uses RELATIVE asset URLs"
     else
         refuse "installed index.html does NOT use relative asset URLs — vite \`base\` regression"
-        note "an absolute base resolves to the FILESYSTEM ROOT from a file:// document:"
-        note "blank page, no error. See shell/src/__tests__/file-protocol-load.test.ts"
+        note "an absolute base resolves against the scheme root rather than the page:"
+        note "blank window, no error. See shell/src/__tests__/bundle-emits-relative-urls.test.ts"
+        note "and runtime/shell-host/tests/real_webkit_load.rs (the real-WebKit proof)."
     fi
 fi
 

@@ -30,9 +30,23 @@ round trip under real rendering (not jsdom):
     Allow   -> the renderer posts the password over window.ipc, the host relays it as a
                datagram => observed here as N bytes arriving.
 
-THE PASSWORD IS NEVER PRINTED, LOGGED, OR STORED. Only its byte length is reported, and this
-probe never authenticates it against anything — there is no PAM here. Type a throwaway string
-if you use the Allow path; it goes nowhere.
+⚠ THIS PROBE RENDERS THE REAL CONSENT DIALOG — A REAL-LOOKING PASSWORD FIELD.
+   A WARNING IS NOT AN ENFORCEMENT MECHANISM (docs/DEFECT_CLASSES.md class 21). This text
+   did NOT stop a real password being entered the first time this probe was run, because the
+   dialog is indistinguishable from the production one — which is exactly what it is proving.
+   So the probe does not rely on you reading this:
+
+     * BY DEFAULT THE PROBE DOES NOT SEND THE PAM PROMPT. The dialog's Approve button is
+       `disabled={submitted || !prompt}` (shell/src/consent/pam-consent-dialog.tsx), so
+       without a prompt the credential path is UNREACHABLE — not discouraged, unreachable.
+       Cancel still proves the full renderer->native round trip.
+     * Exercising the password leg requires an explicit opt-in:
+       DELPHI_PROBE_SEND_PROMPT=1, which prints the residual before it does anything.
+
+   RESIDUAL, stated up front rather than after the fact: if you defeat the prefill and type a
+   real secret, it enters this process's memory and crosses a socket. It is never written
+   anywhere — only `len(data)` is reported, never the bytes — but memory + socket is still a
+   rotation-worthy event. Rotate if you do it.
 """
 
 import os
@@ -47,7 +61,10 @@ HOST_BIN = os.environ.get("DELPHI_HOST_BIN", "/usr/libexec/delphi-shell")
 # A representative action preview. Deliberately literal so what is on screen is legible and
 # obviously matches what was "requested" — the same property the real consent preview needs.
 PREVIEW = "touch /tmp/delphi-p3-marker"
-PROMPT = "Password: "
+# Sent ONLY under DELPHI_PROBE_SEND_PROMPT=1. Names itself so the field is never mistaken
+# for a production prompt — though per class 21 the LABEL is not what protects anyone; the
+# default of not sending it at all is.
+PROMPT = "[TEST PROBE — do NOT enter a real password] "
 TIMEOUT_SECS = 300
 
 
@@ -93,39 +110,68 @@ def main() -> int:
     daemon_end.send(digest + PREVIEW.encode())
     print(f"sent approval request  preview={PREVIEW!r}")
     time.sleep(1)
-    daemon_end.send(PROMPT.encode())
-    print(f"sent PAM prompt        prompt={PROMPT!r}")
+    send_prompt = os.environ.get("DELPHI_PROBE_SEND_PROMPT") == "1"
+    if send_prompt:
+        print()
+        print("!" * 78)
+        print("DELPHI_PROBE_SEND_PROMPT=1 — enabling the password field.")
+        print("Anything you type enters this process's memory and crosses a socket. It is")
+        print("NEVER written anywhere (only its length is reported), but that is still")
+        print("rotation-worthy. Use a throwaway value.")
+        print("!" * 78)
+        daemon_end.send(PROMPT.encode())
+        print(f"sent PAM prompt        prompt={PROMPT!r}")
+    else:
+        print("PAM prompt NOT sent (default) — Approve stays disabled, so the credential")
+        print("path is unreachable. Set DELPHI_PROBE_SEND_PROMPT=1 to exercise it.")
 
     print()
     print("=" * 78)
     print("LOOK AT THE SCREEN. The Delphi shell should be rendered, with the consent dialog")
-    print("showing the preview above and a password field labelled with the prompt.")
+    if send_prompt:
+        print("showing the preview above and a password field labelled with the prompt.")
+    else:
+        print("showing the preview above. The password field is present but Approve is")
+        print("disabled — no prompt was sent.")
     print()
-    print("  Click CANCEL  -> proves the round trip; the host exits 0.")
-    print("  Or type anything and click APPROVE -> also proves it; the bytes arrive here.")
-    print("     (Nothing authenticates it. It is discarded. Do not type a real password.)")
+    print("  Click CANCEL -> proves the round trip; the host exits 0.")
+    if send_prompt:
+        print("  Or type a THROWAWAY value and click APPROVE -> also proves it.")
+        print("     (Nothing authenticates it; only its length is ever reported.)")
+    else:
+        print("  APPROVE is disabled by design — no prompt was sent, so no credential can")
+        print("  be submitted at all. Cancel is the whole proof.")
     print("=" * 78)
     print()
 
+    # ── CLASSIFY EXACTLY ONE OUTCOME ─────────────────────────────────────────────────
+    # Cancel and Approve are DIFFERENT VALID outcomes, and an earlier version ran both
+    # checks unconditionally — so a Cancel run printed "round trip OK" AND "no round trip
+    # observed" in the same output. A report that states two contradictory things forces the
+    # reader to adjudicate, which is exactly the job the report exists to do.
+    #
+    #   Approve -> the renderer posts the password; bytes arrive on the channel.
+    #   Cancel  -> the host calls process::exit(0); no bytes ever arrive.
+    #
+    # Both prove the same underlying property (native -> renderer -> native under real
+    # WebKit). Report whichever ACTUALLY happened, once.
     daemon_end.settimeout(TIMEOUT_SECS)
-    verdict = 1
+    received = None          # Some(n) only if bytes actually arrived
+    channel_note = None      # why nothing arrived, when nothing did
     try:
         data = daemon_end.recv(4096)
         if data:
-            # Length only. Never the content.
-            print(f"RESULT: renderer -> native round trip OK ({len(data)} bytes received)")
-            print("        => window.ipc.postMessage reached the host through real WebKit.")
-            verdict = 0
+            received = len(data)          # LENGTH ONLY — never the content. See the header.
         else:
-            print("RESULT: channel EOF without a message — the host closed its end.")
+            channel_note = "channel EOF — the host closed its end"
     except socket.timeout:
-        print(f"RESULT: no response within {TIMEOUT_SECS}s — nothing was clicked.")
+        channel_note = f"no message within {TIMEOUT_SECS}s"
     except ConnectionResetError:
-        print("RESULT: channel reset — the host exited.")
+        channel_note = "channel reset — the host exited"
 
     # ── SHELL LIFETIME — "started" is NOT "survived" ─────────────────────────────────
     # Conflating the two produced a false success once already. Exit statuses that matter:
-    #   0    Cancel taken (main.rs:144 process::exit(0)) — a genuine round-trip proof
+    #   0    Cancel taken (main.rs `RendererMsg::Cancel` -> process::exit(0))
     #   101  Rust panic — GTK init failed, no display
     #   -6   SIGABRT — the host DIED DURING RENDERING. Two known causes, both measured:
     #        (a) the GTK themed-icon assertion (gtkiconhelper.c:495) when glycin's bwrap
@@ -136,12 +182,18 @@ def main() -> int:
     #        never support a rendering claim.
     time.sleep(0.5)
     rc = proc.poll()
-    if rc == 0:
-        print("RESULT: host exited 0 => Cancel path taken (main.rs:144 process::exit(0)).")
+
+    print()
+    if received is not None:
+        print(f"RESULT: APPROVE path — renderer -> native round trip OK ({received} bytes).")
+        print("        => window.ipc.postMessage reached the host through real WebKit.")
+        verdict = 0
+    elif rc == 0:
+        print("RESULT: CANCEL path — the host exited 0 (RendererMsg::Cancel).")
         print("        => the renderer received the injection, rendered, and posted back.")
         verdict = 0
     elif rc == -6:
-        print("RESULT: host ABORTED (SIGABRT) — it did NOT survive rendering.")
+        print("RESULT: the host ABORTED (SIGABRT) — it did NOT survive rendering.")
         print("        Whether the preview ever drew is UNKNOWN: this run CANNOT support a")
         print("        rendering claim. Check, in order:")
         print("          1. is the AppArmor profile LOADED?  bash installer/p3-preflight.sh")
@@ -150,13 +202,14 @@ def main() -> int:
         print("        and ignores it (measured); it will not name the icon.")
         verdict = 1
     elif rc == 101:
-        print("RESULT: host panicked (101) — GTK init failed; no usable display.")
+        print("RESULT: the host panicked (101) — GTK init failed; no usable display.")
         verdict = 1
-    elif rc is not None:
-        print(f"RESULT: host exited with status {rc} (not a recognised outcome).")
+    elif rc is None:
+        print(f"RESULT: no interaction observed ({channel_note}); the host is still running.")
         verdict = 1
     else:
-        print("host still running (did not exit) — no round trip observed.")
+        print(f"RESULT: the host exited with status {rc} ({channel_note}).")
+        verdict = 1
 
     if proc.poll() is None:
         proc.terminate()
@@ -173,7 +226,8 @@ def main() -> int:
         verdict = 1
     if verdict == 0:
         print("── P3a-1: the host↔renderer contract HOLDS under real WebKit ──")
-        print("   Proven: bundle loads over file://, window.__delphiConsent registers under")
+        print("   Proven: the bundle loads over delphi://shell/index.html (served from the")
+        print("   host's startup snapshot), window.__delphiConsent registers under")
         print("   REAL rendering (not jsdom), injections reach the live handler, and the")
         print("   renderer posts back over window.ipc.")
         print("   NOT proven here: the gate, PAM, mint-confirm, execution, leader==shell.")

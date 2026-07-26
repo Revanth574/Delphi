@@ -56,9 +56,15 @@ run_preflight() {   # perturbation-code
         done
         mkdir -p /usr/lib/systemd/system /usr/share/delphi/shell/assets
 
-        # Binaries: seam-free by construction (no seam symbol in the content).
+        # Binaries: seam-free by construction, and MATCHING what the fixture stages, so the
+        # new installed-vs-staged binary freshness check has a valid state to pass on.
         for b in delphi-runtimed delphi-shell delphi-minimal-ai; do
-            printf "clean-binary-%s\n" "$b" > "/usr/libexec/$b"; chmod 0755 "/usr/libexec/$b"
+            printf "#!/bin/bash\n# clean-binary-%s\nsleep 2\n" "$b" > "$tmp/installer/staging/$b"
+            chmod 0755 "$tmp/installer/staging/$b"
+            # INSTALLED must be byte-identical to STAGED, or the freshness check rightly
+            # refuses. The pre-flight EXECS delphi-shell to read its AppArmor label, so these
+            # must actually run — hence the shebang and the sleep.
+            cp "$tmp/installer/staging/$b" "/usr/libexec/$b"; chmod 0755 "/usr/libexec/$b"
         done
         printf "pam\n" > /etc/pam.d/delphi-runtime
         # The AppArmor profile the shell host needs for userns (GTK/glycin). Only its
@@ -177,6 +183,17 @@ expect_refusal "missing shell bundle" \
 expect_refusal "AppArmor profile absent while userns is restricted" \
     'rm -f /etc/apparmor.d/delphi-shell' \
     "ABSENT while the userns restriction is enforcing"
+
+# THE GAP THAT LET A STALE HOST RUN UNDER A FRESH BUNDLE. The bundle was hash-checked from
+# the start; the binary was not, so an install that refreshed the bundle but left an older
+# /usr/libexec/delphi-shell passed every check and then behaved like the old code.
+expect_refusal "stale host BINARY (installed differs from staged)" \
+    'printf "%s\n" "#!/bin/bash" "# STALE" > /usr/libexec/delphi-shell; chmod 0755 /usr/libexec/delphi-shell' \
+    "installed /usr/libexec/delphi-shell DIFFERS from staging"
+
+expect_refusal "stale DAEMON binary" \
+    'printf "%s\n" "#!/bin/bash" "# STALE" > /usr/libexec/delphi-runtimed; chmod 0755 /usr/libexec/delphi-runtimed' \
+    "installed /usr/libexec/delphi-runtimed DIFFERS from staging"
 
 expect_refusal "Brain address occupied" \
     'printf "stub\n" > /usr/libexec/delphi-ai' \

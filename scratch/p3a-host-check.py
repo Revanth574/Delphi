@@ -41,7 +41,9 @@ import subprocess
 import sys
 import time
 
-HOST_BIN = "/usr/libexec/delphi-shell"
+# The installed host by default. `DELPHI_HOST_BIN` lets a dev point at a freshly-built
+# binary before installing — useful precisely when the installed one is known stale.
+HOST_BIN = os.environ.get("DELPHI_HOST_BIN", "/usr/libexec/delphi-shell")
 # A representative action preview. Deliberately literal so what is on screen is legible and
 # obviously matches what was "requested" — the same property the real consent preview needs.
 PREVIEW = "touch /tmp/delphi-p3-marker"
@@ -52,6 +54,13 @@ TIMEOUT_SECS = 300
 def main() -> int:
     if not os.path.exists(HOST_BIN):
         print(f"REFUSE: {HOST_BIN} not installed — run: sudo bash installer/install.sh")
+        return 1
+    # The bundle the host will serve. Reported so a blank window is never a mystery about
+    # WHICH bytes were on screen — the host also logs a per-asset sha256 audit line at startup.
+    root = os.environ.get("DELPHI_BUNDLE_ROOT", "/usr/share/delphi/shell")
+    print(f"bundle root: {root}")
+    if not os.path.exists(os.path.join(root, "index.html")):
+        print(f"REFUSE: {root}/index.html missing — the host will refuse to start (fail-closed).")
         return 1
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         print("REFUSE: no DISPLAY/WAYLAND_DISPLAY. This probe must run INSIDE the graphical")
@@ -71,9 +80,9 @@ def main() -> int:
     proc = subprocess.Popen([HOST_BIN], env=env, pass_fds=(child_fd,))
     shell_end.close()  # the child owns its end now
 
-    # Give WebKit time to start and load file:///usr/share/delphi/shell/index.html. If the
-    # bundle is missing or its asset URLs are absolute, this is where a blank page happens —
-    # silently, which is why the pre-flight checks both.
+    # Give WebKit time to start and load delphi://shell/index.html (served from the host's
+    # startup snapshot). A blank page would happen here — silently — if the bundle were stale
+    # or its asset URLs absolute, which is why the pre-flight checks both.
     time.sleep(3)
     if proc.poll() is not None:
         print(f"FAIL: host exited early with status {proc.returncode}")
@@ -118,10 +127,13 @@ def main() -> int:
     # Conflating the two produced a false success once already. Exit statuses that matter:
     #   0    Cancel taken (main.rs:144 process::exit(0)) — a genuine round-trip proof
     #   101  Rust panic — GTK init failed, no display
-    #   -6   SIGABRT — the host DIED DURING RENDERING (GTK asserts when a themed-icon load
-    #        fails: gtkiconhelper.c:495 `assertion failed (error == NULL)`, reached via the
-    #        image-missing.png FALLBACK after some earlier lookup missed). Whether anything
-    #        rendered before the abort is UNKNOWN, so this can never support a render claim.
+    #   -6   SIGABRT — the host DIED DURING RENDERING. Two known causes, both measured:
+    #        (a) the GTK themed-icon assertion (gtkiconhelper.c:495) when glycin's bwrap
+    #            loader cannot create a userns — needs /etc/apparmor.d/delphi-shell LOADED;
+    #        (b) wry's IPC unwrap on a page URL that is not a valid http::Uri — only reachable
+    #            if something forced a file:// URL back into DELPHI_SHELL_URL.
+    #        Either way, whether anything rendered before the abort is UNKNOWN, so a -6 can
+    #        never support a rendering claim.
     time.sleep(0.5)
     rc = proc.poll()
     if rc == 0:
@@ -130,10 +142,12 @@ def main() -> int:
         verdict = 0
     elif rc == -6:
         print("RESULT: host ABORTED (SIGABRT) — it did NOT survive rendering.")
-        print("        Almost certainly the GTK icon-loader assertion. Whether the preview")
-        print("        ever drew is UNKNOWN: this run CANNOT support a rendering claim.")
-        print("        Re-run with GTK_DEBUG=icontheme to see which lookup missed:")
-        print("            GTK_DEBUG=icontheme python3 scratch/p3a-host-check.py")
+        print("        Whether the preview ever drew is UNKNOWN: this run CANNOT support a")
+        print("        rendering claim. Check, in order:")
+        print("          1. is the AppArmor profile LOADED?  bash installer/p3-preflight.sh")
+        print("          2. the host's own stderr for the panic/assertion text")
+        print("        NOT GTK_DEBUG=icontheme — Ubuntu's GTK3 is built without G_ENABLE_DEBUG")
+        print("        and ignores it (measured); it will not name the icon.")
         verdict = 1
     elif rc == 101:
         print("RESULT: host panicked (101) — GTK init failed; no usable display.")

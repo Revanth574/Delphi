@@ -941,8 +941,20 @@ git checkout -b phase-{N}/{task-name}
 
 # For tasks touching fortress/, services/ auth code, die/orchestrator/
 # ZKQP or permissions, or ssi/ capability execution — run security review:
-$prompt = "Focus on privilege escalation, auth bypass, and data leakage. Check that all cloud queries pass through ZKQP, no credentials are exposed outside the vault, and no Autonomous-tier code can trigger Biometric-tier actions."
-$prompt | codex review --base main -
+# NOTE (corrected 2026-07-26): `--base` and a PROMPT are MUTUALLY EXCLUSIVE in the
+# installed Codex CLI — `codex review --base main -` fails with
+#   error: the argument '--base <BRANCH>' cannot be used with '[PROMPT]'
+# The previous form documented here could never have run. Use ONE of:
+#
+#   codex review --commit <SHA> -   < prompt.md      # scope to one commit, with a prompt
+#   codex review --uncommitted -    < prompt.md      # scope to the working tree
+#   codex review --base main                         # scope to a base branch, NO prompt
+#
+# Prefer writing the prompt to a file (scratch/codex-*.md) and redirecting it: the round
+# prompts are long, are committed as part of the review ledger, and must be reproducible.
+# Verify the flag set against `codex review --help` before relying on any of these — this
+# note is itself a claim with a date on it.
+cat scratch/codex-<task>-prompt.md | codex review --commit <SHA> -
 
 # Then merge to main:
 git checkout main

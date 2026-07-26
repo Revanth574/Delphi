@@ -213,6 +213,7 @@ VT=$(unit_env DELPHI_SHELL_VT)
 AI_BIN=$(unit_env DELPHI_AI_BIN)
 AI_EXE=$(unit_env DELPHI_AI_EXE)
 AI_ARG=$(unit_env DELPHI_AI_ARG)
+AI_BIND_RW=$(unit_env DELPHI_AI_BIND_RW)
 
 if [ -n "$VT" ]; then
     ok "DELPHI_SHELL_VT=$VT"
@@ -279,10 +280,28 @@ else
         note "$mdir -> $perm"
         ok "marker directory exists (writability UNVERIFIED — re-run as $SESSION_USER to confirm)"
     fi
-    if [ -n "${AI_ARG##/tmp/*}" ] && [ -n "${AI_ARG##/home/*}" ]; then
-        note "NOTE: $AI_ARG is outside /tmp and /home — confirm it is inside DELPHI_AI_BIND_RW,"
-        note "or the sandbox will deny the write regardless of filesystem permissions."
+    # B2A-COMP-R2-01 (P2): VALIDATE THE MARKER AGAINST THE SANDBOX BIND, not against a
+    # hardcoded guess at which prefixes are writable. `delphi-minimal-ai` derives the action's
+    # writable bind from DELPHI_AI_BIND_RW (defaulting to /tmp), and the action runs inside
+    # bwrap with ONLY that bind writable. So a marker outside it is denied by the SANDBOX no
+    # matter what the filesystem permissions say — and the previous check, which only looked at
+    # filesystem writability plus a /tmp-or-/home hint, reported [6/7] green for exactly that
+    # misconfiguration. Drift (AI_ARG=/tmp/... with AI_BIND_RW=/var/tmp) then reads as
+    # all-preconditions-met while every action is denied inside the jail.
+    bind_rw="${AI_BIND_RW:-/tmp}"   # same default as delphi-minimal-ai
+    if [ -z "$AI_BIND_RW" ]; then
+        note "DELPHI_AI_BIND_RW unset in the unit — delphi-minimal-ai defaults it to /tmp"
     fi
+    case "$AI_ARG/" in
+        "$bind_rw"/*)
+            ok "marker is inside the sandbox's writable bind ($bind_rw)" ;;
+        *)
+            refuse "marker $AI_ARG is OUTSIDE the writable bind $bind_rw"
+            note "the action runs in bwrap with only DELPHI_AI_BIND_RW writable, so the write"
+            note "is denied by the SANDBOX regardless of filesystem permissions — and the run"
+            note "would look like a consent/gate failure rather than a config error."
+            note "fix: set DELPHI_AI_ARG inside $bind_rw, or widen DELPHI_AI_BIND_RW." ;;
+    esac
 fi
 
 # ── 7. The session user ───────────────────────────────────────────────────────────────

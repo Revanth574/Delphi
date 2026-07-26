@@ -35,6 +35,26 @@ run_preflight() {   # perturbation-code
     tmp="$(mktemp -d)"
     mkdir -p "$tmp/installer/staging/shell/assets" "$tmp/fakebin"
     ln -s "$REAL" "$tmp/installer/p3-preflight.sh"
+    # ── B2A-COMP-R1-03 (P1): sysctl STUB — makes [3b/7] host-INDEPENDENT ────────────────
+    # The pre-flight branches on `kernel.apparmor_restrict_unprivileged_userns`. Reading the
+    # HOST's value made this suite's verdict depend on the machine's configuration rather than
+    # on the property: on a kernel where it is 0 or absent, removing the profile cannot
+    # exercise the branch at all, so the AppArmor cases were red or green by host config.
+    # (docs/DEFECT_CLASSES.md class 20, inside the test suite itself — and the THIRD
+    # AppArmor+userns instance in this arc, the same sysctl each time.)
+    #
+    # WHY THIS STUB IS LEGITIMATE AND THE REMOVED aa-status ONE WAS NOT — the distinction
+    # matters, so a future reader does not delete this as a repeat of that mistake:
+    #   * the aa-status stub FAKED A CAPABILITY the real tool does not have for an
+    #     unprivileged caller (it returns a permission error), certifying a check that could
+    #     never work in production;
+    #   * this stub supplies a VALUE that the real tool genuinely returns — it controls the
+    #     INPUT to the logic under test, and both possible inputs get a case below.
+    printf '#!/bin/bash\ncat "$(dirname "$0")/sysctl-value" 2>/dev/null || echo 1\n' \
+        > "$tmp/fakebin/sysctl"
+    chmod 0755 "$tmp/fakebin/sysctl"
+    printf '1\n' > "$tmp/fakebin/sysctl-value"   # enforcing, unless a case overrides it
+
     # NO aa-status STUB — deliberately, and this absence is load-bearing.
     # An earlier version stubbed aa-status to report the profile loaded. The REAL tool answers
     # an unprivileged caller with "You do not have enough privilege to read the profile set",
@@ -180,9 +200,21 @@ expect_refusal "missing shell bundle" \
 # when loaded, and the FALSE REFUSAL it replaced was found there too). Simulating it would
 # need a stub more capable than the real mechanism — the exact mistake removed above.
 
+# Both branches of [3b/7], deterministically, regardless of the host's own sysctl.
 expect_refusal "AppArmor profile absent while userns is restricted" \
-    'rm -f /etc/apparmor.d/delphi-shell' \
+    'printf "1\n" > "$tmp/fakebin/sysctl-value"; rm -f /etc/apparmor.d/delphi-shell' \
     "ABSENT while the userns restriction is enforcing"
+
+# The OTHER branch: when the restriction is not enforcing, a missing profile is NOT a
+# precondition failure — the host can create a userns without one. Asserting this keeps the
+# check from being a blanket "profile must exist" that happens to look right on one machine.
+run_preflight 'printf "0\n" > "$tmp/fakebin/sysctl-value"; rm -f /etc/apparmor.d/delphi-shell'
+if [[ "$PF_LOG" == *"is not enforcing — profile not required here"* ]] \
+   && ! [[ "$PF_LOG" == *"ABSENT while the userns restriction is enforcing"* ]]; then
+    ok "userns restriction NOT enforcing — absent profile correctly not a failure"
+else
+    bad "not-enforcing branch not taken: $(echo "$PF_LOG" | grep -A1 "3b/7" | head -2)"
+fi
 
 # THE GAP THAT LET A STALE HOST RUN UNDER A FRESH BUNDLE. The bundle was hash-checked from
 # the start; the binary was not, so an install that refreshed the bundle but left an older
@@ -194,6 +226,15 @@ expect_refusal "stale host BINARY (installed differs from staged)" \
 expect_refusal "stale DAEMON binary" \
     'printf "%s\n" "#!/bin/bash" "# STALE" > /usr/libexec/delphi-runtimed; chmod 0755 /usr/libexec/delphi-runtimed' \
     "installed /usr/libexec/delphi-runtimed DIFFERS from staging"
+
+# B2A-COMP-R2-01 (P2): the marker must be inside the SANDBOX's writable bind, not merely on a
+# filesystem the user can write. delphi-minimal-ai derives the bind from DELPHI_AI_BIND_RW and
+# the action runs in bwrap with only that bind writable, so drift between the two reads as
+# all-preconditions-met while every action is denied INSIDE the jail — a sandbox
+# misconfiguration wearing a consent-failure costume.
+expect_refusal "marker outside DELPHI_AI_BIND_RW" \
+    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/var/tmp|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    "OUTSIDE the writable bind"
 
 expect_refusal "Brain address occupied" \
     'printf "stub\n" > /usr/libexec/delphi-ai' \

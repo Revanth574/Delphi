@@ -125,6 +125,25 @@ while IFS= read -r -d '' entry; do
     done
 
     if [ -d "$entry" ]; then
+        # B2A-COMP-R1-01 (P1): SUBDIRECTORIES MUST BE TRUST-CHECKED TOO.
+        # Before this, only the staging ROOT and the regular FILES were fstat_trust'ed;
+        # nested dirs got nothing but a name check. That left a real attack: a subdirectory
+        # (e.g. `assets/`) owned or group-writable by another local user means that user
+        # controls its CONTENTS, so they can race the `-L` symlink check below against the
+        # by-name `exec {tfd}<` open — swapping `assets/foo.js` for a symlink to a
+        # root-owned regular file. The symlink test passed while it was still a regular
+        # file; the open then FOLLOWS the link; `fstat_trust` sees a root-owned regular file
+        # on the followed fd and passes; and `copy_fd` installs that content world-readable
+        # under /usr/share/delphi/shell.
+        #
+        # Trust-checking every directory forecloses the race rather than narrowing it: if no
+        # unprivileged user can write any directory on the path, no unprivileged user can
+        # create or replace the entry being opened. (The documented bash-cannot-`openat`
+        # residual is unchanged — but it is only exploitable by someone who can write one of
+        # these directories, which this check now denies.)
+        exec {dfd}< "$entry" || refuse "cannot open directory $entry"
+        fstat_trust "$dfd" "$entry" dir
+        exec {dfd}<&-
         TREE_DIRS+=("$rel")
     elif [ -f "$entry" ]; then
         # Bind the inode NOW and fstat-trust it, exactly as the fixed-name files above.
@@ -195,9 +214,27 @@ copy_fd "${FD[delphi-runtime.pam]}"       /etc/pam.d/delphi-runtime             
 # A genuinely confining profile is a recorded follow-up increment, not this.
 install -d -m 0755 /etc/apparmor.d
 copy_fd "${FD[delphi-shell.apparmor]}"    /etc/apparmor.d/delphi-shell                     0644
-if command -v apparmor_parser >/dev/null 2>&1; then
-    apparmor_parser -r -W /etc/apparmor.d/delphi-shell || \
-        echo "WARNING: apparmor_parser could not load /etc/apparmor.d/delphi-shell — the shell will abort on its first themed-icon load until this is resolved."
+# B2A-COMP-R1-02 (P2): a profile that does not LOAD is a profile that does nothing.
+# This used to warn and exit 0, leaving the binary and the profile file installed while the
+# shell would still SIGABRT on its first themed-icon load — and the pre-flight only catches
+# that if the operator remembers to run it. The install must not report success for a system
+# it has left unable to render.
+if ! command -v apparmor_parser >/dev/null 2>&1; then
+    echo "FAILED: apparmor_parser not found, so /etc/apparmor.d/delphi-shell cannot be loaded."
+    echo "  Everything else IS installed. The shell will SIGABRT on its first themed-icon load"
+    echo "  (glycin's bwrap loader needs a user namespace, which an UNPROFILED process is denied"
+    echo "  under kernel.apparmor_restrict_unprivileged_userns=1)."
+    echo "  Install apparmor userspace, then: sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
+    exit 1
+fi
+if ! apparmor_parser -r -W /etc/apparmor.d/delphi-shell; then
+    echo "FAILED: apparmor_parser could not load /etc/apparmor.d/delphi-shell."
+    echo "  Everything else IS installed, but the shell will SIGABRT on its first themed-icon"
+    echo "  load until the profile is loaded. This exits non-zero deliberately: an install that"
+    echo "  reports success here would leave a system that cannot render, and the failure would"
+    echo "  surface much later as an unexplained abort."
+    echo "  Retry: sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
+    exit 1
 fi
 
 # ── The shell bundle TREE (P1) — mutate, via a two-rename replace ─────────────────────

@@ -335,15 +335,12 @@ fn bundle_without_index_refuses_to_start() {
 
 /// Locate a REAL vite-emitted bundle: the installed one, else the staged one.
 fn real_bundle_root() -> Option<PathBuf> {
-    for p in [
+    [
         PathBuf::from("/usr/share/delphi/shell"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../installer/staging/shell"),
-    ] {
-        if p.join("index.html").is_file() {
-            return Some(p);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|p| p.join("index.html").is_file())
 }
 
 /// **THE REAL BUNDLE, END TO END UNDER REAL WEBKIT.**

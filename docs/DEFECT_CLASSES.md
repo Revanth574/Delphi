@@ -876,6 +876,21 @@ any interactive probe that renders a credential-shaped field:**
   log, which contained only the prompt label, the banner text, and the byte count.
   Rotation was still the correct response.
 
+- **THE CLASS CAUGHT ITS OWN AUTHOR, one layer down (same session).** The first attempt at
+  fixing the instance above wrote a **sentinel-prefill guard** into the probe — JavaScript to
+  set the password field to a dummy value and reject anything else. **The probe structurally
+  cannot inject it:** only the HOST calls `evaluate_script`; the probe speaks the private
+  channel, and the one renderer-visible string it controls (the PAM prompt) is `serde_json`-
+  escaped precisely so content cannot become script. The guard would have sat in the file
+  **looking like an enforcement point while enforcing nothing** — the exact shape this class
+  describes, one level down: not a warning mistaken for a control, but a *control that cannot
+  run* mistaken for a control.
+  It was **removed rather than left in**, and replaced by something structural: the probe no
+  longer sends the PAM prompt at all by default, so the dialog's `disabled={submitted ||
+  !prompt}` makes the credential path **unreachable**. The generalisation: **when you write a
+  guard, verify it can actually execute in the position you put it** — an unreachable guard is
+  worse than none, because it stops anyone looking for a real one.
+
 **RED-proof shape.** Two parts, because the class has a design half and a hygiene half.
 (a) **Design:** inspect the probe for an enforcement point — a prefilled sentinel or a
 non-sentinel rejection. Prose in the banner does not satisfy it. (b) **Hygiene:** assert

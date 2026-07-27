@@ -55,24 +55,46 @@ run_preflight() {   # perturbation-code
     chmod 0755 "$tmp/fakebin/sysctl"
     printf '1\n' > "$tmp/fakebin/sysctl-value"   # enforcing, unless a case overrides it
 
-    # systemctl stub. The pre-flight now asks SYSTEMD for the unit environment instead of
-    # grepping the unit file (B2A-COMP-R4-04), so the harness must answer as systemd does.
-    # This is a VALUE-supplying stub of the same kind as the sysctl one: it reports what the
-    # real tool reports. It deliberately handles the QUOTED form, because that is exactly the
-    # syntax the old file-grep could not see.
-    cat > "$tmp/fakebin/systemctl" <<'SCTL'
+    # ── B2A-COMP-R5-02 (P1): THE STUB MUST NOT REPARSE THE UNIT ────────────────────────
+    # The round-3 stub grepped `Environment=` out of the unit file and answered ANY `show`
+    # call with it. R4-04's whole fix was "stop parsing the unit, ask systemd" — so that stub
+    # reintroduced the removed mirror INSIDE THE PROOF, and stayed green even if production
+    # queried the wrong unit or the wrong property. Class 22 one layer deeper: the fix's
+    # APPARATUS inherited the class the fix closed.
+    #
+    # This stub instead (1) VALIDATES the argv production must send, failing loudly otherwise,
+    # and (2) returns a fixture-controlled fixed string. It supplies a VALUE (like the sysctl
+    # stub) rather than reimplementing a parse.
+    #
+    # WHAT IT STILL CANNOT PROVE, stated rather than implied: that systemd's OWN resolution
+    # (EnvironmentFile=, drop-ins, later-wins) matches what the daemon receives. No stub can;
+    # that needs a running systemd. It is checked against the REAL system separately — see
+    # `real_systemd_contract` at the end of this file.
+    # `$UNIT_INST` and `$ENVFILE` are expanded NOW (fixture-creation time) so the stub holds
+    # concrete values; `$1`/`$*` are escaped so they stay the stub's own runtime arguments.
+    # INSIDE the user namespace `id -un` is `root` (uid 0 is what our uid maps to), and the
+    # pre-flight defaults SESSION_USER to `$(id -un)`. So the instance production will ask for
+    # is delphi-runtimed@root.service — NOT the outer username. Getting this wrong made every
+    # stub call exit 64 and return nothing, which read as "every variable unset".
+    local UNIT_INST="delphi-runtimed@root.service" ENVFILE="$tmp/fakebin/unit-env"
+    cat > "$tmp/fakebin/systemctl" <<SCTL
 #!/bin/bash
-case "$1 $2" in
-  "show "*)
-    u=/usr/lib/systemd/system/delphi-runtimed@.service
-    # Emit K=V pairs the way `systemctl show -p Environment --value` does, accepting both
-    # `Environment=K=V` and `Environment="K=V"` — systemd accepts both, so the stub must too.
-    sed -n 's/^Environment=//p' "$u" 2>/dev/null | tr -d '"' | tr '\n' ' '
-    echo ;;
-  *) exit 0 ;;
+if [ "\$1" != show ]; then exit 0; fi
+case " \$* " in
+  *" $UNIT_INST "*) : ;;
+  *) echo "STUB-ERROR: wrong unit instance: \$*" >&2; exit 64 ;;
 esac
+case " \$* " in
+  *" -p Environment "*) : ;;
+  *) echo "STUB-ERROR: wrong property: \$*" >&2; exit 65 ;;
+esac
+cat "$ENVFILE"
 SCTL
     chmod 0755 "$tmp/fakebin/systemctl"
+    # The fixture's declared environment, in the shape `systemctl show -p Environment --value`
+    # emits. Perturbations edit THIS, not a unit file.
+    printf 'DELPHI_SHELL_VT=tty3 DELPHI_AI_BIN=/usr/libexec/delphi-minimal-ai DELPHI_AI_EXE=/usr/bin/touch DELPHI_AI_ARG=/tmp/delphi-p3-marker DELPHI_AI_BIND_RW=/tmp\n' \
+        > "$tmp/fakebin/unit-env"
 
     # NO aa-status STUB — deliberately, and this absence is load-bearing.
     # An earlier version stubbed aa-status to report the profile loaded. The REAL tool answers
@@ -87,6 +109,7 @@ SCTL
         > "$tmp/installer/staging/shell/index.html"
     printf 'BUNDLE-A\n' > "$tmp/installer/staging/shell/assets/app-AAAA.js"
 
+    SESSION_USER_FOR_STUB="$(id -un)"; export SESSION_USER_FOR_STUB
     unshare -rm bash -c '
         set -u
         tmp="$1"; perturb="$2"
@@ -147,6 +170,30 @@ expect_refusal() {   # description  perturbation  expected-substring
     fi
 }
 
+# ── B2A-COMP-R5-03: the structural fix for the generic-assertion class ────────────────
+# FOUR tests in this sweep could not fail for the reason they named, and TWO of them (R3-01,
+# and the containment positives) shared one shape: a POSITIVE case asserting a generic success
+# string that the UNPERTURBED fixture already emits. Such a test passes whether or not its
+# perturbation applied.
+#
+# The rule this encodes: a positive assertion must name a value that the BASELINE does NOT
+# produce — and that must be CHECKED, not remembered. `assert_positive` runs the pristine
+# fixture first and fails if the baseline already satisfies the expected string. A control,
+# in the same sense as the WebKit suite's inline-script leg.
+assert_positive() {   # description  expected-substring (must NOT hold for the baseline)
+    local desc="$1" expect="$2" perturbed="$PF_LOG"
+    run_preflight "true"                       # baseline, no perturbation
+    if [[ "$PF_LOG" == *"$expect"* ]]; then
+        bad "$desc — NON-DISCRIMINATING: the unperturbed fixture already emits '$expect'"
+        return
+    fi
+    if [[ "$perturbed" == *"$expect"* ]]; then
+        ok "$desc"
+    else
+        bad "$desc — expected '$expect'; got: $(echo "$perturbed" | grep -E "^  (OK|REFUSE)" | tail -3)"
+    fi
+}
+
 # THE PASS CASE — and an honest limit on it.
 # [3b/7] probes the AppArmor label the KERNEL applies at execve. A mount namespace does not
 # virtualise AppArmor policy, and the profile attaches by PATH to a real ELF, so a stub
@@ -186,11 +233,11 @@ expect_refusal "seam-carrying binary" \
 
 # The gap that blocked P3: minimal-ai panics without DELPHI_AI_EXE.
 expect_refusal "missing DELPHI_AI_EXE" \
-    'sed -i "/DELPHI_AI_EXE/d" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    'sed -i "s/ *DELPHI_AI_EXE=[^ ]*//" "$tmp/fakebin/unit-env"' \
     "DELPHI_AI_EXE unset"
 
 expect_refusal "missing DELPHI_SHELL_VT" \
-    'sed -i "/DELPHI_SHELL_VT/d" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    'sed -i "s/ *DELPHI_SHELL_VT=[^ ]*//" "$tmp/fakebin/unit-env"' \
     "DELPHI_SHELL_VT unset"
 
 # THE SILENT-WRONG-ANSWER CASE: a stale marker makes a FAILED run read as a success.
@@ -201,7 +248,7 @@ expect_refusal "pre-existing marker" \
 # A missing DELPHI_AI_ARG must not leave the marker sections silently unchecked — a section
 # that prints nothing reads as a section that passed.
 expect_refusal "missing DELPHI_AI_ARG does not silently skip the marker checks" \
-    'sed -i "/DELPHI_AI_ARG/d" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    'sed -i "s/ *DELPHI_AI_ARG=[^ ]*//" "$tmp/fakebin/unit-env"' \
     "marker writability UNCHECKED"
 
 expect_refusal "absolute asset URLs in the installed index.html (vite base regression)" \
@@ -252,7 +299,7 @@ expect_refusal "stale DAEMON binary" \
 # all-preconditions-met while every action is denied INSIDE the jail — a sandbox
 # misconfiguration wearing a consent-failure costume.
 expect_refusal "marker outside DELPHI_AI_BIND_RW" \
-    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-elsewhere|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-elsewhere|" "$tmp/fakebin/unit-env"' \
     "OUTSIDE the writable bind"
 
 # ── Containment cases. EVERY PATH THESE NEED IS CONSTRUCTED BY THE FIXTURE ────────────
@@ -267,8 +314,8 @@ expect_refusal "marker outside DELPHI_AI_BIND_RW" \
 # create, so the earlier directory-exists check passes and the gate is what decides.
 expect_refusal "marker escaping the bind via .. (both dirs constructed)" \
     'mkdir -p /tmp/pf-bind /tmp/pf-outside;
-     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-bind|" /usr/lib/systemd/system/delphi-runtimed@.service;
-     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-bind/../pf-outside/m|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-bind|" "$tmp/fakebin/unit-env";
+     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-bind/../pf-outside/m|" "$tmp/fakebin/unit-env"' \
     "OUTSIDE the writable bind"
 
 # B2A-COMP-R4-01 (P1-class, round 3): the bind must be compared LITERALLY. `sandbox.rs` emits
@@ -277,50 +324,47 @@ expect_refusal "marker escaping the bind via .. (both dirs constructed)" \
 # the symlink's TARGET, which the sandbox would deny. Class 22 firing on the class-22 fix.
 expect_refusal "marker under the bind symlink's TARGET, not the bind itself" \
     'mkdir -p /tmp/pf-target; ln -sfn /tmp/pf-target /tmp/pf-link;
-     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-link|" /usr/lib/systemd/system/delphi-runtimed@.service;
-     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-target/m|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-link|" "$tmp/fakebin/unit-env";
+     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-target/m|" "$tmp/fakebin/unit-env"' \
     "OUTSIDE the writable bind"
 
 # The positive half of the same rule: a marker UNDER the literal bind path must be ACCEPTED,
 # even though that path is a symlink. Without this, "refuse everything symlinked" would pass
 # the case above while being wrong.
 run_preflight 'mkdir -p /tmp/pf-target; ln -sfn /tmp/pf-target /tmp/pf-link;
-     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-link|" /usr/lib/systemd/system/delphi-runtimed@.service;
-     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-link/m|" /usr/lib/systemd/system/delphi-runtimed@.service'
-if [[ "$PF_LOG" == *"resolves inside the sandbox's writable bind"* ]]; then
-    ok "marker under the LITERAL bind path is accepted (bind used verbatim, as sandbox.rs does)"
-else
-    bad "marker under the literal bind was refused: $(echo "$PF_LOG" | grep "^  REFUSE" | head -2)"
-fi
+     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-link|" "$tmp/fakebin/unit-env";
+     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-link/m|" "$tmp/fakebin/unit-env"'
+# B2A-COMP-R5-03 (P1): assert the SPECIFIC bind that was accepted, not the generic success
+# message — the pristine /tmp fixture already emits that message, so a positive case asserting
+# only the generic string passes even if its perturbation stopped applying. That is the FOURTH
+# non-biting test of this sweep and the SECOND of exactly this shape (R3-01 was the first).
+# `assert_positive` below makes the discriminating comparison structural rather than remembered.
+assert_positive "marker under the LITERAL bind path is accepted (bind verbatim, as sandbox.rs)" \
+    "resolves inside the sandbox's writable bind (/tmp/pf-link)"
 
 # B2A-COMP-R4-02 (P2, round 3): `bind_rw=/` built the glob `//*`, matching nothing, so the
 # pre-flight REFUSED a configuration delphi-minimal-ai accepts. Root contains everything.
-run_preflight 'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/|" /usr/lib/systemd/system/delphi-runtimed@.service'
-if [[ "$PF_LOG" == *"resolves inside the sandbox's writable bind"* ]] \
-   && ! [[ "$PF_LOG" == *"OUTSIDE the writable bind"* ]]; then
-    ok "bind_rw=/ contains every absolute marker (not refused)"
-else
-    bad "bind_rw=/ wrongly refused: $(echo "$PF_LOG" | grep "^  REFUSE" | head -2)"
-fi
+run_preflight 'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/|" "$tmp/fakebin/unit-env"'
+assert_positive "bind_rw=/ contains every absolute marker (not refused)" \
+    "resolves inside the sandbox's writable bind (/)"
 
-# B2A-COMP-R4-04 (round 3): the round-2 unit parse was itself a MIRROR of systemd's syntax and
-# diverged from it. MEASURED: `Environment="DELPHI_AI_BIND_RW=/tmp/pf-elsewhere"` produced ZERO matches
-# for `grep -E "^Environment=KEY="`, so the pre-flight read it as ABSENT, defaulted to /tmp,
-# and would have passed a config whose real bind is /tmp/pf-elsewhere — a false green, and R3-03's own
-# class recurring inside R3-03's fix. The pre-flight now asks systemd.
-expect_refusal "QUOTED Environment= assignment is seen (not read as absent)" \
-    'sed -i "s|Environment=DELPHI_AI_BIND_RW=/tmp|Environment=\"DELPHI_AI_BIND_RW=/tmp/pf-elsewhere\"|" /usr/lib/systemd/system/delphi-runtimed@.service' \
-    "OUTSIDE the writable bind"
+# B2A-COMP-R5-01 (round 4): `for kv in $_UNIT_ENV` word-splits, so a bind containing
+# whitespace was truncated (`/tmp/pf elsewhere` -> `/tmp/pf`) and a marker under the truncated
+# prefix looked contained. systemd QUOTES such values, so the raw output carries a quote —
+# the pre-flight now REFUSES rather than splitting it wrong.
+expect_refusal "unit environment with a QUOTED (whitespace-bearing) value is refused" \
+    'printf %s "DELPHI_SHELL_VT=tty3 DELPHI_AI_BIN=/usr/libexec/delphi-minimal-ai DELPHI_AI_EXE=/usr/bin/touch DELPHI_AI_ARG=/tmp/pf/m \"DELPHI_AI_BIND_RW=/tmp/pf elsewhere\"" > "$tmp/fakebin/unit-env"' \
+    "cannot split it faithfully"
 
 # B2A-COMP-R3-03 (P2): the runtime defaults ONLY on absence (env::var -> Ok("") when declared
 # empty), so a declared-but-empty value must NOT be validated as /tmp.
 expect_refusal "DELPHI_AI_BIND_RW declared but EMPTY" \
-    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=|" "$tmp/fakebin/unit-env"' \
     "declared but EMPTY"
 
 # The absent case must still take the runtime's /tmp default and PASS — otherwise the fix
 # above would just be a blanket "must be declared", which is a different rule than the runtime's.
-run_preflight 'sed -i "/DELPHI_AI_BIND_RW/d" /usr/lib/systemd/system/delphi-runtimed@.service'
+run_preflight 'sed -i "s/ *DELPHI_AI_BIND_RW=[^ ]*//" "$tmp/fakebin/unit-env"'
 if [[ "$PF_LOG" == *"not declared — delphi-minimal-ai defaults it to /tmp"* ]] \
    && ! [[ "$PF_LOG" == *"declared but EMPTY"* ]]; then
     ok "DELPHI_AI_BIND_RW ABSENT correctly takes the runtime /tmp default"

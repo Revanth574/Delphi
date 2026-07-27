@@ -256,6 +256,16 @@ else
     _UNIT_ENV_OK=no
 fi
 
+# B2A-COMP-R5-01: `for kv in $_UNIT_ENV` WORD-SPLITS, so
+# `Environment="DELPHI_AI_BIND_RW=/tmp/pf elsewhere"` was read as `/tmp/pf` and the marker
+# then looked contained when it is not. That is the THIRD distinct way this one check has
+# been wrong (lexical prefix -> symlink -> whitespace), so the fix is not a smarter split:
+# a value we cannot split faithfully is REFUSED, per the same rule already applied to a
+# missing systemctl. Approximating here is precisely the false green being removed.
+_unit_env_splittable() {   # 0 if every pair is whitespace-free (systemd quotes otherwise)
+    case "$_UNIT_ENV" in *\"*) return 1 ;; esac
+    return 0
+}
 unit_env() {   # key -> value on stdout, empty if unset
     local k="$1" kv
     for kv in $_UNIT_ENV; do
@@ -272,6 +282,13 @@ unit_env_present() {   # key -> 0 if systemd reports it at all (even empty)
     return 1
 }
 
+if [ "$_UNIT_ENV_OK" = yes ] && ! _unit_env_splittable; then
+    refuse "the unit environment contains a QUOTED value — this check cannot split it faithfully"
+    note "systemd quotes any value containing whitespace, and splitting on whitespace would"
+    note "silently truncate it (e.g. a bind of '/tmp/pf elsewhere' read as '/tmp/pf'), making"
+    note "a marker look contained when it is not. Refusing rather than approximating."
+    note "raw: $_UNIT_ENV"
+fi
 if [ "$_UNIT_ENV_OK" != yes ]; then
     refuse "systemctl unavailable — cannot read the unit environment the way systemd resolves it"
     note "the pre-flight will NOT fall back to grepping the unit file: that parse diverges from"

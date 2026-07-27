@@ -938,6 +938,22 @@ later.
   weaken and **verifying the weaken had applied**; fixed by asserting `/usr/libexec`
   is untouched.
 
+- **THE APPARATUS INHERITS IT TOO — B2A-COMP-R4-04 → R5-02 (round 4).** R4-04 removed a
+  mirror by delegation: stop grepping the unit file, ask `systemctl show`. **Its test stub
+  then grepped the unit file** and answered any `show` call with the result — the removed
+  mirror reinstated *inside the proof*, and green even if production queried the wrong unit
+  or the wrong property. **Weaken (b) applies to the TEST APPARATUS, not only to the fix.**
+  Ask of every stub: *does this stand in for the thing, or does it reimplement the thing the
+  fix just stopped reimplementing?*
+- **The positive-assertion shape (round 4, R5-03).** Two of this sweep's four non-biting tests
+  shared one form: a POSITIVE case asserting a generic success string **that the unperturbed
+  fixture already emits**, so it passed whether or not its perturbation applied. The
+  structural remedy is not vigilance: a positive assertion must name a value the BASELINE does
+  not produce, and that must be **checked mechanically** — run the pristine fixture first and
+  fail if it already satisfies the expectation (`assert_positive` in
+  `installer/tests/p3-preflight.test.sh`). A control leg, in the same sense the WebKit suite
+  uses one.
+
 **RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
 the test must fail; and (b) **the class re-application** — construct the input that
 exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix

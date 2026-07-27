@@ -954,6 +954,17 @@ later.
   `installer/tests/p3-preflight.test.sh`). A control leg, in the same sense the WebKit suite
   uses one.
 
+- **The SAMPLER that measures its own race (round 5).** The regression test for the
+  restore-before-clear invariant sampled with **two separate `[ -e ]` stats**. An atomic
+  `rename(2)` landing between them shows *both* paths absent when one existed at every
+  instant — so the test reported a violation that never happened. It passed 3× then failed on
+  unchanged good code: **intermittent, and therefore worthless** (Iron Law #15 cl. 2 — it
+  cannot distinguish a violated property from an unlucky run). Fixed with a single `readdir`
+  per sample, then proven **10/10 deterministic** and still biting (3/3 under the weaken).
+  The lesson generalises past sampling: **a measurement composed of several observations is
+  not a measurement of a single instant.** When the property is "at every instant X", the
+  sample must be atomic or the harness will invent violations.
+
 **RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
 the test must fail; and (b) **the class re-application** — construct the input that
 exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix

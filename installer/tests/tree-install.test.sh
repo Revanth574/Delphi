@@ -274,9 +274,11 @@ leftover_case "leftover shell.new (died before the swap)" \
 leftover_case "leftover shell.old WITH shell (died before cleanup)" \
     'mkdir -p /usr/share/delphi/shell /usr/share/delphi/shell.old && echo old > /usr/share/delphi/shell.old/j' \
     "clearing leftover"
+# The wording changed with the behaviour (B2A-COMP-R6-01): this state is now RECOVERED by
+# restoring shell.old -> shell BEFORE anything is cleared, not warned about and then deleted.
 leftover_case "leftover shell.old WITHOUT shell (died BETWEEN the renames)" \
     'mkdir -p /usr/share/delphi/shell.old && echo old > /usr/share/delphi/shell.old/j' \
-    "WARNING"
+    "RECOVERING"
 
 # B2A-COMP-R1-02 (P2): AN APPARMOR PROFILE THAT DOES NOT LOAD IS A PROFILE THAT DOES NOTHING.
 # The install used to WARN and exit 0 when `apparmor_parser -r -W` failed, leaving the binary
@@ -333,6 +335,57 @@ if [ "$rc" -ne 0 ] && [[ "$log" == *"apparmor_parser not found"* ]] \
     ok "apparmor_parser ABSENT refused in PRE-FLIGHT (nothing installed at all)"
 else
     bad "apparmor_parser absent but the install reported success (rc=$rc). log: ${log:0:200}"
+fi
+rm -rf "$tmp"
+
+# ── B2A-COMP-R6-01: THE INVARIANT, ASSERTED BY SAMPLING ───────────────────────────────
+# The property is NOT "the rename sequence works" — it is "at every instant there is at least
+# one of shell or shell.old; it is never the case that both are absent". Testing a specific
+# crash point tests one point; SAMPLING the directory throughout the install tests the
+# invariant itself, and catches any ordering that opens a both-absent window.
+#
+# The pre-fix code opened exactly such a window: from the died-between-renames state
+# (shell.old present, shell absent) it did `rm -rf shell.old` FIRST, so nothing good existed
+# until the new tree was built and moved — and a failure in between left neither.
+tmp="$(make_sandbox)"
+stage_valid_tree "$tmp/installer/staging"
+unshare -rm bash -c '
+    set -u; tmp="$1"
+    for d in /usr/share /usr/libexec /usr/lib/systemd/system /etc/pam.d /etc/apparmor.d /usr/sbin; do
+        mkdir -p "$d"; mount -t tmpfs none "$d" || exit 97; done
+    export PATH="$tmp/fakebin:$PATH"
+    # Reproduce the crash state: shell.old is the ONLY good bundle.
+    mkdir -p /usr/share/delphi/shell.old/assets
+    printf "PREVIOUS\n" > /usr/share/delphi/shell.old/index.html
+    # Sample the directory continuously while the install runs.
+    # Record 0 FIRST, then overwrite with 1 the instant a both-absent state is seen. Writing
+    # only at the end meant being killed before writing, which read as "unknown" — a sampler
+    # that cannot report is a test that cannot fail.
+    # ONE directory read per sample, not two stats. Two separate `[ -e ]` tests straddle the
+    # atomic rename(2): the first can observe `shell` absent, the rename then lands, and the
+    # second observes `shell.old` absent — reporting a both-absent state that never existed.
+    # That made this test INTERMITTENT (passed 3x, then failed on unchanged good code), which
+    # is worthless as evidence per Iron Law #15 cl.2 — it cannot distinguish a violated
+    # property from an unlucky run. A single readdir is a consistent snapshot.
+    ( echo 0 > "$tmp/both-absent"
+      while :; do
+          if ! ls -1 /usr/share/delphi 2>/dev/null | grep -qxE "shell|shell\.old"; then
+              echo 1 > "$tmp/both-absent"; break
+          fi
+      done ) &
+    sampler=$!
+    bash "$tmp/installer/install.sh" > "$tmp/out.log" 2>&1; rc=$?
+    kill $sampler 2>/dev/null; wait $sampler 2>/dev/null
+    echo "$rc" > "$tmp/rc"
+    ( cd /usr/share/delphi && find . -maxdepth 1 -printf "%p\n" | sort ) > "$tmp/final.txt"
+' _ "$tmp"
+both="$(cat "$tmp/both-absent" 2>/dev/null || echo unknown)"
+final="$(cat "$tmp/final.txt" 2>/dev/null)"
+log="$(cat "$tmp/out.log" 2>/dev/null)"
+if [ "$both" = 0 ] && [[ "$log" == *"RECOVERING"* ]] && [[ "$final" == *"./shell"* ]]; then
+    ok "crash-between-renames: a good bundle exists at EVERY instant (restore before clear)"
+else
+    bad "both-absent window observed (=$both) or no restore. log: $(echo "$log" | grep -E 'RECOVER|NOTE' | head -2)"
 fi
 rm -rf "$tmp"
 

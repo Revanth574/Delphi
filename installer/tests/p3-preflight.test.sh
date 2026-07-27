@@ -88,7 +88,17 @@ case " \$* " in
   *" -p Environment "*) : ;;
   *) echo "STUB-ERROR: wrong property: \$*" >&2; exit 65 ;;
 esac
-cat "$ENVFILE"
+# B2A-COMP-R6-03: MODEL THE REAL COMMAND'S OUTPUT CONTRACT, not just its argv.
+# The previous stub accepted `-p Environment` with or without `--value` and returned raw
+# K=V either way. The REAL command PREFIXES its output with `Environment=` unless `--value`
+# is given — so if production ever dropped `--value`, the pre-flight would parse
+# `Environment=DELPHI_SHELL_VT=tty3` as the first pair and read EVERY variable as unset,
+# while this suite stayed green. Emitting what the real command emits for the form actually
+# received makes that regression fail here instead of in production.
+case " \$* " in
+  *" --value "*) cat "$ENVFILE" ;;
+  *) printf 'Environment=%s' "\$(cat "$ENVFILE")" ;;
+esac
 SCTL
     chmod 0755 "$tmp/fakebin/systemctl"
     # The fixture's declared environment, in the shape `systemctl show -p Environment --value`
@@ -371,6 +381,19 @@ if [[ "$PF_LOG" == *"not declared — delphi-minimal-ai defaults it to /tmp"* ]]
 else
     bad "absent-vs-empty not distinguished: $(echo "$PF_LOG" | grep -A2 "6/7" | head -3)"
 fi
+
+# B2A-COMP-R6-02 (P2): the daemon resolves DELPHI_SHELL_BIN/DELPHI_AI_BIN from the unit
+# (`bin_path(env, default)`), so hard-coding /usr/libexec/... meant that on a deployment using
+# those SUPPORTED overrides the freshness, seam-free and exec-label checks all certified
+# binaries the daemon never launches. Fourth mirror divergence of the sweep.
+# Here: point DELPHI_SHELL_BIN at an alternate path holding a STALE binary. The check must
+# follow the override — the default path is left byte-correct on purpose, so a pre-flight that
+# still looks there passes and one that follows the override refuses.
+expect_refusal "DELPHI_SHELL_BIN override is followed (stale binary at the OVERRIDDEN path)" \
+    'cp /usr/libexec/delphi-shell /usr/libexec/alt-shell;
+     printf "%s\n" "#!/bin/bash" "# STALE-ALT" > /usr/libexec/alt-shell; chmod 0755 /usr/libexec/alt-shell;
+     sed -i "s|DELPHI_AI_BIN=|DELPHI_SHELL_BIN=/usr/libexec/alt-shell DELPHI_AI_BIN=|" "$tmp/fakebin/unit-env"' \
+    "DIFFERS from staging"
 
 expect_refusal "Brain address occupied" \
     'printf "stub\n" > /usr/libexec/delphi-ai' \

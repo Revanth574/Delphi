@@ -295,14 +295,27 @@ if [ -e "$NEW" ]; then
     echo "NOTE: clearing leftover $NEW (a previous run died before the swap)."
     rm -rf "$NEW"
 fi
+# B2A-COMP-R6-01: RESTORE BEFORE CLEARING — never delete the only good copy.
+# The previous version printed a WARNING for the died-between-renames state and then
+# `rm -rf "$OLD"` regardless. In that state `shell.old` IS the only good bundle, so clearing
+# it first meant any later failure in this run left NEITHER a live bundle NOR a previous one:
+# the self-heal destroying the state it heals from. (Same family as the .smoke-bak window,
+# and the same fix shape: restore first, clear only what is genuinely superseded.)
+#
+# THE INVARIANT this establishes, and which the regression test asserts by SAMPLING rather
+# than by trusting the sequence: at every instant there is at least one of `shell` or
+# `shell.old`. It is never the case that both are absent.
 if [ -e "$OLD" ]; then
     if [ -e "$CUR" ]; then
         echo "NOTE: clearing leftover $OLD (a previous run died after the swap, before cleanup)."
+        rm -rf "$OLD"      # genuinely superseded — $CUR is live
     else
-        echo "WARNING: found $OLD with NO $CUR — a previous run died BETWEEN the two renames,"
-        echo "         leaving the shell bundle UNINSTALLED. Recovering by installing fresh."
+        echo "RECOVERING: found $OLD with NO $CUR — a previous run died BETWEEN the two"
+        echo "            renames. $OLD is the ONLY good bundle, so it is RESTORED to $CUR"
+        echo "            before anything else. If this run then fails, the system still has"
+        echo "            a working bundle instead of none."
+        mv "$OLD" "$CUR"
     fi
-    rm -rf "$OLD"
 fi
 
 # Build the new tree from the BOUND fds (never re-resolving the staged paths).

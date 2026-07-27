@@ -901,6 +901,51 @@ incident; a probe that fails (b) has already had one.
 
 ---
 
+## 22. The FIX inherits the class it was closing  *(new — B2a composition, round 2)*
+
+**Description.** A finding is fixed, the fix is RED-proven, and the fix **exhibits the
+same defect class one degree weaker**. The remediation is not wrong in direction —
+it genuinely removes the reported instance — but it reintroduces the underlying
+shape at a level the new test does not reach. Because a review round tends to close
+a finding once its named instance is gone, this survives precisely when everyone is
+paying attention.
+
+> **A fix is not exempt from the class it fixes. Re-apply the finding's own
+> question to the remedy before declaring it closed.**
+
+**Foreclosing primitive.** **NONE — discipline.** When a fix lands, ask the finding's
+question of the fix itself: *if this is a false-green class, can the new gate produce
+a false green? If this is a non-biting-test class, can the new test fail to bite?*
+Where the answer is "only in a weaker form", that weaker form is a finding now, not
+later.
+
+**Instances (grounded):**
+- **B2A-COMP-R2-01 → B2A-COMP-R3-02 (this arc).** Round 1's R2-01 added a gate because
+  a sandbox misconfiguration read as *all-preconditions-met* — a **false green**. The
+  gate compared paths **lexically** (`case "$AI_ARG/" in "$bind_rw"/*`), so
+  `/tmp/../var/tmp/marker` against `bind_rw=/tmp` has the right prefix, resolves
+  **outside** the bind, and passes — **a false green replaced by a weaker false
+  green.** Fixed by canonicalising with `realpath -m` before comparing.
+- **FD-01's re-aim (earlier in B2a).** The first version of the regression test passed
+  under its own weaken; the re-aimed test bit. The *fix for a non-biting test* was
+  itself non-discriminating until run — the same shape at the test layer, and the
+  reason "verify the fix's fix" is a rule rather than an instinct.
+- **B2A-COMP-R1-01's own test (this round).** The R3-01 fix hoisted the apparmor
+  preconditions into pre-flight; its regression test asserted only that the **bundle
+  tree** was absent — but the tree install runs after the apparmor block either way,
+  so the test passed with the fix reverted. It could not distinguish *refused before
+  any mutation* from *refused after the binaries were copied*. Caught by running the
+  weaken and **verifying the weaken had applied**; fixed by asserting `/usr/libexec`
+  is untouched.
+
+**RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
+the test must fail; and (b) **the class re-application** — construct the input that
+exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix
+that resolves elsewhere) and assert it is caught. A fix with only (a) is proven to
+address its instance, not its class.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -926,3 +971,4 @@ incident; a probe that fails (b) has already had one.
 | 19. Runs compared under different instruments | discipline (pin + record the instrument; re-run the baseline under the new one before believing a delta) | Discipline |
 | 20. Correct test, non-representative environment | discipline (name the mechanism the property needs; prove it against the real component) | Discipline |
 | 21. Warning banner as enforcement | discipline (sentinel prefill or non-sentinel rejection; never persist the value; state the residual up front) | Discipline |
+| 22. The fix inherits the class it closed | discipline (re-apply the finding's own question to the remedy; two weakens, not one) | Discipline |

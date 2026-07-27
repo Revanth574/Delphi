@@ -166,6 +166,28 @@ if [ ! -f "$SHELL_SRC/index.html" ]; then
     refuse "$SHELL_SRC/index.html is missing — the host loads it by name (shell-host/src/main.rs:200)"
 fi
 
+# ── B2A-COMP-R3-01 (P2): APPARMOR PRECONDITIONS BELONG IN PRE-FLIGHT ──────────────────
+# The round-1 fix put both apparmor checks AFTER the binaries/unit/PAM were already copied, so
+# a failure left a mixed old/new install while claiming "everything else IS installed" — false
+# at that point. `command -v` and "does this profile even parse" are PURE PRECONDITIONS: they
+# depend on nothing this script has done, so per B2A-C-R1-04 they belong before the first
+# mutation, where `refuse`'s "no system change made" is TRUE.
+#
+# What CANNOT be hoisted is the actual `-r` load: it mutates kernel policy, so it is a
+# mutation by definition and has to happen in the mutate phase. Validating with `-QK`
+# (skip-kernel-load, skip-cache) here reduces the post-mutation failure to a genuine
+# kernel-load refusal rather than the far more likely "missing tool" or "malformed profile".
+if ! command -v apparmor_parser >/dev/null 2>&1; then
+    refuse "apparmor_parser not found — the shell host needs its AppArmor profile LOADED or it
+  SIGABRTs on the first themed-icon load (glycin's bwrap loader needs a user namespace, which
+  an UNPROFILED process is denied under kernel.apparmor_restrict_unprivileged_userns=1).
+  Install the apparmor userspace tools and re-run."
+fi
+if ! apparmor_parser -QK "$STAGE/delphi-shell.apparmor" >/dev/null 2>&1; then
+    refuse "the staged AppArmor profile does not parse:
+$(apparmor_parser -QK "$STAGE/delphi-shell.apparmor" 2>&1 | head -3)"
+fi
+
 # The Brain's address MUST stay empty — checked BEFORE any mutation (fail-closed, B2A-C-R1-04).
 if [ -e /usr/libexec/delphi-ai ]; then
     echo "REFUSING (no system change made): /usr/libexec/delphi-ai exists but must stay EMPTY"
@@ -178,6 +200,19 @@ fi
 # MUTATE — copy from the BOUND fds (not the paths), then set owner/mode explicitly. Only
 # reached when every pre-flight check above passed.
 # ══════════════════════════════════════════════════════════════════════════════════════
+# B2A-COMP-R3-01 (P2): once mutation has begun, `refuse` is a LIE — it prints "no system
+# change made". Anything failing from here on must say what state the system is actually in.
+# This is not only about the apparmor block: `copy_fd` below has called `refuse` since the
+# original single-file installer, so the false message PREDATES this round's change.
+fail_after_mutation() {   # what  consequence  remedy
+    echo "FAILED MID-INSTALL: $1"
+    echo "  THE SYSTEM IS IN A PARTIAL STATE — this is not a clean 'no change made' failure."
+    echo "  Consequence: $2"
+    echo "  Remedy:      $3"
+    echo "  Then re-run: sudo bash installer/install.sh   (it is idempotent)"
+    exit 1
+}
+
 copy_fd() {   # fd dest mode
     local fd="$1" dest="$2" mode="$3"
     # `install` from the BOUND fd (`/proc/self/fd/$fd`) — reads the same inode the fstat check
@@ -185,7 +220,10 @@ copy_fd() {   # fd dest mode
     # swap), and sets owner+mode ATOMICALLY (no `cat >` umask window where the dest is briefly
     # world-readable-but-wrong-mode). The DEST dir is root-owned (see the `install -d` below),
     # so no attacker can pre-plant a symlink at `$dest` for `install` to follow.
-    install -o root -g root -m "$mode" "/proc/self/fd/$fd" "$dest" || refuse "failed installing $dest"
+    install -o root -g root -m "$mode" "/proc/self/fd/$fd" "$dest" || \
+        fail_after_mutation "failed installing $dest" \
+            "some artifacts are updated and others are not — versions may be mixed" \
+            "fix the cause (disk space, permissions, read-only mount)"
 }
 
 install -d -m 0755 /usr/libexec
@@ -214,27 +252,14 @@ copy_fd "${FD[delphi-runtime.pam]}"       /etc/pam.d/delphi-runtime             
 # A genuinely confining profile is a recorded follow-up increment, not this.
 install -d -m 0755 /etc/apparmor.d
 copy_fd "${FD[delphi-shell.apparmor]}"    /etc/apparmor.d/delphi-shell                     0644
-# B2A-COMP-R1-02 (P2): a profile that does not LOAD is a profile that does nothing.
-# This used to warn and exit 0, leaving the binary and the profile file installed while the
-# shell would still SIGABRT on its first themed-icon load — and the pre-flight only catches
-# that if the operator remembers to run it. The install must not report success for a system
-# it has left unable to render.
-if ! command -v apparmor_parser >/dev/null 2>&1; then
-    echo "FAILED: apparmor_parser not found, so /etc/apparmor.d/delphi-shell cannot be loaded."
-    echo "  Everything else IS installed. The shell will SIGABRT on its first themed-icon load"
-    echo "  (glycin's bwrap loader needs a user namespace, which an UNPROFILED process is denied"
-    echo "  under kernel.apparmor_restrict_unprivileged_userns=1)."
-    echo "  Install apparmor userspace, then: sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
-    exit 1
-fi
+# B2A-COMP-R1-02 (P2): a profile that does not LOAD is a profile that does nothing — the
+# install must not report success for a system it has left unable to render.
+# B2A-COMP-R3-01 (P2): the PRECONDITIONS for this (tool present, profile parses) moved to
+# pre-flight, so what remains here is only the kernel load, which is genuinely a mutation.
 if ! apparmor_parser -r -W /etc/apparmor.d/delphi-shell; then
-    echo "FAILED: apparmor_parser could not load /etc/apparmor.d/delphi-shell."
-    echo "  Everything else IS installed, but the shell will SIGABRT on its first themed-icon"
-    echo "  load until the profile is loaded. This exits non-zero deliberately: an install that"
-    echo "  reports success here would leave a system that cannot render, and the failure would"
-    echo "  surface much later as an unexplained abort."
-    echo "  Retry: sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
-    exit 1
+    fail_after_mutation "the kernel refused to load /etc/apparmor.d/delphi-shell" \
+        "the shell will SIGABRT on its first themed-icon load until the profile loads" \
+        "sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
 fi
 
 # ── The shell bundle TREE (P1) — mutate, via a two-rename replace ─────────────────────

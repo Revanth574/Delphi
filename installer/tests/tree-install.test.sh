@@ -87,6 +87,7 @@ run_installer() {
         bash "$tmp/installer/install.sh" > "$tmp/out.log" 2>&1
         rc=$?
         # The tmpfs vanishes with the namespace, so export what the assertions need.
+        ls -1 /usr/libexec 2>/dev/null > "$tmp/libexec.txt" || true
         if [ -d /usr/share/delphi ]; then
             ( cd /usr/share/delphi && find . -printf "%y %p\n" | sort ) > "$tmp/tree.txt"
             for f in /usr/share/delphi/shell/assets/*; do
@@ -285,26 +286,51 @@ leftover_case "leftover shell.old WITHOUT shell (died BETWEEN the renames)" \
 # silent-failure family as the blank window.
 tmp="$(make_sandbox)"
 stage_valid_tree "$tmp/installer/staging"
-# The stub now FAILS, standing in for a malformed profile or a kernel that refuses it.
-printf '#!/bin/bash\necho "apparmor_parser: refusing" >&2\nexit 1\n' > "$tmp/fakebin/apparmor_parser"
+# The stub PARSES fine (-QK succeeds) but the KERNEL LOAD (-r) refuses. That split matters:
+# after B2A-COMP-R3-01 the parse check is a pre-flight precondition, so a stub that failed
+# EVERYTHING would trip that instead and this case would silently stop testing the load path.
+cat > "$tmp/fakebin/apparmor_parser" <<'AAP'
+#!/bin/bash
+for a in "$@"; do
+  case "$a" in
+    -r|--replace) echo "apparmor_parser: kernel refused the profile" >&2; exit 1 ;;
+  esac
+done
+exit 0
+AAP
 chmod 0755 "$tmp/fakebin/apparmor_parser"
 run_installer "$tmp" >/dev/null 2>&1; rc=$?
 log="$(cat "$tmp/out.log" 2>/dev/null)"
-if [ "$rc" -ne 0 ] && [[ "$log" == *"could not load /etc/apparmor.d/delphi-shell"* ]]; then
-    ok "apparmor_parser failure FAILS the install (non-zero, and says why)"
+# B2A-COMP-R3-01 (P2): a kernel-load refusal is genuinely mid-mutation (loading policy IS a
+# mutation), so it must NOT claim "no system change made" — it must say the system is partial.
+if [ "$rc" -ne 0 ] && [[ "$log" == *"kernel refused to load"* ]] \
+   && [[ "$log" == *"PARTIAL STATE"* ]] \
+   && ! [[ "$log" == *"no system change made"* ]]; then
+    ok "kernel-load refusal fails the install and reports the PARTIAL state truthfully"
 else
     bad "apparmor_parser failed but the install reported success (rc=$rc). log: ${log:0:200}"
 fi
 rm -rf "$tmp"
 
 # The sibling: apparmor_parser missing entirely must also fail, not silently skip.
+# B2A-COMP-R3-01 (P2): apparmor_parser ABSENT is a PURE PRECONDITION and must be caught
+# BEFORE any mutation, so the failure is a clean "no system change made" rather than a mixed
+# old/new install. Asserted on `refuse`'s wording, which is what makes the claim true.
 tmp="$(make_sandbox)"
 stage_valid_tree "$tmp/installer/staging"
 rm -f "$tmp/fakebin/apparmor_parser"
 run_installer "$tmp" >/dev/null 2>&1; rc=$?
-log="$(cat "$tmp/out.log" 2>/dev/null)"
-if [ "$rc" -ne 0 ] && [[ "$log" == *"apparmor_parser not found"* ]]; then
-    ok "apparmor_parser ABSENT fails the install (never a silent skip)"
+log="$(cat "$tmp/out.log" 2>/dev/null)"; tree="$(cat "$tmp/tree.txt" 2>/dev/null)"
+# THE DISCRIMINATOR is whether the BINARIES were copied. Asserting only that the bundle tree
+# is absent does NOT distinguish "refused in pre-flight" from "refused after the binaries were
+# installed" — the tree install runs after the apparmor block either way, so that assertion
+# passed even with the precondition moved back below the first copy_fd. Verified by weaken.
+libexec="$(cat "$tmp/libexec.txt" 2>/dev/null)"
+if [ "$rc" -ne 0 ] && [[ "$log" == *"apparmor_parser not found"* ]] \
+   && [[ "$log" == *"no system change made"* ]] \
+   && [[ "$libexec" != *"delphi-runtimed"* ]] \
+   && [[ "$tree" != *"./shell/index.html"* ]]; then
+    ok "apparmor_parser ABSENT refused in PRE-FLIGHT (nothing installed at all)"
 else
     bad "apparmor_parser absent but the install reported success (rc=$rc). log: ${log:0:200}"
 fi

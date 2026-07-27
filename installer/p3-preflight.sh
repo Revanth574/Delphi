@@ -26,6 +26,35 @@ SHELL_DIR=/usr/share/delphi/shell
 STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/staging"
 SEAM_SYMBOL=DELPHI_INSECURE_ASSUME_ACTIVE_SESSION
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ⚠ THIS SCRIPT IS A MIRROR, AND A MIRROR CAN DIVERGE FROM WHAT IT REFLECTS.
+#
+# Every value below is DUPLICATED from the runtime rather than read from it. B2A-COMP-R3-03
+# was exactly this divergence: the pre-flight applied bash's `${VAR:-default}` (defaults on
+# unset OR empty) while `delphi-minimal-ai` uses `env::var().unwrap_or_else()` (defaults only
+# on ABSENT), so `Environment=DELPHI_AI_BIND_RW=` validated as `/tmp` and ran as `""`.
+#
+# The full mirrored set, with its source of truth, so the next divergence is findable:
+#
+#   /usr/share/delphi/shell   <- shell-host/src/main.rs  DEFAULT_BUNDLE_ROOT
+#   /usr/libexec/delphi-shell <- delphi-runtimed.rs:86   bin_path("DELPHI_SHELL_BIN", ..)
+#   /usr/libexec/delphi-ai    <- delphi-runtimed.rs:87   bin_path("DELPHI_AI_BIN", ..)
+#   /tmp (bind default)       <- delphi-minimal-ai.rs:31 unwrap_or_else(|_| "/tmp")
+#   DELPHI_AI_EXE required    <- delphi-minimal-ai.rs:29 .expect()  → panics if absent
+#   DELPHI_SHELL_VT required  <- delphi-runtimed.rs:95   .context()? → errors if absent
+#   the seam symbol           <- delphi-runtimed.rs:192  cfg(insecure-test-seams)
+#
+# DELIBERATE, DOCUMENTED DIVERGENCE — the one place this mirror is STRICTER than the runtime:
+#   DELPHI_AI_ARG is `unwrap_or_default()` in delphi-minimal-ai.rs:30, so the runtime accepts
+#   it ABSENT (empty marker path). This script REFUSES that, because a run without a marker
+#   has no machine-checkable success signal at all — the whole point of the pre-flight. That
+#   is a stricter gate on purpose, NOT a mirroring bug. Stated here rather than approximated
+#   silently.
+#
+# Reading these from the binaries (a `--print-config` mode) would remove the duplication
+# entirely and is the real fix; it is recorded as owed rather than done here.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
 refusals=0
 ok()     { printf '  \033[32mOK\033[0m      %s\n' "$1"; }
 refuse() { printf '  \033[31mREFUSE\033[0m  %s\n' "$1"; refusals=$((refusals + 1)); }
@@ -209,6 +238,15 @@ echo "[4/7] unit environment"
 unit_env() {   # key -> value on stdout, empty if unset
     sed -n "s/^Environment=$1=//p" "$UNIT" 2>/dev/null | tail -1
 }
+# B2A-COMP-R3-03 (P2): "absent" and "present but EMPTY" are DIFFERENT to the runtime, and
+# `unit_env` alone cannot tell them apart. `delphi-minimal-ai` uses
+# `env::var(..).unwrap_or_else(..)`, which defaults ONLY on absence — a set-but-empty
+# variable is `Ok("")` and is used as-is. Bash's `${VAR:-default}` defaults on BOTH, so the
+# pre-flight would validate `Environment=DELPHI_AI_BIND_RW=` as `/tmp` while the action ran
+# with `""`. Mirroring runtime semantics requires knowing which case it is.
+unit_env_present() {   # key -> 0 if the unit declares it at all (even empty)
+    grep -qE "^Environment=$1=" "$UNIT" 2>/dev/null
+}
 VT=$(unit_env DELPHI_SHELL_VT)
 AI_BIN=$(unit_env DELPHI_AI_BIN)
 AI_EXE=$(unit_env DELPHI_AI_EXE)
@@ -288,20 +326,46 @@ else
     # filesystem writability plus a /tmp-or-/home hint, reported [6/7] green for exactly that
     # misconfiguration. Drift (AI_ARG=/tmp/... with AI_BIND_RW=/var/tmp) then reads as
     # all-preconditions-met while every action is denied inside the jail.
-    bind_rw="${AI_BIND_RW:-/tmp}"   # same default as delphi-minimal-ai
-    if [ -z "$AI_BIND_RW" ]; then
-        note "DELPHI_AI_BIND_RW unset in the unit — delphi-minimal-ai defaults it to /tmp"
+    # B2A-COMP-R3-03 (P2): mirror the RUNTIME's default rule, not bash's. `env::var().
+    # unwrap_or_else()` defaults only on ABSENCE; a declared-but-empty value is used as-is
+    # (and an empty bind makes bwrap fail, so the action dies inside the jail).
+    if unit_env_present DELPHI_AI_BIND_RW; then
+        bind_rw="$AI_BIND_RW"          # declared: used verbatim, EMPTY INCLUDED
+    else
+        bind_rw="/tmp"                 # absent: delphi-minimal-ai's own default
+        note "DELPHI_AI_BIND_RW not declared — delphi-minimal-ai defaults it to /tmp"
     fi
-    case "$AI_ARG/" in
-        "$bind_rw"/*)
-            ok "marker is inside the sandbox's writable bind ($bind_rw)" ;;
-        *)
-            refuse "marker $AI_ARG is OUTSIDE the writable bind $bind_rw"
-            note "the action runs in bwrap with only DELPHI_AI_BIND_RW writable, so the write"
-            note "is denied by the SANDBOX regardless of filesystem permissions — and the run"
-            note "would look like a consent/gate failure rather than a config error."
-            note "fix: set DELPHI_AI_ARG inside $bind_rw, or widen DELPHI_AI_BIND_RW." ;;
-    esac
+
+    if [ -z "$bind_rw" ]; then
+        refuse "DELPHI_AI_BIND_RW is declared but EMPTY"
+        note "the runtime does NOT default an empty value (env::var returns Ok(\"\")), so the"
+        note "sandbox gets an empty writable bind and every action fails inside bwrap."
+        note "fix: give it a path, or remove the line entirely to get the /tmp default."
+    elif [ "${bind_rw#/}" = "$bind_rw" ]; then
+        refuse "DELPHI_AI_BIND_RW=$bind_rw is not an absolute path"
+    else
+        # B2A-COMP-R3-02 (P2): CANONICALISE BEFORE COMPARING. A purely lexical prefix test
+        # accepts `/tmp/../var/tmp/marker` against `bind_rw=/tmp` — it has the right prefix and
+        # resolves OUTSIDE the bind, so the action is still denied inside bwrap. That is the
+        # exact false-green this gate was added to prevent, reintroduced in weaker form by the
+        # gate itself. `realpath -m` resolves `..` and symlinks without requiring the target to
+        # exist, which matters because the pre-flight also REQUIRES the marker to be absent.
+        real_arg=$(realpath -m -- "$AI_ARG" 2>/dev/null || echo "$AI_ARG")
+        real_bind=$(realpath -m -- "$bind_rw" 2>/dev/null || echo "$bind_rw")
+        case "$real_arg/" in
+            "$real_bind"/*)
+                ok "marker resolves inside the sandbox's writable bind ($real_bind)"
+                if [ "$real_arg" != "$AI_ARG" ]; then
+                    note "note: $AI_ARG resolves to $real_arg"
+                fi ;;
+            *)
+                refuse "marker $AI_ARG resolves to $real_arg, OUTSIDE the writable bind $real_bind"
+                note "the action runs in bwrap with only DELPHI_AI_BIND_RW writable, so the write"
+                note "is denied by the SANDBOX regardless of filesystem permissions — and the run"
+                note "would look like a consent/gate failure rather than a config error."
+                note "fix: set DELPHI_AI_ARG inside $real_bind, or widen DELPHI_AI_BIND_RW." ;;
+        esac
+    fi
 fi
 
 # ── 7. The session user ───────────────────────────────────────────────────────────────

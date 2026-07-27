@@ -236,6 +236,29 @@ expect_refusal "marker outside DELPHI_AI_BIND_RW" \
     'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/var/tmp|" /usr/lib/systemd/system/delphi-runtimed@.service' \
     "OUTSIDE the writable bind"
 
+# B2A-COMP-R3-02 (P2): the R2-01 gate INHERITED the class it was closing. A lexical prefix
+# test accepts a path with the right prefix that RESOLVES outside the bind — a false-green
+# replaced by a weaker false-green. Canonicalise before comparing.
+expect_refusal "marker with the right PREFIX but resolving outside the bind" \
+    'sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/../var/tmp/delphi-p3-marker|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    "OUTSIDE the writable bind"
+
+# B2A-COMP-R3-03 (P2): the runtime defaults ONLY on absence (env::var -> Ok("") when declared
+# empty), so a declared-but-empty value must NOT be validated as /tmp.
+expect_refusal "DELPHI_AI_BIND_RW declared but EMPTY" \
+    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    "declared but EMPTY"
+
+# The absent case must still take the runtime's /tmp default and PASS — otherwise the fix
+# above would just be a blanket "must be declared", which is a different rule than the runtime's.
+run_preflight 'sed -i "/DELPHI_AI_BIND_RW/d" /usr/lib/systemd/system/delphi-runtimed@.service'
+if [[ "$PF_LOG" == *"not declared — delphi-minimal-ai defaults it to /tmp"* ]] \
+   && ! [[ "$PF_LOG" == *"declared but EMPTY"* ]]; then
+    ok "DELPHI_AI_BIND_RW ABSENT correctly takes the runtime /tmp default"
+else
+    bad "absent-vs-empty not distinguished: $(echo "$PF_LOG" | grep -A2 "6/7" | head -3)"
+fi
+
 expect_refusal "Brain address occupied" \
     'printf "stub\n" > /usr/libexec/delphi-ai' \
     "must stay empty"

@@ -55,6 +55,25 @@ run_preflight() {   # perturbation-code
     chmod 0755 "$tmp/fakebin/sysctl"
     printf '1\n' > "$tmp/fakebin/sysctl-value"   # enforcing, unless a case overrides it
 
+    # systemctl stub. The pre-flight now asks SYSTEMD for the unit environment instead of
+    # grepping the unit file (B2A-COMP-R4-04), so the harness must answer as systemd does.
+    # This is a VALUE-supplying stub of the same kind as the sysctl one: it reports what the
+    # real tool reports. It deliberately handles the QUOTED form, because that is exactly the
+    # syntax the old file-grep could not see.
+    cat > "$tmp/fakebin/systemctl" <<'SCTL'
+#!/bin/bash
+case "$1 $2" in
+  "show "*)
+    u=/usr/lib/systemd/system/delphi-runtimed@.service
+    # Emit K=V pairs the way `systemctl show -p Environment --value` does, accepting both
+    # `Environment=K=V` and `Environment="K=V"` — systemd accepts both, so the stub must too.
+    sed -n 's/^Environment=//p' "$u" 2>/dev/null | tr -d '"' | tr '\n' ' '
+    echo ;;
+  *) exit 0 ;;
+esac
+SCTL
+    chmod 0755 "$tmp/fakebin/systemctl"
+
     # NO aa-status STUB — deliberately, and this absence is load-bearing.
     # An earlier version stubbed aa-status to report the profile loaded. The REAL tool answers
     # an unprivileged caller with "You do not have enough privilege to read the profile set",
@@ -233,14 +252,64 @@ expect_refusal "stale DAEMON binary" \
 # all-preconditions-met while every action is denied INSIDE the jail — a sandbox
 # misconfiguration wearing a consent-failure costume.
 expect_refusal "marker outside DELPHI_AI_BIND_RW" \
-    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/var/tmp|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-elsewhere|" /usr/lib/systemd/system/delphi-runtimed@.service' \
     "OUTSIDE the writable bind"
 
-# B2A-COMP-R3-02 (P2): the R2-01 gate INHERITED the class it was closing. A lexical prefix
-# test accepts a path with the right prefix that RESOLVES outside the bind — a false-green
-# replaced by a weaker false-green. Canonicalise before comparing.
-expect_refusal "marker with the right PREFIX but resolving outside the bind" \
-    'sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/../var/tmp/delphi-p3-marker|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+# ── Containment cases. EVERY PATH THESE NEED IS CONSTRUCTED BY THE FIXTURE ────────────
+# B2A-COMP-R4-03 (P1): the round-2 version of the first case used `/tmp/../var/tmp/marker`,
+# which assumes the rootfs HAS `/var/tmp`. Where it does not, [6/7] refuses earlier with
+# "marker directory does not exist" and the canonicalisation gate is never reached — the
+# test's verdict coming from the rootfs rather than from the property. That is the THIRD
+# host-dependent test in three rounds (R1-03's sysctl, R3-01's wrong artifact, this).
+# A test proving a containment gate must build the tree it needs.
+
+# `..` escape: bind is a directory we create; the marker escapes it into a sibling we also
+# create, so the earlier directory-exists check passes and the gate is what decides.
+expect_refusal "marker escaping the bind via .. (both dirs constructed)" \
+    'mkdir -p /tmp/pf-bind /tmp/pf-outside;
+     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-bind|" /usr/lib/systemd/system/delphi-runtimed@.service;
+     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-bind/../pf-outside/m|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    "OUTSIDE the writable bind"
+
+# B2A-COMP-R4-01 (P1-class, round 3): the bind must be compared LITERALLY. `sandbox.rs` emits
+# `--bind $p $p` verbatim, so a bind that is a SYMLINK still makes the jail's writable dest
+# the symlink path — canonicalising it (round 2 used `realpath -m`) accepted a marker under
+# the symlink's TARGET, which the sandbox would deny. Class 22 firing on the class-22 fix.
+expect_refusal "marker under the bind symlink's TARGET, not the bind itself" \
+    'mkdir -p /tmp/pf-target; ln -sfn /tmp/pf-target /tmp/pf-link;
+     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-link|" /usr/lib/systemd/system/delphi-runtimed@.service;
+     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-target/m|" /usr/lib/systemd/system/delphi-runtimed@.service' \
+    "OUTSIDE the writable bind"
+
+# The positive half of the same rule: a marker UNDER the literal bind path must be ACCEPTED,
+# even though that path is a symlink. Without this, "refuse everything symlinked" would pass
+# the case above while being wrong.
+run_preflight 'mkdir -p /tmp/pf-target; ln -sfn /tmp/pf-target /tmp/pf-link;
+     sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/tmp/pf-link|" /usr/lib/systemd/system/delphi-runtimed@.service;
+     sed -i "s|DELPHI_AI_ARG=/tmp/delphi-p3-marker|DELPHI_AI_ARG=/tmp/pf-link/m|" /usr/lib/systemd/system/delphi-runtimed@.service'
+if [[ "$PF_LOG" == *"resolves inside the sandbox's writable bind"* ]]; then
+    ok "marker under the LITERAL bind path is accepted (bind used verbatim, as sandbox.rs does)"
+else
+    bad "marker under the literal bind was refused: $(echo "$PF_LOG" | grep "^  REFUSE" | head -2)"
+fi
+
+# B2A-COMP-R4-02 (P2, round 3): `bind_rw=/` built the glob `//*`, matching nothing, so the
+# pre-flight REFUSED a configuration delphi-minimal-ai accepts. Root contains everything.
+run_preflight 'sed -i "s|DELPHI_AI_BIND_RW=/tmp|DELPHI_AI_BIND_RW=/|" /usr/lib/systemd/system/delphi-runtimed@.service'
+if [[ "$PF_LOG" == *"resolves inside the sandbox's writable bind"* ]] \
+   && ! [[ "$PF_LOG" == *"OUTSIDE the writable bind"* ]]; then
+    ok "bind_rw=/ contains every absolute marker (not refused)"
+else
+    bad "bind_rw=/ wrongly refused: $(echo "$PF_LOG" | grep "^  REFUSE" | head -2)"
+fi
+
+# B2A-COMP-R4-04 (round 3): the round-2 unit parse was itself a MIRROR of systemd's syntax and
+# diverged from it. MEASURED: `Environment="DELPHI_AI_BIND_RW=/tmp/pf-elsewhere"` produced ZERO matches
+# for `grep -E "^Environment=KEY="`, so the pre-flight read it as ABSENT, defaulted to /tmp,
+# and would have passed a config whose real bind is /tmp/pf-elsewhere — a false green, and R3-03's own
+# class recurring inside R3-03's fix. The pre-flight now asks systemd.
+expect_refusal "QUOTED Environment= assignment is seen (not read as absent)" \
+    'sed -i "s|Environment=DELPHI_AI_BIND_RW=/tmp|Environment=\"DELPHI_AI_BIND_RW=/tmp/pf-elsewhere\"|" /usr/lib/systemd/system/delphi-runtimed@.service' \
     "OUTSIDE the writable bind"
 
 # B2A-COMP-R3-03 (P2): the runtime defaults ONLY on absence (env::var -> Ok("") when declared

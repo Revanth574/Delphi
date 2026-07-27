@@ -235,18 +235,50 @@ fi
 # ── 4. Unit configuration ─────────────────────────────────────────────────────────────
 echo
 echo "[4/7] unit environment"
+# ── B2A-COMP-R4-04: ASK SYSTEMD, DO NOT REPARSE THE UNIT FILE ─────────────────────────
+# The round-2 version grepped `^Environment=KEY=` out of the unit file. That is a MIRROR of
+# systemd's unit syntax, and it diverges: systemd accepts `Environment="KEY=VALUE"`, several
+# assignments on one line, continuation lines, `EnvironmentFile=`, and later assignments
+# overriding earlier ones. MEASURED: for `Environment="DELPHI_AI_BIND_RW=/var/tmp"` the grep
+# finds ZERO matches, so the pre-flight would read it as ABSENT, default it to /tmp, and pass
+# a config whose real bind is /var/tmp — a FALSE GREEN, and R3-03's own class recurring in
+# R3-03's fix (class 22).
+#
+# `systemctl show` reports systemd's OWN resolution, works for a not-yet-started instance,
+# and removes the unit-syntax mirror entirely. This is the same foreclose-by-construction
+# argument as Design B: stop reimplementing the rule, read it from the thing that owns it.
+UNIT_INSTANCE="delphi-runtimed@${SESSION_USER}.service"
+_UNIT_ENV=""
+if command -v systemctl >/dev/null 2>&1; then
+    _UNIT_ENV=$(systemctl show "$UNIT_INSTANCE" -p Environment --value 2>/dev/null)
+    _UNIT_ENV_OK=yes
+else
+    _UNIT_ENV_OK=no
+fi
+
 unit_env() {   # key -> value on stdout, empty if unset
-    sed -n "s/^Environment=$1=//p" "$UNIT" 2>/dev/null | tail -1
+    local k="$1" kv
+    for kv in $_UNIT_ENV; do
+        case "$kv" in "$k="*) printf '%s' "${kv#*=}" ;; esac
+    done
 }
-# B2A-COMP-R3-03 (P2): "absent" and "present but EMPTY" are DIFFERENT to the runtime, and
-# `unit_env` alone cannot tell them apart. `delphi-minimal-ai` uses
-# `env::var(..).unwrap_or_else(..)`, which defaults ONLY on absence — a set-but-empty
-# variable is `Ok("")` and is used as-is. Bash's `${VAR:-default}` defaults on BOTH, so the
-# pre-flight would validate `Environment=DELPHI_AI_BIND_RW=` as `/tmp` while the action ran
-# with `""`. Mirroring runtime semantics requires knowing which case it is.
-unit_env_present() {   # key -> 0 if the unit declares it at all (even empty)
-    grep -qE "^Environment=$1=" "$UNIT" 2>/dev/null
+# "absent" and "declared but EMPTY" are DIFFERENT to the runtime: `env::var().unwrap_or_else()`
+# defaults only on absence, while a declared-empty value is `Ok("")` and used as-is.
+unit_env_present() {   # key -> 0 if systemd reports it at all (even empty)
+    local k="$1" kv
+    for kv in $_UNIT_ENV; do
+        case "$kv" in "$k="*) return 0 ;; esac
+    done
+    return 1
 }
+
+if [ "$_UNIT_ENV_OK" != yes ]; then
+    refuse "systemctl unavailable — cannot read the unit environment the way systemd resolves it"
+    note "the pre-flight will NOT fall back to grepping the unit file: that parse diverges from"
+    note "systemd's (quoted assignments, EnvironmentFile=, later-wins) and the divergence"
+    note "presents as a FALSE GREEN. Refusing rather than approximating."
+fi
+
 VT=$(unit_env DELPHI_SHELL_VT)
 AI_BIN=$(unit_env DELPHI_AI_BIN)
 AI_EXE=$(unit_env DELPHI_AI_EXE)
@@ -344,27 +376,49 @@ else
     elif [ "${bind_rw#/}" = "$bind_rw" ]; then
         refuse "DELPHI_AI_BIND_RW=$bind_rw is not an absolute path"
     else
-        # B2A-COMP-R3-02 (P2): CANONICALISE BEFORE COMPARING. A purely lexical prefix test
-        # accepts `/tmp/../var/tmp/marker` against `bind_rw=/tmp` — it has the right prefix and
-        # resolves OUTSIDE the bind, so the action is still denied inside bwrap. That is the
-        # exact false-green this gate was added to prevent, reintroduced in weaker form by the
-        # gate itself. `realpath -m` resolves `..` and symlinks without requiring the target to
-        # exist, which matters because the pre-flight also REQUIRES the marker to be absent.
-        real_arg=$(realpath -m -- "$AI_ARG" 2>/dev/null || echo "$AI_ARG")
-        real_bind=$(realpath -m -- "$bind_rw" 2>/dev/null || echo "$bind_rw")
-        case "$real_arg/" in
-            "$real_bind"/*)
-                ok "marker resolves inside the sandbox's writable bind ($real_bind)"
-                if [ "$real_arg" != "$AI_ARG" ]; then
-                    note "note: $AI_ARG resolves to $real_arg"
-                fi ;;
-            *)
-                refuse "marker $AI_ARG resolves to $real_arg, OUTSIDE the writable bind $real_bind"
-                note "the action runs in bwrap with only DELPHI_AI_BIND_RW writable, so the write"
-                note "is denied by the SANDBOX regardless of filesystem permissions — and the run"
-                note "would look like a consent/gate failure rather than a config error."
-                note "fix: set DELPHI_AI_ARG inside $real_bind, or widen DELPHI_AI_BIND_RW." ;;
-        esac
+        # ── Containment, mirroring what the SANDBOX actually does ──────────────────
+        # B2A-COMP-R3-02 (round 2): a purely LEXICAL prefix test accepted
+        # `/tmp/../var/tmp/marker` against `bind_rw=/tmp` — right prefix, resolves outside.
+        # B2A-COMP-R4-01 (round 3): the round-2 fix used `realpath -m`, which FOLLOWS
+        # SYMLINKS — and that is a second false green, because `sandbox.rs` passes the bind
+        # LITERALLY (`--bind $p $p`, verified at sandbox.rs). With
+        # `DELPHI_AI_BIND_RW=/tmp/link -> /var/tmp`, canonicalising the bind made the gate
+        # accept `/var/tmp/marker`, while the jail's writable dest is the literal
+        # `/tmp/link` — so the write lands OUTSIDE. Class 22 firing on the class-22 fix.
+        #
+        # The rule the runtime actually has: the bind string is used verbatim; only `..`
+        # is collapsed by the kernel when the mount is made. So normalise LEXICALLY on both
+        # sides (`-m -s`: resolve `..`, do NOT follow symlinks) and compare. This mirrors
+        # the runtime rather than being more-correct-seeming than it.
+        norm_path() { realpath -m -s -- "$1"; }
+        real_arg=$(norm_path "$AI_ARG" 2>/dev/null || echo "$AI_ARG")
+        real_bind=$(norm_path "$bind_rw" 2>/dev/null || echo "$bind_rw")
+
+        # B2A-COMP-R4-02 (round 3): `bind_rw=/` made the glob `//*`, which matches nothing,
+        # so every marker fell to OUTSIDE — the pre-flight REFUSING a configuration
+        # `delphi-minimal-ai` accepts. Root is the one bind under which every absolute path
+        # is contained, and it needs saying explicitly rather than emerging from the glob.
+        if [ "$real_bind" = "/" ]; then
+            inside=yes
+        else
+            case "$real_arg/" in
+                "$real_bind"/*) inside=yes ;;
+                *)              inside=no  ;;
+            esac
+        fi
+
+        if [ "$inside" = yes ]; then
+            ok "marker resolves inside the sandbox's writable bind ($real_bind)"
+            if [ "$real_arg" != "$AI_ARG" ]; then
+                note "note: $AI_ARG normalises to $real_arg"
+            fi
+        else
+            refuse "marker $AI_ARG normalises to $real_arg, OUTSIDE the writable bind $real_bind"
+            note "the action runs in bwrap with only DELPHI_AI_BIND_RW writable, so the write"
+            note "is denied by the SANDBOX regardless of filesystem permissions — and the run"
+            note "would look like a consent/gate failure rather than a config error."
+            note "fix: set DELPHI_AI_ARG inside $real_bind, or widen DELPHI_AI_BIND_RW."
+        fi
     fi
 fi
 

@@ -134,8 +134,35 @@ if [ "$_UNIT_ENV_OK" != yes ]; then
 fi
 
 # The paths the DAEMON will actually launch, resolved from the unit rather than assumed.
-SHELL_BIN=$(unit_env DELPHI_SHELL_BIN); SHELL_BIN=${SHELL_BIN:-$SHELL_BIN_DEFAULT}
-AI_BIN=$(unit_env DELPHI_AI_BIN);       AI_BIN=${AI_BIN:-$AI_BIN_DEFAULT}
+# B2A-COMP-R7-02: `${VAR:-default}` defaults on empty AND unset; the runtime's `bin_path()`
+# uses `var_os` and defaults ONLY on absent, so a DECLARED-EMPTY `DELPHI_SHELL_BIN` makes the
+# daemon `execve` an empty path while the pre-flight cheerfully checks the default binary.
+# Exactly the R3-03 divergence, different variable — which is why the absent/declared
+# distinction has its own helper rather than being spelled inline each time.
+resolve_bin() {   # var-name  runtime-default  ->  the path the DAEMON will use
+    local var="$1" dflt="$2" val
+    if unit_env_present "$var"; then
+        val=$(unit_env "$var")
+        if [ -z "$val" ]; then
+            # Declared empty: the runtime does NOT substitute a default here.
+            printf '%s' "<declared-empty>"
+            return
+        fi
+        printf '%s' "$val"
+    else
+        printf '%s' "$dflt"
+    fi
+}
+SHELL_BIN=$(resolve_bin DELPHI_SHELL_BIN "$SHELL_BIN_DEFAULT")
+AI_BIN=$(resolve_bin DELPHI_AI_BIN       "$AI_BIN_DEFAULT")
+for _pair in "DELPHI_SHELL_BIN:$SHELL_BIN" "DELPHI_AI_BIN:$AI_BIN"; do
+    if [ "${_pair#*:}" = "<declared-empty>" ]; then
+        refuse "${_pair%%:*} is declared but EMPTY in the unit"
+        note "the runtime resolves it with var_os + default-on-ABSENT, so an empty declaration"
+        note "is used as-is: the daemon would execve an empty path. Remove the line to get the"
+        note "default, or give it a path."
+    fi
+done
 
 # ── 1. The installed artifacts ────────────────────────────────────────────────────────
 echo "[1/7] installed artifacts"
@@ -207,12 +234,16 @@ else
     fi
 fi
 # Same for the daemon and the AI scaffold — a stale daemon is the same failure one layer up.
-for b in delphi-runtimed delphi-minimal-ai; do
-    if [ -f "$STAGE_DIR/$b" ] && [ -f "/usr/libexec/$b" ]; then
-        if [ "$(sha256sum "$STAGE_DIR/$b" | cut -d' ' -f1)" = "$(sha256sum "/usr/libexec/$b" | cut -d' ' -f1)" ]; then
-            ok "installed $b matches staging"
+# B2A-COMP-R7-03 (class 17): R6-02 resolved the binary paths for the artifact/seam/exec-label
+# checks but left THIS loop hashing the fixed /usr/libexec/delphi-minimal-ai — the fix applied
+# to one site while a sibling carried the defect. Every site now uses the resolved path.
+for _b in "delphi-runtimed:/usr/libexec/delphi-runtimed" "delphi-minimal-ai:$AI_BIN"; do
+    _stage="$STAGE_DIR/${_b%%:*}"; _inst="${_b#*:}"
+    if [ -f "$_stage" ] && [ -f "$_inst" ]; then
+        if [ "$(sha256sum "$_stage" | cut -d' ' -f1)" = "$(sha256sum "$_inst" | cut -d' ' -f1)" ]; then
+            ok "installed $_inst matches staging"
         else
-            refuse "installed /usr/libexec/$b DIFFERS from staging — it is STALE"
+            refuse "installed $_inst DIFFERS from staging — it is STALE"
             note "fix: sudo bash installer/install.sh"
         fi
     fi

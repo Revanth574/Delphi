@@ -395,6 +395,24 @@ expect_refusal "DELPHI_SHELL_BIN override is followed (stale binary at the OVERR
      sed -i "s|DELPHI_AI_BIN=|DELPHI_SHELL_BIN=/usr/libexec/alt-shell DELPHI_AI_BIN=|" "$tmp/fakebin/unit-env"' \
     "DIFFERS from staging"
 
+# B2A-COMP-R7-02 (P2): `${VAR:-default}` defaults on empty AND unset; the runtime's bin_path()
+# uses var_os and defaults only on ABSENT, so a declared-empty DELPHI_SHELL_BIN makes the
+# daemon execve an empty path while the pre-flight checks the default binary. Same class as
+# R3-03, different variable.
+expect_refusal "DELPHI_SHELL_BIN declared but EMPTY" \
+    'sed -i "s|DELPHI_AI_BIN=|DELPHI_SHELL_BIN= DELPHI_AI_BIN=|" "$tmp/fakebin/unit-env"' \
+    "DELPHI_SHELL_BIN is declared but EMPTY"
+
+# B2A-COMP-R7-03 (P2, class 17): R6-02 resolved the bin paths for the artifact/seam/exec-label
+# checks but the [2/7] freshness loop still hashed the FIXED minimal-ai path. Point
+# DELPHI_AI_BIN at an alternate holding a STALE binary; the default path is left correct on
+# purpose, so a pre-flight still hashing it passes and one following the override refuses.
+expect_refusal "DELPHI_AI_BIN override is followed by the FRESHNESS check too" \
+    'cp /usr/libexec/delphi-minimal-ai /usr/libexec/alt-ai;
+     printf "%s\n" "#!/bin/bash" "# STALE-ALT-AI" > /usr/libexec/alt-ai; chmod 0755 /usr/libexec/alt-ai;
+     sed -i "s|DELPHI_AI_BIN=[^ ]*|DELPHI_AI_BIN=/usr/libexec/alt-ai|" "$tmp/fakebin/unit-env"' \
+    "alt-ai DIFFERS from staging"
+
 expect_refusal "Brain address occupied" \
     'printf "stub\n" > /usr/libexec/delphi-ai' \
     "must stay empty"

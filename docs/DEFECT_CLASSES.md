@@ -965,6 +965,33 @@ later.
   not a measurement of a single instant.** When the property is "at every instant X", the
   sample must be atomic or the harness will invent violations.
 
+- **THE SAMPLER, TWICE — and what actually proves a synchronisation fix (round 6).** The
+  restore-before-clear test's measurement was wrong twice in successive rounds: first two
+  stats straddling an atomic `rename(2)` (inventing a violation), then — in the *fix* for
+  that — the initial write placed INSIDE the background sampler, so the parent could launch
+  the subject and kill the sampler before the write happened, reading "unknown" and failing on
+  GOOD code. Class 22 in the same test, two iterations running.
+
+  **REPETITION IS NOT A PROOF FOR A RACE, and this arc demonstrated it twice.** The startup
+  race survived a **10/10 deterministic** run, and reintroducing it under an ordinary
+  weaken **still passed** — because the window is scheduler-dependent, and repetition samples
+  the usual interleaving rather than the one that matters. A count of green runs is evidence
+  about the scheduler, not about the code.
+
+  **The standard that does apply, both parts required:**
+  1. **A happens-before you can point to in the source** — the race removed *by construction*,
+     not by timing. Here: the initial value is written by the PARENT before the fork (so the
+     file exists whenever the parent reads it), and the sampler signals readiness after a
+     completed sample with the parent blocking on that signal (so "hope it started" becomes
+     "it demonstrably started").
+  2. **A widened-window experiment** — force the bad interleaving instead of waiting for it.
+     Inject a delay at the suspect point so the race is near-certain, and show the old shape
+     fails and the new one does not. Measured here under a forced 0.5 s scheduling delay:
+     old shape → `UNKNOWN`, new shape → `0`. That discriminates where 10/10 could not.
+
+  **If neither is available — no structural argument and no way to widen the window — say the
+  fix is unproven rather than running it more times.**
+
 **RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
 the test must fail; and (b) **the class re-application** — construct the input that
 exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix

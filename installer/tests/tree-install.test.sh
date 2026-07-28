@@ -357,23 +357,42 @@ unshare -rm bash -c '
     # Reproduce the crash state: shell.old is the ONLY good bundle.
     mkdir -p /usr/share/delphi/shell.old/assets
     printf "PREVIOUS\n" > /usr/share/delphi/shell.old/index.html
-    # Sample the directory continuously while the install runs.
-    # Record 0 FIRST, then overwrite with 1 the instant a both-absent state is seen. Writing
-    # only at the end meant being killed before writing, which read as "unknown" — a sampler
-    # that cannot report is a test that cannot fail.
-    # ONE directory read per sample, not two stats. Two separate `[ -e ]` tests straddle the
-    # atomic rename(2): the first can observe `shell` absent, the rename then lands, and the
-    # second observes `shell.old` absent — reporting a both-absent state that never existed.
-    # That made this test INTERMITTENT (passed 3x, then failed on unchanged good code), which
-    # is worthless as evidence per Iron Law #15 cl.2 — it cannot distinguish a violated
-    # property from an unlucky run. A single readdir is a consistent snapshot.
-    ( echo 0 > "$tmp/both-absent"
-      while :; do
-          if ! ls -1 /usr/share/delphi 2>/dev/null | grep -qxE "shell|shell\.old"; then
+    # ── SAMPLING, SYNCHRONISED BY CONSTRUCTION (B2A-COMP-R7-01) ───────────────────────
+    # This sampler has been wrong TWICE. Both failures were the measurement, not the subject:
+    #   1st: two separate `[ -e ]` stats straddled the atomic rename(2), inventing a
+    #        both-absent state that never existed.
+    #   2nd: `echo 0` ran INSIDE the background subshell, so the parent could launch the
+    #        installer and kill the sampler before that first write ever happened — the file
+    #        then did not exist and the test read "unknown", failing on GOOD code.
+    #
+    # The second is a class-22 recurrence *in the same test*: the fix for a measurement race
+    # introduced a startup race. And "10/10 deterministic" did not catch it, because the
+    # window is scheduler-dependent — repetition samples the the scheduler usual interleaving,
+    # not the one that matters.
+    #
+    # BOTH races are now removed BY CONSTRUCTION, so the argument is a happens-before you can
+    # read rather than a frequency you have to trust:
+    #   * the initial `0` is written by the PARENT, before the fork. The file therefore exists
+    #     whenever the parent later reads it — no window at all.
+    #   * the sampler signals READINESS after its first completed sample, and the parent waits
+    #     for that signal before launching the installer. "Hope it started" becomes "it
+    #     demonstrably started".
+    echo 0 > "$tmp/both-absent"          # BEFORE the fork — happens-before the parent read
+    ( while :; do
+          snapshot=$(ls -1 /usr/share/delphi 2>/dev/null)
+          # ONE readdir per sample: two stats cannot observe an atomic rename.
+          if ! echo "$snapshot" | grep -qxE "shell|shell\.old"; then
               echo 1 > "$tmp/both-absent"; break
           fi
+          # Signal readiness only AFTER a completed sample, so the handshake means sampling
+          # is genuinely underway, not merely that the subshell was scheduled.
+          [ -e "$tmp/sampler-ready" ] || : > "$tmp/sampler-ready"
       done ) &
     sampler=$!
+    # Bounded wait for the handshake. If it never arrives the sampler is broken, and that must
+    # be a loud failure rather than a silent unsynchronised run.
+    for _ in $(seq 1 500); do [ -e "$tmp/sampler-ready" ] && break; done
+    [ -e "$tmp/sampler-ready" ] || echo "SAMPLER-NEVER-READY" > "$tmp/both-absent"
     bash "$tmp/installer/install.sh" > "$tmp/out.log" 2>&1; rc=$?
     kill $sampler 2>/dev/null; wait $sampler 2>/dev/null
     echo "$rc" > "$tmp/rc"
@@ -382,7 +401,9 @@ unshare -rm bash -c '
 both="$(cat "$tmp/both-absent" 2>/dev/null || echo unknown)"
 final="$(cat "$tmp/final.txt" 2>/dev/null)"
 log="$(cat "$tmp/out.log" 2>/dev/null)"
-if [ "$both" = 0 ] && [[ "$log" == *"RECOVERING"* ]] && [[ "$final" == *"./shell"* ]]; then
+if [ "$both" = SAMPLER-NEVER-READY ]; then
+    bad "crash-between-renames: the sampler never signalled readiness — measurement unusable"
+elif [ "$both" = 0 ] && [[ "$log" == *"RECOVERING"* ]] && [[ "$final" == *"./shell"* ]]; then
     ok "crash-between-renames: a good bundle exists at EVERY instant (restore before clear)"
 else
     bad "both-absent window observed (=$both) or no restore. log: $(echo "$log" | grep -E 'RECOVER|NOTE' | head -2)"

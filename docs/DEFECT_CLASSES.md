@@ -999,6 +999,50 @@ later.
   **If neither is available — no structural argument and no way to widen the window — say the
   fix is unproven rather than running it more times.**
 
+- **THE SAMPLER, A THIRD TIME — and the resolution: STOP SAMPLING (round 7).** The round-6
+  fix carried a third timing defect of the same class: the parent's readiness handshake was a
+  bounded busy-wait (`for _ in $(seq 1 500)`), so on a loaded or single-core runner 500 `-e`
+  checks can complete before the background sampler is scheduled even once, and GOOD code
+  reports `SAMPLER-NEVER-READY`. *"Hope it started"* had become *"hope it starts within 500
+  iterations"* — the happens-before argument covered the file existing, not the sampler being
+  scheduled. Three fixes, three defects, all timing.
+
+  > **THREE DEFECTS OF ONE CLASS IN ONE TEST IS THE INSTRUMENT TELLING YOU IT IS THE WRONG
+  > INSTRUMENT.** A sampler observes at INTERVALS. The property was "at **every instant** at
+  > least one of X or Y exists". **A sampler cannot decide that even in principle** — between
+  > any two observations there is a gap it did not see — so every fix could only shrink the
+  > gaps, never remove them, and every fix was on the wrong axis. The fourth would have been
+  > too. The tell is the repetition of a CLASS, not the difficulty of any one instance.
+
+  **The foreclosing move: derive the invariant from a COMPLETE RECORD instead of observing
+  states.** A directory entry's existence changes *only* by syscall, and `strace -f` records
+  every syscall of the traced tree. Existence is therefore a step function whose every step is
+  on record, and evaluating the invariant after each step evaluates it at every instant — by
+  construction, with **no interval, no iteration count, and no dependence on scheduling.**
+  Implemented as `installer/tests/trace-invariant.py`.
+
+  **What that buys, and it is exactly what the blind spot above denies:** the weaken is
+  DETERMINISTIC. Measured — clear-before-restore reintroduced, **10/10 runs detected**, and
+  the verdict names the cause (`VIOLATION both-absent-after:unlinkat:line1389:step2`) rather
+  than reporting an anomaly. The 10/10 is a *description*, not the evidence: the trace
+  CONTAINS the `unlinkat` that opens the window, so the violation is **derived, not observed**,
+  and no interleaving is involved. Contrast round 6, where a reintroduced race survived its
+  weaken. **Escaping the blind spot beats managing it** — when a property is temporal, look
+  for a complete record before accepting a sampling harness and the whole class-22 apparatus
+  that a sampling harness then requires.
+
+  **A checker is an instrument too, so it carries the same burden — and can now discharge it
+  cheaply:** the checker is proven to bite on **synthetic traces** (fixed input → fixed
+  verdict), which is a weaken/restore with no timing in it at all. **It must fail CLOSED**,
+  because the completeness argument holds only where every mutation is visible *and*
+  classified: an unknown syscall, a dirfd-relative mutation, a `<unfinished>` split on a
+  mutating call, or an unreadable return value each yield `REFUSE`, never a reassuring `OK`.
+  This is not theoretical — the first run against a real trace **refused**, on `execve` and
+  directory-`openat` splits (74 split lines occur in one real install). Narrowing to skip
+  splits on *provably inert* syscalls is legitimate (Iron Law #15 cl. 3: a split on a
+  *mutating* call still refuses, with its own self-test); widening the accepted set to make
+  the refusal disappear would have been the forbidden edit available at the same moment.
+
 **RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
 the test must fail; and (b) **the class re-application** — construct the input that
 exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix
@@ -1042,6 +1086,51 @@ labelled as such in the record so a reader can weigh it correctly.
 
 ---
 
+## 24. In-band sentinel — a signal drawn from the value space it describes  *(new — B2a composition, round 7)*
+
+**Description.** A helper needs to report *both* a value and a condition about that value, and
+encodes the condition as a **reserved value of the same type** — `<declared-empty>` for a
+pathname, `-1` for a count, `<none>` / `N/A` for a string. The value space and the signal
+space overlap, so two things become impossible to distinguish: **legitimate data that happens
+to equal the sentinel**, and **the condition itself**. Every consumer downstream must then
+know about the sentinel, and any consumer that does not silently treats the signal as data.
+
+**Instance.** `p3-preflight.sh`'s `resolve_bin` printed the literal string `<declared-empty>`
+when a bin path was declared-but-empty in the unit. Two consequences, both real:
+
+1. **Consumers treated it as a filename.** `$SHELL_BIN` flows into `[ -e ]`, `[ -f ]`,
+   `sha256sum`, `strings` and an `[ -x ]`-guarded `execve`. A declared-empty bin produced a
+   *second* refusal — `<declared-empty> is ABSENT — run: sudo bash installer/install.sh` —
+   naming a file nobody wrote and prescribing the installer when the fault is the unit
+   declaration. A misdiagnosis printed in the voice of a diagnosis.
+2. **Value collision.** A deployment whose path genuinely is that string is reported as having
+   declared nothing. Narrow, but it is the defect proper, and **no amount of downstream
+   guarding can fix it** — only moving the signal off the value channel can.
+
+**Foreclosing primitive.** **NONE — discipline, with a standard shape.** Signal out of band:
+a **distinct exit status** (`return 2`), a separate flag variable, or a second output field.
+Return the *honest* value on the data channel — for `resolve_bin` that is the empty string,
+which is literally what the daemon would `execve` — and let the status carry "and that is a
+fault". Refuse once, at the point of resolution, and have downstream checks **skip** an
+unresolved value rather than re-refusing it under a wrong name.
+
+**RED-proof shape.** The symptom is an EXTRA misleading line, not a missing one, so the
+assertions are negative and must be paired:
+(a) perturb into the condition and assert the correct refusal appears **and the sentinel
+string does not appear anywhere in the log**;
+(b) set the value to *be* the sentinel string and assert it is **not** reported as the
+condition. Weaken by restoring the in-band return and the unguarded consumers: both go RED,
+and (a)'s failure output prints the misleading refusal verbatim — which is the finding.
+Implemented as B2A-COMP-R8-03 in `installer/tests/p3-preflight.test.sh`.
+
+**Sibling worth checking whenever this class appears.** The same review found
+`AI_BIN=$(unit_env DELPHI_AI_BIN)` in section 4 **reassigning** a name that already held the
+*resolved* path from section 0 — one identifier meaning two different things at two points in
+one script. Same root disease as the sentinel (a name whose meaning is positional rather than
+fixed), so audit for it in the same pass.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1069,3 +1158,5 @@ labelled as such in the record so a reader can weigh it correctly.
 | 21. Warning banner as enforcement | discipline (sentinel prefill or non-sentinel rejection; never persist the value; state the residual up front) | Discipline |
 | 22. The fix inherits the class it closed | discipline (re-apply the finding's own question to the remedy; two weakens, not one) | Discipline |
 | 23. Forecasting your own code | discipline (construct an experiment; a forecast about your own work is a claim awaiting one) | Discipline |
+| 24. In-band sentinel drawn from the value space | discipline (signal by exit status / separate field; return the honest value; refuse once, skip downstream) | Discipline |
+| 22a. Temporal invariant decided by SAMPLING | `installer/tests/trace-invariant.py` (derive from a complete syscall record; fail closed on anything unclassifiable) | **Extracted** |

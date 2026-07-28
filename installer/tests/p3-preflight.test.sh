@@ -70,23 +70,31 @@ run_preflight() {   # perturbation-code
     # (EnvironmentFile=, drop-ins, later-wins) matches what the daemon receives. No stub can;
     # that needs a running systemd. It is checked against the REAL system separately — see
     # `real_systemd_contract` at the end of this file.
-    # `$UNIT_INST` and `$ENVFILE` are expanded NOW (fixture-creation time) so the stub holds
-    # concrete values; `$1`/`$*` are escaped so they stay the stub's own runtime arguments.
     # INSIDE the user namespace `id -un` is `root` (uid 0 is what our uid maps to), and the
     # pre-flight defaults SESSION_USER to `$(id -un)`. So the instance production will ask for
     # is delphi-runtimed@root.service — NOT the outer username. Getting this wrong made every
     # stub call exit 64 and return nothing, which read as "every variable unset".
     local UNIT_INST="delphi-runtimed@root.service" ENVFILE="$tmp/fakebin/unit-env"
-    cat > "$tmp/fakebin/systemctl" <<SCTL
-#!/bin/bash
-if [ "\$1" != show ]; then exit 0; fi
-case " \$* " in
+    # THE BODY IS A QUOTED HEREDOC, and the two fixture values are injected as shell variables
+    # in a generated prologue instead. The previous form used an UNQUOTED `<<SCTL` so that
+    # `$UNIT_INST` / `$ENVFILE` would expand — which also made every BACKTICK in the body
+    # command substitution. It executed: the comments below quote `-p Environment` and
+    # `--value`, so fixture creation ran those as commands (`line 80: -p: command not found`
+    # on every call) and substituted their EMPTY output into the generated stub, silently
+    # mangling the text a reader of that file would see. Escaping each `\$` and each backtick
+    # is the fix that the next editor forgets; removing expansion from the body is the fix
+    # that cannot be forgotten. `%q` makes the injected values re-parse as themselves.
+    {
+        printf '#!/bin/bash\nUNIT_INST=%q\nENVFILE=%q\n' "$UNIT_INST" "$ENVFILE"
+        cat <<'SCTL'
+if [ "$1" != show ]; then exit 0; fi
+case " $* " in
   *" $UNIT_INST "*) : ;;
-  *) echo "STUB-ERROR: wrong unit instance: \$*" >&2; exit 64 ;;
+  *) echo "STUB-ERROR: wrong unit instance: $*" >&2; exit 64 ;;
 esac
-case " \$* " in
+case " $* " in
   *" -p Environment "*) : ;;
-  *) echo "STUB-ERROR: wrong property: \$*" >&2; exit 65 ;;
+  *) echo "STUB-ERROR: wrong property: $*" >&2; exit 65 ;;
 esac
 # B2A-COMP-R6-03: MODEL THE REAL COMMAND'S OUTPUT CONTRACT, not just its argv.
 # The previous stub accepted `-p Environment` with or without `--value` and returned raw
@@ -95,11 +103,12 @@ esac
 # `Environment=DELPHI_SHELL_VT=tty3` as the first pair and read EVERY variable as unset,
 # while this suite stayed green. Emitting what the real command emits for the form actually
 # received makes that regression fail here instead of in production.
-case " \$* " in
+case " $* " in
   *" --value "*) cat "$ENVFILE" ;;
-  *) printf 'Environment=%s' "\$(cat "$ENVFILE")" ;;
+  *) printf 'Environment=%s' "$(cat "$ENVFILE")" ;;
 esac
 SCTL
+    } > "$tmp/fakebin/systemctl"
     chmod 0755 "$tmp/fakebin/systemctl"
     # The fixture's declared environment, in the shape `systemctl show -p Environment --value`
     # emits. Perturbations edit THIS, not a unit file.
@@ -402,6 +411,33 @@ expect_refusal "DELPHI_SHELL_BIN override is followed (stale binary at the OVERR
 expect_refusal "DELPHI_SHELL_BIN declared but EMPTY" \
     'sed -i "s|DELPHI_AI_BIN=|DELPHI_SHELL_BIN= DELPHI_AI_BIN=|" "$tmp/fakebin/unit-env"' \
     "DELPHI_SHELL_BIN is declared but EMPTY"
+
+# B2A-COMP-R8-03 (P3): the "declared empty" condition was signalled IN BAND, as the pathname
+# `<declared-empty>` on resolve_bin's stdout. Two consequences, one test each — both assert
+# what must NOT appear, because the defect's symptom is an EXTRA misleading line, not a
+# missing one.
+#
+# (a) downstream checks consumed the sentinel AS A PATH, so a declared-empty bin produced a
+#     second refusal reading "<declared-empty> is ABSENT — run: sudo bash installer/install.sh"
+#     — naming a file nobody wrote and prescribing the wrong fix (the fault is the unit).
+run_preflight 'sed -i "s|DELPHI_AI_BIN=|DELPHI_SHELL_BIN= DELPHI_AI_BIN=|" "$tmp/fakebin/unit-env"'
+if [[ "$PF_LOG" == *"DELPHI_SHELL_BIN is declared but EMPTY"* ]] \
+   && ! [[ "$PF_LOG" == *"declared-empty"* ]]; then
+    ok "declared-empty is refused ONCE, by its own reason — no sentinel-as-filename refusal"
+else
+    bad "sentinel leaked into a path check: $(echo "$PF_LOG" | grep -i 'declared-empty' | head -2)"
+fi
+
+# (b) the sentinel's value space OVERLAPPED the data it described: a deployment whose
+#     DELPHI_SHELL_BIN really is that string was misreported as having declared nothing.
+#     Narrow (the value must match exactly) but it is the in-band-signal defect proper, and
+#     it is the half that no amount of downstream guarding could fix.
+run_preflight 'sed -i "s|DELPHI_AI_BIN=|DELPHI_SHELL_BIN=<declared-empty> DELPHI_AI_BIN=|" "$tmp/fakebin/unit-env"'
+if ! [[ "$PF_LOG" == *"DELPHI_SHELL_BIN is declared but EMPTY"* ]]; then
+    ok "a bin path that IS the old sentinel string is not misread as an empty declaration"
+else
+    bad "value/sentinel collision: a real path was reported as an empty declaration"
+fi
 
 # B2A-COMP-R7-03 (P2, class 17): R6-02 resolved the bin paths for the artifact/seam/exec-label
 # checks but the [2/7] freshness loop still hashed the FIXED minimal-ai path. Point

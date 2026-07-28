@@ -139,35 +139,45 @@ fi
 # daemon `execve` an empty path while the pre-flight cheerfully checks the default binary.
 # Exactly the R3-03 divergence, different variable — which is why the absent/declared
 # distinction has its own helper rather than being spelled inline each time.
-resolve_bin() {   # var-name  runtime-default  ->  the path the DAEMON will use
+# B2A-COMP-R8-03: "declared but empty" is signalled OUT OF BAND, by exit status, never by a
+# magic value on stdout. The previous `<declared-empty>` sentinel was an in-band PATHNAME:
+# a deployment legitimately using that name would be misread, and every downstream check
+# treated it as a filename — `$p is ABSENT — run: sudo bash installer/install.sh` names a
+# file that was never meant to exist and misdirects to the installer when the fault is the
+# unit declaration. Same class as the `<none>`/`-` sentinels this project has already paid
+# for: a value space that overlaps the data it describes cannot be disambiguated later.
+#
+# The empty string IS the honest value here — it is literally what the daemon would execve —
+# so it is what callers receive, with the status carrying the "and that is a fault" signal.
+resolve_bin() {   # var-name  runtime-default  ->  path on stdout; rc 0 = usable, 2 = declared-empty
     local var="$1" dflt="$2" val
     if unit_env_present "$var"; then
         val=$(unit_env "$var")
-        if [ -z "$val" ]; then
-            # Declared empty: the runtime does NOT substitute a default here.
-            printf '%s' "<declared-empty>"
-            return
-        fi
+        [ -n "$val" ] || return 2      # nothing on stdout: no value to mistake for a path
         printf '%s' "$val"
     else
         printf '%s' "$dflt"
     fi
 }
-SHELL_BIN=$(resolve_bin DELPHI_SHELL_BIN "$SHELL_BIN_DEFAULT")
-AI_BIN=$(resolve_bin DELPHI_AI_BIN       "$AI_BIN_DEFAULT")
-for _pair in "DELPHI_SHELL_BIN:$SHELL_BIN" "DELPHI_AI_BIN:$AI_BIN"; do
-    if [ "${_pair#*:}" = "<declared-empty>" ]; then
+SHELL_BIN=$(resolve_bin DELPHI_SHELL_BIN "$SHELL_BIN_DEFAULT"); SHELL_BIN_RC=$?
+AI_BIN=$(resolve_bin DELPHI_AI_BIN       "$AI_BIN_DEFAULT");    AI_BIN_RC=$?
+for _pair in "DELPHI_SHELL_BIN:$SHELL_BIN_RC" "DELPHI_AI_BIN:$AI_BIN_RC"; do
+    if [ "${_pair#*:}" = "2" ]; then
         refuse "${_pair%%:*} is declared but EMPTY in the unit"
         note "the runtime resolves it with var_os + default-on-ABSENT, so an empty declaration"
         note "is used as-is: the daemon would execve an empty path. Remove the line to get the"
         note "default, or give it a path."
     fi
 done
+# Refused ONCE above. Downstream path checks SKIP an unresolved bin rather than emitting a
+# second refusal that names an empty file and points at the wrong fix.
+have_bin() { [ -n "$1" ]; }
 
 # ── 1. The installed artifacts ────────────────────────────────────────────────────────
 echo "[1/7] installed artifacts"
 for p in /usr/libexec/delphi-runtimed "$SHELL_BIN" "$AI_BIN" \
          /etc/pam.d/delphi-runtime /etc/apparmor.d/delphi-shell "$UNIT"; do
+    have_bin "$p" || continue      # unresolved bin: refused above, by its actual reason
     if [ -e "$p" ]; then ok "$p"; else refuse "$p is ABSENT — run: sudo bash installer/install.sh"; fi
 done
 if [ -f "$SHELL_DIR/index.html" ]; then
@@ -216,7 +226,9 @@ fi
 # every check and then behaved like the old code — which is exactly what happened when the
 # custom-scheme host had been built but not yet installed. Same treatment as the bundle:
 # compare installed content against staged content.
-if [ ! -f "$STAGE_DIR/delphi-shell" ]; then
+if ! have_bin "$SHELL_BIN"; then
+    note "skipping the host freshness check — DELPHI_SHELL_BIN did not resolve (refused above)"
+elif [ ! -f "$STAGE_DIR/delphi-shell" ]; then
     refuse "$STAGE_DIR/delphi-shell missing — run: bash installer/build.sh (unprivileged)"
 elif [ ! -f "$SHELL_BIN" ]; then
     refuse "$SHELL_BIN missing — run: sudo bash installer/install.sh"
@@ -320,6 +332,8 @@ if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || ec
 elif [ ! -e /etc/apparmor.d/delphi-shell ]; then
     refuse "/etc/apparmor.d/delphi-shell ABSENT while the userns restriction is enforcing"
     note "the shell will SIGABRT on its first themed-icon load — after GTK init reports ok"
+elif ! have_bin "$SHELL_BIN"; then
+    note "skipping the exec-label probe — DELPHI_SHELL_BIN did not resolve (refused above)"
 elif [ ! -x "$SHELL_BIN" ]; then
     refuse "cannot probe the exec label — $SHELL_BIN is not executable"
 else
@@ -342,7 +356,11 @@ echo
 echo "[4/7] unit environment"
 
 VT=$(unit_env DELPHI_SHELL_VT)
-AI_BIN=$(unit_env DELPHI_AI_BIN)
+# NOT `AI_BIN`: that name already holds the RESOLVED path (default applied) from section 0,
+# and reassigning it here made one identifier mean two different things at two points in the
+# script. Section 4 asks a different question — "does the unit DECLARE it" — so it gets its
+# own name. Nothing after this point may read DECL_AI_BIN as the path the daemon will run.
+DECL_AI_BIN=$(unit_env DELPHI_AI_BIN)
 AI_EXE=$(unit_env DELPHI_AI_EXE)
 AI_ARG=$(unit_env DELPHI_AI_ARG)
 AI_BIND_RW=$(unit_env DELPHI_AI_BIND_RW)
@@ -355,7 +373,7 @@ else
     refuse "DELPHI_SHELL_VT unset in $UNIT — the daemon refuses to launch without it"
 fi
 
-for pair in "DELPHI_AI_BIN:$AI_BIN" "DELPHI_AI_EXE:$AI_EXE" "DELPHI_AI_ARG:$AI_ARG"; do
+for pair in "DELPHI_AI_BIN:$DECL_AI_BIN" "DELPHI_AI_EXE:$AI_EXE" "DELPHI_AI_ARG:$AI_ARG"; do
     k=${pair%%:*}; v=${pair#*:}
     if [ -n "$v" ]; then ok "$k=$v"; else
         refuse "$k unset in $UNIT"
@@ -366,7 +384,7 @@ for pair in "DELPHI_AI_BIN:$AI_BIN" "DELPHI_AI_EXE:$AI_EXE" "DELPHI_AI_ARG:$AI_A
     fi
 done
 
-for pair in "DELPHI_AI_BIN:$AI_BIN" "DELPHI_AI_EXE:$AI_EXE"; do
+for pair in "DELPHI_AI_BIN:$DECL_AI_BIN" "DELPHI_AI_EXE:$AI_EXE"; do
     k=${pair%%:*}; v=${pair#*:}
     [ -n "$v" ] || continue
     if [ -x "$v" ]; then ok "$k target is executable"; else refuse "$k=$v is not an executable file"; fi

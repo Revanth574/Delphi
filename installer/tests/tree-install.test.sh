@@ -338,15 +338,74 @@ else
 fi
 rm -rf "$tmp"
 
-# ── B2A-COMP-R6-01: THE INVARIANT, ASSERTED BY SAMPLING ───────────────────────────────
+# ── B2A-COMP-R8-01: THE INVARIANT, DECIDED FROM A COMPLETE RECORD ─────────────────────
 # The property is NOT "the rename sequence works" — it is "at every instant there is at least
-# one of shell or shell.old; it is never the case that both are absent". Testing a specific
-# crash point tests one point; SAMPLING the directory throughout the install tests the
-# invariant itself, and catches any ordering that opens a both-absent window.
+# one of shell or shell.old; it is never the case that both are absent".
+#
+# THE INSTRUMENT CHANGED, because three successive samplers each carried a timing defect
+# (straddled stats → startup race → bounded busy-wait). That is not three unlucky
+# implementations: a sampler observes at INTERVALS, so it cannot decide "at every instant"
+# even in principle, and every fix could only shrink the gaps it cannot see. The fourth fix
+# would have been on the same wrong axis.
+#
+# A directory entry changes only by syscall, and `strace -f` records every syscall of the
+# traced tree — so existence is a step function whose every step is on record. Deciding the
+# invariant after each step decides it at every instant, with no interval, no iteration count,
+# and no dependence on scheduling. See installer/tests/trace-invariant.py for the full
+# argument and the four fail-closed REFUSE conditions.
 #
 # The pre-fix code opened exactly such a window: from the died-between-renames state
 # (shell.old present, shell absent) it did `rm -rf shell.old` FIRST, so nothing good existed
 # until the new tree was built and moved — and a failure in between left neither.
+CHECKER="$REPO/installer/tests/trace-invariant.py"
+if ! command -v strace >/dev/null 2>&1; then
+    # A skipped test yields PASS/PASS and is worthless (Iron Law #15 clause 2). Fail loudly.
+    bad "strace not installed — the invariant CANNOT be decided. Install with: apt install strace"
+else
+
+# ── The checker is now the instrument, so the checker is proven to bite FIRST ──────────
+# Synthetic traces, no installer, no timing: the same input always yields the same verdict.
+# This is the deterministic weaken/restore that class 22 says a scheduler-dependent test
+# cannot honestly provide — the reason for moving off sampling at all.
+checker_case() {   # description  expected-word  trace-body
+    local desc="$1" expect="$2" body="$3" out ftmp
+    ftmp="$(mktemp)"; printf '%s\n' "$body" > "$ftmp"
+    out="$(python3 "$CHECKER" "$ftmp" /usr/share/delphi shell shell.old shell.old 2>&1)"
+    rm -f "$ftmp"
+    if [[ "$out" == "$expect"* ]]; then ok "checker: $desc → $expect"
+    else bad "checker: $desc expected $expect, got: $out"; fi
+}
+P=/usr/share/delphi
+checker_case "restore-before-clear (the shipped order)" OK \
+"1 renameat2(AT_FDCWD, \"$P/shell.old\", AT_FDCWD, \"$P/shell\", RENAME_NOREPLACE) = 0
+1 mkdir(\"$P/shell.new\", 0777) = 0
+1 renameat2(AT_FDCWD, \"$P/shell\", AT_FDCWD, \"$P/shell.old\", RENAME_NOREPLACE) = 0
+1 renameat2(AT_FDCWD, \"$P/shell.new\", AT_FDCWD, \"$P/shell\", RENAME_NOREPLACE) = 0
+1 unlinkat(AT_FDCWD, \"$P/shell.old\", AT_REMOVEDIR) = 0"
+checker_case "clear-before-restore (THE defect this test exists for)" VIOLATION \
+"1 unlinkat(AT_FDCWD, \"$P/shell.old\", AT_REMOVEDIR) = 0
+1 renameat2(AT_FDCWD, \"$P/shell.new\", AT_FDCWD, \"$P/shell\", RENAME_NOREPLACE) = 0"
+checker_case "a FAILED remove changes nothing" OK \
+"1 unlinkat(AT_FDCWD, \"$P/shell.old\", AT_REMOVEDIR) = -1 ENOENT (No such file or directory)
+1 renameat2(AT_FDCWD, \"$P/shell.old\", AT_FDCWD, \"$P/shell\", RENAME_NOREPLACE) = 0"
+checker_case "unclassified syscall naming a watched path" REFUSE \
+"1 some_new_syscall(AT_FDCWD, \"$P/shell.old\") = 0"
+checker_case "dirfd-relative mutation (fts-style rm)" REFUSE \
+"1 unlinkat(3, \"shell.old\", AT_REMOVEDIR) = 0"
+checker_case "MUTATING syscall split across <unfinished>" REFUSE \
+"1 unlinkat(AT_FDCWD, \"$P/shell.old\", AT_REMOVEDIR <unfinished ...>"
+# The narrowing that lets a real trace be decided at all, and its boundary. A real run splits
+# `execve` and a directory `openat` on the live bundle path; neither can change existence.
+# An `openat` that COULD create still refuses — that is what makes the skip a narrowing.
+checker_case "INERT syscall split is skipped, not refused" OK \
+"1 execve(\"/usr/bin/find\", [\"find\", \"$P/shell\"], 0x0 /* 83 vars */ <unfinished ...>
+1 openat(AT_FDCWD, \"$P/shell\", O_RDONLY|O_DIRECTORY <unfinished ...>
+1 renameat2(AT_FDCWD, \"$P/shell.old\", AT_FDCWD, \"$P/shell\", RENAME_NOREPLACE) = 0"
+checker_case "split openat that COULD create still refuses" REFUSE \
+"1 openat(AT_FDCWD, \"$P/shell\", O_WRONLY|O_CREAT, 0644 <unfinished ...>"
+checker_case "a trace with no mutation at all is not a vacuous pass" REFUSE \
+"1 newfstatat(AT_FDCWD, \"$P/shell\", 0x7ffd, 0) = 0"
+
 tmp="$(make_sandbox)"
 stage_valid_tree "$tmp/installer/staging"
 unshare -rm bash -c '
@@ -357,58 +416,26 @@ unshare -rm bash -c '
     # Reproduce the crash state: shell.old is the ONLY good bundle.
     mkdir -p /usr/share/delphi/shell.old/assets
     printf "PREVIOUS\n" > /usr/share/delphi/shell.old/index.html
-    # ── SAMPLING, SYNCHRONISED BY CONSTRUCTION (B2A-COMP-R7-01) ───────────────────────
-    # This sampler has been wrong TWICE. Both failures were the measurement, not the subject:
-    #   1st: two separate `[ -e ]` stats straddled the atomic rename(2), inventing a
-    #        both-absent state that never existed.
-    #   2nd: `echo 0` ran INSIDE the background subshell, so the parent could launch the
-    #        installer and kill the sampler before that first write ever happened — the file
-    #        then did not exist and the test read "unknown", failing on GOOD code.
-    #
-    # The second is a class-22 recurrence *in the same test*: the fix for a measurement race
-    # introduced a startup race. And "10/10 deterministic" did not catch it, because the
-    # window is scheduler-dependent — repetition samples the the scheduler usual interleaving,
-    # not the one that matters.
-    #
-    # BOTH races are now removed BY CONSTRUCTION, so the argument is a happens-before you can
-    # read rather than a frequency you have to trust:
-    #   * the initial `0` is written by the PARENT, before the fork. The file therefore exists
-    #     whenever the parent later reads it — no window at all.
-    #   * the sampler signals READINESS after its first completed sample, and the parent waits
-    #     for that signal before launching the installer. "Hope it started" becomes "it
-    #     demonstrably started".
-    echo 0 > "$tmp/both-absent"          # BEFORE the fork — happens-before the parent read
-    ( while :; do
-          snapshot=$(ls -1 /usr/share/delphi 2>/dev/null)
-          # ONE readdir per sample: two stats cannot observe an atomic rename.
-          if ! echo "$snapshot" | grep -qxE "shell|shell\.old"; then
-              echo 1 > "$tmp/both-absent"; break
-          fi
-          # Signal readiness only AFTER a completed sample, so the handshake means sampling
-          # is genuinely underway, not merely that the subshell was scheduled.
-          [ -e "$tmp/sampler-ready" ] || : > "$tmp/sampler-ready"
-      done ) &
-    sampler=$!
-    # Bounded wait for the handshake. If it never arrives the sampler is broken, and that must
-    # be a loud failure rather than a silent unsynchronised run.
-    for _ in $(seq 1 500); do [ -e "$tmp/sampler-ready" ] && break; done
-    [ -e "$tmp/sampler-ready" ] || echo "SAMPLER-NEVER-READY" > "$tmp/both-absent"
-    bash "$tmp/installer/install.sh" > "$tmp/out.log" 2>&1; rc=$?
-    kill $sampler 2>/dev/null; wait $sampler 2>/dev/null
-    echo "$rc" > "$tmp/rc"
+    # Record EVERY syscall of the installer and its children. `%file` is deliberately broader
+    # than the mutating set: the checker must SEE an unclassified call naming a watched path
+    # in order to refuse, and it cannot refuse over what was never traced.
+    strace -f -o "$tmp/trace.log" -e trace=%file \
+        bash "$tmp/installer/install.sh" > "$tmp/out.log" 2>&1
+    echo "$?" > "$tmp/rc"
     ( cd /usr/share/delphi && find . -maxdepth 1 -printf "%p\n" | sort ) > "$tmp/final.txt"
 ' _ "$tmp"
-both="$(cat "$tmp/both-absent" 2>/dev/null || echo unknown)"
 final="$(cat "$tmp/final.txt" 2>/dev/null)"
 log="$(cat "$tmp/out.log" 2>/dev/null)"
-if [ "$both" = SAMPLER-NEVER-READY ]; then
-    bad "crash-between-renames: the sampler never signalled readiness — measurement unusable"
-elif [ "$both" = 0 ] && [[ "$log" == *"RECOVERING"* ]] && [[ "$final" == *"./shell"* ]]; then
-    ok "crash-between-renames: a good bundle exists at EVERY instant (restore before clear)"
+verdict="$(python3 "$CHECKER" "$tmp/trace.log" /usr/share/delphi shell shell.old shell.old 2>&1)"
+if [[ "$verdict" == REFUSE* ]]; then
+    bad "crash-between-renames: the trace could not be fully accounted for — $verdict"
+elif [ "$verdict" = OK ] && [[ "$log" == *"RECOVERING"* ]] && [[ "$final" == *"./shell"* ]]; then
+    ok "crash-between-renames: a good bundle exists at EVERY instant (complete syscall record)"
 else
-    bad "both-absent window observed (=$both) or no restore. log: $(echo "$log" | grep -E 'RECOVER|NOTE' | head -2)"
+    bad "invariant verdict=$verdict or no restore. log: $(echo "$log" | grep -E 'RECOVER|NOTE' | head -2)"
 fi
 rm -rf "$tmp"
+fi   # strace available
 
 echo
 echo "── tree-install: $pass passed, $fail failed ──"

@@ -972,11 +972,18 @@ later.
   the subject and kill the sampler before the write happened, reading "unknown" and failing on
   GOOD code. Class 22 in the same test, two iterations running.
 
-  **REPETITION IS NOT A PROOF FOR A RACE, and this arc demonstrated it twice.** The startup
-  race survived a **10/10 deterministic** run, and reintroducing it under an ordinary
-  weaken **still passed** — because the window is scheduler-dependent, and repetition samples
-  the usual interleaving rather than the one that matters. A count of green runs is evidence
-  about the scheduler, not about the code.
+  > **⚠ THE WEAKEN PROTOCOL HAS A BLIND SPOT, AND THIS IS IT.**
+  > The weaken/restore cycle is this project's primary verification tool: revert the fix, the
+  > test must fail. **For a scheduler-dependent property it can pass while the defect is
+  > present.** Measured here — the startup race was *reintroduced* under an ordinary weaken
+  > and **the test still passed**, because the bad interleaving simply did not occur in that
+  > run. The same race had already survived a **10/10 deterministic** run.
+  >
+  > This is a limit on the tool, not a note about counting greens. Wherever a property depends
+  > on ordering between concurrent actors — sampling, signal handling, fork/exec sequencing,
+  > file-descriptor lifetime, lock acquisition — **a passing weaken is not evidence.** The
+  > protocol silently degrades from "proven to bite" to "did not happen to bite this time",
+  > and nothing in the output distinguishes those two.
 
   **The standard that does apply, both parts required:**
   1. **A happens-before you can point to in the source** — the race removed *by construction*,
@@ -997,6 +1004,41 @@ the test must fail; and (b) **the class re-application** — construct the input
 exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix
 that resolves elsewhere) and assert it is caught. A fix with only (a) is proven to
 address its instance, not its class.
+
+---
+
+## 23. Forecasting your own code instead of interrogating it  *(new — B2a composition)*
+
+**Description.** Asked where a defect is likely to be, an author predicts — and the
+prediction is a model of code they wrote, built from the same understanding that
+produced the code. Where that understanding is wrong, the prediction is wrong in
+**exactly the place the defect is**. The failure is not carelessness; it is that
+introspection and authorship draw on the same model, so the error is common-mode.
+
+Measured over this sweep: the author's forecasts about **where findings would be**
+were wrong twice in succession, both times pessimistic — predicting the
+custom-protocol handler would not survive a dedicated pass (it did, three times) and
+that a stub audit would find a fourth instance of a three-for-three pattern (it found
+zero, which was itself the informative result). Over the same period the author's
+**experiments** — weaken/restore, the widened window, running the real binary against
+the real bundle — repeatedly produced correct findings, including ones the reviewer
+had not asked for.
+
+> **On your own code, construct an experiment rather than forecast a result.**
+> A weaken, a widened window, a control leg and a real-binary run all work by making
+> the SYSTEM answer. A prediction works by asking yourself — which is the one source
+> already known to be wrong wherever the defect lives.
+
+**Foreclosing primitive.** **NONE — discipline.** When tempted to say "I expect X is
+where the problem is", convert it: what run would distinguish X from not-X, and can it
+be done now? Where the forecast cannot be converted into an experiment, state it as a
+guess with its track record attached rather than as an expectation.
+
+**RED-proof shape.** Not applicable in the usual sense — this class is about the
+provenance of a claim rather than a defect in code. Its check is procedural: any
+statement of the form "this is probably fine" or "this is probably where it breaks",
+made about one's own work, is a **claim awaiting an experiment**, and should be
+labelled as such in the record so a reader can weigh it correctly.
 
 ---
 
@@ -1026,3 +1068,4 @@ address its instance, not its class.
 | 20. Correct test, non-representative environment | discipline (name the mechanism the property needs; prove it against the real component) | Discipline |
 | 21. Warning banner as enforcement | discipline (sentinel prefill or non-sentinel rejection; never persist the value; state the residual up front) | Discipline |
 | 22. The fix inherits the class it closed | discipline (re-apply the finding's own question to the remedy; two weakens, not one) | Discipline |
+| 23. Forecasting your own code | discipline (construct an experiment; a forecast about your own work is a claim awaiting one) | Discipline |

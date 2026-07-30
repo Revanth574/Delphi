@@ -1,0 +1,63 @@
+# ══════════════════════════════════════════════════════════════════════════════════════
+#  THIS PROFILE IS NOT A CONFINEMENT MEASURE. IT CONFINES NOTHING.
+#
+#  Read this before concluding anything from the existence of a file in /etc/apparmor.d/
+#  bearing this component's name. A profile here LOOKS like hardening. This one provides
+#  NONE. `flags=(unconfined)` means every access is permitted; the profile exists only to
+#  give the process a NAME instead of the label "unconfined".
+#
+#  WHAT IT ACTUALLY CHANGES — one thing:
+#    Ubuntu 24.04+ sets kernel.apparmor_restrict_unprivileged_userns=1, which denies
+#    unprivileged user-namespace creation to processes that have NO AppArmor profile.
+#    A *named* profile granting `userns,` is exempt. That exemption is the entire purpose
+#    of this file.
+#
+#  WHY THE SHELL HOST NEEDS IT:
+#    Ubuntu routes GTK3 image loading through glycin (libgtk-3.so.0 links libglycin-2.so.0),
+#    and glycin runs its image loader inside `bwrap`, which REQUIRES a user namespace. With
+#    the namespace denied, EVERY themed-icon load fails; GTK3 then tries its `image-missing`
+#    fallback, which fails for the same reason, and gtkiconhelper.c:495 ASSERTS —
+#    SIGABRT'ing the host. Measured: the abort reproduces deterministically from an
+#    unprofiled shell and never (0/24 launches) from a shell holding a userns-granting
+#    profile. This is not avoidable in our code: the icon request comes from GTK3 window
+#    creation itself — identical with our bundle, with about:blank, and with a bare
+#    GtkWindow containing no WebKit at all — and the icon is not missing, merely unloadable.
+#
+#  THE HONEST DELTA:
+#    Before this file, /usr/libexec/delphi-shell runs with NO profile — i.e. already
+#    unconfined. This grants it nothing it did not already have EXCEPT `userns`. It is the
+#    status quo plus a name. It is NOT a new grant of authority, and it is NOT a security
+#    improvement.
+#
+#  WHAT REMAINS UNCONFINED — STATE THIS PLAINLY TO ANY FUTURE READER:
+#    delphi-shell embeds WebKitGTK and hosts the UNTRUSTED RENDERER — the component
+#    docs/TRUST_MODEL.md treats as hostile, the one that must not be able to forge an
+#    approval. That renderer is NOT sandboxed by this profile. WebKit's own subprocess
+#    sandbox and the native consent relay (the R-2 keystone — renderer-cannot-forge,
+#    enforced in delphi_runtime::consent_relay, never in the renderer) remain the ONLY
+#    controls on it. Nothing here adds to them.
+#
+#    The security property is enforced NATIVELY, not by confinement:
+#      - the private channel fd is CLOEXEC-contained, fail-closed, BEFORE any WebKit
+#        process exists (B2A-R2-01, shell-host/src/main.rs ensure_channel_contained);
+#      - a renderer postMessage reaches the channel nowhere outside the PAM window;
+#      - the mint-confirm is sent from the host's OWN held digest, never the renderer's.
+#
+#  FOLLOW-UP OWED (recorded in PROGRESS.md, NOT done here):
+#    A genuinely CONFINING profile — granting `userns` plus exactly the filesystem, D-Bus,
+#    dri, shm and font access WebKitGTK needs — is the principled answer and is its own
+#    increment. It is substantially harder (WebKit profiles are brittle) and cannot be
+#    written blind: it needs root to install and iterate. Replacing this file with that one
+#    is the goal; shipping this one is the minimal unblock, not the destination.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+abi <abi/5.0>,
+include <tunables/global>
+
+profile delphi-shell /usr/libexec/delphi-shell flags=(unconfined) {
+  userns,
+  @{exec_path} mr,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/delphi-shell>
+}

@@ -32,6 +32,29 @@ Environment=DELPHI_SHELL_VT=tty3
 # the visible B1 scaffold under its OWN name — it is NOT the Brain, and installing it at
 # the Brain's address would be the stub-at-the-real-address lie this project refuses.
 Environment=DELPHI_AI_BIN=/usr/libexec/delphi-minimal-ai
+# ── What the B1 scaffold AI proposes (P3) ────────────────────────────────────
+# `delphi-minimal-ai` does `env::var("DELPHI_AI_EXE").expect(...)` and PANICS without it, and
+# the daemon passes `ai_env: &[]` — the launcher supplies only DELPHI_APPROVE_SOCK. So these
+# MUST be set here (the children inherit the daemon's env) or the AI dies at startup and no
+# action is ever proposed. This gap blocked P3 until it was found by reading the env plumbing
+# end to end; `installer/p3-preflight.sh` now refuses when any of them is missing.
+#
+# The proposed action is `touch /tmp/delphi-p3-marker`, chosen so that:
+#   * the consent PREVIEW the user reads is short, literal, and obviously harmless;
+#   * SUCCESS IS MACHINE-CHECKABLE — the marker's existence after the run means the action
+#     really executed, which is the only claim a screenshot cannot make; and
+#   * it is writable by the PRIV-DROPPED session user, not root.
+#
+# The marker lives under DELPHI_AI_BIND_RW so the bwrap profile grants it. `--bind` (not
+# `--tmpfs`) binds the HOST path into the jail, so the marker persists on the real filesystem
+# and is observable after the run — verified in sandbox.rs (`BindMode::ReadWrite => "--bind"`).
+#
+# THE MARKER MUST NOT PRE-EXIST. A marker surviving a previous attempt makes a FAILED P3 read
+# as a success — the silent-wrong-answer shape this phase is most exposed to. The pre-flight
+# refuses on it; if you clear it by hand, `rm -f /tmp/delphi-p3-marker` before every run.
+Environment=DELPHI_AI_EXE=/usr/bin/touch
+Environment=DELPHI_AI_ARG=/tmp/delphi-p3-marker
+Environment=DELPHI_AI_BIND_RW=/tmp
 # The daemon logs under this identifier; the shell inherits its stdout/stderr, so shell
 # diagnostics appear here too (launcher.rs stdio policy). Fully SEPARATING shell output
 # from daemon output is a shell-side concern (the shell reopening its own stream), not the

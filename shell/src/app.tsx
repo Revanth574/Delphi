@@ -7,6 +7,7 @@ import { Topbar } from "./components/topbar.tsx";
 import { Dock } from "./components/dock.tsx";
 import { CommandBar } from "./command-bar/command-bar.tsx";
 import { SettingsPanel } from "./components/settings-panel.tsx";
+import { PamConsentDialog } from "./consent/pam-consent-dialog.tsx";
 import { useModeStore } from "./stores/mode-store.ts";
 
 /**
@@ -43,6 +44,18 @@ export function App() {
       <Dock />
       <CommandBar />
       <SettingsPanel />
+
+      {/*
+        Mounted UNCONDITIONALLY and at the root, never lazily and never behind a route or a
+        user gesture. The WRY host may inject `onApprovalRequest` as soon as the page loads
+        (runtime/shell-host/src/main.rs:163), and its injections are guarded — an
+        unregistered `window.__delphiConsent` makes them silent NO-OPS (`inject()`, :190),
+        so a late registration does not queue the first request, it LOSES it: the daemon
+        waits, the user sees nothing, and no error surfaces. The component renders `null`
+        until a request arrives, so mounting it always costs nothing.
+        Pinned by src/__tests__/app-consent-contract.test.tsx.
+      */}
+      <PamConsentDialog />
     </div>
   );
 }

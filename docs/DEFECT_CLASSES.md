@@ -641,12 +641,493 @@ next copy fails loudly rather than shipping green (Class 15's `fixture_hygiene` 
   the pre-fix code, and passes after — with zero false positives on `leader_is_shell.rs`, which
   references the PAM path but never `remove_file`s it (it removes only test-owned `/run` dirs).
 
+- **AppArmor userns gate — the SAME gate, a DIFFERENT door (B2a composition, 2026-07-25).** Two
+  expensive instances on one box, months apart, both rooted in
+  `kernel.apparmor_restrict_unprivileged_userns=1`:
+  1. **Earlier in the arc:** a test failed with `bwrap: execvp permission denied`. Two diagnoses
+     were wrong; `dmesg | grep apparmor` gave ground truth (`profile="bwrap" ... DENIED`). Fixed by
+     disabling the `bwrap-userns-restrict` profile — i.e. **bwrap confined by its OWN profile**.
+  2. **This session:** the WRY shell host aborts because *glycin*'s bwrap-sandboxed image loader
+     cannot create a userns — the **CALLER has no profile at all**, and an unprofiled process is
+     denied userns creation under the same sysctl.
+  The first remedy could not cover the second: it addressed the door (`bwrap`'s own profile), not
+  the gate (the sysctl's treatment of *every* userns creator). **The class lesson: when a fix
+  targets one actor's confinement, enumerate the OTHER actors subject to the same control before
+  declaring the class closed** — here, "what else on this box creates a userns, and what is ITS
+  profile?" would have surfaced the caller-side case immediately. `dmesg | grep -i apparmor` (and
+  `/proc/self/attr/current` + `unshare -r`) is the ground-truth probe for this class; reasoning
+  about it has now failed twice.
+
 **RED-proof shape.** The finder-guard must FIRE against an un-fixed copy before it is fixed —
 `fixture_hygiene.rs` naming `pam_interposition.rs` (and later `systemd_smoke.rs`) is the
 reference. A "fix" with no finder and no cross-tree grep is unproven: it is the count of
 instances you *remembered*, not the count that *exist*. And a finder-guard must be scoped to the
 **shape across all paths**, not the one path it was written for — else it becomes the next Class-17
 instance itself.
+
+---
+
+## 18. The verification loop mutates the thing under test  *(new — B2a composition)*
+
+**Description.** A verification procedure — a weaken/restore cycle, a bisect, a
+before/after comparison — runs a command that **mutates the artifact it is
+measuring**. The damage then surfaces as a **failing test**, so it is read as a
+product defect and diagnosed as one. The actor cannot see it: from inside the loop
+the red looks exactly like the red you were hunting.
+
+This is the generalisation of two incidents that were first recorded separately as
+VCS accidents. They are not about `git` — `git` is merely the sharpest available
+instrument. The invariant they share:
+
+> **A verification loop must not run commands that can mutate the thing under
+> test.** Measurement is read-only; the only writes a verification loop may make
+> are the deliberate, named perturbation (the weaken) and its exact inverse.
+
+The two properties that make this class expensive are worth naming, because they
+are why it costs more diagnostic time than the defects it hides:
+
+1. **The damage is silent at the moment it happens** — a destructive command
+   succeeds quietly; nothing reports "you just deleted the change you are testing".
+2. **The damage is loud in the wrong place** — it re-emerges as a red, attributed
+   to the product, one or more steps downstream of its cause.
+
+**Foreclosing primitive.** **NONE — discipline, plus an external check.**
+Before any step of a verification loop that moves `HEAD`, discards changes, or
+rewrites files: **`git status --porcelain` must be empty, or the work must be
+committed or stashed first.** Prefer perturbations that are *exactly invertible in
+the editor* (edit → run → edit back) over any that route through `git` at all. When
+a restore *does* go through `git`, **verify the restore by reading the diff, not by
+observing the test go green** — a green after a botched restore and a green after a
+correct one are indistinguishable.
+
+**Instances (grounded):**
+- **`git reset --hard HEAD~1` with a dirty tree (B2a C1, 2026-07-22)** — run to
+  amend a non-`HEAD` commit; destroyed three fixture fixes, a new test file's
+  contents, and a `PROGRESS.md` rewrite. Recovered **only** because those edits
+  happened to have been made by scripted `python` patches that could be re-run.
+  That is luck, not a property of the workflow. (See §6 "Git history surgery".)
+- **`git checkout -- src/app.tsx` mid-weaken-loop (P2, 2026-07-25)** — run to undo a
+  weaken, on a file whose P2 mount edit was still **uncommitted**. It reverted the
+  file to `HEAD`, i.e. to the *pre-P2* state, discarding the change under test. The
+  following "restore" run was red **because the mount was gone**, not because a test
+  had broken — the loop reported a product failure it had itself caused. Caught by
+  reading `git diff`, not by the test result.
+
+- **A patch script that AssertionError'd partway, reported as done (B2a composition, 2026-07-25).**
+  A Python patch was to make three edits to a test file. The first succeeded in memory; a
+  later `assert old in s` failed, so the interpreter exited **before its trailing
+  `open(p,"w").write(s)`** — writing **nothing**. The visible output still showed the earlier
+  step's `print("patched")`, the suite still went green (the change was inert), and the commit
+  message went on to assert "The stub is removed, not repaired." **It was not removed.** Caught
+  only by grepping the **committed** file (`git show HEAD:… | grep -c`) rather than trusting the
+  run. Same shape as the `git checkout` instance above: a **partially-failed tool operation
+  reported as its intended state**, with the damage surfacing far from its cause — here as a
+  false claim in the audit trail rather than as a red.
+  **The rule both instances share: verify the ARTIFACT, not the operation's apparent success.**
+  A tool printing progress, exiting 0, or leaving a green suite is not evidence that the
+  intended change is in the file. Grep the file; diff the commit.
+
+**RED-proof shape.** This class is a *process* defect, so its proof is procedural
+rather than a test: after any restore step, the restored artifact must be shown
+**byte-identical to its pre-weaken state** (`git diff --stat` empty for a committed
+baseline, or an explicit content check for uncommitted work) *before* the restored
+run's result is believed. A restore verified only by "the test is green again" is
+unproven — that is precisely the observation a destroyed change can also produce.
+Note the asymmetry with Class 16: there a *fixture* mutated shared state it did not
+own; here the *verification procedure itself* mutates the code under test.
+
+---
+
+## 19. Comparing runs taken with DIFFERENT INSTRUMENTS  *(new — B2a composition)*
+
+**Description.** Two runs are compared to locate a difference in the system, but the
+**measurement apparatus** changed between them — a different trace filter, log level,
+build flag, timeout, or environment. The delta observed is then **the observer's own
+change**, attributed to the system. This is the sibling of class 18: there the
+verification loop *mutated* its subject; here it *re-instruments* between
+observations. Both corrupt the result while looking like a clean experiment, and both
+produce a confident, wrong, **publishable-looking** conclusion.
+
+> **The rule: when comparing runs, the instrument is part of the experiment.**
+> Change exactly one thing — and it must not be the instrument.
+
+**Foreclosing primitive.** **NONE — discipline.** Pin the instrument first and record
+it beside the result (the exact filter/flags), so a later comparison can see whether it
+matches. When a comparison produces a surprising result, **re-run the baseline under the
+new instrument before believing the delta** — the cheapest possible check, and the one
+that reverses this class every time.
+
+**Instances (grounded — both in a single afternoon's diagnosis, both one commit from
+being recorded as findings):**
+- **"The consent dialog triggers the icon load."** Runs traced with `-e trace=openat`
+  showed **0** icon-theme lookups for the none / approval-only / approval+prompt modes,
+  while the earlier baseline (traced `openat,newfstatat`) showed 6. GTK **stats** icon
+  directories rather than opening them, so the filter — not the dialog — produced the
+  difference. Under the matched instrument all three modes show the **same 6**: the
+  dialog is irrelevant.
+- **"It is WebKit-specific."** With the same truncated filter a bare `GtkWindow` showed
+  no sized-category lookups, implying the WebView was responsible. Under
+  `openat,newfstatat` the bare window shows the **same 6** — it is GTK3 window creation,
+  and WebKit is irrelevant. Had this stood, the fix would have been aimed at the wrong
+  component entirely.
+
+**RED-proof shape.** Procedural, like class 18: before accepting a difference between
+two runs, **re-run the earlier configuration under the later instrument** and confirm
+the delta survives. If it vanishes, the instrument was the variable. Record the
+instrument string (e.g. the full `strace -e trace=…` expression) next to each result so
+the comparison is auditable after the fact rather than reconstructed from memory.
+
+---
+
+## 20. A correctly-biting test in a NON-REPRESENTATIVE environment  *(new — B2a composition)*
+
+**Description.** A test is written well: it is RED-proven, its weaken/restore
+discriminates, its assertion names a real property. And it certifies **the wrong
+thing**, because the environment it runs in **does not implement the mechanism the
+property depends on**. Nothing about the test is sloppy; the green is simply
+evidence about the harness rather than about production.
+
+This is **distinct from the vacuous-test failure** (class 15 clause 2 — a test never
+proven to bite). That test's green means nothing because it cannot fail. *This*
+test's green means something — just not what the reader takes it to mean. And it is
+distinct from class 19, where the instrument **changed between runs**; here a single
+consistent instrument is **incapable of observing the property at all**.
+
+> **The discriminating question: does the test environment IMPLEMENT the mechanism
+> the property depends on?**
+> If it does not, the green is **evidence about the test environment, not about
+> production** — no matter how rigorously the test bites.
+
+**Foreclosing primitive.** **NONE — discipline.** For any property that depends on a
+platform mechanism (module loading, origin/CORS rules, process sandboxing, kernel
+policy, real IPC transports), name the mechanism explicitly and check the harness
+implements it before trusting a green. Where it does not, say so **in the test
+file**, scope the test's claim down to what the harness *can* see, and prove the
+real property against the real component.
+
+**Instances (grounded):**
+- **`shell/src/__tests__/file-protocol-load.test.ts` (P1).** It built through the real
+  vite config, resolved every emitted asset with browser semantics, executed the
+  bundle, asserted React mounted — and was **verified to bite** (`base:"/"` → 2 failed,
+  `base:"./"` → 3 passed). It certified that the bundle loads over `file://`. **It does
+  not.** jsdom has **no module loader, no origins and no CORS**, so the test injected
+  the emitted module as a *classic script* — a narrowing that was documented, and that
+  turned out to remove the very mechanism the production failure lives in. Real WebKit
+  **never fetches an external `<script type="module">` from a `file://` page** (opaque
+  origin), so the bundle never executes and the page is blank. The `base:"./"` fix
+  remains correct; the *claim the green supported* did not transfer.
+- **Sibling, same session:** the `aa-status` stub that was **more capable than the tool
+  it stood in for** — the suite proved a registry check "works" while the real tool
+  returns a permission error to any unprivileged caller. Same shape at the tooling
+  layer: the harness implemented a mechanism production does not have.
+
+**RED-proof shape.** The property must be proven against the **real component in the
+real environment**, with the harness test demoted to what it can honestly observe.
+For P1 that means the ladder (`scratch/file-protocol-ladder.py` → a committed
+shell-host test): the **real** `delphi-shell` binary, **real** WebKitGTK, the **real**
+scheme, using the only machine-checkable signal the host offers
+(`{"kind":"cancel"}` → `process::exit(0)`, so *exit 0 = the page executed*). A green
+there is evidence about production because production is what ran.
+
+---
+
+## 21. A warning banner is not an enforcement mechanism  *(new — B2a composition)*
+
+**Description.** A test harness, probe, or demo renders something that **looks
+authentic** — most sharply, a credential prompt — and relies on **text** to stop the
+human from treating it as real. It does not stop them. A dialog that presents as the
+system's own password field will receive the system's own password, regardless of
+what is written above it, because the person is responding to the interface, not
+reading the terms of the experiment.
+
+The failure is not carelessness on the reader's part. An authentic-looking prompt is
+*designed* to elicit the credential; a paragraph of warning text competes with that
+design and loses. Treating the warning as the control confuses **documentation** with
+**enforcement** — the same confusion as a comment that says "do not call this
+concurrently" standing in for a mutex.
+
+> **If a probe can receive a real credential, assume it will. Design so that it
+> cannot be the thing that matters, rather than asking the human not to supply it.**
+
+**Foreclosing primitive.** **NONE — discipline, with three concrete requirements for
+any interactive probe that renders a credential-shaped field:**
+
+1. **Prefill a sentinel** (e.g. `DUMMY-DO-NOT-USE`) so the field is never empty and
+   inviting, **or reject any input that is not the sentinel** — an enforcement point,
+   not a request.
+2. **Never persist what is received.** Report a **length or a hash**, never the value;
+   never write it to a log, a file, an argv, or an environment variable. This is the
+   property that determines whether an incident is *"a secret crossed a socket into a
+   process"* or *"a secret is on disk"* — a large difference in blast radius.
+3. **State the residual honestly.** Even with (1) and (2), a credential typed into the
+   probe has entered a process's memory. That is a rotation-worthy event, and the probe
+   should say so **before** the interaction, not after.
+
+**Instances (grounded):**
+- **`scratch/p3a-host-check.py` (P3a-1, 2026-07-25).** The probe drove the REAL consent
+  dialog — the real preview, the real PAM-prompt label, the real password field — to
+  prove the renderer→native round trip under real WebKit. It carried a banner stating
+  plainly that nothing authenticates the value and that a throwaway string should be
+  used. **The operator entered their real password**, because the dialog was
+  indistinguishable from the production one, which is precisely what the test was
+  demonstrating. Mitigating factors held, and they held **by design rather than by
+  luck**: the probe reports only `len(data)` and never the bytes, so the value reached
+  a process's memory and a socket but **never disk** — confirmed by grepping the run
+  log, which contained only the prompt label, the banner text, and the byte count.
+  Rotation was still the correct response.
+
+- **THE CLASS CAUGHT ITS OWN AUTHOR, one layer down (same session).** The first attempt at
+  fixing the instance above wrote a **sentinel-prefill guard** into the probe — JavaScript to
+  set the password field to a dummy value and reject anything else. **The probe structurally
+  cannot inject it:** only the HOST calls `evaluate_script`; the probe speaks the private
+  channel, and the one renderer-visible string it controls (the PAM prompt) is `serde_json`-
+  escaped precisely so content cannot become script. The guard would have sat in the file
+  **looking like an enforcement point while enforcing nothing** — the exact shape this class
+  describes, one level down: not a warning mistaken for a control, but a *control that cannot
+  run* mistaken for a control.
+  It was **removed rather than left in**, and replaced by something structural: the probe no
+  longer sends the PAM prompt at all by default, so the dialog's `disabled={submitted ||
+  !prompt}` makes the credential path **unreachable**. The generalisation: **when you write a
+  guard, verify it can actually execute in the position you put it** — an unreachable guard is
+  worse than none, because it stops anyone looking for a real one.
+
+**RED-proof shape.** Two parts, because the class has a design half and a hygiene half.
+(a) **Design:** inspect the probe for an enforcement point — a prefilled sentinel or a
+non-sentinel rejection. Prose in the banner does not satisfy it. (b) **Hygiene:** assert
+mechanically that no received byte is written anywhere — grep the probe for any use of
+the received buffer other than `len()`/hash, and grep a real run's artifacts for the
+value. A probe that passes (b) but fails (a) is one confused human away from an
+incident; a probe that fails (b) has already had one.
+
+---
+
+## 22. The FIX inherits the class it was closing  *(new — B2a composition, round 2)*
+
+**Description.** A finding is fixed, the fix is RED-proven, and the fix **exhibits the
+same defect class one degree weaker**. The remediation is not wrong in direction —
+it genuinely removes the reported instance — but it reintroduces the underlying
+shape at a level the new test does not reach. Because a review round tends to close
+a finding once its named instance is gone, this survives precisely when everyone is
+paying attention.
+
+> **A fix is not exempt from the class it fixes. Re-apply the finding's own
+> question to the remedy before declaring it closed.**
+
+**Foreclosing primitive.** **NONE — discipline.** When a fix lands, ask the finding's
+question of the fix itself: *if this is a false-green class, can the new gate produce
+a false green? If this is a non-biting-test class, can the new test fail to bite?*
+Where the answer is "only in a weaker form", that weaker form is a finding now, not
+later.
+
+**Instances (grounded):**
+- **B2A-COMP-R2-01 → B2A-COMP-R3-02 (this arc).** Round 1's R2-01 added a gate because
+  a sandbox misconfiguration read as *all-preconditions-met* — a **false green**. The
+  gate compared paths **lexically** (`case "$AI_ARG/" in "$bind_rw"/*`), so
+  `/tmp/../var/tmp/marker` against `bind_rw=/tmp` has the right prefix, resolves
+  **outside** the bind, and passes — **a false green replaced by a weaker false
+  green.** Fixed by canonicalising with `realpath -m` before comparing.
+- **FD-01's re-aim (earlier in B2a).** The first version of the regression test passed
+  under its own weaken; the re-aimed test bit. The *fix for a non-biting test* was
+  itself non-discriminating until run — the same shape at the test layer, and the
+  reason "verify the fix's fix" is a rule rather than an instinct.
+- **B2A-COMP-R1-01's own test (this round).** The R3-01 fix hoisted the apparmor
+  preconditions into pre-flight; its regression test asserted only that the **bundle
+  tree** was absent — but the tree install runs after the apparmor block either way,
+  so the test passed with the fix reverted. It could not distinguish *refused before
+  any mutation* from *refused after the binaries were copied*. Caught by running the
+  weaken and **verifying the weaken had applied**; fixed by asserting `/usr/libexec`
+  is untouched.
+
+- **THE APPARATUS INHERITS IT TOO — B2A-COMP-R4-04 → R5-02 (round 4).** R4-04 removed a
+  mirror by delegation: stop grepping the unit file, ask `systemctl show`. **Its test stub
+  then grepped the unit file** and answered any `show` call with the result — the removed
+  mirror reinstated *inside the proof*, and green even if production queried the wrong unit
+  or the wrong property. **Weaken (b) applies to the TEST APPARATUS, not only to the fix.**
+  Ask of every stub: *does this stand in for the thing, or does it reimplement the thing the
+  fix just stopped reimplementing?*
+- **The positive-assertion shape (round 4, R5-03).** Two of this sweep's four non-biting tests
+  shared one form: a POSITIVE case asserting a generic success string **that the unperturbed
+  fixture already emits**, so it passed whether or not its perturbation applied. The
+  structural remedy is not vigilance: a positive assertion must name a value the BASELINE does
+  not produce, and that must be **checked mechanically** — run the pristine fixture first and
+  fail if it already satisfies the expectation (`assert_positive` in
+  `installer/tests/p3-preflight.test.sh`). A control leg, in the same sense the WebKit suite
+  uses one.
+
+- **The SAMPLER that measures its own race (round 5).** The regression test for the
+  restore-before-clear invariant sampled with **two separate `[ -e ]` stats**. An atomic
+  `rename(2)` landing between them shows *both* paths absent when one existed at every
+  instant — so the test reported a violation that never happened. It passed 3× then failed on
+  unchanged good code: **intermittent, and therefore worthless** (Iron Law #15 cl. 2 — it
+  cannot distinguish a violated property from an unlucky run). Fixed with a single `readdir`
+  per sample, then proven **10/10 deterministic** and still biting (3/3 under the weaken).
+  The lesson generalises past sampling: **a measurement composed of several observations is
+  not a measurement of a single instant.** When the property is "at every instant X", the
+  sample must be atomic or the harness will invent violations.
+
+- **THE SAMPLER, TWICE — and what actually proves a synchronisation fix (round 6).** The
+  restore-before-clear test's measurement was wrong twice in successive rounds: first two
+  stats straddling an atomic `rename(2)` (inventing a violation), then — in the *fix* for
+  that — the initial write placed INSIDE the background sampler, so the parent could launch
+  the subject and kill the sampler before the write happened, reading "unknown" and failing on
+  GOOD code. Class 22 in the same test, two iterations running.
+
+  > **⚠ THE WEAKEN PROTOCOL HAS A BLIND SPOT, AND THIS IS IT.**
+  > The weaken/restore cycle is this project's primary verification tool: revert the fix, the
+  > test must fail. **For a scheduler-dependent property it can pass while the defect is
+  > present.** Measured here — the startup race was *reintroduced* under an ordinary weaken
+  > and **the test still passed**, because the bad interleaving simply did not occur in that
+  > run. The same race had already survived a **10/10 deterministic** run.
+  >
+  > This is a limit on the tool, not a note about counting greens. Wherever a property depends
+  > on ordering between concurrent actors — sampling, signal handling, fork/exec sequencing,
+  > file-descriptor lifetime, lock acquisition — **a passing weaken is not evidence.** The
+  > protocol silently degrades from "proven to bite" to "did not happen to bite this time",
+  > and nothing in the output distinguishes those two.
+
+  **The standard that does apply, both parts required:**
+  1. **A happens-before you can point to in the source** — the race removed *by construction*,
+     not by timing. Here: the initial value is written by the PARENT before the fork (so the
+     file exists whenever the parent reads it), and the sampler signals readiness after a
+     completed sample with the parent blocking on that signal (so "hope it started" becomes
+     "it demonstrably started").
+  2. **A widened-window experiment** — force the bad interleaving instead of waiting for it.
+     Inject a delay at the suspect point so the race is near-certain, and show the old shape
+     fails and the new one does not. Measured here under a forced 0.5 s scheduling delay:
+     old shape → `UNKNOWN`, new shape → `0`. That discriminates where 10/10 could not.
+
+  **If neither is available — no structural argument and no way to widen the window — say the
+  fix is unproven rather than running it more times.**
+
+- **THE SAMPLER, A THIRD TIME — and the resolution: STOP SAMPLING (round 7).** The round-6
+  fix carried a third timing defect of the same class: the parent's readiness handshake was a
+  bounded busy-wait (`for _ in $(seq 1 500)`), so on a loaded or single-core runner 500 `-e`
+  checks can complete before the background sampler is scheduled even once, and GOOD code
+  reports `SAMPLER-NEVER-READY`. *"Hope it started"* had become *"hope it starts within 500
+  iterations"* — the happens-before argument covered the file existing, not the sampler being
+  scheduled. Three fixes, three defects, all timing.
+
+  > **THREE DEFECTS OF ONE CLASS IN ONE TEST IS THE INSTRUMENT TELLING YOU IT IS THE WRONG
+  > INSTRUMENT.** A sampler observes at INTERVALS. The property was "at **every instant** at
+  > least one of X or Y exists". **A sampler cannot decide that even in principle** — between
+  > any two observations there is a gap it did not see — so every fix could only shrink the
+  > gaps, never remove them, and every fix was on the wrong axis. The fourth would have been
+  > too. The tell is the repetition of a CLASS, not the difficulty of any one instance.
+
+  **The foreclosing move: derive the invariant from a COMPLETE RECORD instead of observing
+  states.** A directory entry's existence changes *only* by syscall, and `strace -f` records
+  every syscall of the traced tree. Existence is therefore a step function whose every step is
+  on record, and evaluating the invariant after each step evaluates it at every instant — by
+  construction, with **no interval, no iteration count, and no dependence on scheduling.**
+  Implemented as `installer/tests/trace-invariant.py`.
+
+  **What that buys, and it is exactly what the blind spot above denies:** the weaken is
+  DETERMINISTIC. Measured — clear-before-restore reintroduced, **10/10 runs detected**, and
+  the verdict names the cause (`VIOLATION both-absent-after:unlinkat:line1389:step2`) rather
+  than reporting an anomaly. The 10/10 is a *description*, not the evidence: the trace
+  CONTAINS the `unlinkat` that opens the window, so the violation is **derived, not observed**,
+  and no interleaving is involved. Contrast round 6, where a reintroduced race survived its
+  weaken. **Escaping the blind spot beats managing it** — when a property is temporal, look
+  for a complete record before accepting a sampling harness and the whole class-22 apparatus
+  that a sampling harness then requires.
+
+  **A checker is an instrument too, so it carries the same burden — and can now discharge it
+  cheaply:** the checker is proven to bite on **synthetic traces** (fixed input → fixed
+  verdict), which is a weaken/restore with no timing in it at all. **It must fail CLOSED**,
+  because the completeness argument holds only where every mutation is visible *and*
+  classified: an unknown syscall, a dirfd-relative mutation, a `<unfinished>` split on a
+  mutating call, or an unreadable return value each yield `REFUSE`, never a reassuring `OK`.
+  This is not theoretical — the first run against a real trace **refused**, on `execve` and
+  directory-`openat` splits (74 split lines occur in one real install). Narrowing to skip
+  splits on *provably inert* syscalls is legitimate (Iron Law #15 cl. 3: a split on a
+  *mutating* call still refuses, with its own self-test); widening the accepted set to make
+  the refusal disappear would have been the forbidden edit available at the same moment.
+
+**RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
+the test must fail; and (b) **the class re-application** — construct the input that
+exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix
+that resolves elsewhere) and assert it is caught. A fix with only (a) is proven to
+address its instance, not its class.
+
+---
+
+## 23. Forecasting your own code instead of interrogating it  *(new — B2a composition)*
+
+**Description.** Asked where a defect is likely to be, an author predicts — and the
+prediction is a model of code they wrote, built from the same understanding that
+produced the code. Where that understanding is wrong, the prediction is wrong in
+**exactly the place the defect is**. The failure is not carelessness; it is that
+introspection and authorship draw on the same model, so the error is common-mode.
+
+Measured over this sweep: the author's forecasts about **where findings would be**
+were wrong twice in succession, both times pessimistic — predicting the
+custom-protocol handler would not survive a dedicated pass (it did, three times) and
+that a stub audit would find a fourth instance of a three-for-three pattern (it found
+zero, which was itself the informative result). Over the same period the author's
+**experiments** — weaken/restore, the widened window, running the real binary against
+the real bundle — repeatedly produced correct findings, including ones the reviewer
+had not asked for.
+
+> **On your own code, construct an experiment rather than forecast a result.**
+> A weaken, a widened window, a control leg and a real-binary run all work by making
+> the SYSTEM answer. A prediction works by asking yourself — which is the one source
+> already known to be wrong wherever the defect lives.
+
+**Foreclosing primitive.** **NONE — discipline.** When tempted to say "I expect X is
+where the problem is", convert it: what run would distinguish X from not-X, and can it
+be done now? Where the forecast cannot be converted into an experiment, state it as a
+guess with its track record attached rather than as an expectation.
+
+**RED-proof shape.** Not applicable in the usual sense — this class is about the
+provenance of a claim rather than a defect in code. Its check is procedural: any
+statement of the form "this is probably fine" or "this is probably where it breaks",
+made about one's own work, is a **claim awaiting an experiment**, and should be
+labelled as such in the record so a reader can weigh it correctly.
+
+---
+
+## 24. In-band sentinel — a signal drawn from the value space it describes  *(new — B2a composition, round 7)*
+
+**Description.** A helper needs to report *both* a value and a condition about that value, and
+encodes the condition as a **reserved value of the same type** — `<declared-empty>` for a
+pathname, `-1` for a count, `<none>` / `N/A` for a string. The value space and the signal
+space overlap, so two things become impossible to distinguish: **legitimate data that happens
+to equal the sentinel**, and **the condition itself**. Every consumer downstream must then
+know about the sentinel, and any consumer that does not silently treats the signal as data.
+
+**Instance.** `p3-preflight.sh`'s `resolve_bin` printed the literal string `<declared-empty>`
+when a bin path was declared-but-empty in the unit. Two consequences, both real:
+
+1. **Consumers treated it as a filename.** `$SHELL_BIN` flows into `[ -e ]`, `[ -f ]`,
+   `sha256sum`, `strings` and an `[ -x ]`-guarded `execve`. A declared-empty bin produced a
+   *second* refusal — `<declared-empty> is ABSENT — run: sudo bash installer/install.sh` —
+   naming a file nobody wrote and prescribing the installer when the fault is the unit
+   declaration. A misdiagnosis printed in the voice of a diagnosis.
+2. **Value collision.** A deployment whose path genuinely is that string is reported as having
+   declared nothing. Narrow, but it is the defect proper, and **no amount of downstream
+   guarding can fix it** — only moving the signal off the value channel can.
+
+**Foreclosing primitive.** **NONE — discipline, with a standard shape.** Signal out of band:
+a **distinct exit status** (`return 2`), a separate flag variable, or a second output field.
+Return the *honest* value on the data channel — for `resolve_bin` that is the empty string,
+which is literally what the daemon would `execve` — and let the status carry "and that is a
+fault". Refuse once, at the point of resolution, and have downstream checks **skip** an
+unresolved value rather than re-refusing it under a wrong name.
+
+**RED-proof shape.** The symptom is an EXTRA misleading line, not a missing one, so the
+assertions are negative and must be paired:
+(a) perturb into the condition and assert the correct refusal appears **and the sentinel
+string does not appear anywhere in the log**;
+(b) set the value to *be* the sentinel string and assert it is **not** reported as the
+condition. Weaken by restoring the in-band return and the unguarded consumers: both go RED,
+and (a)'s failure output prints the misleading refusal verbatim — which is the finding.
+Implemented as B2A-COMP-R8-03 in `installer/tests/p3-preflight.test.sh`.
+
+**Sibling worth checking whenever this class appears.** The same review found
+`AI_BIN=$(unit_env DELPHI_AI_BIN)` in section 4 **reassigning** a name that already held the
+*resolved* path from section 0 — one identifier meaning two different things at two points in
+one script. Same root disease as the sentinel (a name whose meaning is positional rather than
+fixed), so audit for it in the same pass.
 
 ---
 
@@ -671,3 +1152,11 @@ instance itself.
 | 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |
 | 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |
 | 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |
+| 18. Verification loop mutates its subject | discipline (clean tree before destructive steps; verify the RESTORE by diff, never by green) | Discipline |
+| 19. Runs compared under different instruments | discipline (pin + record the instrument; re-run the baseline under the new one before believing a delta) | Discipline |
+| 20. Correct test, non-representative environment | discipline (name the mechanism the property needs; prove it against the real component) | Discipline |
+| 21. Warning banner as enforcement | discipline (sentinel prefill or non-sentinel rejection; never persist the value; state the residual up front) | Discipline |
+| 22. The fix inherits the class it closed | discipline (re-apply the finding's own question to the remedy; two weakens, not one) | Discipline |
+| 23. Forecasting your own code | discipline (construct an experiment; a forecast about your own work is a claim awaiting one) | Discipline |
+| 24. In-band sentinel drawn from the value space | discipline (signal by exit status / separate field; return the honest value; refuse once, skip downstream) | Discipline |
+| 22a. Temporal invariant decided by SAMPLING | `installer/tests/trace-invariant.py` (derive from a complete syscall record; fail closed on anything unclassifiable) | **Extracted** |

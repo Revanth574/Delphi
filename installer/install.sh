@@ -68,11 +68,125 @@ fstat_trust "$STAGE_FD" "$STAGE" dir
 # Each staged file: bind its inode + fstat-trust it. build.sh stages the binaries AND the unit
 # + PAM here (tight), so this ONE dir is the only source — never the group-writable repo tree.
 declare -A FD
-for f in delphi-runtimed delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam; do
+for f in delphi-runtimed delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam delphi-shell.apparmor; do
     exec {fd}< "$STAGE/$f" || refuse "cannot open $STAGE/$f — run installer/build.sh first"
     fstat_trust "$fd" "$STAGE/$f" file
     FD[$f]=$fd
 done
+
+# ── The shell bundle TREE (P1) — pre-flight ───────────────────────────────────────────
+# FIRST directory-tree install. The per-file discipline above (open → fstat_trust the BOUND
+# fd → copy from /proc/self/fd) extends here PER ENTRY, unchanged, and carries the same
+# documented bash-cannot-openat residual (see the RESIDUAL note above); Class 2 needs nothing
+# new. What IS new is Class 12 (reject the invalid CLASS, not the value): above, the 5
+# destination names are LITERALS in this script, but a tree takes its names FROM THE SOURCE.
+# So `..`, absolute paths, newlines, and non-regular entries become INPUTS, and each must be
+# gated as a class — fail-closed — rather than spot-checked.
+SHELL_SRC="$STAGE/shell"
+MAX_TREE_DEPTH=4      # dist/ is index.html + assets/<file>; 4 is slack, not a prediction
+MAX_TREE_ENTRIES=256  # bounded so the held-fd set cannot approach the per-process fd limit
+
+exec {SHELL_FD}< "$SHELL_SRC" || refuse "cannot open $SHELL_SRC — run installer/build.sh (UNPRIVILEGED) first"
+fstat_trust "$SHELL_FD" "$SHELL_SRC" dir
+
+declare -a TREE_DIRS=() TREE_FILES=() TREE_FILE_FD=()
+tree_count=0
+while IFS= read -r -d '' entry; do
+    rel="${entry#"$SHELL_SRC"/}"
+
+    tree_count=$((tree_count + 1))
+    if [ "$tree_count" -gt "$MAX_TREE_ENTRIES" ]; then
+        refuse "$SHELL_SRC has more than $MAX_TREE_ENTRIES entries — refusing rather than exhausting the fd table"
+    fi
+
+    # A symlink ANYWHERE in the tree is refused outright: copying THROUGH one would read an
+    # inode outside the staged tree (a symlink to /etc/shadow would be installed into a
+    # world-readable /usr/share path), and copying it AS one would plant a dangling or
+    # escaping link under a root-owned directory. The bundle legitimately contains neither.
+    if [ -L "$entry" ]; then
+        refuse "$rel is a symlink — the bundle tree must contain only regular files and directories"
+    fi
+
+    # Name gating, per component: the allowlist admits exactly what vite emits (including
+    # content-hashed names like index-DhCw579K.js) and excludes `/`, newline, whitespace, and
+    # shell metacharacters by construction. `..` matches the allowlist (dots are legal in
+    # filenames), so it is rejected explicitly — that is the traversal case.
+    IFS='/' read -ra parts <<< "$rel"
+    if [ "${#parts[@]}" -gt "$MAX_TREE_DEPTH" ]; then
+        refuse "$rel exceeds the maximum tree depth of $MAX_TREE_DEPTH"
+    fi
+    for part in "${parts[@]}"; do
+        if ! [[ "$part" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            refuse "$rel contains a path component ('$part') outside the allowed name class [A-Za-z0-9._-]"
+        fi
+        if [ "$part" = "." ] || [ "$part" = ".." ]; then
+            refuse "$rel contains a '$part' component — path traversal refused"
+        fi
+    done
+
+    if [ -d "$entry" ]; then
+        # B2A-COMP-R1-01 (P1): SUBDIRECTORIES MUST BE TRUST-CHECKED TOO.
+        # Before this, only the staging ROOT and the regular FILES were fstat_trust'ed;
+        # nested dirs got nothing but a name check. That left a real attack: a subdirectory
+        # (e.g. `assets/`) owned or group-writable by another local user means that user
+        # controls its CONTENTS, so they can race the `-L` symlink check below against the
+        # by-name `exec {tfd}<` open — swapping `assets/foo.js` for a symlink to a
+        # root-owned regular file. The symlink test passed while it was still a regular
+        # file; the open then FOLLOWS the link; `fstat_trust` sees a root-owned regular file
+        # on the followed fd and passes; and `copy_fd` installs that content world-readable
+        # under /usr/share/delphi/shell.
+        #
+        # Trust-checking every directory forecloses the race rather than narrowing it: if no
+        # unprivileged user can write any directory on the path, no unprivileged user can
+        # create or replace the entry being opened. (The documented bash-cannot-`openat`
+        # residual is unchanged — but it is only exploitable by someone who can write one of
+        # these directories, which this check now denies.)
+        exec {dfd}< "$entry" || refuse "cannot open directory $entry"
+        fstat_trust "$dfd" "$entry" dir
+        exec {dfd}<&-
+        TREE_DIRS+=("$rel")
+    elif [ -f "$entry" ]; then
+        # Bind the inode NOW and fstat-trust it, exactly as the fixed-name files above.
+        exec {tfd}< "$entry" || refuse "cannot open $entry"
+        fstat_trust "$tfd" "$entry" file
+        TREE_FILES+=("$rel")
+        TREE_FILE_FD+=("$tfd")
+    else
+        refuse "$rel is neither a regular file nor a directory — refusing (device/FIFO/socket)"
+    fi
+done < <(find "$SHELL_SRC" -mindepth 1 -print0 | sort -z)
+
+# An empty tree would "install" successfully and leave the host with no page to load — the
+# blank-page failure this whole increment exists to prevent. Refuse it.
+if [ "${#TREE_FILES[@]}" -eq 0 ]; then
+    refuse "$SHELL_SRC contains no regular files — run installer/build.sh first"
+fi
+# The host loads index.html by name; without it the install is vacuous.
+if [ ! -f "$SHELL_SRC/index.html" ]; then
+    refuse "$SHELL_SRC/index.html is missing — the host loads it by name (shell-host/src/main.rs:200)"
+fi
+
+# ── B2A-COMP-R3-01 (P2): APPARMOR PRECONDITIONS BELONG IN PRE-FLIGHT ──────────────────
+# The round-1 fix put both apparmor checks AFTER the binaries/unit/PAM were already copied, so
+# a failure left a mixed old/new install while claiming "everything else IS installed" — false
+# at that point. `command -v` and "does this profile even parse" are PURE PRECONDITIONS: they
+# depend on nothing this script has done, so per B2A-C-R1-04 they belong before the first
+# mutation, where `refuse`'s "no system change made" is TRUE.
+#
+# What CANNOT be hoisted is the actual `-r` load: it mutates kernel policy, so it is a
+# mutation by definition and has to happen in the mutate phase. Validating with `-QK`
+# (skip-kernel-load, skip-cache) here reduces the post-mutation failure to a genuine
+# kernel-load refusal rather than the far more likely "missing tool" or "malformed profile".
+if ! command -v apparmor_parser >/dev/null 2>&1; then
+    refuse "apparmor_parser not found — the shell host needs its AppArmor profile LOADED or it
+  SIGABRTs on the first themed-icon load (glycin's bwrap loader needs a user namespace, which
+  an UNPROFILED process is denied under kernel.apparmor_restrict_unprivileged_userns=1).
+  Install the apparmor userspace tools and re-run."
+fi
+if ! apparmor_parser -QK "$STAGE/delphi-shell.apparmor" >/dev/null 2>&1; then
+    refuse "the staged AppArmor profile does not parse:
+$(apparmor_parser -QK "$STAGE/delphi-shell.apparmor" 2>&1 | head -3)"
+fi
 
 # The Brain's address MUST stay empty — checked BEFORE any mutation (fail-closed, B2A-C-R1-04).
 if [ -e /usr/libexec/delphi-ai ]; then
@@ -86,6 +200,19 @@ fi
 # MUTATE — copy from the BOUND fds (not the paths), then set owner/mode explicitly. Only
 # reached when every pre-flight check above passed.
 # ══════════════════════════════════════════════════════════════════════════════════════
+# B2A-COMP-R3-01 (P2): once mutation has begun, `refuse` is a LIE — it prints "no system
+# change made". Anything failing from here on must say what state the system is actually in.
+# This is not only about the apparmor block: `copy_fd` below has called `refuse` since the
+# original single-file installer, so the false message PREDATES this round's change.
+fail_after_mutation() {   # what  consequence  remedy
+    echo "FAILED MID-INSTALL: $1"
+    echo "  THE SYSTEM IS IN A PARTIAL STATE — this is not a clean 'no change made' failure."
+    echo "  Consequence: $2"
+    echo "  Remedy:      $3"
+    echo "  Then re-run: sudo bash installer/install.sh   (it is idempotent)"
+    exit 1
+}
+
 copy_fd() {   # fd dest mode
     local fd="$1" dest="$2" mode="$3"
     # `install` from the BOUND fd (`/proc/self/fd/$fd`) — reads the same inode the fstat check
@@ -93,7 +220,10 @@ copy_fd() {   # fd dest mode
     # swap), and sets owner+mode ATOMICALLY (no `cat >` umask window where the dest is briefly
     # world-readable-but-wrong-mode). The DEST dir is root-owned (see the `install -d` below),
     # so no attacker can pre-plant a symlink at `$dest` for `install` to follow.
-    install -o root -g root -m "$mode" "/proc/self/fd/$fd" "$dest" || refuse "failed installing $dest"
+    install -o root -g root -m "$mode" "/proc/self/fd/$fd" "$dest" || \
+        fail_after_mutation "failed installing $dest" \
+            "some artifacts are updated and others are not — versions may be mixed" \
+            "fix the cause (disk space, permissions, read-only mount)"
 }
 
 install -d -m 0755 /usr/libexec
@@ -105,9 +235,113 @@ install -d -m 0755 /usr/lib/systemd/system
 copy_fd "${FD[delphi-runtimed@.service]}" /usr/lib/systemd/system/delphi-runtimed@.service 0644
 copy_fd "${FD[delphi-runtime.pam]}"       /etc/pam.d/delphi-runtime                        0644
 
+# ── AppArmor profile for the shell host ──────────────────────────────────────────────
+# ⚠ THIS IS NOT A CONFINEMENT MEASURE AND CONFINES NOTHING. A file in /etc/apparmor.d/
+# named after a component LOOKS like hardening; this one provides none. `flags=(unconfined)`
+# permits every access. Its ONLY effect is to give the host a NAMED profile, which exempts
+# it from kernel.apparmor_restrict_unprivileged_userns=1 — the sysctl that denies user
+# namespaces to UNPROFILED processes. Without that exemption, glycin's bwrap image loader
+# cannot start, every GTK3 themed-icon load fails, the `image-missing` fallback fails too,
+# and gtkiconhelper.c:495 ASSERTS — SIGABRT'ing the shell.
+#
+# THE RENDERER REMAINS UNCONFINED. delphi-shell embeds WebKitGTK and hosts the UNTRUSTED
+# renderer (docs/TRUST_MODEL.md). This profile adds NOTHING to the controls on it: the
+# security property is enforced natively (fail-closed CLOEXEC channel containment before any
+# WebKit exists; the consent relay's renderer-cannot-forge keystone; the mint-confirm sent
+# from the host's own held digest). Do not read this file's existence as sandboxing.
+# A genuinely confining profile is a recorded follow-up increment, not this.
+install -d -m 0755 /etc/apparmor.d
+copy_fd "${FD[delphi-shell.apparmor]}"    /etc/apparmor.d/delphi-shell                     0644
+# B2A-COMP-R1-02 (P2): a profile that does not LOAD is a profile that does nothing — the
+# install must not report success for a system it has left unable to render.
+# B2A-COMP-R3-01 (P2): the PRECONDITIONS for this (tool present, profile parses) moved to
+# pre-flight, so what remains here is only the kernel load, which is genuinely a mutation.
+if ! apparmor_parser -r -W /etc/apparmor.d/delphi-shell; then
+    fail_after_mutation "the kernel refused to load /etc/apparmor.d/delphi-shell" \
+        "the shell will SIGABRT on its first themed-icon load until the profile loads" \
+        "sudo apparmor_parser -r -W /etc/apparmor.d/delphi-shell"
+fi
+
+# ── The shell bundle TREE (P1) — mutate, via a two-rename replace ─────────────────────
+# `install` replaces ONE file atomically; a TREE has no atomic equivalent. So build the new
+# tree beside the live one under a DETERMINISTIC name, then swap by rename.
+#
+# WHY DETERMINISTIC, NOT PID-SUFFIXED: a pid-suffixed staging dir left behind by a crashed
+# run is invisible — the next run cannot tell it from a live one, so leftovers ACCUMULATE
+# silently and are rediscovered later as a mystery disk-usage leak (this project already paid
+# for that lesson once: 113 stale /run/delphi-*-<pid> dirs, ~24MB each). A fixed name is a
+# NAMED STATE the next run can detect, report, and clear — the same reasoning as the
+# systemd_smoke fixed-name backup.
+DEST_PARENT=/usr/share/delphi
+CUR="$DEST_PARENT/shell"
+NEW="$DEST_PARENT/shell.new"
+OLD="$DEST_PARENT/shell.old"
+
+install -d -m 0755 "$DEST_PARENT"
+
+# Leftover states from a crashed previous run — each is HANDLED and REPORTED, never silently
+# stepped over:
+#
+#   shell.new exists            -> a run died before the swap. Pure scratch, nothing depends
+#                                  on it. Remove it.
+#   shell.old exists + shell    -> a run died after the swap but before cleanup. shell.old is
+#                                  the superseded tree. Remove it.
+#   shell.old exists, NO shell  -> a run died BETWEEN the two renames. shell.old holds the
+#                                  last-good tree and the live path is currently ABSENT. We
+#                                  are about to install a fresh tree, so it is recoverable —
+#                                  but say so LOUDLY rather than quietly papering over the
+#                                  fact that the system was found in a broken state.
+if [ -e "$NEW" ]; then
+    echo "NOTE: clearing leftover $NEW (a previous run died before the swap)."
+    rm -rf "$NEW"
+fi
+# B2A-COMP-R6-01: RESTORE BEFORE CLEARING — never delete the only good copy.
+# The previous version printed a WARNING for the died-between-renames state and then
+# `rm -rf "$OLD"` regardless. In that state `shell.old` IS the only good bundle, so clearing
+# it first meant any later failure in this run left NEITHER a live bundle NOR a previous one:
+# the self-heal destroying the state it heals from. (Same family as the .smoke-bak window,
+# and the same fix shape: restore first, clear only what is genuinely superseded.)
+#
+# THE INVARIANT this establishes, and which the regression test asserts by SAMPLING rather
+# than by trusting the sequence: at every instant there is at least one of `shell` or
+# `shell.old`. It is never the case that both are absent.
+if [ -e "$OLD" ]; then
+    if [ -e "$CUR" ]; then
+        echo "NOTE: clearing leftover $OLD (a previous run died after the swap, before cleanup)."
+        rm -rf "$OLD"      # genuinely superseded — $CUR is live
+    else
+        echo "RECOVERING: found $OLD with NO $CUR — a previous run died BETWEEN the two"
+        echo "            renames. $OLD is the ONLY good bundle, so it is RESTORED to $CUR"
+        echo "            before anything else. If this run then fails, the system still has"
+        echo "            a working bundle instead of none."
+        mv "$OLD" "$CUR"
+    fi
+fi
+
+# Build the new tree from the BOUND fds (never re-resolving the staged paths).
+install -d -m 0755 "$NEW"
+for rel in "${TREE_DIRS[@]}"; do
+    install -d -m 0755 "$NEW/$rel"
+done
+for i in "${!TREE_FILES[@]}"; do
+    copy_fd "${TREE_FILE_FD[$i]}" "$NEW/${TREE_FILES[$i]}" 0644
+done
+
+# The swap. Between the two renames `$CUR` does not exist — a brief window in which the host
+# would fail to load the page. That is UNAVAILABILITY, not corruption, and it is the accepted
+# cost of not putting a symlink at a root-owned path the host resolves. Both renames are
+# within one filesystem, so each is a single atomic rename(2).
+if [ -e "$CUR" ]; then
+    mv "$CUR" "$OLD"
+fi
+mv "$NEW" "$CUR"
+rm -rf "$OLD"
+
 systemctl daemon-reload
 
 echo "installed:"
 ls -l /usr/libexec/delphi-runtimed /usr/libexec/delphi-shell /usr/libexec/delphi-minimal-ai
 echo "Brain address intentionally absent: $(ls /usr/libexec/delphi-ai 2>&1)"
 echo "PAM stack: $(ls -l /etc/pam.d/delphi-runtime)"
+echo "shell bundle: $(find "$CUR" -type f | wc -l) files under $CUR"
+echo "  the host serves it over: delphi://shell/index.html (from its startup snapshot)"

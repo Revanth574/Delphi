@@ -687,8 +687,31 @@ fn b1_launcher_keeps_the_channel_out_of_the_ai() {
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
 
     // Both children are a 2s sleeper script so /proc/<pid>/fd is readable mid-life.
+    //
+    // D0-R1-03: the shell child must SIGNAL READINESS or `launch()` refuses it after
+    // `DEFAULT_READY_TIMEOUT` and this test times out before reaching its assertions. This
+    // fixture was MISSED when D0 landed because the update was driven by "files I edited"
+    // (the C sleepers in leader_is_shell.rs) rather than by "every fixture readiness now
+    // requires" — Class 17 occurring inside the fix for Class 17. The complete set is
+    // enumerated at `LaunchSpec::shell_path`.
+    //
+    // The marker is written from a FILE whose bytes come from `READY_DATAGRAM`, not from a
+    // shell literal: `READY_DATAGRAM` contains a NUL, and a POSIX shell cannot carry a NUL
+    // in an argument or a variable. `cat`ting a 21-byte file emits it as one write(2), i.e.
+    // one SEQPACKET datagram. Generated, never transcribed — same discipline as the C
+    // sleeper, for the same reason (B2A-COMP-R3-03's duplication false green).
+    let marker = base.join("ready.bin");
+    std::fs::write(&marker, delphi_runtime::readiness::READY_DATAGRAM).unwrap();
     let sleeper = base.join("sleeper.sh");
-    std::fs::write(&sleeper, "#!/bin/sh\nsleep 2\n").unwrap();
+    std::fs::write(
+        &sleeper,
+        // `|| :` and `2>/dev/null` because THIS SAME SCRIPT is also the `ai_path`, and the
+        // AI child deliberately never receives the channel (the FD-01 sweep closes fd 3 for
+        // it). There the redirection fails with EBADF; the AI must still reach `sleep 2`
+        // exactly as before, and must not print a spurious diagnostic into the test output.
+        format!("#!/bin/sh\ncat {} >&3 2>/dev/null || :\nsleep 2\n", marker.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&sleeper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let spec = LaunchSpec {
         shell_path: &sleeper,

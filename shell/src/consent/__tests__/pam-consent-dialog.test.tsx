@@ -25,6 +25,22 @@ describe("PamConsentDialog", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  // D0-R1-01. The host previously signalled readiness from the WebView's page-load-finished
+  // event, which fires for FAILED loads and can precede this component registering
+  // `window.__delphiConsent` — so the daemon could be told the shell was ready while an
+  // approval request would still hit an unregistered surface and be dropped.
+  it("posts a ready message to native once the consent surface has registered", () => {
+    render(<PamConsentDialog />);
+
+    const posted = (window.ipc!.postMessage as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => JSON.parse(c[0] as string) as { kind: string },
+    );
+    expect(posted).toContainEqual({ kind: "ready" });
+    // The ordering is the property, not merely the message: readiness must not be claimed
+    // before the callback surface exists to receive a request.
+    expect(window.__delphiConsent).toBeDefined();
+  });
+
   it("Allow posts the password via window.ipc and clears it on submit", async () => {
     const user = userEvent.setup();
     render(<PamConsentDialog />);

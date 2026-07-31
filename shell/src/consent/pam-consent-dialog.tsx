@@ -61,6 +61,15 @@ export function PamConsentDialog() {
       onPasswordPrompt: (arg) => setPrompt(arg.prompt),
       onDenied: () => reset(),
     };
+    // D0-R1-01: tell native the consent surface is LIVE. This must happen here — after the
+    // assignment above, in the same effect — because that assignment is the exact moment an
+    // approval request stops being silently dropped. Signalling anywhere earlier (the host
+    // previously used the WebView's page-load-finished event) reports the shell ready while
+    // a request would still hit an unregistered surface.
+    //
+    // Safe to send more than once: the host owns the one-shot (`READY_SENT`), so a remount
+    // or reload cannot push a second marker onto the consent channel.
+    window.ipc?.postMessage(JSON.stringify({ kind: "ready" }));
     return () => {
       delete window.__delphiConsent;
       setPassword(""); // clear the secret on unmount

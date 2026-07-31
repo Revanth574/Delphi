@@ -135,6 +135,72 @@ green. `delphi-shell-host` compiles.
    leader==shell, fd containment, or privdrop depends on the shell staying silent, the assertions
    are untouched, and the `pause()` — what makes the shell outlive the measurement — is kept.
 
+### D0 Codex round 1 — REVISE, 6 findings (3×P1), ALL FIXED AT ROOT
+
+| ID | sev | site | fix |
+|---|---|---|---|
+| D0-R1-01 | P1 | `shell-host/src/main.rs` | readiness moved off `PageLoadEvent::Finished` (fires for FAILED loads, can precede React registering `__delphiConsent`, and re-fires on reload) onto a **one-shot ack after consent bootstrap**. The React effect posts `{kind:"ready"}` immediately after assigning `window.__delphiConsent`; the **native** side owns the one-shot (`READY_SENT`), so reload safety is a property, not a convention. |
+| D0-R1-02 | P1 | `readiness.rs` | terminal events now overrule a valid marker, **after** validating it. Measured cause: `real datagram, peer CLOSED` presents `POLLIN\|POLLHUP` together, so reading the marker and returning reported an already-dead shell as ready — verbatim P3a. |
+| D0-R1-03 | P1 | `b1_integration.rs` | the missed **fourth** fixture (`sleeper.sh`, silent `sleep 2`) now emits the marker from a file whose bytes are `READY_DATAGRAM` (a POSIX shell cannot carry the NUL in a literal). The complete caller set is enumerated at `LaunchSpec::shell_path`. |
+| D0-R1-04 | P2 | `launcher.rs` | readiness failure now **kills via `pidfd_send_signal` and reaps**. Previously a wedged shell kept the VT and an open logind session forever, and a dead one became a zombie. The signal goes through the pidfd, never the pid — pid reuse. |
+| D0-R1-05 | P2 | `readiness.rs` tests | the `to_vec()` after `fork()` moved **before** the fork. Parallel execution was retained rather than traded for serial — parallel is the configuration that stresses these. |
+| D0-R1-06 | P2 | `readiness.rs` | `read()==0` no longer always means death. **Measured:** an empty datagram and EOF are indistinguishable at the socket (both `0`, `msg_flags 0x0`, `MSG_EOR` **clear** — so `MSG_EOR`, the obvious discriminator, does not work). `POLLHUP` is now the primary discriminator, with the pidfd as the oracle where the distinction is temporal. |
+
+**R1-03 is the one to learn from.** It is the class-6 composition gap predicted in the review
+prompt — and it was **a missed caller, not a subtle one**. The D0 fixture update was driven by
+*"files I touched"* (the C sleepers in `leader_is_shell.rs`) rather than *"every fixture
+readiness now requires"*. **Class 17 occurring inside the fix for Class 17.** The corrective is
+mechanical and recorded at `LaunchSpec::shell_path`: enumerate by `grep`, not by recall. The
+structural foreclosure (one shared fixture helper, so a silent shell is unconstructible) is
+**deferred, not solved** — a doc table is weaker than a type.
+
+**Two findings the remediation produced that Codex did not:**
+
+1. **My first R1-06 fix trusted a negative from its own oracle — Class 22, again.** It asked
+   `poll(pidfd, 0)` and read "not readable" as **"alive"**. Measured: a child that `_exit`s
+   closes its fds *before* its pidfd becomes readable, so in that window the channel already
+   shows `POLLHUP` while the pidfd shows nothing. A genuinely dead shell was reported as a
+   live one with a protocol fault. **A pidfd is authoritative for death and says nothing about
+   life; `!dead` means "not yet observed dead".** Fixed with `DEATH_GRACE` — liveness is a
+   positive claim and must be established by waiting out the death that would contradict it —
+   and structured so the grace is **never paid on the success path**.
+2. **The class-22 blind spot is now MEASURED rather than argued** (`docs/DEFECT_CLASSES.md`
+   class 22). Same defect, same weaken, two tests: detection **20/20** vs **5/20**. Root cause
+   of the 5/20: the test `SIGKILL`ed its child without ordering the child's write first, so
+   **75% of runs exercised a different property and passed for the wrong reason** while
+   appearing green. Ordered → 20/20. The rule extracted: **a weaken's detection rate is
+   measured and reported as `n/N`, and a rate below N/N means the test's setup does not
+   establish its own precondition.**
+
+**A flaky test was caught by the ≥30 rule, exactly as intended.** A new weaken-(b) test failed
+**3/30**, then **1/30** — it would have shipped green on a single run. Root cause: `fork()`
+copies the fd table, so a sibling test's child holds this test's channel end open and
+**suppresses `POLLHUP`**. Measured directly (`marker + close(), extra dup OPEN → POLLIN=1
+POLLHUP=0`), and `shutdown(SHUT_WR)` was tried as a refcount-independent alternative and
+**measured not to work**. Fixed by serialising the module's forking tests against each other
+and reaping every child before the guard drops → **30/30**. Production forecloses the
+interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
+the AI is not a third), so this is a harness artifact — **shown, not asserted**.
+
+**Verification:** weaken (a) re-run against the FINAL code for every P1 — R1-02 **20/20** on
+both guards, R1-06 **20/20** on both, R1-01 bites (only the new test fails). Weaken (b), the
+class re-application, shipped as two new second-form tests
+(`marker_then_channel_close_while_alive`, `silent_channel_close_while_alive`) that separate
+the `POLLHUP` and pidfd legs a one-legged fix would still pass. `delphi-runtime` **109** tests,
+**30/30 DEFAULT PARALLEL**; clippy `-D warnings` clean; shell **108** Vitest (+1) and `tsc -b`
+clean.
+
+**STILL UNPROVEN, unchanged by this round:** the WRY host's readiness leg now depends on the
+renderer's bootstrap ack rather than a wry callback — which removes the "does the callback fire
+for a custom scheme" unknown, but **the end-to-end path is still unrun on a display**. Lane run
+still owed, together with the serial ≥30 of B-1/FD-01/B-3 against the marker-writing sleeper.
+
+**Codex did NOT answer the class-22 bounding question — asked twice now, and the prompt
+explicitly instructed it to say so if it could not.** It did neither. Per the operator's
+instruction this is recorded as **asked-twice-unanswered**; if round 2 does not answer it, the
+item closes as an open limitation with **no external opinion available** and the measurement
+above stands in its place.
+
 ### 🚩 FINDING (Q3) — the logind verdict is a STARTUP SNAPSHOT, and the comment saying otherwise is wrong
 
 `delphi-runtimed.rs:128` computes `let verdict = logind_verdict(children.shell_pid)` **once**, and

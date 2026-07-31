@@ -203,11 +203,29 @@ enum Ue {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum RendererMsg {
+    /// The consent surface has bootstrapped — `window.__delphiConsent` is registered and an
+    /// approval request delivered from now on will actually reach the dialog (D0-R1-01).
+    ///
+    /// **This is a liveness signal, not an authorization.** It mints nothing, opens no PAM
+    /// window, and does not touch [`HostSession`]; the R‑2 keystone is untouched by it. A
+    /// renderer that sent it early would only tell the daemon "I am up" sooner — it gains no
+    /// path to the channel it did not already have, and the marker's *content* is native's,
+    /// never the renderer's.
+    Ready,
     /// The user entered a password and clicked Allow.
     Password { value: String },
     /// The user dismissed the dialog.
     Cancel,
 }
+
+/// Has the readiness marker already gone out? (D0-R1-01)
+///
+/// **The one-shot is owned by NATIVE, not by the renderer**, which is what makes reload
+/// safety a property rather than a convention: a page reload re-runs the React effect and
+/// re-sends `{"kind":"ready"}`, and this flag drops every one after the first. Without it a
+/// second marker would land in the consent stream *after* the daemon stopped reading
+/// readiness, where `HostSession` would take it for a protocol message.
+static READY_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The consent session, shared between the channel-reader thread (which creates it and
 /// opens the PAM window) and the WebKit IPC thread (which applies the password).
@@ -253,30 +271,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc_session = Arc::clone(&session);
     let webview = wry::WebViewBuilder::new()
         .with_url(shell_url())
-        // ── READINESS (D0) ──────────────────────────────────────────────────────────
-        // The daemon's `launch()` blocks until this fires. It is deliberately attached to
-        // **page-load-finished** and not to `build()` returning, because the failure this
-        // whole contract exists to catch — P3a — was an abort *during rendering*, after
-        // `GTK INIT: ok`. Signalling at construction would have reported that corpse as up,
-        // which is precisely today's behaviour.
+        // ── READINESS (D0) is NOT signalled here — see `on_ipc`'s `Ready` arm ───────
         //
-        // Native, not renderer-driven: wry invokes this from the GTK main loop on a load
-        // event, so the marker cannot be forged by page content. The renderer never learns
-        // the marker and has no path to the channel outside `HostSession` (the R-2 keystone).
+        // D0-R1-01 (P1): the first draft hung readiness on `PageLoadEvent::Finished`, which
+        // is wrong on three counts, each independently sufficient:
         //
-        // ⚠ UNVERIFIED ON THE LANE. That `PageLoadEvent::Finished` fires for a **custom
-        // scheme** (`delphi://shell/…`) rather than only for http(s)/file is read from the
-        // wry 0.55.1 API, NOT measured — this box has no display, so the host cannot be run
-        // here. If it does not fire, every launch fails closed with `ShellReadyTimeout`
-        // (loud, bounded, never a false success) — but it fails. **This leg must be run on
-        // the seated lane before D0 merges.**
-        .with_on_page_load_handler(move |event, _url| {
-            if matches!(event, wry::PageLoadEvent::Finished)
-                && let Err(e) = delphi_runtime::readiness::signal_ready(chan_fd)
-            {
-                eprintln!("[delphi-shell] FAILED to signal readiness: {e}");
-            }
-        })
+        //   1. **It fires for FAILED loads too.** `PageLoadEvent` has exactly `Started` and
+        //      `Finished` — there is no success/failure discrimination in it. A page that
+        //      404s, or whose module script throws, still "finishes". The daemon would be
+        //      told the shell is up by a shell that rendered nothing.
+        //   2. **It can PRECEDE the consent surface existing.** Load-finished is a document
+        //      event; `window.__delphiConsent` is registered by a React `useEffect` in
+        //      `PamConsentDialog`, which runs after mount. Signalling at load-finished can
+        //      therefore report ready while an approval request would still hit an
+        //      unregistered surface and be silently dropped — the exact class the P2 mount
+        //      fix closed.
+        //   3. **Reloads emit ADDITIONAL markers.** Every navigation fires it again, so a
+        //      reload would push a second marker into the consent stream, where the daemon
+        //      is no longer reading readiness and `HostSession` would see it as a protocol
+        //      message.
+        //
+        // Readiness is therefore a ONE-SHOT ACKNOWLEDGEMENT sent after the consent surface
+        // has actually bootstrapped, and the NATIVE side owns the one-shot (see
+        // `READY_SENT`) so no amount of renderer behaviour can emit a second one.
         // Serve the snapshot. The closure owns the bundle; NOTHING here touches the
         // filesystem, so a renderer-supplied URI cannot become a file read.
         .with_custom_protocol(SCHEME.to_string(), move |_id, request| {
@@ -315,10 +332,24 @@ fn on_ipc(session: &SharedSession, chan_fd: RawFd, body: &str) {
     let Ok(msg) = serde_json::from_str::<RendererMsg>(body) else {
         return; // malformed renderer message → dropped
     };
+    // Handled BEFORE the session lock: readiness is independent of consent state (it fires
+    // long before any approval exists), and taking the lock for it would make a poisoned
+    // mutex silently suppress the launch signal — turning an unrelated fault into a
+    // ShellReadyTimeout the operator would misdiagnose.
+    if matches!(msg, RendererMsg::Ready) {
+        // `swap` is the one-shot: only the first caller sees `false` and writes.
+        if !READY_SENT.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && let Err(e) = delphi_runtime::readiness::signal_ready(chan_fd)
+        {
+            eprintln!("[delphi-shell] FAILED to signal readiness: {e}");
+        }
+        return;
+    }
     let Ok(mut guard) = session.lock() else {
         return; // poisoned mutex → fail-closed (write nothing)
     };
     match msg {
+        RendererMsg::Ready => unreachable!("handled above, before the session lock"),
         RendererMsg::Password { value } => {
             if let Some(sess) = guard.as_mut() {
                 let mut chan = FdChannel::new(chan_fd);

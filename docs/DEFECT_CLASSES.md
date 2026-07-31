@@ -1097,7 +1097,46 @@ later.
   *mutating* call still refuses, with its own self-test); widening the accepted set to make
   the refusal disappear would have been the forbidden edit available at the same moment.
 
-**RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix,
+### The blind spot, MEASURED at last (D0 round 1, 2026-07-31)
+
+The standing question — *can a weaken pass while the defect is present, for a
+scheduler-dependent property?* — was put to Codex twice and **never answered**. It is now
+answered by measurement instead, from D0's own round-1 remediation.
+
+One injected R1-02 defect, one weaken, two regression tests that both assert the same
+property. Detection rate over 20 runs of the module:
+
+| test | detected the injected defect |
+|---|---|
+| `marker_then_channel_close_while_alive_is_not_ready` | **20/20** |
+| `marker_from_an_already_dead_shell_is_not_ready` | **5/20** |
+
+**So yes: a weaken/restore run resting on the second test alone would have reported "the
+weaken did not bite" three times in four**, and the natural reading of that — "this test is
+worthless, delete or rewrite it" — would have been wrong. The test was fine; its *setup* was
+racy.
+
+**Root cause, and it is the more useful half.** The second test forked a child that wrote the
+marker then exited, and the parent `SIGKILL`ed and reaped it. Nothing ordered the child's
+`write` before the parent's kill, so 15 runs in 20 the child died **before signalling** — and
+the run then exercised *"died without signalling"*, a different property that passes for a
+different reason. The test was **passing for the wrong reason 75% of the time** while
+appearing green. Adding an explicit setup barrier (child signals a pipe after writing; parent
+blocks on it) took detection to **20/20**.
+
+**The rule this yields, which is stronger than "run it 30 times":**
+
+> A weaken's **detection rate** is a property to be measured, not assumed. Report it as
+> `n/N`, not as "the weaken bit". A weaken that detects at less than N/N does not mean the
+> fix is unproven — it means the **test's setup does not establish its own precondition**,
+> and the defect is in the harness, upstream of the assertion.
+
+This also sharpens Class 20 (a correctly-biting test in a non-representative environment):
+here the environment was fine and the *ordering* was not. And it is the reason the RED-proof
+shape below now requires the weaken to be run repeatedly rather than once.
+
+**RED-proof shape.** Two weakens, not one, **each run ≥20 times and reported as `n/N`**.
+(a) the ordinary weaken — revert the fix,
 the test must fail; and (b) **the class re-application** — construct the input that
 exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix
 that resolves elsewhere) and assert it is caught. A fix with only (a) is proven to

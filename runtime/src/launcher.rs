@@ -160,6 +160,29 @@ impl VtName {
 /// What to launch and as whom.
 pub struct LaunchSpec<'a> {
     /// The shell binary to exec (B1: the minimal shell).
+    ///
+    /// # OBLIGATION — this binary MUST signal readiness (D0)
+    ///
+    /// Whatever is named here must write [`crate::readiness::READY_DATAGRAM`] to
+    /// [`SHELL_CHANNEL_FD`] once it is up, or [`launch`] refuses it after
+    /// [`crate::readiness::DEFAULT_READY_TIMEOUT`] and kills it. **Adding a new shell
+    /// fixture without the marker produces a timeout far from its cause**, which is exactly
+    /// how D0-R1-03 was missed.
+    ///
+    /// THE COMPLETE SET OF CALLERS, enumerated by `grep -rn 'shell_path' --include=*.rs`
+    /// rather than recalled — the recall is what failed:
+    ///
+    /// | site | fixture | signals? |
+    /// |---|---|---|
+    /// | `bin/delphi-runtimed.rs` | the real `/usr/libexec/delphi-shell` | yes — on consent bootstrap |
+    /// | `bin/delphi-minimal-shell.rs` (via `b1_integration`, 3 sites) | `signal_ready` at entry | yes |
+    /// | `tests/b1_integration.rs` fd-test | `sleeper.sh` (`cat marker >&3`) | yes |
+    /// | `tests/leader_is_shell.rs` (3 sites) | the C `pause()` sleeper | yes |
+    /// | `tests/leader_is_shell.rs` missing-shell | a path that does not exist | **no, correctly** — `execve` fails, so readiness is never reached |
+    ///
+    /// The structural foreclosure (one shared fixture helper every test must go through, so
+    /// a silent shell is unconstructible) is **deferred, not solved** — this table is
+    /// documentation, which is weaker. Recorded in PROGRESS.
     pub shell_path: &'a Path,
     /// The AI binary to exec (B1: the minimal AI).
     pub ai_path: &'a Path,
@@ -242,18 +265,69 @@ pub fn launch(spec: &LaunchSpec) -> Result<Children, RuntimeError> {
     // catches it — this makes the fast path fast and the diagnosis correct.)
     drop(shell_end);
 
-    // Phase 2 — the shell must SAY it is up. On any failure the caller gets a typed error
-    // and no `Children`; the shell's pidfd drops here, and the shell's own death tears down
-    // its logind session (leader == shell, R3-01c) with no orphan to clean up.
-    readiness::await_shell_ready(
+    // Phase 2 — the shell must SAY it is up.
+    //
+    // D0-R1-04: on failure the shell must be REAPED, not merely dropped. The first draft
+    // returned the error and let `shell_pidfd` fall out of scope, which closes a descriptor
+    // and does nothing else — so the two failure modes leaked:
+    //   * `ShellReadyTimeout` (the shell is WEDGED, not dead) left a live process holding
+    //     the seat's VT, with an OPEN logind session, forever. systemd would restart the
+    //     daemon into a VT that is still taken.
+    //   * `ShellDiedBeforeReady` left a ZOMBIE, because nothing ever `waitpid`s it.
+    // Under leader == shell (R3-01c) the shell's death IS its session's teardown, so
+    // killing it is also what releases the logind session and the VT.
+    if let Err(e) = readiness::await_shell_ready(
         daemon_end.as_fd(),
         shell_pidfd.as_fd(),
         readiness::DEFAULT_READY_TIMEOUT,
-    )?;
+    ) {
+        kill_and_reap_shell(&shell_pidfd, shell_pid);
+        return Err(e);
+    }
 
     let ai_pid = fork_ai(spec)?;
 
     Ok(Children { daemon_channel: daemon_end, shell_pid, shell_pidfd, ai_pid })
+}
+
+/// Kill and reap a shell that failed the readiness contract (D0-R1-04).
+///
+/// # Why the signal goes through the PIDFD and never through the pid
+///
+/// `kill(pid, SIGKILL)` on a pid the daemon has not reaped is a **pid-reuse race**: between
+/// the readiness failure and the signal, the pid can in principle be recycled and the
+/// daemon would SIGKILL an unrelated process. `pidfd_send_signal` targets the *handle* the
+/// daemon has held since the fork (R3-03's race-free pin), so it can only ever signal the
+/// process that handle refers to — or fail with `ESRCH` if it already exited.
+///
+/// Best-effort by design: every failure here is already on an error path, and the typed
+/// readiness error is what the caller must see. A failed kill is logged, never substituted
+/// for the real diagnosis.
+fn kill_and_reap_shell(shell_pidfd: &OwnedFd, shell_pid: i32) {
+    // SAFETY: `pidfd_send_signal(pidfd, sig, NULL, 0)` — the fd is owned and valid for the
+    // call; a null `siginfo` means "as if from kill(2)". Returns 0 or -1.
+    let rc = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            shell_pidfd.as_raw_fd(),
+            nix::libc::SIGKILL,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        // ESRCH is the ordinary case for `ShellDiedBeforeReady` — it is already gone, and
+        // the `waitpid` below is then the whole job.
+        if e.raw_os_error() != Some(nix::libc::ESRCH) {
+            tracing::warn!(shell_pid, error = %e, "could not SIGKILL the unready shell");
+        }
+    }
+    // Reap unconditionally: on the timeout path the kill above created the corpse, and on
+    // the death path it was already one. Without this the daemon accumulates a zombie.
+    if let Err(e) = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None) {
+        tracing::warn!(shell_pid, error = %e, "could not reap the unready shell");
+    }
 }
 
 /// Fork the shell via a **manual `fork()`** (shape (b), `docs/TRUST_MODEL.md` §4 R3-01b):

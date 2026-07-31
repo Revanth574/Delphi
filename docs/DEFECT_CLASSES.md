@@ -692,9 +692,12 @@ are why it costs more diagnostic time than the defects it hides:
    to the product, one or more steps downstream of its cause.
 
 **Foreclosing primitive.** **NONE — discipline, plus an external check.**
-Before any step of a verification loop that moves `HEAD`, discards changes, or
-rewrites files: **`git status --porcelain` must be empty, or the work must be
-committed or stashed first.** Prefer perturbations that are *exactly invertible in
+Before any operation that moves `HEAD`, discards changes, or rewrites files —
+**inside a verification loop or not**; the 2026-07-30 instance was ordinary work, not a
+weaken/restore — **`git status --porcelain` must be empty for the target, or the work
+must be committed or stashed first.** See "The operational form" below for the
+pre-condition version of this rule and why the post-hoc checks do not substitute for
+it. Prefer perturbations that are *exactly invertible in
 the editor* (edit → run → edit back) over any that route through `git` at all. When
 a restore *does* go through `git`, **verify the restore by reading the diff, not by
 observing the test go green** — a green after a botched restore and a green after a
@@ -726,6 +729,57 @@ correct one are indistinguishable.
   **The rule both instances share: verify the ARTIFACT, not the operation's apparent success.**
   A tool printing progress, exiting 0, or leaving a green suite is not evidence that the
   intended change is in the file. Grep the file; diff the commit.
+
+- **`Write` over an untracked `scratch/display-arc-scoping.md` (display-arc scoping, 2026-07-30)**
+  — the file was already present and **untracked** (visible as `?? scratch/display-arc-scoping.md`
+  in the session's opening `git status`, which had been *read*). A full-file write replaced it
+  without the target ever being inspected. Nothing was recoverable: untracked means no git object,
+  no reflog entry, no dangling blob. A search of other session transcripts returned nothing. The
+  prior content is simply gone, and **what it contained is unknown** — which is the worst
+  available outcome, because the loss cannot even be scoped.
+
+### The operational form — the precondition all four instances share
+
+The four instances above look like four different accidents (a `reset --hard`, a `checkout --`, a
+half-applied patch script, a `Write`). They are one. **In every case the target was untracked or
+dirty at the moment of the destructive operation, so there was no committed object to recover
+from.** That single precondition is what turned each mistake from an inconvenience into a
+permanent loss.
+
+**This is why the detection rules above are not sufficient, and saying so is the point of this
+subsection.** "Verify the artifact, not the operation" and "read the diff, don't watch the test go
+green" are **detection** rules. They work when a committed baseline exists: you notice the damage
+and you restore. Against an untracked target they do nothing useful — they convert a *silent*
+unrecoverable loss into a *known* unrecoverable loss. **Detection is not recovery.** A rule that
+fires after the write is the wrong instrument for a target that cannot be restored.
+
+> **THE OPERATIVE RULE (pre-condition, not post-condition).** Before any operation that
+> overwrites, discards, or moves `HEAD` across a target, establish the target's **tracked-ness**,
+> and **refuse on untracked**. `git status --porcelain -- <target>`: empty ⇒ tracked and clean ⇒
+> git can restore it ⇒ proceed. `??` (untracked) or a dirty marker (` M`, `AM`) ⇒ **stop**, and
+> commit, stash, or copy the target aside first.
+
+Three properties make this the right shape:
+
+1. **It is a refusal, not a warning.** A warning is advice the actor is free to be wrong about,
+   and every one of the four incidents was committed by an actor who believed the operation was
+   safe. Belief is not the failing input here — the check is.
+2. **The destructive verb does not have to be a `git` verb.** This is the generalisation the
+   fourth instance forces. `Write`, `cp`, `>`, `mv`, `truncate`, an editor save, and a patch
+   script's `open(p,"w")` are all the same operation as `git checkout --` when the target is
+   untracked. Scoping the discipline to VCS commands (as the original wording of this class did)
+   leaves the most common case — an ordinary file write — outside the rule.
+3. **The cost asymmetry is absolute.** The check is one command with an empty-string comparison.
+   The loss it prevents is unbounded, silent, and — as the 2026-07-30 instance shows — sometimes
+   not even scopeable afterwards.
+
+**Mechanizable form (preferred over discipline).** A pre-flight helper that takes the target path,
+runs `git status --porcelain -- "$path"`, and exits non-zero on any non-empty output is a
+five-line script and forecloses the class for every tool that can be made to call it. It fails
+**closed**: an unparseable status, a path outside the repo, or a `git` that errors all yield a
+refusal, never an approval. Until such a helper exists this remains **discipline plus an external
+check** — and note that all four instances were caught by an external check (the operator, a diff,
+a `git show | grep`, the operator again), **never** by the actor that caused them.
 
 **RED-proof shape.** This class is a *process* defect, so its proof is procedural
 rather than a test: after any restore step, the restored artifact must be shown
@@ -1152,7 +1206,7 @@ fixed), so audit for it in the same pass.
 | 15. Self-inspecting guard counts itself | discipline (`compile_fail` where it reaches; else scope the audit + derive the boundary loudly) | Discipline |
 | 16. Fixture mutates unowned system state | discipline (adopt-or-provision; delete only what you created) | Discipline |
 | 17. Defect propagated by copy | discipline (grep the shape before declaring fixed) + finder-guard where enumerable | Discipline |
-| 18. Verification loop mutates its subject | discipline (clean tree before destructive steps; verify the RESTORE by diff, never by green) | Discipline |
+| 18. Verification loop mutates its subject — **and its operational form: destroying an UNTRACKED target** | discipline (**pre-condition**: `git status --porcelain -- <target>` must be empty before ANY overwrite/discard/`HEAD` move, in a verification loop or not — **refuse on untracked**, because post-hoc "verify the artifact" cannot restore what git never held; verify a RESTORE by diff, never by green) | Discipline (mechanizable: a fail-closed tracked-ness pre-flight) |
 | 19. Runs compared under different instruments | discipline (pin + record the instrument; re-run the baseline under the new one before believing a delta) | Discipline |
 | 20. Correct test, non-representative environment | discipline (name the mechanism the property needs; prove it against the real component) | Discipline |
 | 21. Warning banner as enforcement | discipline (sentinel prefill or non-sentinel rejection; never persist the value; state the residual up front) | Discipline |

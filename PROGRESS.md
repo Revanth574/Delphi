@@ -144,6 +144,17 @@ frozen booleans** — it does **not** re-query logind. So `delphi-runtimed.rs:13
 consent GATE re-checks this per-request (`service.rs` `session_passes_gate`)", is **inaccurate**:
 it re-checks the snapshot, not the world.
 
+**This is not merely an inaccurate comment — it is a DECISION WHOSE PREMISE DID NOT HOLD.** The
+comment at `:135` was **load-bearing in a prior review**. When Codex asked for an abort on a false
+startup verdict (B2A-C-R3-02), the accepted counter-argument was that the `active` axis is
+*dynamic* rather than a static config error, **and that the gate re-checks it per request**. The
+second half of that premise is false: the gate re-evaluates three booleans frozen at startup. The
+conclusion — do not abort, warn loudly — may well survive on the first half alone (aborting would
+still false-positive on the dev SECONDARY shape and on a boot race). **But it was accepted on a
+claim the code does not support, and it has to be re-derived rather than assumed to still stand.**
+Record it that way: a decision resting on a false premise is a different object from a stale
+comment, and only one of them needs re-opening.
+
 **Bounded today, latent-critical for P4.** B1 services exactly one action then exits, so the
 snapshot is seconds old and used once. P4's entire purpose is to make the daemon loop — at which
 point the snapshot ages without bound.

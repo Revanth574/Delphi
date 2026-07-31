@@ -105,6 +105,9 @@ use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{geteuid, Gid, Pid, Uid, User};
 
+#[path = "common/shell_fixtures.rs"]
+mod shell_fixtures;
+
 /// The installed production stack (C2). NOT written by this test — it is a system-config
 /// artifact the operator installs, and a test that wrote it could mask its absence.
 const PAM_FILE: &str = "/etc/pam.d/delphi-runtime";
@@ -289,64 +292,6 @@ fn reap_children(shell_pid: i32, ai_pid: i32, uid: Uid) {
     }
 }
 
-/// Build the `pause()` sleeper used as the shell under test. See the module docs for why
-/// this is not `delphi-minimal-shell`.
-fn build_sleeper(dir: &std::path::Path) -> Option<PathBuf> {
-    let src = dir.join("sleeper.c");
-    let bin = dir.join("sleeper");
-    // PRECISE DIAGNOSTIC (was: any failure → an imprecise "no working cc" SKIP that lied when
-    // cc was in fact present and working). Each failure mode now prints its ACTUAL cause, so a
-    // SKIP names WHY — write-fail vs cc-spawn-fail (with PATH) vs compile-fail (with cc's
-    // stderr) — instead of blaming a toolchain that may be fine.
-    // D0: the sleeper must now SIGNAL READINESS before blocking, or `launch()` refuses it
-    // after `readiness::DEFAULT_READY_TIMEOUT` and every test here fails to even reach its
-    // assertion. The marker goes to `SHELL_CHANNEL_FD` (3).
-    //
-    // THIS IS NOT A WEAKEN (Iron Law 15 clause 3). None of the three properties measured
-    // through this sleeper — B-1 leader == shell, FD-01 inherited-fd containment, B-3
-    // privdrop effect — depends on the shell staying silent; adding the write removes a
-    // dependency that would otherwise INVALIDATE the measurement (the launch would never
-    // return). The assertions are untouched, and each still fails if its property is
-    // violated. The kept `pause()` is what matters: the shell must outlive the measurement.
-    //
-    // The C literal is GENERATED from `readiness::READY_DATAGRAM` rather than transcribed.
-    // A hand-copied marker here would be an eighth reimplementation of a runtime constant —
-    // the exact duplication class that produced B2A-COMP-R3-03's false green in
-    // `p3-preflight.sh`. Foreclose by construction: if the constant changes, this changes.
-    let marker = delphi_runtime::readiness::READY_DATAGRAM;
-    let c_escaped: String = marker.iter().map(|b| format!("\\{b:03o}")).collect();
-    if let Err(e) = std::fs::write(
-        &src,
-        format!(
-            "#include <unistd.h>\n\
-             int main(void){{ write(3, \"{c_escaped}\", {}); pause(); return 0; }}\n",
-            marker.len()
-        ),
-    ) {
-        eprintln!("build_sleeper: cannot write {}: {e}", src.display());
-        return None;
-    }
-    match Command::new("cc").args([src.to_str()?, "-o", bin.to_str()?]).output() {
-        Ok(o) if o.status.success() => Some(bin),
-        Ok(o) => {
-            eprintln!(
-                "build_sleeper: `cc` ran but exited {} — NOT a missing toolchain. stderr:\n{}\nstdout:\n{}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr),
-                String::from_utf8_lossy(&o.stdout),
-            );
-            None
-        }
-        Err(e) => {
-            eprintln!(
-                "build_sleeper: cannot SPAWN `cc`: {e} — PATH={:?}, cwd={:?}",
-                std::env::var("PATH").unwrap_or_default(),
-                std::env::current_dir(),
-            );
-            None
-        }
-    }
-}
 
 /// The VT handed to PAM as `PAM_TTY`. Overridable because VT availability is a property of
 /// the machine, not of the test; `tty1` is the default since the dev lane's own session sits
@@ -436,7 +381,7 @@ fn session_leader_is_the_shell_itself_r3_01c() {
 
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let Some(shell_bin) = build_sleeper(&work) else {
+    let Some(shell_bin) = shell_fixtures::signalling_c_sleeper(&work) else {
         eprintln!(
             "SKIP session_leader_is_the_shell: build_sleeper failed — SEE ITS DIAGNOSTIC ABOVE \
              for the ACTUAL cause (write / cc-spawn / cc-compile); it is NOT necessarily a \
@@ -612,7 +557,7 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let Some(shell_bin) = build_sleeper(&work) else {
+    let Some(shell_bin) = shell_fixtures::signalling_c_sleeper(&work) else {
         eprintln!("SKIP fd01: build_sleeper failed — see its diagnostic above for the ACTUAL cause.");
         return;
     };
@@ -786,7 +731,7 @@ fn shell_child_drops_to_the_session_user_b3() {
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let Some(shell_bin) = build_sleeper(&work) else {
+    let Some(shell_bin) = shell_fixtures::signalling_c_sleeper(&work) else {
         eprintln!("SKIP b3: build_sleeper failed — see its diagnostic above for the ACTUAL cause.");
         return;
     };

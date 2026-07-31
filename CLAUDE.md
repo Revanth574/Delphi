@@ -1031,7 +1031,7 @@ Delphi uses an external second model — Codex CLI, run by the human operator �
 1. Operator runs Codex with the prepared prompt and pastes the verdict.
 2. APPROVE → proceed to merge. REVISE / FAIL → continue.
 3. Claude Code fixes **every** finding at its root cause (Iron Law #8) — no workarounds, no scope creep into adjacent issues.
-4. Each fix ships a regression test verified to **fail against the pre-fix code** and pass after. A test that passes against buggy code is worse than no test (Task 3A.6 Round 3 caught exactly this — a descendant-survival test that passed for the wrong reason because the backgrounded process inherited the capture pipes).
+4. Each fix ships a regression test verified to **fail against the pre-fix code** and pass after. **How much verification that fix owes is set by §6 "Verification tiers"** — tier 1 (sole defence) gets the full protocol below; tier 2 gets RED + one weaken and no stability run unless it has actually flaked. The rest of this clause states the tier-1 obligation. A test that passes against buggy code is worse than no test (Task 3A.6 Round 3 caught exactly this — a descendant-survival test that passed for the wrong reason because the backgrounded process inherited the capture pipes).
    **A single green run cannot see NON-DETERMINISM — this is a known gap in the review protocol, not merely a property of one test.** Codex reviews a diff and a test run; a test that fails 1 run in 10 presents as green and passes review invisibly. This is not hypothetical: `terminal_contract_release_produces_eof_no_wedge` (~7-10% failure rate under parallel execution, measured 3/30 at `d57442e`) landed inside the **Codex-APPROVED** B2a WSL2-provable half (`3e40e22`) and was found only when a later session happened to run the suite repeatedly. **Therefore:** any test whose outcome depends on file descriptors, `fork`/subprocess lifetime, sockets, timing, or cross-test shared state MUST be run **repeatedly (>=30 iterations) under the DEFAULT parallel settings** before it is offered to review — not once, and not only under `--test-threads=1`, which is precisely the configuration that hides interference. Report the iteration count and the failure count, not "tests pass." A flaky test is strictly worse than a failing one: it trains the reader to re-run until green.
    **CARVE-OUT — `fork`+PAM (or `fork`+any non-async-signal-safe child) tests are SERIAL-ONLY; their ≥30 run is `--test-threads=1`, and that is NOT the hiding configuration for them.** The default-parallel rule above assumes parallel execution stresses the *product*. For a test that `fork()`s and then does non-async-signal-safe work in the child (PAM, allocation, D-Bus — e.g. `runtime/tests/leader_is_shell.rs`'s B-1/FD-01/B-3), the parallel test runner is itself a **multithreaded parent**, and forking PAM from a multithreaded parent is the hazard `launcher.rs`'s standing constraint documents — the child can deadlock on an allocator lock a non-surviving thread held. **Production (`delphi-runtimed`) is single-threaded, so it never has this hazard;** the parallel FAILURES are therefore a *harness artifact of the test runner*, not product flakiness — measured 2026-07-23: B-1/FD-01/B-3 fail ~20/30 under parallel (ALL failures pre-`execve` child death, ZERO real property violations) and **0/30 under `--test-threads=1`**. For these tests the SERIAL ≥30 run is authoritative: it matches production's single-threaded fork parent while still catching within-test races (timing, `/proc`, PAM/logind). Distinguish this honestly per Iron Law #15 clause 5 — a parallel failure is a harness artifact ONLY when SHOWN to be pre-`execve` child death with no real violation (read the failing lines; do not assume). This also retroactively explains the earlier FD-01 "15/30 parallel, 0/30 serial" result, which was imprecisely attributed to "shared VT/PAM state" — the sharp cause is fork+PAM from a multithreaded parent. **Sibling mechanism (same carve-out, different plumbing) — CONCURRENT PAM SESSIONS ON A SHARED VT.** `b1_integration`'s `b1_daemon_binary_runs_the_assembled_flow` runs the daemon as a SINGLE-threaded subprocess (so NOT the multithreaded-fork hazard), yet fails 30/30 parallel / 0/30 serial with VARYING reasons (`pam_open_session failed`, `logind: session not active+local`, `PAM authentication failed`) — a race among all `b1_integration` tests opening PAM sessions on the SAME `tty1` under parallel execution (measured 2026-07-24). Production runs ONE daemon per session on its OWN seat's VT, never N contending on one — so this too is a test-harness artifact, serial-only, not a product defect. The general rule: a test that opens a PAM/logind session (by fork+PAM OR by spawning a PAM-using subprocess on a shared VT) is SERIAL-ONLY; its parallel failures are contention the harness creates and production forecloses.
 5. One focused commit per round, with the verbatim Codex finding IDs in the body. Carried-forward noise (Cargo.lock, PROGRESS.md) defers to a final cleanup commit so each round's diff stays narrow and auditable.
@@ -1043,6 +1043,120 @@ Delphi uses an external second model — Codex CLI, run by the human operator �
 - A REVISE / FAIL verdict at the 3-round budget boundary escalates to an explicit human decision — *merge-with-documented-risk* vs. *extend the budget* — and does NOT auto-stretch to another round. Record the decision in the merge commit body and PROGRESS.md.
 - On APPROVE, merge to main via `git merge --no-ff phase-{N}/sweep-{crate}`; the branch carries the round fix-commits and their regression tests. A sweep that returns APPROVE on round 1 with zero findings has nothing to merge — record the clean result in PROGRESS.md and delete the branch.
 - Every sweep keeps a per-finding ledger (ID, severity, root cause, fix commit) in the merge commit body and a summary in PROGRESS.md, so the full review history is reconstructable from git alone.
+
+### Verification tiers — scale rigor to what ships (amended 2026-07-31)
+
+The full protocol (RED + weaken (a) + weaken (b) + ≥30 stability) was applied uniformly to
+everything, including scripts that never leave the repo. That is why the D0 increment produced
+roughly **4,000 lines of verification and documentation against ~700 lines of product**. The
+uniform rule is replaced by a decidable test.
+
+**THE PRINCIPLE, so this generalises past the list: the SOLE DEFENCE against a class gets full
+rigor; DEFENCE IN DEPTH does not.** If a defect in the thing is caught by something downstream
+— a type, a later gate, a loud runtime failure — it is defence in depth. If nothing else stands
+behind it, it is the sole defence, whatever file it lives in.
+
+**TIER 1 — full protocol.** Applies if a defect in this code could:
+
+- **(a)** run on a user's machine;
+- **(b)** mutate system state;
+- **(c)** weaken a security property; or
+- **(d)** be cited as the evidence that a security property holds.
+
+**TIER 2 — RED + ONE weaken.** Anything failing all four. No second weaken. No stability run
+**unless it has actually flaked** — a flake, once observed, is a fact about the test and gets
+run to ≥30 regardless of tier.
+
+**Clause (d) is the one that does real work**, and it is why "does it ship?" is the wrong
+question. A verifier that never leaves the repo is tier 1 the moment its green is quoted as
+proof: `installer/tests/trace-invariant.py` is the *sole* evidence for the both-absent install
+invariant, and `installer/tests/tree-install.test.sh` for the tree-replace invariant. Neither
+ships. Both are tier 1.
+
+**Classification of the tree at amendment time:**
+
+| Tier 1 | why |
+|---|---|
+| `runtime/src/**` (launcher, readiness, consent_relay, service, execute, sandbox, token, pam, logind, fdsec, privdrop, anchor, channel, store, action) | (a)(c) — the trust boundary |
+| `runtime/shell-host/**` | (a)(c) — holds the consent channel |
+| `shell/src/consent/**` | (a)(c) — the consent surface |
+| `installer/install.sh`, the systemd unit, PAM stack, AppArmor profile | (a)(b) |
+| `installer/tests/trace-invariant.py`, `installer/tests/tree-install.test.sh` | **(d)** — sole evidence, despite never shipping |
+| `installer/p3-preflight.sh` | **(d)** — see below; promoted on day one |
+
+| Tier 2 | why |
+|---|---|
+| `runtime/tests/common/shell_fixtures.rs` | fails loudly and closed; `launch()` refuses a silent fixture |
+| `scratch/**` probes (`d1-drm-probe.sh`, the seq/poll measurements) | report facts, decide nothing |
+| test-only helpers that exist to set up a measurement (barriers, locks, fixture builders) | a defect makes the test fail, not the product pass |
+
+**WHAT THIS GIVES UP — named, because the relaxation is not free.**
+
+**B2A-COMP-R4-04 was found by weaken (b) and by nothing else.** `p3-preflight.sh` grepped the
+unit file for `DELPHI_AI_BIND_RW` and missed **systemd's quoted form**
+(`Environment="DELPHI_AI_BIND_RW=/var/tmp"`), so it fell through to its default and reported a
+green for a configuration whose real bind was somewhere else entirely. Weaken (a) — revert the
+fix, watch the test fail — would not have surfaced it; only constructing the second form did.
+**Under this amendment, that class ships in tier-2 code.**
+
+The honest price: **roughly one demonstrated false-green class every few rounds, in code whose
+false green is caught downstream.** "Caught downstream" is doing the work in that sentence and
+is exactly what clause (d) is for — where nothing is downstream, the code is tier 1 and keeps
+weaken (b).
+
+**ESCALATION IS BY EVIDENCE, NOT BY OPINION.** A tier-2 item promotes to tier 1 when either:
+
+1. clause (d) starts applying to it — something began citing its green as proof; or
+2. **it has produced a false green — demonstrated, not suspected.**
+
+`installer/p3-preflight.sh` qualifies on **both**, on day one: its green is quoted as
+"preconditions met", and R3-03/R4-04 are two *demonstrated* false greens from it. It is
+classified tier 1 above. That is the rule working as intended, not an exception to it — an
+amendment whose first act is to promote something is behaving correctly.
+
+**REVIEW TRIGGER.** Revisit at the close of the next increment, **or immediately if a tier-2
+defect causes a real problem.** If the false-green rate exceeds the price stated above, the
+amendment is wrong and gets reverted rather than renegotiated.
+
+### Design before code — approval on the approach, not on the diff (2026-07-31)
+
+For anything non-trivial, **before writing the implementation**, state in prose, **under 200
+words**:
+
+1. **what the mechanism is**;
+2. **why it can prove the property — or why it cannot**; and
+3. **what its first RED looks like**.
+
+Then stop for approval on the approach. Write the code after.
+
+**Why this is a rule and not advice.** Nearly every expensive failure in the B2a and D0 work was
+a **wrong approach caught after implementation**, when a paragraph would have caught it before:
+the round-6 sampler that could not prove its invariant *in principle*; FD-01's first weaken,
+which could not bite because it was aimed at the wrong property; three successive wrong bind
+comparisons (lexical → `realpath -m` → `realpath -m -s`). Each cost a full review round. The
+cost asymmetry is the same one Iron Law #11 rests on: the paragraph is minutes, the round is
+days.
+
+Point 2 is the load-bearing one. "Why it *cannot* prove the property" is a valid and welcome
+answer — reaching it before implementation is the entire saving.
+
+### Comment budget — comments explain WHY, never WHAT (2026-07-31)
+
+- **No comment longer than the code it describes.**
+- **No `# DECISION:` blocks in source.** Decisions go in `docs/TRUST_MODEL.md` or an ADR; source
+  carries a **one-line pointer** to them. (This supersedes Section 11's instruction to put
+  `# DECISION:` comments in code — the rationale is unchanged, only its location.)
+- **No ASCII-art banners in source.** Banners in *script output* are fine; they serve a reader
+  watching a run.
+- **Do not restate the defect-class corpus inline.** Cite the class number; do not re-explain
+  the class. `docs/DEFECT_CLASSES.md` is the explanation.
+- **If a comment is teaching, it belongs in a doc.** A source comment earns its place by telling
+  a reader why the code is *this* rather than the obvious alternative.
+
+The failure mode this corrects is real and is visible in the tree: `runtime/src/readiness.rs`
+shipped at 830 lines for a ~200-line mechanism, most of the remainder being comment that taught
+classes already written down elsewhere. Trimming existing over-budget files is owed work, done
+when those files are next touched — not as a sweep.
 
 ### Git history surgery — NEVER rewrite history with a dirty working tree
 
@@ -1446,7 +1560,7 @@ All are targets. Measure with `criterion` benchmarks and track in CI.
 3. **NEVER** implement a feature partially and leave TODO comments for "later." Either implement it fully or don't start it. Partial implementations create integration nightmares.
 4. **ALWAYS** write tests BEFORE or ALONGSIDE the implementation, never after.
 5. **ALWAYS** run the full test suite before committing. If any test fails, fix it before committing.
-6. If you're unsure about a design decision, add a `# DECISION:` comment in the code explaining the choice and why, with a reference to the relevant spec section.
+6. If you're unsure about a design decision, record it in `docs/TRUST_MODEL.md` or an ADR and leave a **one-line pointer** in the code. (Amended 2026-07-31 — see §6 "Comment budget". The rationale requirement is unchanged; only its location moved, because `# DECISION:` blocks in source grew into the teaching-in-comments problem that amendment names.)
 7. When adding a new dependency:
    - Check its license (must be MIT/Apache/BSD compatible)
    - Check its maintenance status (must have commits in last 6 months)

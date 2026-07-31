@@ -404,6 +404,48 @@ mod tests {
         FORK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Block until `fd` actually reports `POLLHUP`, so a test that MEASURES a fully-closed
+    /// channel does not run before the channel is fully closed.
+    ///
+    /// # Why a barrier and not another flake-chase
+    ///
+    /// `POLLHUP` fires only when the refcount of the peer end reaches zero, so **any** other
+    /// process holding a copy suppresses it. Two suppressors were found and closed —
+    /// non-`CLOEXEC` test sockets inherited across `exec` (fixed in [`channel_pair`]) and
+    /// this module's own `fork`ed children (fixed by [`FORK_LOCK`]) — and a **third
+    /// remains**: a sibling test's `Command::spawn` holds every fd in the window **between
+    /// its `fork` and its `exec`**. That window is microseconds and cannot be locked out
+    /// from here, but it always ends.
+    ///
+    /// So rather than chase it, the test **establishes its own precondition**: wait for the
+    /// state it intends to measure, then measure. This is the same correction that took
+    /// `marker_from_an_already_dead_shell_is_not_ready` from 5/20 to 20/20 — a test that
+    /// measures before its precondition holds is testing something else.
+    ///
+    /// # Panics
+    ///
+    /// If `POLLHUP` never arrives. That is a HARNESS failure, and it says so — it must never
+    /// be mistaken for the product property under test, and must never silently skip.
+    fn wait_for_hup(fd: BorrowedFd<'_>, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "HARNESS FAILURE (not a product failure): the channel never reported POLLHUP \
+                 within {timeout:?}, so this test's precondition — a fully-closed peer — never \
+                 held and its assertion would measure something else. Some other process is \
+                 holding a copy of the channel fd."
+            );
+            let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+            // `poll` does not consume the queued datagram, so the measurement is unaffected.
+            let _ = nix::poll::poll(&mut fds, PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO));
+            if fds[0].revents().is_some_and(|r| r.intersects(PollFlags::POLLHUP)) {
+                return;
+            }
+        }
+    }
+
     /// SIGKILL and reap `pid`, so it cannot outlive the [`FORK_LOCK`] guard.
     fn kill_and_reap(pid: nix::unistd::Pid) {
         // SAFETY: signalling a child this process forked and has not yet reaped.
@@ -412,12 +454,32 @@ mod tests {
     }
 
     /// A SOCK_SEQPACKET pair standing in for the real private channel.
+    ///
+    /// # `SOCK_CLOEXEC` is REQUIRED here, and matching production is the point
+    ///
+    /// `channel::approval_socketpair` creates the real channel with
+    /// `SockFlag::SOCK_CLOEXEC`. This helper originally used `SockFlag::empty()` — a silent
+    /// divergence from the thing it stands in for, and it had a measurable cost.
+    ///
+    /// **Measured:** with `empty()`, the suite failed **1/30** under default parallelism.
+    /// Cause: sibling lib tests in `execute.rs` / `audit.rs` run `Command::new("bwrap")` and
+    /// `Command::new("/bin/sh")` concurrently. Those `fork`+`exec` children **inherit a
+    /// non-`CLOEXEC` fd** and hold it for their lifetime, which keeps the channel's refcount
+    /// above zero and **suppresses `POLLHUP`** — the exact signal
+    /// `marker_then_channel_close_while_alive_is_not_ready` measures.
+    ///
+    /// `SOCK_CLOEXEC` closes that at the `exec`. [`FORK_LOCK`] remains necessary for the
+    /// other half — `fork` **without** `exec`, where `CLOEXEC` never fires and this module's
+    /// own children are the holders. Two mechanisms, two distinct causes; neither replaces
+    /// the other.
     fn channel_pair() -> (OwnedFd, OwnedFd) {
         nix::sys::socket::socketpair(
             nix::sys::socket::AddressFamily::Unix,
             nix::sys::socket::SockType::SeqPacket,
             None,
-            nix::sys::socket::SockFlag::empty(),
+            // Mirrors `channel::approval_socketpair` — a test channel that is not the same
+            // KIND of channel as production is a fidelity gap, not merely a flaky one.
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
         )
         .expect("socketpair")
     }
@@ -649,6 +711,8 @@ mod tests {
         drop(shell_end);
         kill_and_reap(pid); // now unambiguously AFTER the write
 
+        wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
+
         let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect_err("a shell that signalled and then DIED is dead, not ready");
         assert!(
@@ -708,6 +772,8 @@ mod tests {
         });
         drop(shell_end);
 
+        wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
+
         let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect_err("a shell that closed the consent channel is not ready, alive or not");
         assert!(
@@ -738,6 +804,8 @@ mod tests {
             unsafe { nix::libc::sleep(5) };
         });
         drop(shell_end);
+
+        wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
 
         let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect_err("a closed channel is not readiness");

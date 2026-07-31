@@ -1224,6 +1224,51 @@ fixed), so audit for it in the same pass.
 
 ---
 
+## 25. The fixture is constructed differently from the thing it stands in for  *(new — D0 round 1)*
+
+**Description.** A test builds its own copy of a resource the production code also builds —
+a socket, a pipe, a file, a directory, a process — but with **different flags or options**.
+The test then measures a system that differs from the one that ships, and the difference is
+invisible because both objects have the same *type*.
+
+Distinct from Class 20 (a correctly-biting test in a non-representative **environment**):
+there the environment was wrong; here the **fixture itself** is, and the fixture is code the
+test author wrote on purpose.
+
+**Instances (grounded):**
+
+- **`SockFlag::empty()` vs `SOCK_CLOEXEC` (D0, 2026-07-31).** `readiness.rs`'s in-module test
+  hand-rolled its `SOCK_SEQPACKET` pair while `channel::approval_socketpair` uses
+  `SOCK_CLOEXEC`. Concurrent tests running `Command::spawn` inherited the non-`CLOEXEC` fd
+  across `exec` and held it, suppressing the `POLLHUP` the test measured — a **1/30 flake**
+  whose cause was a fidelity gap, not scheduling.
+- **The three stub-permissiveness findings and R3-03's unit-file mirror** (B2a composition)
+  are the same class in non-socket form: a stand-in that accepted more than the real thing.
+
+**The sweep that found it, and its more useful result.** Every *integration* test in
+`runtime/tests/` calls `approval_socketpair()` — the production constructor — so none of them
+can diverge. The only divergent fixture was the one that hand-rolled the resource because it
+was "just a socketpair". A second, harmless instance was found in the same pass
+(`nix::unistd::pipe()` in a test helper against `pipe2(O_CLOEXEC)` in `launcher.rs`) and
+aligned.
+
+**Deliberate divergence is not this class, and must not be "fixed".** `fdsec.rs`'s tests
+create **non-`CLOEXEC`** pipes on purpose: the subject under test is the CLOEXEC-marking
+sweep, so a non-`CLOEXEC` fixture is the correct input. The discriminating question is
+*whether the difference is the thing being measured*.
+
+**Foreclosing primitive.** **Call the production constructor.** Where one exists and is
+reachable (`approval_socketpair`, `ensure_runtime_dir`, `pipe2(O_CLOEXEC)`), a test that uses
+it cannot diverge; a test that re-implements it can, silently. Where a fixture must diverge,
+say so at the construction site and state which property the divergence serves.
+
+**RED-proof shape.** Construct the fixture the production way and the fixture's way, and show
+the test's verdict differs. For the D0 instance that is the measured pair:
+`marker + close(), extra dup OPEN → POLLIN=1 POLLHUP=0` versus
+`no extra dup → POLLIN=1 POLLHUP=1`.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1253,3 +1298,4 @@ fixed), so audit for it in the same pass.
 | 23. Forecasting your own code | discipline (construct an experiment; a forecast about your own work is a claim awaiting one) | Discipline |
 | 24. In-band sentinel drawn from the value space | discipline (signal by exit status / separate field; return the honest value; refuse once, skip downstream) | Discipline |
 | 22a. Temporal invariant decided by SAMPLING | `installer/tests/trace-invariant.py` (derive from a complete syscall record; fail closed on anything unclassifiable) | **Extracted** |
+| 25. Fixture constructed differently from its subject | **call the production constructor** (`approval_socketpair`, `ensure_runtime_dir`, `pipe2(O_CLOEXEC)`); a fixture that must diverge says so and names the property the divergence serves | Discipline (foreclosed wherever a production constructor is reachable) |

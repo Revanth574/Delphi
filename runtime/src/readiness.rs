@@ -1,105 +1,59 @@
 // SPDX-License-Identifier: MIT
 
-//! The shell readiness contract (Increment D0).
+//! The shell readiness contract (Increment D0): a post-`execve` liveness signal.
 //!
-//! # The gap this closes
+//! `launcher::wait_for_child_setup`'s sync pipe is `O_CLOEXEC`, so its EOF is delivered *by*
+//! the `execve` — it cannot observe anything the shell does afterwards. This module supplies
+//! that half, so `launch()` returning `Ok` means the shell is running and said so.
 //!
-//! [`crate::launcher::wait_for_child_setup`] answers exactly one question: **did the
-//! `execve` happen?** Its sync pipe is `O_CLOEXEC`, so a successful `execve` closes the
-//! write end and the parent reads EOF. That is a *pre*-`execve* signal by construction —
-//! it has already been delivered by the time the new program's `main` runs, so **nothing
-//! the shell does after `execve` can be observed through it**.
+//! Readiness rides the existing consent channel rather than a second inherited fd; rationale
+//! in `docs/TRUST_MODEL.md` §4 R3-01e (a new fd would need an FD-01 allowlist exemption).
 //!
-//! Measured consequence (PROGRESS.md, P3a): the WRY host reported `GTK INIT: ok`, then
-//! **aborted during rendering**. The launcher had already recorded "shell started
-//! successfully"; the daemon went on to derive the logind verdict, accept the AI, and
-//! service an action *against a shell that was already dead*. The failure was loud in the
-//! journal and **invisible to the component whose job is to know whether the shell came
-//! up**.
-//!
-//! This module supplies the missing half: a **post-`execve` liveness + readiness signal**,
-//! so `launch()` returning `Ok` means *the shell is running and said so*, not merely that
-//! `execve` returned.
-//!
-//! # Why the signal rides the private channel and not a second pipe
-//!
-//! A second pipe would have to survive `execve`, which means it must be **exempted from the
-//! FD-01 sweep** ([`crate::fdsec::mark_cloexec_except_raw`]). Widening that allowlist is the
-//! precise class FD-01 (P1) closed — "the allowlist MUST be explicitly enumerated and
-//! minimal" (`docs/TRUST_MODEL.md` §4). So readiness reuses **the one descriptor §4 Reading
-//! A already says legitimately survives into the shell**: the fork-passed `SOCK_SEQPACKET`
-//! consent channel on [`crate::launcher::SHELL_CHANNEL_FD`]. No new fd, no allowlist change,
-//! no new attack surface.
-//!
-//! The channel is `SOCK_SEQPACKET`, so the ready datagram is **framed** — it cannot be
-//! coalesced with, or split across, a later protocol message. Readiness is a *prologue*: the
-//! daemon reads exactly one datagram before it writes anything, and the host's
-//! [`crate::consent_relay::HostSession::recv_approval`] still reads the approval request as
-//! the first datagram *it* receives. The two orderings do not interact.
-//!
-//! # What "ready" does NOT mean — read this before trusting a green
-//!
-//! This contract proves the shell **process is alive and reached the point where it emits
-//! the marker**. It does **not** prove anything was drawn, and it must never be reported as
-//! if it did. Under the SECONDARY dev shape there may be no display at all. Tightening
-//! "ready" to mean "a client buffer reached scanout" is D2/D4 work and needs a compositor;
-//! see `scratch/display-arc-scoping.md` §4 (Tier 2).
-//!
-//! A shell that emits the marker and *then* dies is still observable — the daemon holds the
-//! pidfd (R3-03) and sees the death. This contract closes the **startup** window only.
+//! **"Ready" does not mean "drew anything."** It means the process reached the marker.
+//! Tightening it to "a client buffer reached scanout" needs a compositor (D2/D4).
 
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::BorrowedFd;
 use std::time::{Duration, Instant};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 
 use crate::RuntimeError;
 
-/// The exact datagram a shell writes to its channel end to claim it is up.
+/// The datagram a shell writes to claim it is up.
 ///
-/// Versioned (`v1`) so a future tightening of what readiness *means* (D2/D4: a client buffer
-/// reached scanout) is a **new marker the daemon can distinguish**, not a silent
-/// reinterpretation of this one. A daemon that expects `v2` and receives `v1` must reject —
-/// which is why the comparison below is exact-match, not a prefix test.
-///
-/// Not drawn from any value space the later protocol uses: the channel's subsequent messages
-/// are a 32-byte digest + preview, a PAM prompt, a password, and a 32-byte mint-confirm. A
-/// fixed ASCII sentinel with a NUL is in none of those spaces, so this is not the in-band
-/// sentinel class (`docs/DEFECT_CLASSES.md` class 24) — and the framing makes it moot anyway.
+/// Versioned so a future tightening of what readiness *means* is a marker the daemon can
+/// distinguish rather than a silent reinterpretation — hence exact-match, not prefix, below.
 pub const READY_DATAGRAM: &[u8] = b"delphi-shell-ready\0v1";
 
-/// How long the daemon waits for a shell to signal ready before giving up.
-///
-/// A shell that `execve`s and then hangs forever (no signal, no death) must not wedge the
-/// daemon. Ten seconds is generous for a WebKit process on a cold page cache and short
-/// enough that a wedged launch surfaces as a bounded failure rather than a hung service.
+/// Launch budget: a shell that neither signals nor dies must not wedge the daemon.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Block until the shell signals ready, dies, or the timeout expires.
+/// Grace for a death notification before concluding a process is genuinely alive.
 ///
-/// Watches **both** the channel and the pidfd, so a shell that dies without signalling is
-/// reported immediately rather than after the full timeout. `pidfd` becoming readable is the
-/// kernel's race-free death notification for the pinned child (R3-03).
+/// A child closes its fds *before* its pidfd becomes readable, so an instantaneous poll can
+/// report "not dead" for a corpse. **A pidfd is authoritative for death and says nothing
+/// about life**: `!dead` means "not yet observed dead", so any positive liveness claim must
+/// wait out the death that would contradict it.
+const DEATH_GRACE: Duration = Duration::from_millis(250);
+
+/// Block until the shell signals ready, dies, or `timeout` elapses.
+///
+/// Watches the channel and the pidfd together, so a death is reported at once rather than
+/// after the full budget.
 ///
 /// # Errors
 ///
-/// - [`RuntimeError::ShellDiedBeforeReady`] — the child exited, or closed the channel,
-///   before emitting [`READY_DATAGRAM`].
-/// - [`RuntimeError::ShellReadyTimeout`] — neither happened within `timeout`.
-/// - [`RuntimeError::Protocol`] — the shell wrote something that is not the marker.
-/// - [`RuntimeError::Syscall`] — `poll` or `read` failed.
+/// [`RuntimeError::ShellDiedBeforeReady`], [`RuntimeError::ShellReadyTimeout`],
+/// [`RuntimeError::Protocol`] (wrote something that is not the marker), or
+/// [`RuntimeError::Syscall`].
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use std::time::Duration;
 /// use delphi_runtime::readiness::{await_shell_ready, DEFAULT_READY_TIMEOUT};
 /// # fn demo(chan: std::os::fd::BorrowedFd, pidfd: std::os::fd::BorrowedFd) {
-/// // Called by `launch()` between the fork and returning `Children`.
-/// match await_shell_ready(chan, pidfd, DEFAULT_READY_TIMEOUT) {
-///     Ok(()) => { /* the shell is up AND said so */ }
-///     Err(e) => eprintln!("shell never came up: {e}"),
-/// }
+/// let up = await_shell_ready(chan, pidfd, DEFAULT_READY_TIMEOUT).is_ok();
+/// # let _ = up;
 /// # }
 /// ```
 #[must_use = "a shell that never signalled ready must not be treated as running"]
@@ -116,19 +70,16 @@ pub fn await_shell_ready(
             return Err(RuntimeError::ShellReadyTimeout { secs: timeout.as_secs() });
         }
 
-        // Order is load-bearing for the assertions below: index 0 is the channel, 1 the pidfd.
         let mut fds = [
             PollFd::new(chan, PollFlags::POLLIN),
             PollFd::new(pidfd, PollFlags::POLLIN),
         ];
-        let poll_timeout = PollTimeout::try_from(remaining)
-            .unwrap_or(PollTimeout::MAX);
-
-        match nix::poll::poll(&mut fds, poll_timeout) {
-            // EINTR is not a failure — recompute the remaining budget and re-arm. Without
-            // this a stray signal would report a spurious timeout.
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(source) => return Err(RuntimeError::Syscall { op: "poll (shell readiness)", source }),
+        match nix::poll::poll(&mut fds, PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX))
+        {
+            Err(nix::errno::Errno::EINTR) => continue, // re-arm on the remaining budget
+            Err(source) => {
+                return Err(RuntimeError::Syscall { op: "poll (shell readiness)", source })
+            }
             Ok(0) => return Err(RuntimeError::ShellReadyTimeout { secs: timeout.as_secs() }),
             Ok(_) => {}
         }
@@ -136,51 +87,21 @@ pub fn await_shell_ready(
         let chan_revents = fds[0].revents().unwrap_or(PollFlags::empty());
         let pidfd_revents = fds[1].revents().unwrap_or(PollFlags::empty());
 
-        // The channel is READ first — but reading is not the same as deciding. See
-        // `classify_and_confirm_alive`: the marker is VALIDATED first (so a wrong datagram
-        // is diagnosed as a protocol error rather than as a death), and only then do
-        // terminal events get to overrule it.
         if chan_revents.intersects(PollFlags::POLLIN) {
             return classify_and_confirm_alive(chan, pidfd, chan_revents);
         }
-        if pidfd_revents.intersects(PollFlags::POLLIN) {
-            return Err(RuntimeError::ShellDiedBeforeReady);
-        }
-        // POLLHUP/POLLERR on the channel with no POLLIN: the peer is gone with nothing to
-        // read. Same verdict as death — the shell will never signal.
-        if chan_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+        if pidfd_revents.intersects(PollFlags::POLLIN)
+            || chan_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
+        {
             return Err(RuntimeError::ShellDiedBeforeReady);
         }
     }
 }
 
-/// How long to wait for a death notification before concluding a process is genuinely alive.
+/// Has the pinned child died within `grace`?
 ///
-/// # This constant exists because the FIRST fix trusted a negative, and that was the same
-/// class it was closing
-///
-/// **MEASURED (parallel-only failure, 2026-07-31).** A child that `_exit`s closes its fds
-/// **before** its pidfd becomes readable. In that window the channel already shows `POLLHUP`
-/// while `poll(pidfd, 0)` still reports nothing — so an instantaneous check reports
-/// "not dead", and the first R1-06 fix turned that into the positive claim **"alive"**,
-/// misdiagnosing a genuinely dead shell as a live one with a protocol fault. The window is
-/// invisible in an isolated run and opens under parallel scheduling pressure, which is
-/// exactly the non-determinism §6 requires ≥30 iterations to see.
-///
-/// **The general lesson, which outlives this constant:** a pidfd is authoritative for
-/// *death* and says **nothing** about life. `!dead` means "not yet observed dead", never
-/// "alive". Anywhere the distinction matters, liveness must be established by waiting a
-/// bounded time for the death that would contradict it.
-const DEATH_GRACE: Duration = Duration::from_millis(250);
-
-/// Has the pinned child died — waiting up to `grace` for a notification?
-///
-/// `Ok(false)` means "still alive after `grace`", which is a **positive** claim and is why
-/// this takes a budget rather than polling instantaneously (see [`DEATH_GRACE`]). Pass
-/// `Duration::ZERO` only where a `false` is not treated as evidence of life.
-///
-/// The pidfd is immune to pid reuse (R3-03), which is why it — and not the socket — is the
-/// oracle this module consults whenever the socket's answer is ambiguous.
+/// `Ok(false)` is a positive liveness claim, which is why this takes a budget — see
+/// [`DEATH_GRACE`]. Pass `ZERO` only where `false` is not treated as evidence of life.
 fn child_died_within(pidfd: BorrowedFd<'_>, grace: Duration) -> Result<bool, RuntimeError> {
     let deadline = Instant::now() + grace;
     loop {
@@ -192,7 +113,7 @@ fn child_died_within(pidfd: BorrowedFd<'_>, grace: Duration) -> Result<bool, Run
             Err(source) => {
                 return Err(RuntimeError::Syscall { op: "poll (pidfd liveness)", source })
             }
-            Ok(0) => return Ok(false), // the grace elapsed with no death
+            Ok(0) => return Ok(false),
             Ok(_) => {
                 if fds[0].revents().is_some_and(|r| r.intersects(PollFlags::POLLIN)) {
                     return Ok(true);
@@ -205,49 +126,22 @@ fn child_died_within(pidfd: BorrowedFd<'_>, grace: Duration) -> Result<bool, Run
     }
 }
 
-/// Read one datagram, classify it, and only then let terminal events overrule a valid marker.
+/// Read one datagram, validate it, then let terminal events overrule a valid marker.
 ///
-/// # Why the order is validate-then-overrule (D0-R1-02 / D0-R1-06)
-///
-/// **MEASURED on this box, 2026-07-31** — these are not reasoned properties:
-///
-/// | case | `recvmsg` | `msg_flags` | `poll` revents |
-/// |---|---|---|---|
-/// | empty datagram, peer OPEN | `0` | `0x0` (`MSG_EOR` clear) | `POLLIN` |
-/// | empty datagram, peer CLOSED | `0` | `0x0` | `POLLIN\|POLLHUP` |
-/// | nothing queued, peer CLOSED (EOF) | `0` | `0x0` | `POLLIN\|POLLHUP` |
-/// | **real datagram, peer CLOSED** | `n>0` | — | **`POLLIN\|POLLHUP`** |
-///
-/// Two consequences, each a finding the first draft got wrong:
-///
-/// 1. **D0-R1-02 — a queued marker must not outrank a dead peer.** The last row is the
-///    killer: a shell that writes the marker and *then dies* presents `POLLIN` **and**
-///    `POLLHUP` in the same `poll` return. The first draft checked `POLLIN`, read a valid
-///    marker, and returned `Ok` without ever looking at `POLLHUP` — reporting an
-///    already-dead shell as ready, which is verbatim the P3a failure D0 exists to prevent.
-///    Its stated justification ("resolve the race toward *it did signal*") was backwards:
-///    at the moment of return we hold evidence the process is gone, and returning `Ok`
-///    would knowingly report a corpse. **Terminal events win — but only AFTER the marker is
-///    validated**, so a *wrong* datagram is still diagnosed as a protocol error and not
-///    misattributed to death.
-/// 2. **D0-R1-06 — `read() == 0` is ambiguous and the socket cannot resolve it.** An empty
-///    datagram and EOF are indistinguishable at the socket layer: both return 0, both with
-///    `msg_flags == 0x0` and `MSG_EOR` clear (so `MSG_EOR`, the obvious candidate, does
-///    **not** discriminate — measured, row 1 vs row 3). The first draft called both EOF and
-///    reported `ShellDiedBeforeReady`, sending an operator whose shell is *alive but
-///    speaking the wrong protocol* to diagnose a crash. Resolved by asking the
-///    **authoritative oracle** — the pidfd — instead of the socket.
+/// Measured on AF_UNIX/SEQPACKET, and both rows foreclose an obvious wrong fix:
+/// a real datagram from a **closed** peer presents `POLLIN|POLLHUP` *together* (so returning
+/// on `POLLIN` alone reports a corpse as ready — D0-R1-02); and an empty datagram is
+/// indistinguishable from EOF at the socket — both `read()==0`, `msg_flags 0x0`, `MSG_EOR`
+/// **clear**, so `MSG_EOR` does not discriminate and the pidfd must (D0-R1-06).
 fn classify_and_confirm_alive(
     chan: BorrowedFd<'_>,
     pidfd: BorrowedFd<'_>,
     chan_revents: PollFlags,
 ) -> Result<(), RuntimeError> {
-    // A datagram larger than the marker is by definition not the marker; a bounded buffer
-    // one byte longer lets a too-long message be DETECTED rather than silently truncated
-    // into a match. (Truncating into a match is the under-coverage class 1 shape.)
+    // One byte longer than the marker, so an over-long datagram is detected, not truncated
+    // into a match (DEFECT_CLASSES 1).
     let mut buf = [0u8; READY_DATAGRAM.len() + 1];
-    // SAFETY: `chan` is a valid borrowed fd for the duration of the call; the read is
-    // bounded by the buffer's own length. SEQPACKET delivers a whole datagram or none.
+    // SAFETY: `chan` is valid for the call; the read is bounded by the buffer's own length.
     let n = unsafe {
         nix::libc::read(
             std::os::fd::AsRawFd::as_raw_fd(&chan),
@@ -262,71 +156,56 @@ fn classify_and_confirm_alive(
         });
     }
     if n == 0 {
-        // POLLHUP is the PRIMARY discriminator, and it is decided from the socket alone —
-        // no pidfd, no waiting. Without HUP the peer still holds its end, so the shell is
-        // alive BY CONSTRUCTION of the socket, and this was an empty datagram. This branch
-        // is what keeps the common protocol fault fast and unambiguous.
+        // No HUP ⇒ the peer still holds its end ⇒ alive by construction of the socket, so no
+        // pidfd query and no waiting is needed to call this a protocol fault.
         if !chan_revents.intersects(PollFlags::POLLHUP) {
             return Err(RuntimeError::Protocol(
                 "the shell is RUNNING but sent a ZERO-LENGTH datagram instead of the \
-                 readiness marker. SOCK_SEQPACKET permits empty packets, so this is a live \
-                 shell speaking the wrong protocol — not a dead one. Check it is the \
-                 installed /usr/libexec/delphi-shell."
+                 readiness marker — a live shell speaking the wrong protocol, not a dead \
+                 one. Check it is the installed /usr/libexec/delphi-shell."
                     .to_owned(),
             ));
         }
-        // HUP: the channel is fully closed. Dead, or alive-having-closed-its-channel — and
-        // ONLY here is the distinction temporal, so only here is the grace paid.
+        // HUP: dead, or alive-having-closed-its-channel. Only here is the distinction
+        // temporal, so only here is the grace paid.
         if child_died_within(pidfd, DEATH_GRACE)? {
             return Err(RuntimeError::ShellDiedBeforeReady);
         }
         return Err(RuntimeError::Protocol(
             "the shell is RUNNING but closed its end of the private consent channel without \
-             signalling readiness. It can never receive an approval request over a closed \
-             channel — this is a shell-side protocol fault, not a crash."
+             signalling readiness — it can never receive an approval request over a closed \
+             channel. A shell-side protocol fault, not a crash."
                 .to_owned(),
         ));
     }
-    #[allow(clippy::cast_sign_loss)] // n > 0 is established above.
+    #[allow(clippy::cast_sign_loss)] // n > 0 established above
     let got = &buf[..n as usize];
     if got == READY_DATAGRAM {
-        // D0-R1-02: the marker is VALID. Terminal events now overrule it — a shell that
-        // signalled and then died is DEAD, and `launch()` must not hand back `Children`
-        // whose pidfd is already a zombie.
-        //
-        // `POLLHUP` is checked FIRST and short-circuits, so the grace is never paid on the
-        // SUCCESS path: a healthy shell holds its channel open, so HUP is clear and the
-        // pidfd check below runs with a ZERO budget and returns immediately. The grace is
-        // reserved for the ambiguous read()==0 branch above.
+        // ORDER IS LOAD-BEARING: `POLLHUP` first short-circuits, so the success path (HUP
+        // clear) reaches the pidfd query with a ZERO budget and never pays the grace.
         if chan_revents.intersects(PollFlags::POLLHUP)
             || child_died_within(pidfd, Duration::ZERO)?
         {
             return Err(RuntimeError::ShellDiedBeforeReady);
         }
-        // RESIDUAL, STATED RATHER THAN PAPERED OVER: a shell that dies in the instant
-        // between this check and the return is reported ready. No synchronous check can
-        // close that — the process can always die one instruction later. What IS guaranteed
-        // is that this function never returns `Ok` while holding evidence of death. The
-        // daemon keeps the pidfd (R3-03) and observes any later death there; that is the
-        // mechanism for post-launch death, and this contract covers startup only.
+        // Residual: a shell dying between this check and the return is reported ready. No
+        // synchronous check can close that; the guarantee is only that `Ok` is never returned
+        // while holding evidence of death. Post-launch death is the daemon's pidfd (R3-03).
         return Ok(());
     }
-    // Deliberately reports the LENGTH, never the bytes. This datagram arrives before the
-    // consent flow, so it should never carry a secret — but "should never" is not a reason
-    // to log an untrusted payload into the journal (§10.1: never log user data).
+    // Reports the LENGTH, never the bytes — an untrusted payload must not reach the journal.
     Err(RuntimeError::Protocol(format!(
-        "shell's first datagram was {n} bytes and is not the readiness marker \
-         (expected {} bytes of `delphi-shell-ready`); the shell binary is not speaking the \
-         D0 readiness contract — check it is the installed /usr/libexec/delphi-shell",
+        "shell's first datagram was {n} bytes, not the {}-byte readiness marker; the binary \
+         is not speaking the D0 contract — check it is the installed /usr/libexec/delphi-shell",
         READY_DATAGRAM.len()
     )))
 }
 
-/// Write the readiness marker to `chan` — the shell side of the contract.
+/// Write the readiness marker — the shell side of the contract.
 ///
-/// Every binary launched as `LaunchSpec::shell_path` MUST call this once it is up, or the
-/// daemon will refuse the launch after [`DEFAULT_READY_TIMEOUT`]. That refusal is the point:
-/// a shell that cannot say it is up is indistinguishable from one that died.
+/// Every `LaunchSpec::shell_path` binary must call this once it is up, or `launch()` refuses
+/// it after [`DEFAULT_READY_TIMEOUT`]: a shell that cannot say it is up is indistinguishable
+/// from one that died.
 ///
 /// # Errors
 ///
@@ -335,18 +214,15 @@ fn classify_and_confirm_alive(
 /// # Examples
 ///
 /// ```no_run
-/// use delphi_runtime::readiness::signal_ready;
 /// # fn demo(chan_fd: std::os::fd::RawFd) -> Result<(), Box<dyn std::error::Error>> {
-/// signal_ready(chan_fd)?;   // the daemon's `launch()` now returns Ok
+/// delphi_runtime::readiness::signal_ready(chan_fd)?;
 /// # Ok(())
 /// # }
 /// ```
 pub fn signal_ready(chan_fd: std::os::fd::RawFd) -> Result<(), RuntimeError> {
-    // SAFETY: single bounded write of a const buffer to the caller-supplied channel fd.
-    // SEQPACKET sends it as exactly one datagram.
-    let n = unsafe {
-        nix::libc::write(chan_fd, READY_DATAGRAM.as_ptr().cast(), READY_DATAGRAM.len())
-    };
+    // SAFETY: single bounded write of a const buffer; SEQPACKET sends it as one datagram.
+    let n =
+        unsafe { nix::libc::write(chan_fd, READY_DATAGRAM.as_ptr().cast(), READY_DATAGRAM.len()) };
     if n < 0 {
         return Err(RuntimeError::Syscall {
             op: "write (shell readiness marker)",
@@ -356,46 +232,20 @@ pub fn signal_ready(chan_fd: std::os::fd::RawFd) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Borrow a raw fd as a `BorrowedFd` for the duration of a call.
-///
-/// The launcher holds the channel as an `OwnedFd`; this keeps the call sites tidy.
-#[must_use]
-pub fn borrow(fd: &impl AsFd) -> BorrowedFd<'_> {
-    fd.as_fd()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
-    /// Serialises the forking tests in this module against **each other**.
+    /// Serialises this module's forking tests against each other.
     ///
-    /// # Measured, not assumed — the mechanism behind a 1-3/30 flake
-    ///
-    /// `fork()` copies the whole fd table, so a child forked by test B inherits test A's
-    /// channel fds and **holds them open for its lifetime**. Any test whose property depends
-    /// on the channel being FULLY closed (`POLLHUP`) then observes no `POLLHUP`, because a
-    /// sibling's child is still a holder. Measured directly:
-    ///
-    /// ```text
-    /// marker + close(), extra dup OPEN   revents=0x1  POLLIN=1 POLLHUP=0   <- the flake
-    /// marker + close(), no extra dup     revents=0x11 POLLIN=1 POLLHUP=1   <- intended
-    /// ```
-    ///
-    /// `shutdown(SHUT_WR)` was tried as a refcount-independent alternative and **measured
-    /// not to work** — `POLLHUP` stays clear while a datagram is queued, with or without the
-    /// extra reference. So the interference cannot be engineered away inside the child; the
-    /// forks must not overlap.
-    ///
-    /// **PRODUCTION FORECLOSES THIS, which is what makes it a harness artifact rather than a
-    /// product defect** (Iron Law 15 clause 5 — shown, not asserted). The consent channel has
-    /// exactly two holders: the daemon and the shell. The AI never receives it — `fork_ai`
-    /// runs the FD-01 `close_range` sweep — and the daemon forks nothing else in between. A
-    /// third process holding the channel fd cannot occur outside this test harness.
-    ///
-    /// Every test below therefore takes this lock **and reaps its child before releasing
-    /// it**, so no child outlives the guard and leaks into the next test's fd table.
+    /// `fork()` copies the fd table, so a sibling test's child holds this test's channel end
+    /// and suppresses the `POLLHUP` these tests measure. `shutdown(SHUT_WR)` was measured NOT
+    /// to substitute (HUP stays clear while a datagram is queued), so the forks must not
+    /// overlap. Production cannot hit this — the channel has exactly two holders, `fork_ai`'s
+    /// FD-01 sweep being what keeps the AI from being a third — so it is a harness artifact
+    /// (Iron Law 15 clause 5, shown not asserted). Every test reaps its child before
+    /// releasing the guard.
     static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Take [`FORK_LOCK`], surviving poisoning from an earlier failing test (a poisoned
@@ -404,28 +254,18 @@ mod tests {
         FORK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Block until `fd` actually reports `POLLHUP`, so a test that MEASURES a fully-closed
-    /// channel does not run before the channel is fully closed.
+    /// Block until `fd` reports `POLLHUP`, so a test measuring a fully-closed channel does
+    /// not run before the channel is closed.
     ///
-    /// # Why a barrier and not another flake-chase
-    ///
-    /// `POLLHUP` fires only when the refcount of the peer end reaches zero, so **any** other
-    /// process holding a copy suppresses it. Two suppressors were found and closed —
-    /// non-`CLOEXEC` test sockets inherited across `exec` (fixed in [`channel_pair`]) and
-    /// this module's own `fork`ed children (fixed by [`FORK_LOCK`]) — and a **third
-    /// remains**: a sibling test's `Command::spawn` holds every fd in the window **between
-    /// its `fork` and its `exec`**. That window is microseconds and cannot be locked out
-    /// from here, but it always ends.
-    ///
-    /// So rather than chase it, the test **establishes its own precondition**: wait for the
-    /// state it intends to measure, then measure. This is the same correction that took
-    /// `marker_from_an_already_dead_shell_is_not_ready` from 5/20 to 20/20 — a test that
-    /// measures before its precondition holds is testing something else.
+    /// [`FORK_LOCK`] and `SOCK_CLOEXEC` close two of the three `POLLHUP` suppressors; the
+    /// third — a sibling `Command::spawn` holding fds between its `fork` and `exec` — cannot
+    /// be locked out from here but always ends. So the test waits for its own precondition
+    /// instead of racing it.
     ///
     /// # Panics
     ///
-    /// If `POLLHUP` never arrives. That is a HARNESS failure, and it says so — it must never
-    /// be mistaken for the product property under test, and must never silently skip.
+    /// If `POLLHUP` never arrives — a harness failure, and it says so. It must never be
+    /// mistaken for the product property, and must never silently skip.
     fn wait_for_hup(fd: BorrowedFd<'_>, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -455,23 +295,10 @@ mod tests {
 
     /// A SOCK_SEQPACKET pair standing in for the real private channel.
     ///
-    /// # `SOCK_CLOEXEC` is REQUIRED here, and matching production is the point
-    ///
-    /// `channel::approval_socketpair` creates the real channel with
-    /// `SockFlag::SOCK_CLOEXEC`. This helper originally used `SockFlag::empty()` — a silent
-    /// divergence from the thing it stands in for, and it had a measurable cost.
-    ///
-    /// **Measured:** with `empty()`, the suite failed **1/30** under default parallelism.
-    /// Cause: sibling lib tests in `execute.rs` / `audit.rs` run `Command::new("bwrap")` and
-    /// `Command::new("/bin/sh")` concurrently. Those `fork`+`exec` children **inherit a
-    /// non-`CLOEXEC` fd** and hold it for their lifetime, which keeps the channel's refcount
-    /// above zero and **suppresses `POLLHUP`** — the exact signal
-    /// `marker_then_channel_close_while_alive_is_not_ready` measures.
-    ///
-    /// `SOCK_CLOEXEC` closes that at the `exec`. [`FORK_LOCK`] remains necessary for the
-    /// other half — `fork` **without** `exec`, where `CLOEXEC` never fires and this module's
-    /// own children are the holders. Two mechanisms, two distinct causes; neither replaces
-    /// the other.
+    /// `SOCK_CLOEXEC` mirrors `channel::approval_socketpair`. It is not incidental: with
+    /// `empty()`, sibling tests' `Command::spawn` children inherited the fd and suppressed
+    /// `POLLHUP`. A test resource constructed with different flags than the production
+    /// resource it stands in for is a fidelity gap, not just a flaky one.
     fn channel_pair() -> (OwnedFd, OwnedFd) {
         nix::sys::socket::socketpair(
             nix::sys::socket::AddressFamily::Unix,
@@ -486,50 +313,28 @@ mod tests {
 
     /// Fork a child that runs `body` and then `_exit(0)`. Returns (pid, pidfd).
     ///
-    /// # The async-signal-safety contract these tests rely on (D0-R1-05)
+    /// Children here perform raw syscalls only, so the multithreaded-fork hazard that makes
+    /// `leader_is_shell.rs` serial-only does not apply and DEFAULT PARALLEL is correct.
     ///
-    /// This module's tests run under the **DEFAULT PARALLEL** harness, i.e. the fork parent
-    /// is multithreaded. That is only sound because every `body` here performs **raw
-    /// syscalls and nothing else** — no allocation, no locks, no D-Bus — so the child cannot
-    /// deadlock on an allocator lock held by a thread that did not survive the fork (the
-    /// hazard `launcher.rs` documents and that makes `leader_is_shell.rs` serial-only).
-    ///
-    /// **That claim was asserted before it was true.** `marker_with_trailing_bytes_does_not_match`
-    /// called `READY_DATAGRAM.to_vec()` *inside* the child — a heap allocation after `fork`,
-    /// which is exactly what the claim forbids (D0-R1-05: an honesty declaration checked and
-    /// found false). The fix is to allocate **before** the fork and move the finished buffer
-    /// into the closure; the child then only reads it. Serial execution was deliberately
-    /// **not** the fix — parallel is the configuration that stresses these, so the
-    /// allocation moved rather than the test.
-    ///
-    /// **Standing rule for anything added here: build every buffer before `fork_child`.**
+    /// **Build every buffer before `fork_child`** — allocation after `fork` in a
+    /// multithreaded harness can deadlock on an allocator lock (D0-R1-05).
     fn fork_child(body: impl FnOnce()) -> (nix::unistd::Pid, OwnedFd) {
         fork_child_inner(body, None)
     }
 
     /// Like [`fork_child`], but the parent **blocks until the child's setup is done**.
     ///
-    /// # Why this exists — a test of mine that failed 3 runs in 30
+    /// Orders a child's setup against the parent's measurement. Without it,
+    /// `marker_then_channel_close_while_alive_is_not_ready` failed 3/30: the parent polled
+    /// between the marker landing and the close, where `Ok` is the correct answer.
     ///
-    /// `marker_then_channel_close_while_alive_is_not_ready` needs the child to have written
-    /// the marker **and closed its channel end** before the parent polls. Without ordering,
-    /// the parent frequently polls in between: `POLLIN` is set (marker queued), `POLLHUP` is
-    /// not (the child still holds its end), and `await_shell_ready` correctly returns `Ok` —
-    /// so the test failed **3/30 under parallel execution and passed in isolation**.
-    ///
-    /// That was a **test-design defect, not a product defect**, and the distinction is the
-    /// point: a shell that closes the channel *after* the daemon has already judged it ready
-    /// is a post-launch event, handled downstream by the pidfd — not something
-    /// `await_shell_ready` can or should catch. The test was measuring before its own
-    /// precondition held.
-    ///
-    /// It is recorded here rather than quietly fixed because it is §6's non-determinism rule
-    /// paying for itself: a single green run could not have distinguished this from a sound
-    /// test, and it would have entered review as evidence.
     /// `body` receives the sync fd and MUST call [`setup_done`] at the exact point its
     /// precondition holds — which is generally *before* any sleep, not after it.
     fn fork_child_synced(body: impl FnOnce(RawFd)) -> (nix::unistd::Pid, OwnedFd) {
-        let (r, w) = nix::unistd::pipe().expect("sync pipe");
+        // `pipe2(O_CLOEXEC)` mirrors `launcher.rs`'s setup-sync pipe. Harmless either way here
+        // (this child never execs), but a hand-rolled fixture that differs from the
+        // production constructor is the divergence class (DEFECT_CLASSES 25).
+        let (r, w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("sync pipe");
         let w_raw = w.as_raw_fd();
         let (pid, pidfd) = fork_child_inner(move || body(w_raw), None);
         drop(w); // the parent holds only the read end, so a dead child yields EOF not a hang
@@ -565,13 +370,8 @@ mod tests {
         }
     }
 
-    /// THE KEYSTONE. A shell that `execve`s fine and then dies without signalling must NOT
-    /// be reported as up. This is the exact P3a failure: the launcher recorded success while
-    /// the process was already gone.
-    ///
-    /// VERIFIED TO BITE: replacing `await_shell_ready`'s body with `Ok(())` — which is a
-    /// faithful encoding of the PRE-D0 behaviour, where nothing observed the child after
-    /// `execve` — makes this test FAIL. See the weaken record in the D0 commit body.
+    /// THE KEYSTONE: a shell that exec'd fine and then died is not up — the P3a failure.
+    /// Verified to bite; weaken record in the D0 commit body.
     #[test]
     fn shell_that_dies_without_signalling_is_not_ready() {
         let _guard = fork_guard();
@@ -592,9 +392,8 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// The positive leg. Without it the keystone above could pass for the wrong reason —
-    /// e.g. an implementation that always returns `Err` (the FAIL/FAIL shape Iron Law 15
-    /// clause 2 names as equally worthless).
+    /// The positive leg: without it the keystone could pass against an always-`Err` impl
+    /// (the FAIL/FAIL shape, Iron Law 15 clause 2).
     #[test]
     fn shell_that_signals_is_ready() {
         let _guard = fork_guard();
@@ -612,8 +411,7 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// A shell that comes up but speaks a different protocol is a configuration error, and
-    /// must be named as one rather than silently accepted or reported as a death.
+    /// A live shell speaking a different protocol is a config error, not a death.
     #[test]
     fn wrong_first_datagram_is_a_protocol_error_not_a_ready() {
         let _guard = fork_guard();
@@ -632,10 +430,7 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// A marker that is a PREFIX of a longer datagram must not match. This is the
-    /// under-coverage shape (class 1): a prefix test would accept
-    /// `delphi-shell-ready\0v1<anything>` and so would accept a `v2` shell against a `v1`
-    /// daemon.
+    /// A prefix test would accept a `v2` shell against a `v1` daemon (DEFECT_CLASSES 1).
     #[test]
     fn marker_with_trailing_bytes_does_not_match() {
         let _guard = fork_guard();
@@ -655,9 +450,8 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// A shell that neither signals nor dies must be given up on, not waited for forever.
-    /// The pre-D0 launcher had no timeout because it had no post-`execve` wait at all; a
-    /// wait without a bound would trade a silent false-success for a silent hang.
+    /// A wedged shell must be given up on: a wait without a bound would trade a silent
+    /// false-success for a silent hang.
     #[test]
     fn shell_that_neither_signals_nor_dies_times_out() {
         let _guard = fork_guard();
@@ -684,20 +478,10 @@ mod tests {
     /// `poll` return, so an implementation that reads the marker and returns without
     /// re-checking terminal state reports a corpse as up — verbatim the P3a failure.
     ///
-    /// # This test PASSED FOR THE WRONG REASON 15 runs in 20 before it was ordered
-    ///
-    /// Its first form forked a child that wrote the marker and exited, then had the parent
-    /// `kill_and_reap` it. Nothing ordered the child's `write` before the parent's `SIGKILL`,
-    /// so the child was frequently killed **before signalling** — and the run then exercised
-    /// "died without signalling" (which passes for a completely different reason) instead of
-    /// "signalled, then died".
-    ///
-    /// Measured against an injected R1-02 defect: this test detected it **5/20**, while its
-    /// sibling `marker_then_channel_close_while_alive_is_not_ready` detected the *same*
-    /// defect **20/20**. A weaken/restore run resting on this test alone would have reported
-    /// "the weaken did not bite" three times in four — a **concrete instance of the class-22
-    /// blind spot**, produced here rather than argued about. Ordering the child's write ahead
-    /// of the parent's kill removes it; the assertions are unchanged.
+    /// Ordered because the unordered form passed for the WRONG reason 15 runs in 20: nothing
+    /// sequenced the child's write before the parent's SIGKILL, so most runs exercised "died
+    /// without signalling" instead. Detection of an injected R1-02 defect went 5/20 -> 20/20.
+    /// The measurement behind DEFECT_CLASSES 22's n/N rule.
     #[test]
     fn marker_from_an_already_dead_shell_is_not_ready() {
         let _guard = fork_guard();
@@ -721,10 +505,8 @@ mod tests {
         );
     }
 
-    /// **D0-R1-06 REGRESSION.** A LIVE shell that sends a zero-length datagram must be
-    /// reported as a PROTOCOL fault, not as a death. Measured: an empty datagram and EOF are
-    /// indistinguishable at the socket (`read` → 0, `msg_flags` 0x0, `MSG_EOR` clear for
-    /// both), so the verdict must come from the pidfd rather than the socket.
+    /// D0-R1-06: an empty datagram and EOF are indistinguishable at the socket, so the
+    /// verdict must come from the pidfd. A live shell must not be reported dead.
     #[test]
     fn empty_datagram_from_a_live_shell_is_a_protocol_error_not_a_death() {
         let _guard = fork_guard();
@@ -748,14 +530,9 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// **CLASS-22 WEAKEN (b) FOR D0-R1-02 — the second form of the same class.**
-    ///
-    /// R1-02's fix is `child_is_dead(pidfd)? || chan_revents.intersects(POLLHUP)`. A fix
-    /// that checked only ONE of those legs would still pass
-    /// `marker_from_an_already_dead_shell_is_not_ready`, where both fire together. This is
-    /// the input that separates them: the shell writes a valid marker, **closes its channel
-    /// end, and stays ALIVE**. POLLHUP fires; the pidfd does not. A pidfd-only fix reports
-    /// ready — and the shell can never receive an approval over a channel it closed.
+    /// Class-22 weaken (b) for D0-R1-02: separates the two legs of
+    /// `POLLHUP || child_died`. Here HUP fires and the pidfd does not, so a pidfd-only fix
+    /// still reports ready over a channel the shell closed.
     #[test]
     fn marker_then_channel_close_while_alive_is_not_ready() {
         let _guard = fork_guard();
@@ -784,13 +561,8 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// **CLASS-22 WEAKEN (b) FOR D0-R1-06 — the second ambiguous form.**
-    ///
-    /// R1-06 is "a `read() == 0` attributed to the wrong cause". The first form is an empty
-    /// datagram from a live shell. This is the *other* one: a live shell that closes the
-    /// channel **without writing anything at all**. `read` returns 0 exactly as it does at
-    /// EOF-by-death, and only the pidfd can tell them apart. A fix that special-cased the
-    /// empty-datagram path alone would misreport this as a death.
+    /// Class-22 weaken (b) for D0-R1-06: the other ambiguous `read()==0` — a live shell that
+    /// closed the channel writing nothing. A fix special-casing only empty datagrams misses it.
     #[test]
     fn silent_channel_close_while_alive_is_a_protocol_error_not_a_death() {
         let _guard = fork_guard();
@@ -819,9 +591,7 @@ mod tests {
         kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
-    /// The marker must stay distinguishable from the protocol messages that follow it on the
-    /// same channel. A 32-byte digest is what the *next* datagram is; if the marker were 32
-    /// bytes a framing slip would be much harder to diagnose.
+    /// Keeps the marker distinguishable from the 32-byte digest that follows it on the wire.
     #[test]
     fn marker_is_not_digest_sized() {
         assert_ne!(READY_DATAGRAM.len(), 32, "marker must not collide with the digest size");

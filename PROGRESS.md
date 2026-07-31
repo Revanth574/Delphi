@@ -182,6 +182,17 @@ and reaping every child before the guard drops → **30/30**. Production foreclo
 interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
 the AI is not a third), so this is a harness artifact — **shown, not asserted**.
 
+**THE n/N RULE APPLIED TO ITSELF, ONE ROUND AFTER IT WAS EXTRACTED.** The flake fix went
+**1/30 → 1/50 → 50/50**, and that sequence is the finding: the first two "fixes" were
+**partial**, and only the third established the precondition. `FORK_LOCK` closed
+fork-without-exec; `SOCK_CLOEXEC` closed inheritance across `exec`; neither closed a sibling
+`Command::spawn` holding fds in the window **between** its fork and its exec. Each of the
+first two produced a green run and would have been reported as the fix on a single pass.
+**Only the barrier — waiting for `POLLHUP` before measuring — made the test measure the state
+it names.** Exactly the correction the 5/20 case had just taught, missed once more before it
+was applied. Recorded because the rule's value is in noticing partial fixes, and it took a
+third measurement here to notice.
+
 **Verification:** weaken (a) re-run against the FINAL code for every P1 — R1-02 **20/20** on
 both guards, R1-06 **20/20** on both, R1-01 bites (only the new test fails). Weaken (b), the
 class re-application, shipped as two new second-form tests

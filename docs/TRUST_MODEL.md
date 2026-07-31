@@ -279,6 +279,23 @@ foreground-`closing` case was not exercised. Under leader == shell no shell can 
 session, so the edge **cannot arise** and needs no separate proof. (Any future variant that
 reintroduces a leader ≠ shell path would owe that proof.)
 
+### R3-01e — readiness rides the consent channel, not a second inherited fd
+
+The D0 readiness signal (`runtime/src/readiness.rs`) needs a descriptor that survives the
+shell's `execve`. A **second pipe** would therefore have to be **exempted from the FD-01
+sweep**, and widening that allowlist is the precise class FD-01 (P1) closed — "the allowlist
+MUST be explicitly enumerated and minimal", above.
+
+`# DECISION:` **readiness reuses the fork-passed `SOCK_SEQPACKET` consent channel** — under
+Reading A the one descriptor that legitimately survives into the shell. No new fd, no
+allowlist change, no new attack surface. `SOCK_SEQPACKET` framing keeps the marker from
+coalescing with a later protocol message; it is a prologue the daemon reads once, before it
+writes anything, so it does not interact with `HostSession::recv_approval`'s ordering.
+
+**Readiness is a liveness signal, not an authorization.** It mints nothing and opens no PAM
+window. The R‑2 keystone is unaffected: the marker's content is native's, and the renderer
+gains no channel path it did not already have.
+
 ### R3-01d — the display arc reintroduces leader ≠ shell, and R3-01c already priced it
 
 **This subsection discharges an obligation R3-01c wrote down in advance.** R3-01c closes with:

@@ -298,9 +298,30 @@ fn build_sleeper(dir: &std::path::Path) -> Option<PathBuf> {
     // cc was in fact present and working). Each failure mode now prints its ACTUAL cause, so a
     // SKIP names WHY — write-fail vs cc-spawn-fail (with PATH) vs compile-fail (with cc's
     // stderr) — instead of blaming a toolchain that may be fine.
+    // D0: the sleeper must now SIGNAL READINESS before blocking, or `launch()` refuses it
+    // after `readiness::DEFAULT_READY_TIMEOUT` and every test here fails to even reach its
+    // assertion. The marker goes to `SHELL_CHANNEL_FD` (3).
+    //
+    // THIS IS NOT A WEAKEN (Iron Law 15 clause 3). None of the three properties measured
+    // through this sleeper — B-1 leader == shell, FD-01 inherited-fd containment, B-3
+    // privdrop effect — depends on the shell staying silent; adding the write removes a
+    // dependency that would otherwise INVALIDATE the measurement (the launch would never
+    // return). The assertions are untouched, and each still fails if its property is
+    // violated. The kept `pause()` is what matters: the shell must outlive the measurement.
+    //
+    // The C literal is GENERATED from `readiness::READY_DATAGRAM` rather than transcribed.
+    // A hand-copied marker here would be an eighth reimplementation of a runtime constant —
+    // the exact duplication class that produced B2A-COMP-R3-03's false green in
+    // `p3-preflight.sh`. Foreclose by construction: if the constant changes, this changes.
+    let marker = delphi_runtime::readiness::READY_DATAGRAM;
+    let c_escaped: String = marker.iter().map(|b| format!("\\{b:03o}")).collect();
     if let Err(e) = std::fs::write(
         &src,
-        "#include <unistd.h>\nint main(void){ pause(); return 0; }\n",
+        format!(
+            "#include <unistd.h>\n\
+             int main(void){{ write(3, \"{c_escaped}\", {}); pause(); return 0; }}\n",
+            marker.len()
+        ),
     ) {
         eprintln!("build_sleeper: cannot write {}: {e}", src.display());
         return None;

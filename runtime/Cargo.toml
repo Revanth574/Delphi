@@ -34,7 +34,10 @@ path = "src/bin/delphi-minimal-ai.rs"
 # Syscall layer (§13.7: reuse the workspace's existing nix 0.30; add the feature
 # gates 1a needs — `user` for set{groups,gid,uid}/geteuid, `fs` for chown/unlink,
 # `process` for fork/execve used by the child-drop path).
-nix = { version = "0.30", features = ["user", "fs", "process", "socket", "signal"] }
+# D0 adds "poll": the readiness wait watches the channel and the pidfd together, so a shell
+# that dies without signalling is reported at once instead of after the full timeout. A
+# feature of an already-vetted dependency — no new crate, no change to the audit surface.
+nix = { version = "0.30", features = ["user", "fs", "process", "socket", "signal", "poll"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

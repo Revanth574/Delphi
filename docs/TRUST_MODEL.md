@@ -279,6 +279,75 @@ foreground-`closing` case was not exercised. Under leader == shell no shell can 
 session, so the edge **cannot arise** and needs no separate proof. (Any future variant that
 reintroduces a leader ≠ shell path would owe that proof.)
 
+### R3-01d — the display arc reintroduces leader ≠ shell, and R3-01c already priced it
+
+**This subsection discharges an obligation R3-01c wrote down in advance.** R3-01c closes with:
+"Under leader == shell no shell can outlive its session, so the edge **cannot arise** and needs
+no separate proof. (**Any future variant that reintroduces a leader ≠ shell path would owe that
+proof.**)" The display arc is exactly that variant. What follows is therefore not a new
+exception carved out to fit new work — it is the document's own forward obligation coming due,
+on the terms the document set.
+
+**Why the topology must change at all — ORDERING, not aesthetics.** §4 R3-02a pins the PRIMARY
+deployment shape: the Living Surface **is** the session on its seat, holding the seat's VT. On a
+bare VT there is no display server, and the shell (`/usr/libexec/delphi-shell`, a WebKitGTK
+application) is a **Wayland client**. A client cannot connect to a compositor that does not yet
+exist. So something must hold the VT and be running *before* the shell execs. That is a strict
+ordering constraint, and it is the whole reason the leader question reopens.
+
+**The three candidate topologies, and why only one survives:**
+
+1. **Compositor as a child of the shell.** Foreclosed by the same ordering constraint: the shell
+   would have to be running to spawn the compositor, but the shell cannot start without a
+   compositor to connect to. The dependency is circular, not merely ugly.
+2. **Compositor as session leader, shell as a cgroup-member child.** Viable. `sd_pid_get_session`
+   resolves by **cgroup membership**, not leadership (A-1, quoted in R3-01c), so a non-leader
+   shell still resolves to the session and still passes the full active-local-seated gate. The
+   R3-03 approver pin is unaffected — it is a **pidfd** the daemon holds, not a leadership claim.
+3. **Compositor and shell as siblings, each opening its own session on the same VT.**
+   Structurally unconstructible: logind refuses the second session on an occupied VT with
+   `VirtualTerminalAlreadyTaken`, one layer below the gate.
+
+`# DECISION:` **the display arc adopts topology (2) — leader == compositor, shell as a
+cgroup-member child.**
+
+**What is LOST, stated as a cost accepted and not as an equivalence.** R3-01c chose leader ==
+shell for a specific failure-mode property: shell-death *is* leader-death *is* session teardown,
+**structurally**, with no orphan window. Topology (2) gives that up. Under it the shell can die
+while the compositor (the leader) lives, and the compositor can die leaving the shell orphaned in
+a `closing` session — the exact shape recon Phase D measured and rejected.
+
+The replacement is **mechanized teardown**: the daemon pidfd-pins the compositor as well as the
+shell, and on either death kills the other and refuses every approval bound to the dead pidfd.
+
+**This is strictly weaker than structural teardown, and the ways it can fail are known:**
+
+- **The daemon can die first.** Structural teardown is enforced by the kernel and logind and does
+  not depend on any Delphi process being alive. Mechanized teardown depends on the daemon. If the
+  daemon dies before it observes the compositor's death, nothing performs the teardown.
+  (Mitigated, not removed, by the daemon being a `Restart=on-failure` root unit whose restart
+  fails all pending approvals closed — but the orphan window is real while it is down.)
+- **The deaths can race.** If compositor and shell die close together, the daemon observes two
+  pidfd events in an order it does not control, and "kill the other" may target a pid that is
+  already gone — or, worse, a **recycled** one. The pidfd pin is what makes the latter safe, and
+  it must be the pidfd that is used for the kill (`pidfd_send_signal`), never a raw pid.
+- **It is code, and code is reviewable but fallible.** Structural teardown had no implementation
+  to get wrong.
+
+**The obligation R3-01c named is therefore now LIVE and is NOT discharged by this decision.** The
+edge R3-01c was allowed to leave untested — *whether a `closing` session whose VT is foreground
+still reports `Active=yes` and thus passes the gate* — can arise again under topology (2), because
+a shell can now outlive its session's teardown. **That measurement is owed before any consent can
+be minted in the PRIMARY shape**, and it is a lane measurement, not an argument. Until it is
+taken, this decision is a decision about *structure* only; it does not certify the gate under the
+new topology.
+
+**Sequencing.** This subsection is a decision, not an implementation. It is recorded before the
+display arc's first backend increment (D1) precisely so the topology is not discovered from
+inside an increment scoped to something else. The mechanized-teardown implementation, its
+pidfd-race handling, and the foreground-`closing` measurement are D1/D2 deliverables and get
+their own review.
+
 **Pre-`execve` fd containment is mandatory (FD-01).** Because leader == shell means the *same
 pid* that ran `pam_start`/`pam_open_session` becomes the shell, every fd PAM opened — including
 `pam_systemd`'s D-Bus connection to logind — is live in the process about to `execve`. Any such

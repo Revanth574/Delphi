@@ -21,7 +21,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +34,7 @@ use pam_client2::{Context, Flag, SessionToken};
 use crate::channel::approval_socketpair;
 use crate::pidfd;
 use crate::privdrop::{drop_privileges, RealPrivDropOps};
+use crate::readiness;
 use crate::RuntimeError;
 
 /// Where the forked shell finds its private-channel fd (the launcher dups the
@@ -202,18 +203,53 @@ pub struct Children {
 /// Fork + exec the shell (channel fork-passed) and the AI (no channel), each
 /// dropped to the session user, and pin the shell by pidfd.
 ///
+/// # The two-phase launch contract (Increment D0)
+///
+/// `Ok` means **the shell is running and said so**, not merely that `execve` returned.
+/// Two distinct signals are required, and they answer different questions:
+///
+/// 1. [`wait_for_child_setup`] — *did the child reach `execve`?* A `O_CLOEXEC` sync pipe,
+///    so it is delivered **by the `execve` itself** and can say nothing about what happens
+///    afterwards.
+/// 2. [`readiness::await_shell_ready`] — *is the shell alive on the other side?* The shell
+///    writes [`readiness::READY_DATAGRAM`] on the private channel once it is up.
+///
+/// Before D0 only (1) existed, so a shell that exec'd and then aborted was reported
+/// **started** — measured live in P3a, where the daemon went on to service an action
+/// against a dead shell. Do not remove (2) as redundant: (1) cannot observe a post-`execve`
+/// death by construction, and (2) is the only thing that can.
+///
+/// The AI is forked **after** the shell is ready, so a failed shell launch never leaves an
+/// orphaned AI running against a boundary that will not exist.
+///
 /// # Errors
 ///
 /// [`RuntimeError::Syscall`] if the socketpair or pidfd fails;
-/// [`RuntimeError::Filesystem`] if a child cannot be spawned.
+/// [`RuntimeError::Filesystem`] if a child cannot be spawned;
+/// [`RuntimeError::ShellSetupFailed`] if the child died before `execve`;
+/// [`RuntimeError::ShellDiedBeforeReady`] / [`RuntimeError::ShellReadyTimeout`] if it
+/// exec'd but never came up.
 pub fn launch(spec: &LaunchSpec) -> Result<Children, RuntimeError> {
     // The private channel (1b): daemon keeps `.0`, the shell gets `.1` at fork.
     let (daemon_end, shell_end) = approval_socketpair()?;
 
     let shell_pid = fork_shell(spec, &shell_end)?;
     let shell_pidfd = pidfd::open(Pid::from_raw(shell_pid))?;
-    // The daemon closes its copy of the shell's end; only the shell holds it now.
+    // The daemon closes its copy of the shell's end BEFORE the readiness wait. This is
+    // load-bearing, not tidiness: while the daemon holds a copy of the shell's end, the
+    // channel never reaches EOF, so a dead shell would present as silence and the wait
+    // would burn the full timeout instead of returning at once. (The pidfd leg still
+    // catches it — this makes the fast path fast and the diagnosis correct.)
     drop(shell_end);
+
+    // Phase 2 — the shell must SAY it is up. On any failure the caller gets a typed error
+    // and no `Children`; the shell's pidfd drops here, and the shell's own death tears down
+    // its logind session (leader == shell, R3-01c) with no orphan to clean up.
+    readiness::await_shell_ready(
+        daemon_end.as_fd(),
+        shell_pidfd.as_fd(),
+        readiness::DEFAULT_READY_TIMEOUT,
+    )?;
 
     let ai_pid = fork_ai(spec)?;
 

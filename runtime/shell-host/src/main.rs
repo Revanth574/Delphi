@@ -253,6 +253,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc_session = Arc::clone(&session);
     let webview = wry::WebViewBuilder::new()
         .with_url(shell_url())
+        // ── READINESS (D0) ──────────────────────────────────────────────────────────
+        // The daemon's `launch()` blocks until this fires. It is deliberately attached to
+        // **page-load-finished** and not to `build()` returning, because the failure this
+        // whole contract exists to catch — P3a — was an abort *during rendering*, after
+        // `GTK INIT: ok`. Signalling at construction would have reported that corpse as up,
+        // which is precisely today's behaviour.
+        //
+        // Native, not renderer-driven: wry invokes this from the GTK main loop on a load
+        // event, so the marker cannot be forged by page content. The renderer never learns
+        // the marker and has no path to the channel outside `HostSession` (the R-2 keystone).
+        //
+        // ⚠ UNVERIFIED ON THE LANE. That `PageLoadEvent::Finished` fires for a **custom
+        // scheme** (`delphi://shell/…`) rather than only for http(s)/file is read from the
+        // wry 0.55.1 API, NOT measured — this box has no display, so the host cannot be run
+        // here. If it does not fire, every launch fails closed with `ShellReadyTimeout`
+        // (loud, bounded, never a false success) — but it fails. **This leg must be run on
+        // the seated lane before D0 merges.**
+        .with_on_page_load_handler(move |event, _url| {
+            if matches!(event, wry::PageLoadEvent::Finished)
+                && let Err(e) = delphi_runtime::readiness::signal_ready(chan_fd)
+            {
+                eprintln!("[delphi-shell] FAILED to signal readiness: {e}");
+            }
+        })
         // Serve the snapshot. The closure owns the bundle; NOTHING here touches the
         // filesystem, so a renderer-supplied URI cannot become a file read.
         .with_custom_protocol(SCHEME.to_string(), move |_id, request| {

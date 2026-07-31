@@ -56,6 +56,7 @@ pub mod logind;
 pub mod pam;
 pub mod pidfd;
 pub mod privdrop;
+pub mod readiness;
 pub mod sandbox;
 pub mod service;
 pub mod store;
@@ -178,4 +179,36 @@ pub enum RuntimeError {
          `shell child failed before execve: …`)"
     )]
     ShellSetupFailed,
+
+    /// The shell `execve`d successfully and then died — or closed its channel — before
+    /// signalling readiness (Increment D0, `readiness::READY_DATAGRAM`).
+    ///
+    /// This is the case the pre-D0 launcher **could not represent at all**: its setup-sync
+    /// pipe is `O_CLOEXEC`, so a successful `execve` already delivered EOF and the parent
+    /// had recorded "shell started". Measured live in P3a — the WRY host reported
+    /// `GTK INIT: ok`, aborted during rendering, and the daemon serviced an action against
+    /// a corpse.
+    #[error(
+        "the shell exec'd but died before signalling readiness — it is NOT running. \
+         Check the daemon journal for the shell's own diagnostics (it inherits the daemon's \
+         stderr): a WebKit/GTK abort, a missing AppArmor profile, or an absent display are \
+         the observed causes. Verify with `installer/p3-preflight.sh`."
+    )]
+    ShellDiedBeforeReady,
+
+    /// The shell neither signalled readiness nor died within the launch budget
+    /// (Increment D0, `readiness::DEFAULT_READY_TIMEOUT`).
+    ///
+    /// Distinct from [`Self::ShellDiedBeforeReady`] on purpose: a wedged shell and a dead
+    /// shell have different causes and different fixes, and collapsing them would make the
+    /// journal say the wrong thing about which one happened.
+    #[error(
+        "the shell exec'd but neither signalled readiness nor exited within {secs}s — it is \
+         wedged, not dead. A shell that cannot say it is up is indistinguishable from one \
+         that never came up, so the launch is refused rather than proceeding against it."
+    )]
+    ShellReadyTimeout {
+        /// The budget that elapsed, in seconds.
+        secs: u64,
+    },
 }

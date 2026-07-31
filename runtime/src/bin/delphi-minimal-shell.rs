@@ -22,6 +22,12 @@ fn main() {
         .expect("DELPHI_CHANNEL_FD is a fd number");
     let password = std::env::var("DELPHI_PASSWORD").unwrap_or_default();
 
+    // 0. READINESS (D0). The daemon's `launch()` blocks here until this datagram arrives:
+    //    until it does, the shell is indistinguishable from one that exec'd and died. This
+    //    minimal shell has nothing to initialise, so "up" is simply "reached main" — the real
+    //    WRY host signals later, once its WebView has loaded (see runtime/shell-host).
+    delphi_runtime::readiness::signal_ready(chan).expect("signal readiness");
+
     // 1. The approval request: digest + the arbiter's preview of the exact action.
     let (digest, preview) = recv_approval_request(chan).expect("recv approval request");
     eprintln!("[minimal-shell] approval preview over the private channel:\n{preview}");

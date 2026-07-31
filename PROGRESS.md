@@ -1,11 +1,171 @@
 # Delphi OS — Progress State
 
-Last updated: 2026-07-28 (**B2a COMPOSITION built; its 7-round Codex sweep CLOSED — awaiting the root-lane gate + merge.** P1 bundle-tree install, P2 dialog mount, P3a composition-to-the-gate, the custom-protocol host, and the named-unconfined AppArmor profile. Sweep closed by decision, not by APPROVE — see the composition section below for the terminus argument and the four items carried UNPROVEN past the close.) PRIOR: 2026-07-24 (**B2a lane-dependent security core MERGED to main `71ce87d`** — the C1 shape-(b) manual-fork launcher restructure (leader==shell, setup-sync pipe for parent-side error propagation), three RED-proven shell-child regression tests (B-1, FD-01, B-3/B′, each verified to bite via weaken/restore), and the C2 install surface (real WRY shell binary + systemd unit + PAM stack), after a 4-round Codex adversarial sweep (R1 REVISE → R2 REVISE → R3 REVISE → R4 APPROVE, every finding fixed at root with a biting regression test) and a runtime-verification gate (gate 1: the changed `launch()` RUNTIME-PROVEN via `launch_returns_err…`, not just read; the one residual failure, `b1_daemon_binary_runs_the_assembled_flow`, diagnosed as an environment precondition — needs the `insecure-test-seams` feature to exercise the gate-bypass seam, else the real logind gate correctly denies a non-foreground session — gated with a legible skip and POSITIVELY CONFIRMED to pass with the feature). This is the SECURITY-CORE lane half — **NOT B2a complete** (the composition, gate-POSITIVE-via-real-shell, and long-lived-shell lifecycle remain PENDING). Prior: **B2a WSL2-provable half MERGED to main `3e40e22`** — the real React-WRY shell's SECURITY CORE on the B1 spine, Codex-APPROVED after 2 remediation rounds (0 findings). Immediately-prior runtime milestone: **B1 MERGED `f5b823d`** — the runtime boundary RUNS as an integrated process. Earlier: **Leverage pass MERGED to main at v0.4.1 (`b1bf565`)** after a 2-round Codex review — primitives confirmed byte-identical (round-1), R1-01 test-fix (round-2 APPROVE); see the close-out section. Earlier milestones below. INF-1 (API-key Debug redaction) **FIXED + Codex APPROVE, 0 findings**, merged via `fix/inf-1-apikey-redaction` — the first `CODEBASE_REVIEW` security candidate triaged; see the INF-1 section below. Prior milestone — Phase 3B.0 — **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED TO MAIN `84d84b3`**. The FINAL Phase 3B.0 sweep — **Phase 3B.0 is now CLOSED** (the D-Bus boundary `services/`, `die/orchestrator/`, and the security layer `fortress/` have all been swept and merged). Three adversarial Codex rounds + one scoped re-verification: **R1 FAIL (5 findings) → R2 FAIL (4 findings) → R3 FAIL (1 composition-seam regression) → R3-reverify APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **7 pre-review fixes** and **3 dead detection paths wired before round 1** (the "fix what you find" discipline). Severities are Codex's actual verdicts — **two P1s** (FORT-R1-01 the silent ZKQP PII leak that justified the sweep; FORT-R2-01 the digit-completeness class), both fixed and verified, so main holds no known P1. The full-workspace pre-merge audit additionally caught 3 downstream tests that encoded the pre-R1-04 credential-name leak across `#[from]` boundaries — corrected (`e7fdbb0`). The 18 fix commits + the pre-merge PROGRESS chore (`06c46a1`) landed via `--no-ff` merge **`84d84b3`** (`68b045d..84d84b3`), pushed to origin, branch `phase-3b/sweep-fortress` deleted. Prior milestone: `die/orchestrator/` sweep merged `ab1ffc7`.)
-Current phase: **Runtime arc — B2a lane-dependent security core MERGED (`71ce87d`); composition/gate-POSITIVE/lifecycle NEXT.** The C1 restructure, its three RED-proven regression tests, and the C2 install surface are on `main`, Codex-converged (4 rounds → APPROVE) and runtime-verified (gate 1 clean, including the positively-confirmed `b1_daemon_binary` under `insecure-test-seams`). **B2a is still NOT complete** — the composition (host drawing the real bundle through the consent path), the gate-POSITIVE-via-real-shell, and the long-lived-shell lifecycle remain PENDING. Prior: **B2a WSL2-provable half MERGED (`3e40e22`).** Trust model RATIFIED (`docs/TRUST_MODEL.md` @ `0065919`, 6-round Codex → APPROVE); 1a–1d BUILT + reviewed + MERGED (`e5f25d5`); B1 (make 1a–1d run — the launcher + service loops assembling the proven primitives, minimal sides) BUILT + own-Codex-reviewed (3 rounds) + MERGED (`f5b823d`); **B2a — the REAL React-WRY shell's SECURITY CORE on the B1 spine — BUILT + Codex-APPROVED (2 rounds, 0 findings) + MERGED (`3e40e22`)**, the WSL2-provable HALF. **Next: the LANE-DEPENDENT half** — the real seated-desktop half of B2a, its own recon + build + review, once a real seated lane is provisioned.
-Current task: **B2a lane-dependent half — security core MERGED (`71ce87d`); composition + gate-POSITIVE + long-lived-shell lifecycle PENDING.** Recon closed on a real seated VM (Ubuntu 26.04, systemd 259, seat0): A-1 (resolution is by cgroup, not leadership; `PAM_TTY=ttyN` is the whole seat obligation), the first gate-POSITIVE, R3-01c leader == shell PROVEN 9x, A-2.1-A-2.4 lifecycle, and a 3-round Codex gate on the recon binary whose FD-01 (P1) changed the DESIGN (mandatory pre-`execve` fd sweep, now in §4). See the 2026-07-19 milestone section. Remaining (the BUILD): **PENDING.** Original scope statement: Prerequisite: a real seated Linux desktop (`seat0` `CanGraphical=yes` + a greeter; the A-0 probe validates any candidate — WSL2 does NOT qualify). Comprises: shape-(b) manual-fork launcher restructure (Command/pre_exec → manual `fork()` so the child opens its own session, CARRYING its re-run 1b sibling-fd-theft + fd-discipline/privdrop RED-proofs — the proven launcher properties must survive the restructure); the real `pam_open_session` provisioning (shape b — child opens, unambiguous leader); the gate-POSITIVE (a real seated session PASSES the tightened gate); the long-lived-shell lifecycle (the deferred B1-ism — the daemon doesn't block on a shell that never exits); the composition (the host drawing the real React bundle through the consent path). **SHAPE DECISION SETTLED — shape (b) FORCED BY SOURCE** (pam_systemd leader = `getpid_cached`, its own pid, no parent-for-child mechanism; logind rejects a 2nd session per leader — SESSION_BUSY); residual observation (does `for_pid(cgroup-member-but-not-leader shell)` resolve the session, since `sd_pid_get_session` resolves by cgroup) the lane-pending CONFIRMATION — a RESOLVED decision, not an open question.
-Current step: **B2a composition BUILT; Codex sweep CLOSED after 7 rounds; root-lane gate PENDING before merge.** PRIOR: **B2a lane-dependent security core CLOSED (merged `71ce87d`, Codex-converged, runtime-verified).** THE HONEST BOUNDARY (load-bearing): the security property = C1 restructure + three RED-proven regression tests (B-1, FD-01, B-3/B′), each verified to bite via weaken/restore; the setup-sync pipe's success/failure discrimination is RUNTIME-PROVEN (`launch_returns_err…` PASSED), not just read by Codex; C2 install is real (systemd unit + PAM stack). This is the SECURITY-CORE **lane-dependent** half merged, **NOT B2a complete** — the COMPOSITION (host drawing the real bundle) + the gate-POSITIVE-via-real-shell + the long-lived-shell LIFECYCLE remain PENDING. Next: build the composition on the seated lane.
-Status: **B2a composition on `phase-3b/b2a-composition`, sweep closed, merge gate in progress.** PRIOR: **B2a WSL2-provable half MERGED + reviewed-sound (`3e40e22`).** 7 commits (5 GREEN + 2 fixes): keystone RED `877e220`, gate-tightening `1e712fe`, channel-driving + deny-on-EOF `cefda93`, WRY host `73a2853`, R-3 dialog `78bbf85`, B2A-R2-01 fail-closed CLOEXEC `3961ef0`, B2A-R2-02 terminal contract `f760d12`. Codex implementation review: round-1 REVISE (2 findings — B2A-R2-01 P2-med CLOEXEC best-effort = relay-bypass; B2A-R2-02 P2-low terminal-contract wedge; BOTH composition AROUND the core, the core APPROVED) → both FIXED at root + RED-proven (verified-to-bite) → round-2 APPROVE, 0 findings. The lane-dependent half gets its OWN review when built against the seated lane. (B1 detail preserved in the B1 milestone sections below.)
-Tests passing: B2a adds — `consent_relay` **7** lib tests (4 stub + 3 real-channel; keystone verified-to-bite on a real SOCK_SEQPACKET socketpair); `delphi-shell-host` (decoupled crate) **2** (fail-closed CLOEXEC containment); `b1_integration` **+1** non-root (`terminal_contract_release_produces_eof_no_wedge`); `logind_gate` **+1** (live gate-negative — WSL2's real seatless session "3" fails the seated gate); the gate decision test now covers the seat axis. Shell Vitest **94 → 98** (+4 PAM consent dialog); `tsc -b` clean. All `clippy --all-targets -- -D warnings` clean. (Full runtime lib/integration recount folds in at the lane-dependent merge.)
+Last updated: 2026-07-30 (**Display arc SCOPED; D-0 topology decision RECORDED in `docs/TRUST_MODEL.md` §4 R3-01d; D0 readiness contract BUILT + weaken-proven (4 FAIL / 2 pass weakened → 6/6 restored) + 30/30 stable under DEFAULT PARALLEL.** Two findings recorded as their own items: `cargo check --workspace` has not been runnable on the WSL dev box (the gate was ABSENT, not passing), and the logind verdict is a STARTUP SNAPSHOT whose per-request re-check comment is inaccurate — bounded today, latent-critical for P4. D0 carries TWO items UNPROVEN: the WRY host's `PageLoadEvent::Finished` leg and the B-1/FD-01/B-3 sleeper change, both lane-pending.) PRIOR: 2026-07-28 (**B2a COMPOSITION built; its 7-round Codex sweep CLOSED — awaiting the root-lane gate + merge.** P1 bundle-tree install, P2 dialog mount, P3a composition-to-the-gate, the custom-protocol host, and the named-unconfined AppArmor profile. Sweep closed by decision, not by APPROVE — see the composition section below for the terminus argument and the four items carried UNPROVEN past the close.) PRIOR: 2026-07-24 (**B2a lane-dependent security core MERGED to main `71ce87d`** — the C1 shape-(b) manual-fork launcher restructure (leader==shell, setup-sync pipe for parent-side error propagation), three RED-proven shell-child regression tests (B-1, FD-01, B-3/B′, each verified to bite via weaken/restore), and the C2 install surface (real WRY shell binary + systemd unit + PAM stack), after a 4-round Codex adversarial sweep (R1 REVISE → R2 REVISE → R3 REVISE → R4 APPROVE, every finding fixed at root with a biting regression test) and a runtime-verification gate (gate 1: the changed `launch()` RUNTIME-PROVEN via `launch_returns_err…`, not just read; the one residual failure, `b1_daemon_binary_runs_the_assembled_flow`, diagnosed as an environment precondition — needs the `insecure-test-seams` feature to exercise the gate-bypass seam, else the real logind gate correctly denies a non-foreground session — gated with a legible skip and POSITIVELY CONFIRMED to pass with the feature). This is the SECURITY-CORE lane half — **NOT B2a complete** (the composition, gate-POSITIVE-via-real-shell, and long-lived-shell lifecycle remain PENDING). Prior: **B2a WSL2-provable half MERGED to main `3e40e22`** — the real React-WRY shell's SECURITY CORE on the B1 spine, Codex-APPROVED after 2 remediation rounds (0 findings). Immediately-prior runtime milestone: **B1 MERGED `f5b823d`** — the runtime boundary RUNS as an integrated process. Earlier: **Leverage pass MERGED to main at v0.4.1 (`b1bf565`)** after a 2-round Codex review — primitives confirmed byte-identical (round-1), R1-01 test-fix (round-2 APPROVE); see the close-out section. Earlier milestones below. INF-1 (API-key Debug redaction) **FIXED + Codex APPROVE, 0 findings**, merged via `fix/inf-1-apikey-redaction` — the first `CODEBASE_REVIEW` security candidate triaged; see the INF-1 section below. Prior milestone — Phase 3B.0 — **`fortress/` sweep COMPLETE + Codex APPROVE + MERGED TO MAIN `84d84b3`**. The FINAL Phase 3B.0 sweep — **Phase 3B.0 is now CLOSED** (the D-Bus boundary `services/`, `die/orchestrator/`, and the security layer `fortress/` have all been swept and merged). Three adversarial Codex rounds + one scoped re-verification: **R1 FAIL (5 findings) → R2 FAIL (4 findings) → R3 FAIL (1 composition-seam regression) → R3-reverify APPROVE (0 findings)**, every finding fixed at root with a RED-proven regression test, plus **7 pre-review fixes** and **3 dead detection paths wired before round 1** (the "fix what you find" discipline). Severities are Codex's actual verdicts — **two P1s** (FORT-R1-01 the silent ZKQP PII leak that justified the sweep; FORT-R2-01 the digit-completeness class), both fixed and verified, so main holds no known P1. The full-workspace pre-merge audit additionally caught 3 downstream tests that encoded the pre-R1-04 credential-name leak across `#[from]` boundaries — corrected (`e7fdbb0`). The 18 fix commits + the pre-merge PROGRESS chore (`06c46a1`) landed via `--no-ff` merge **`84d84b3`** (`68b045d..84d84b3`), pushed to origin, branch `phase-3b/sweep-fortress` deleted. Prior milestone: `die/orchestrator/` sweep merged `ab1ffc7`.)
+Current phase: **Display arc — D-0 recorded, D0 built on `phase-3b/d0-readiness-contract`, awaiting the lane run + Codex review.** PRIOR: **Runtime arc — B2a lane-dependent security core MERGED (`71ce87d`); composition/gate-POSITIVE/lifecycle NEXT.** The C1 restructure, its three RED-proven regression tests, and the C2 install surface are on `main`, Codex-converged (4 rounds → APPROVE) and runtime-verified (gate 1 clean, including the positively-confirmed `b1_daemon_binary` under `insecure-test-seams`). **B2a is still NOT complete** — the composition (host drawing the real bundle through the consent path), the gate-POSITIVE-via-real-shell, and the long-lived-shell lifecycle remain PENDING. Prior: **B2a WSL2-provable half MERGED (`3e40e22`).** Trust model RATIFIED (`docs/TRUST_MODEL.md` @ `0065919`, 6-round Codex → APPROVE); 1a–1d BUILT + reviewed + MERGED (`e5f25d5`); B1 (make 1a–1d run — the launcher + service loops assembling the proven primitives, minimal sides) BUILT + own-Codex-reviewed (3 rounds) + MERGED (`f5b823d`); **B2a — the REAL React-WRY shell's SECURITY CORE on the B1 spine — BUILT + Codex-APPROVED (2 rounds, 0 findings) + MERGED (`3e40e22`)**, the WSL2-provable HALF. **Next: the LANE-DEPENDENT half** — the real seated-desktop half of B2a, its own recon + build + review, once a real seated lane is provisioned.
+Current task: **D0 — the readiness contract** (`runtime/src/readiness.rs` + `launch()` wiring + the three shell binaries). D1–D5 scoped in `scratch/display-arc-scoping.md`; D1 is framed as the arc's go/no-go feasibility probe, with `scratch/d1-drm-probe.sh` as its lane instrument. PRIOR: **B2a lane-dependent half — security core MERGED (`71ce87d`); composition + gate-POSITIVE + long-lived-shell lifecycle PENDING.** Recon closed on a real seated VM (Ubuntu 26.04, systemd 259, seat0): A-1 (resolution is by cgroup, not leadership; `PAM_TTY=ttyN` is the whole seat obligation), the first gate-POSITIVE, R3-01c leader == shell PROVEN 9x, A-2.1-A-2.4 lifecycle, and a 3-round Codex gate on the recon binary whose FD-01 (P1) changed the DESIGN (mandatory pre-`execve` fd sweep, now in §4). See the 2026-07-19 milestone section. Remaining (the BUILD): **PENDING.** Original scope statement: Prerequisite: a real seated Linux desktop (`seat0` `CanGraphical=yes` + a greeter; the A-0 probe validates any candidate — WSL2 does NOT qualify). Comprises: shape-(b) manual-fork launcher restructure (Command/pre_exec → manual `fork()` so the child opens its own session, CARRYING its re-run 1b sibling-fd-theft + fd-discipline/privdrop RED-proofs — the proven launcher properties must survive the restructure); the real `pam_open_session` provisioning (shape b — child opens, unambiguous leader); the gate-POSITIVE (a real seated session PASSES the tightened gate); the long-lived-shell lifecycle (the deferred B1-ism — the daemon doesn't block on a shell that never exits); the composition (the host drawing the real React bundle through the consent path). **SHAPE DECISION SETTLED — shape (b) FORCED BY SOURCE** (pam_systemd leader = `getpid_cached`, its own pid, no parent-for-child mechanism; logind rejects a 2nd session per leader — SESSION_BUSY); residual observation (does `for_pid(cgroup-member-but-not-leader shell)` resolve the session, since `sd_pid_get_session` resolves by cgroup) the lane-pending CONFIRMATION — a RESOLVED decision, not an open question.
+Current step: **D0 built + RED-proven off-lane; the lane legs are OWED before merge** — the WRY host readiness signal (custom-scheme page-load callback, UNVERIFIED) and the serial ≥30 re-run of B-1/FD-01/B-3 against the marker-writing sleeper (all four SKIP without root here — 'A SKIP PROVES NOTHING'). PRIOR: **B2a composition BUILT; Codex sweep CLOSED after 7 rounds; root-lane gate PENDING before merge.** PRIOR: **B2a lane-dependent security core CLOSED (merged `71ce87d`, Codex-converged, runtime-verified).** THE HONEST BOUNDARY (load-bearing): the security property = C1 restructure + three RED-proven regression tests (B-1, FD-01, B-3/B′), each verified to bite via weaken/restore; the setup-sync pipe's success/failure discrimination is RUNTIME-PROVEN (`launch_returns_err…` PASSED), not just read by Codex; C2 install is real (systemd unit + PAM stack). This is the SECURITY-CORE **lane-dependent** half merged, **NOT B2a complete** — the COMPOSITION (host drawing the real bundle) + the gate-POSITIVE-via-real-shell + the long-lived-shell LIFECYCLE remain PENDING. Next: build the composition on the seated lane.
+Status: **D0 on `phase-3b/d0-readiness-contract`, not merged.** Codex review REQUIRED (it touches the launcher's trust-boundary child-spawn path). PRIOR: **B2a composition on `phase-3b/b2a-composition`, sweep closed, merge gate in progress.** PRIOR: **B2a WSL2-provable half MERGED + reviewed-sound (`3e40e22`).** 7 commits (5 GREEN + 2 fixes): keystone RED `877e220`, gate-tightening `1e712fe`, channel-driving + deny-on-EOF `cefda93`, WRY host `73a2853`, R-3 dialog `78bbf85`, B2A-R2-01 fail-closed CLOEXEC `3961ef0`, B2A-R2-02 terminal contract `f760d12`. Codex implementation review: round-1 REVISE (2 findings — B2A-R2-01 P2-med CLOEXEC best-effort = relay-bypass; B2A-R2-02 P2-low terminal-contract wedge; BOTH composition AROUND the core, the core APPROVED) → both FIXED at root + RED-proven (verified-to-bite) → round-2 APPROVE, 0 findings. The lane-dependent half gets its OWN review when built against the seated lane. (B1 detail preserved in the B1 milestone sections below.)
+Tests passing: `delphi-runtime` **105** (was 99; +6 `readiness::` — keystone verified-to-bite via weaken/restore, 30/30 DEFAULT PARALLEL). `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; `delphi-shell-host` compiles. NOTE: a workspace-wide count cannot be produced on this box — see the `cargo check --workspace` finding below. PRIOR: B2a adds — `consent_relay` **7** lib tests (4 stub + 3 real-channel; keystone verified-to-bite on a real SOCK_SEQPACKET socketpair); `delphi-shell-host` (decoupled crate) **2** (fail-closed CLOEXEC containment); `b1_integration` **+1** non-root (`terminal_contract_release_produces_eof_no_wedge`); `logind_gate` **+1** (live gate-negative — WSL2's real seatless session "3" fails the seated gate); the gate decision test now covers the seat axis. Shell Vitest **94 → 98** (+4 PAM consent dialog); `tsc -b` clean. All `clippy --all-targets -- -D warnings` clean. (Full runtime lib/integration recount folds in at the lane-dependent merge.)
+
+## Display arc — SCOPED; D-0 topology decision RECORDED; D0 readiness contract BUILT + weaken-proven (2026-07-30)
+
+The compositor gap (the roadmap-level finding of 2026-07-25, "nothing in the repo can put a
+display on a bare VT") was scoped before any code was written. Full enumeration:
+`scratch/display-arc-scoping.md`. It is an **arc of six increments** (D-0 decision, D0 readiness,
+D1 session+devices, D2 modeset, D3 input, D4 client path, D5 = P3b), not one increment.
+
+**The scoping corrected a premise, and reading rather than assuming is what caught it.**
+`compositor/` was believed to be "a working nested compositor missing a DRM backend." It is not:
+`grep -rn "add_socket\|ListeningSocket\|WAYLAND_DISPLAY" compositor/src/` returns **no matches** —
+nothing ever calls `Display::add_socket_auto()`, so there is **no listening socket, and no Wayland
+client has ever connected to this compositor or can**. `handlers.rs`'s xdg_shell, `window.rs`'s
+hit-testing and `render.rs`'s surface path are unreached code; the winit backend paints `#1a1a2e`
+over a permanently empty stacking order. The 28 unit tests are pure-function tests (colors, hit
+zones, mode cycling) and none exercises a client.
+
+### 🚩 FINDING (its own item, not a footnote) — `cargo check --workspace` has NOT been runnable on the WSL dev box, so §13.4's self-audit has been silently scoped to individual crates
+
+```
+$ cargo check -p compositor --all-targets
+EXIT=101
+thread 'main' panicked at libudev-sys-0.1.4/build.rs:38:41:
+  "The system library `libudev` required by crate `libudev-sys` was not found."
+```
+
+pkg-config on this box: **libseat, libinput, libudev, gbm, libdrm all MISSING** (egl 1.5,
+wayland-server 1.24.0, xkbcommon 1.13.1 present). `compositor` is a default workspace member and
+the workspace manifest already enables `backend_drm` / `backend_udev` /
+`backend_session_libseat` / `backend_libinput` / `renderer_multi` (`Cargo.toml:78-88`), so the
+workspace-wide gate cannot complete here.
+
+**Nothing was misreported** — every session flagged the per-crate scoping at the time. But the
+distinction that matters is recorded now: **the gate was ABSENT, not passing.** A verification
+that cannot run is not a verification that succeeded, and "we ran the per-crate checks" is a
+weaker claim than the protocol's text implies. Two consequences, both actionable:
+
+- `README.md:122` lists prerequisites as `libwayland-dev libudev-dev libinput-dev
+  libxkbcommon-dev` and **omits `libseat-dev` and `libgbm-dev`**, which the already-enabled
+  features require. A contributor following the README reproduces the failure above.
+- **UNVERIFIED:** `.github/workflows/ci.yml:39,50` runs `--workspace` clippy + test on
+  `ubuntu-latest` with **no apt-install step**. Whether that is green depends on the runner image
+  shipping those headers. `gh` is not installed on this box; the operator is checking.
+
+**Same class, smaller: a doc describing a mechanism that is not there.** `compositor/Cargo.toml`
+declares `zbus` and `grep -rn zbus compositor/ --include=*.rs` returns **no matches**;
+`compositor/src/lib.rs:15` documents a D-Bus wire to the DIE orchestrator and
+`compositor/src/input.rs:13,145` document an "Alt+Space → command bar signal (D-Bus)" whose
+implementation at `:147` is an `info!` log. Rides along with D1.
+
+### D-0 — the topology decision, RECORDED (`docs/TRUST_MODEL.md` §4 R3-01d)
+
+PRIMARY needs a compositor holding the VT before the shell — which is a **Wayland client** — can
+connect. That ordering constraint, not aesthetics, is what reopens the leader question. Three
+topologies; (1) compositor-as-child-of-shell is **circular** (the shell cannot start without a
+compositor to connect to), (3) sibling sessions on one VT is **unconstructible**
+(`VirtualTerminalAlreadyTaken`). `# DECISION:` **(2) leader == compositor, shell as a
+cgroup-member child** — the gate still passes because `sd_pid_get_session` resolves by cgroup
+membership (A-1), and R3-03's approver pin is a pidfd, not a leadership claim.
+
+**R3-01c priced this in advance and the obligation is now LIVE.** Its closing parenthesis reads
+"(Any future variant that reintroduces a leader ≠ shell path would owe that proof.)" — the proof
+being whether a `closing` session whose VT is *foreground* still reports `Active=yes` and passes
+the gate. The display arc IS that variant, so this is the document's own forward obligation coming
+due on its own terms, not a new exception carved to fit new work. **The measurement is owed before
+any consent is minted in the PRIMARY shape**, is a lane measurement rather than an argument, and
+is NOT discharged by the decision.
+
+**What is given up, recorded as a cost accepted and not as an equivalence.** Structural teardown
+(shell-death *is* leader-death *is* session teardown, enforced by kernel+logind, no
+implementation to get wrong) is replaced by **mechanized teardown** (the daemon pidfd-pins both
+and kills the survivor). Strictly weaker, with known failure modes: the **daemon can die first**
+(structural teardown depended on no Delphi process being alive; this one depends on the daemon),
+the **deaths can race** (the kill must use `pidfd_send_signal`, never a raw pid, or a recycled pid
+can be signalled), and it is code rather than structure.
+
+### D0 — the readiness contract: BUILT, weaken-proven, 30/30 stable
+
+`runtime/src/readiness.rs` + `launch()` wiring. The pre-D0 launcher could not represent
+"the child died after `execve`" **at all**: `wait_for_child_setup`'s sync pipe is `O_CLOEXEC`, so
+EOF is delivered *by* the `execve` and nothing after it is observable. P3a measured the
+consequence live — `GTK INIT: ok`, abort during rendering, and the daemon serviced an action
+against a corpse.
+
+Readiness rides the **existing private channel** (`SHELL_CHANNEL_FD`), not a second pipe: a new
+inherited fd would have to be exempted from the FD-01 sweep, and widening that allowlist is the
+precise class FD-01 (P1) closed. No new fd, no allowlist change. `SOCK_SEQPACKET` framing keeps
+the marker from coalescing with protocol messages.
+
+**VERIFIED TO BITE — the discriminating result, not a green.** Weaken = replace
+`await_shell_ready`'s body with `Ok(())` (a faithful encoding of pre-D0 behaviour, where nothing
+observed the child post-`execve`). Measured:
+
+| | weakened | restored |
+|---|---|---|
+| `shell_that_dies_without_signalling_is_not_ready` (**keystone**) | **FAIL** | ok |
+| `wrong_first_datagram_is_a_protocol_error_not_a_ready` | **FAIL** | ok |
+| `marker_with_trailing_bytes_does_not_match` | **FAIL** | ok |
+| `shell_that_neither_signals_nor_dies_times_out` | **FAIL** | ok |
+| `shell_that_signals_is_ready` (positive leg) | ok | ok |
+| `marker_is_not_digest_sized` (constant) | ok | ok |
+
+`test result: FAILED. 2 passed; 4 failed` → restore → `test result: ok. 6 passed; 0 failed`. Not
+PASS/PASS, not FAIL/FAIL — the positive leg passing under both is what makes the pair
+discriminating (Iron Law 15 clause 2).
+
+**Non-determinism:** 30/30 pass, **DEFAULT PARALLEL** (`pass=30 fail=0`, full 57-test lib binary).
+These forks do only raw syscalls — no PAM, no allocation, no D-Bus — so they are **not** the
+serial-only carve-out; parallel is the correct and reported configuration.
+
+`cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean. Full `delphi-runtime` suite
+green. `delphi-shell-host` compiles.
+
+**CARRIED UNPROVEN — must not be absorbed into a merge:**
+
+1. **The WRY host's readiness leg is UNVERIFIED.** It is attached to
+   `PageLoadEvent::Finished` (deliberately — signalling at `build()` would have reported P3a's
+   corpse as up, i.e. today's behaviour). That the callback fires for a **custom scheme**
+   (`delphi://shell/…`) is read from the wry 0.55.1 API, **not measured** — this box has no
+   display. If it does not fire, every launch fails **closed** with `ShellReadyTimeout` (loud,
+   bounded, never a false success) — but it fails. **Must be run on the seated lane before merge.**
+2. **The B-1 / FD-01 / B-3 sleeper change is UNEXERCISED here.** The `pause()` sleeper now writes
+   the marker (generated from `READY_DATAGRAM`, not transcribed — a hand-copied constant would be
+   the duplication class that produced B2A-COMP-R3-03's false green). All four `leader_is_shell`
+   tests **SKIP without root** — their own messages say "A SKIP PROVES NOTHING." **The serial ≥30
+   re-run on the lane is owed.** Argued as NARROWING not weakening (Iron Law 15 clause 3): none of
+   leader==shell, fd containment, or privdrop depends on the shell staying silent, the assertions
+   are untouched, and the `pause()` — what makes the shell outlive the measurement — is kept.
+
+### 🚩 FINDING (Q3) — the logind verdict is a STARTUP SNAPSHOT, and the comment saying otherwise is wrong
+
+`delphi-runtimed.rs:128` computes `let verdict = logind_verdict(children.shell_pid)` **once**, and
+`:156` hands `verdict.as_ref()` to `ServiceCtx.session_verdict: &'a dyn SessionVerdict`.
+`service.rs:148`'s `session_passes_gate(ctx.session_verdict)` then re-evaluates **the same three
+frozen booleans** — it does **not** re-query logind. So `delphi-runtimed.rs:135`'s comment, "The
+consent GATE re-checks this per-request (`service.rs` `session_passes_gate`)", is **inaccurate**:
+it re-checks the snapshot, not the world.
+
+**Bounded today, latent-critical for P4.** B1 services exactly one action then exits, so the
+snapshot is seconds old and used once. P4's entire purpose is to make the daemon loop — at which
+point the snapshot ages without bound.
+
+**The dangerous direction is the opposite of the one asked about.** A session that becomes
+*active* after the snapshot is a false DENY (usability). A session that becomes **INACTIVE** after
+the snapshot — the user switches VT away from Delphi — is a **false ALLOW**: a consent minted
+while the seat is pointing somewhere else, which is exactly what R3-02's active axis exists to
+prevent. **Provable today**, and it wants its own increment + review rather than being folded into
+D0 or discovered inside P4.
+
+### Answers carried forward
+
+- **Q2 (is the VirtualBox lane adequate for D2?)** — not treated as procurement until measured.
+  Probe: `scratch/d1-drm-probe.sh`, to be run on the seated lane. If `vboxvideo` presents a DRM
+  device with a modesettable CRTC, D2 can prove the mechanism with "virtual hardware only" as a
+  stated scope limit; if not, **D1's verdict changes too**.
+- **D1 is a go/no-go feasibility probe for the whole arc**, not merely its first increment. If
+  libseat cannot take the seat or `primary_gpu` finds nothing, the correct reading is "the
+  approach needs rethinking on this lane", **not** "D1 needs more work".
+
+---
 
 ## Runtime arc — B2a COMPOSITION built; 7-round Codex sweep CLOSED BY DECISION (2026-07-28)
 

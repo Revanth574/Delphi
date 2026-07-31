@@ -940,21 +940,51 @@ git checkout -b phase-{N}/{task-name}
 # On the feature branch, all tests green, all commits clean
 
 # For tasks touching fortress/, services/ auth code, die/orchestrator/
-# ZKQP or permissions, or ssi/ capability execution — run security review:
-# NOTE (corrected 2026-07-26): `--base` and a PROMPT are MUTUALLY EXCLUSIVE in the
-# installed Codex CLI — `codex review --base main -` fails with
+# ZKQP or permissions, or ssi/ capability execution — run security review.
+#
+# ── THE INVOCATION. THIS ONE. ────────────────────────────────────────────────────────
+#
+#   codex review - < scratch/codex-<task>-prompt.md
+#
+# ── ALL THREE RANGE-SELECTION FLAGS REJECT A PROMPT (verified 2026-07-31) ────────────
+# `--commit`, `--base`, AND `--uncommitted` are each mutually exclusive with the
+# `[PROMPT]` positional. Measured directly against the installed CLI, all three:
+#
+#   $ codex review --commit 0000000 "test prompt"
+#   error: the argument '--commit <SHA>' cannot be used with '[PROMPT]'
+#   $ codex review --base no-such-branch-xyz "test prompt"
 #   error: the argument '--base <BRANCH>' cannot be used with '[PROMPT]'
-# The previous form documented here could never have run. Use ONE of:
+#   $ codex review --uncommitted "test prompt"
+#   error: the argument '--uncommitted' cannot be used with '[PROMPT]'
 #
-#   codex review --commit <SHA> -   < prompt.md      # scope to one commit, with a prompt
-#   codex review --uncommitted -    < prompt.md      # scope to the working tree
-#   codex review --base main                         # scope to a base branch, NO prompt
+# STATED GENERALLY ON PURPOSE — this is Class 17 (defect propagated by copy) inside the
+# law file. The 2026-07-26 correction fixed only `--base`, the flag that had been tripped
+# over, and then RECOMMENDED `--commit` and `--uncommitted` — which carry the identical
+# defect. Documenting the instance instead of the class is what let a non-executable
+# command survive in this file across the whole B2a sweep and cost SEVEN retries. There is
+# no fourth flag to discover: it is every flag that selects a range.
 #
-# Prefer writing the prompt to a file (scratch/codex-*.md) and redirecting it: the round
-# prompts are long, are committed as part of the review ledger, and must be reproducible.
-# Verify the flag set against `codex review --help` before relying on any of these — this
-# note is itself a claim with a date on it.
-cat scratch/codex-<task>-prompt.md | codex review --commit <SHA> -
+# ── WHY THE FLAGLESS FORM IS THE RIGHT ONE, NOT MERELY THE ONE THAT PARSES ───────────
+# With no range flag, THE RANGE LIVES INSIDE THE PROMPT. That is why every prompt in this
+# project opens by naming its own target — the commit or range, and the diff stat the
+# reviewer should expect — and instructs the reviewer to inspect the live tree through the
+# CLI (`git show <SHA>`) rather than trust a supplied diff.
+#
+# Three properties follow, and a reader who has them will not try to reintroduce a flag:
+#   * SELF-SCOPING — the scope travels with the prompt, so it is reproducible from the
+#     committed review ledger alone. A flag lives only in a shell history nobody kept.
+#   * DRIFT-DETECTABLE — the reviewer compares what it finds against the stated diff stat
+#     and reports a mismatch as a finding. A flag cannot disagree with itself, so a flag
+#     silently reviews whatever it selected. This is the §6 requirement that scope drift
+#     be detectable, and only the prompt-carried form satisfies it.
+#   * AUDITABLE — `scratch/codex-*.md` IS the ledger. The invocation carries no argument
+#     that is not in the repo.
+# (`codex review --help` documents no default range for the flagless form. It does not
+# need one: nothing here relies on a default, because the prompt names the target.)
+#
+# Write the prompt to a file and redirect it — never paste it inline. The round prompts
+# are long, are committed as part of the review ledger, and must be reproducible.
+codex review - < scratch/codex-<task>-prompt.md
 
 # Then merge to main:
 git checkout main
@@ -1330,7 +1360,7 @@ Claude Code cannot run Codex directly (it's a separate tool on the user's machin
 ┌─────────────────────────────────────────────────────┐
 │ SECURITY REVIEW REQUIRED — run before merging:     │
 │                                                     │
-│ codex review --uncommitted                          │
+│ codex review - < scratch/codex-<task>-prompt.md     │
 │                                                     │
 │ Focus areas for this task: [specific things to      │
 │ check based on what was built — e.g., "verify       │

@@ -15,8 +15,10 @@ therefore carried IN THIS DOCUMENT (the "Scope" section below names the commit a
 exact diff stat), not in a flag — which is more robust anyway, because §6 requires the
 reviewer to inspect the live code through the CLI rather than trust a supplied diff.
 
-KNOWN DRIFT: CLAUDE.md §6 still documents `codex review --commit <SHA> - < prompt.md` as
-a valid form. It is not. That note needs correcting; it is flagged, not yet fixed.
+Verified 2026-07-31 against the installed CLI: ALL THREE range-selection flags
+(`--commit`, `--base`, `--uncommitted`) reject the `[PROMPT]` positional. CLAUDE.md §6
+has been corrected to state that generally and to carry the flagless form — so this
+header no longer diverges from the law file, it agrees with it.
 -->
 
 ## Scope — exactly this, and detect drift from it

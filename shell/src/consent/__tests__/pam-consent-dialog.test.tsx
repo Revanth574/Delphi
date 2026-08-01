@@ -29,16 +29,24 @@ describe("PamConsentDialog", () => {
   // event, which fires for FAILED loads and can precede this component registering
   // `window.__delphiConsent` — so the daemon could be told the shell was ready while an
   // approval request would still hit an unregistered surface and be dropped.
-  it("posts a ready message to native once the consent surface has registered", () => {
+  //
+  // D0-R2-05: the first version asserted `window.__delphiConsent` was defined AFTER render,
+  // which is true however the effect is ordered internally — moving the post above the
+  // assignment left all five specs green. The surface's presence must be sampled AT THE
+  // MOMENT the message is posted, which is the only instant the property is about.
+  it("posts ready only once the consent surface is already registered", () => {
+    const surfacePresentWhenPosted: boolean[] = [];
+    window.ipc = {
+      postMessage: vi.fn((msg: string) => {
+        if ((JSON.parse(msg) as { kind: string }).kind === "ready") {
+          surfacePresentWhenPosted.push(window.__delphiConsent !== undefined);
+        }
+      }),
+    };
+
     render(<PamConsentDialog />);
 
-    const posted = (window.ipc!.postMessage as ReturnType<typeof vi.fn>).mock.calls.map(
-      (c) => JSON.parse(c[0] as string) as { kind: string },
-    );
-    expect(posted).toContainEqual({ kind: "ready" });
-    // The ordering is the property, not merely the message: readiness must not be claimed
-    // before the callback surface exists to receive a request.
-    expect(window.__delphiConsent).toBeDefined();
+    expect(surfacePresentWhenPosted).toEqual([true]);
   });
 
   it("Allow posts the password via window.ipc and clears it on submit", async () => {

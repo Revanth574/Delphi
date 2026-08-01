@@ -329,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "delphi-runtime",
  "libc",
+ "nix",
  "serde",
  "serde_json",
  "sha2",

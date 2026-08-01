@@ -202,6 +202,7 @@ enum Ue {
 /// The renderer→native consent message carried over `window.ipc.postMessage`.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
+#[cfg_attr(test, derive(Debug))]
 enum RendererMsg {
     /// The consent surface has bootstrapped — `window.__delphiConsent` is registered and an
     /// approval request delivered from now on will actually reach the dialog (D0-R1-01).
@@ -323,6 +324,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+/// Emit the readiness marker at most once, releasing the one-shot if the write fails.
+///
+/// D0-R2-06: setting the flag *before* the write made a transient failure permanent — the
+/// retry a reload would have produced was suppressed by a marker that never reached the
+/// channel. The flag is a parameter so tests get their own rather than racing the global.
+fn signal_ready_once(flag: &std::sync::atomic::AtomicBool, chan_fd: RawFd) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if flag.compare_exchange(false, true, SeqCst, SeqCst).is_ok()
+        && let Err(e) = delphi_runtime::readiness::signal_ready(chan_fd)
+    {
+        flag.store(false, SeqCst);
+        eprintln!("[delphi-shell] FAILED to signal readiness (will retry on reload): {e}");
+    }
+}
+
 /// Handle a renderer `window.ipc.postMessage(body)`. Parse it and route through the
 /// keystone: a password reaches the channel only via [`HostSession::on_renderer_message`]
 /// (only in the PAM window; the mint-confirm is native's held digest). A malformed
@@ -338,11 +354,7 @@ fn on_ipc(session: &SharedSession, chan_fd: RawFd, body: &str) {
     // ShellReadyTimeout the operator would misdiagnose.
     if matches!(msg, RendererMsg::Ready) {
         // `swap` is the one-shot: only the first caller sees `false` and writes.
-        if !READY_SENT.swap(true, std::sync::atomic::Ordering::SeqCst)
-            && let Err(e) = delphi_runtime::readiness::signal_ready(chan_fd)
-        {
-            eprintln!("[delphi-shell] FAILED to signal readiness: {e}");
-        }
+        signal_ready_once(&READY_SENT, chan_fd);
         return;
     }
     let Ok(mut guard) = session.lock() else {
@@ -658,6 +670,72 @@ mod tests {
     /// deserialize. `#[serde(tag = "kind", rename_all = "lowercase")]` renames VARIANTS only,
     /// so the `value` FIELD keeps its name — that asymmetry is exactly the kind of thing a
     /// reading-based check gets wrong, so it is pinned against real JSON.
+    /// **D0-R2-06.** A failed first write must not consume the one-shot: the retry a reload
+    /// produces is the only thing standing between a transient error and a launch that
+    /// times out. Forced by writing to a closed fd, so the failure is certain, not sampled.
+    #[test]
+    fn a_failed_readiness_write_does_not_consume_the_one_shot() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let flag = AtomicBool::new(false);
+
+        signal_ready_once(&flag, -1); // EBADF — certain failure
+        assert!(!flag.load(SeqCst), "a failed write must release the one-shot");
+
+        let (a, b) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("socketpair");
+        signal_ready_once(&flag, std::os::fd::AsRawFd::as_raw_fd(&b));
+        assert!(flag.load(SeqCst), "the retry must succeed and consume the one-shot");
+
+        let mut buf = [0u8; 32];
+        // SAFETY: bounded read of the marker the retry wrote.
+        let n = unsafe {
+            nix::libc::read(
+                std::os::fd::AsRawFd::as_raw_fd(&a),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert!(n > 0, "the retry wrote nothing");
+        assert_eq!(&buf[..n as usize], delphi_runtime::readiness::READY_DATAGRAM);
+    }
+
+    /// A second call after a SUCCESSFUL write is dropped — a reload cannot push a second
+    /// marker into the consent stream.
+    #[test]
+    fn readiness_is_emitted_at_most_once_after_success() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        let (a, b) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("socketpair");
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&b);
+        signal_ready_once(&flag, fd);
+        signal_ready_once(&flag, fd);
+
+        let mut buf = [0u8; 32];
+        // SAFETY: drain the first datagram.
+        let n = unsafe {
+            nix::libc::read(std::os::fd::AsRawFd::as_raw_fd(&a), buf.as_mut_ptr().cast(), buf.len())
+        };
+        assert!(n > 0);
+        // A second datagram must NOT be queued.
+        let mut fds = [nix::poll::PollFd::new(
+            std::os::fd::AsFd::as_fd(&a),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let ready = nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO).expect("poll");
+        assert_eq!(ready, 0, "a second marker was emitted");
+    }
+
     #[test]
     fn renderer_messages_parse_from_the_shapes_the_dialog_posts() {
         // Mirrors shell/src/consent/pam-consent-dialog.tsx:76 and :82.
@@ -665,12 +743,20 @@ mod tests {
             .expect("the dialog's password shape must parse")
         {
             RendererMsg::Password { value } => assert_eq!(value, "hunter2"),
-            RendererMsg::Cancel => panic!("parsed as Cancel"),
+            other => panic!("parsed as {other:?}, not Password"),
         }
         assert!(matches!(
             serde_json::from_str::<RendererMsg>(r#"{"kind":"cancel"}"#)
                 .expect("the dialog's cancel shape must parse"),
             RendererMsg::Cancel
+        ));
+        // D0-R2-03: the readiness shape the dialog posts (pam-consent-dialog.tsx). Adding the
+        // variant without this arm broke `cargo test --no-run` with E0004 — invisible because
+        // no verification command reached this decoupled crate's TEST targets.
+        assert!(matches!(
+            serde_json::from_str::<RendererMsg>(r#"{"kind":"ready"}"#)
+                .expect("the dialog's ready shape must parse"),
+            RendererMsg::Ready
         ));
     }
 }

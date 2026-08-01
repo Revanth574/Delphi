@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{Gid, Pid, Uid};
 use pam_client2::conv_null::Conversation as NullConv;
 use pam_client2::{Context, Flag, SessionToken};
@@ -323,12 +324,47 @@ fn kill_and_reap_shell(shell_pidfd: &OwnedFd, shell_pid: i32) {
             tracing::warn!(shell_pid, error = %e, "could not SIGKILL the unready shell");
         }
     }
-    // Reap unconditionally: on the timeout path the kill above created the corpse, and on
-    // the death path it was already one. Without this the daemon accumulates a zombie.
-    if let Err(e) = nix::sys::wait::waitpid(Pid::from_raw(shell_pid), None) {
-        tracing::warn!(shell_pid, error = %e, "could not reap the unready shell");
+    // BOUNDED reap (D0-R2-04) — see `reap_within`.
+    if !reap_within(shell_pid, REAP_TIMEOUT) {
+        tracing::warn!(
+            shell_pid,
+            "unready shell did not exit within {REAP_TIMEOUT:?} of SIGKILL — leaking a zombie \
+             rather than blocking the daemon. A task in uninterruptible sleep is the usual cause."
+        );
     }
 }
+
+/// Reap `pid`, giving up after `timeout`. Returns whether it was reaped.
+///
+/// A blocking `waitpid` here can wedge the daemon's launch path: `SIGKILL` does not dislodge
+/// a task in uninterruptible sleep, the kill may have failed outright, and `EINTR` would
+/// restart an unbounded wait indefinitely. Bounded polling makes the worst case a logged,
+/// leaked zombie instead of a hung service.
+fn reap_within(pid: i32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(REAP_POLL_INTERVAL);
+            }
+            Ok(_) => return true,                       // reaped
+            Err(nix::errno::Errno::EINTR) => {}         // retry against the same deadline
+            Err(nix::errno::Errno::ECHILD) => return true, // already reaped
+            Err(e) => {
+                tracing::warn!(pid, error = %e, "could not reap the unready shell");
+                return false;
+            }
+        }
+    }
+}
+
+/// How long [`kill_and_reap_shell`] waits for a SIGKILLed shell before giving up.
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Poll interval while waiting for the corpse.
+const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Fork the shell via a **manual `fork()`** (shape (b), `docs/TRUST_MODEL.md` §4 R3-01b):
 /// the child opens its OWN logind session and then `execve`s **in place**, so the session
@@ -973,6 +1009,46 @@ fn priv_to_io(e: RuntimeError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    /// **D0-R2-04.** `reap_within` must return on a child that outlives the budget rather
+    /// than blocking. The forced shape: a child that ignores nothing but is simply still
+    /// alive — an unbounded `waitpid` here never returns, which is the wedge this bounds.
+    #[test]
+    fn reap_within_gives_up_on_a_child_that_outlives_the_budget() {
+        // SAFETY: the child only sleeps and `_exit`s — raw syscalls, no allocation.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => {
+                unsafe { nix::libc::sleep(30) };
+                unsafe { nix::libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => child,
+        };
+
+        let t0 = std::time::Instant::now();
+        let reaped = super::reap_within(pid.as_raw(), std::time::Duration::from_millis(200));
+        let elapsed = t0.elapsed();
+
+        assert!(!reaped, "a live child must not report as reaped");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "reap_within blocked for {elapsed:?} — the bound is not bounding"
+        );
+
+        // SAFETY: clean up our own child.
+        unsafe { nix::libc::kill(pid.as_raw(), nix::libc::SIGKILL) };
+        let _ = nix::sys::wait::waitpid(pid, None);
+    }
+
+    /// The ordinary path: an already-dead child is reaped promptly.
+    #[test]
+    fn reap_within_reaps_a_dead_child() {
+        // SAFETY: the child exits immediately.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => unsafe { nix::libc::_exit(0) },
+            nix::unistd::ForkResult::Parent { child } => child,
+        };
+        assert!(super::reap_within(pid.as_raw(), std::time::Duration::from_secs(2)));
+    }
     use super::*;
 
     /// **B2A-C-R1-01 regression — the setup-sync mechanism DISCRIMINATES failure from success.**

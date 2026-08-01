@@ -29,6 +29,8 @@ delphi-runtime = { path = ".." }
 wry = "0.55"
 tao = "0.35"
 libc = "0.2"
+# D0-R2-06 tests need socketpair/poll; same crate the boundary already vets.
+nix = { version = "0.30", features = ["socket", "poll"] }
 # The renderer→native consent message ({kind:"password"|"cancel", value}). serde_json
 # also builds the native→renderer evaluate_script arguments with proper string escaping
 # (so a preview/prompt cannot inject JS).

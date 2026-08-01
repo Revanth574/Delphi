@@ -1789,6 +1789,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace 2>&1 | tee /tmp/test_results.txt
 grep "test result:" /tmp/test_results.txt
 
+# ── DECOUPLED WORKSPACES — `--workspace` DOES NOT REACH THEM ────────────────────────
+# `runtime/shell-host` has its own `[workspace]` table and is `exclude`d from the root
+# manifest, so EVERY root-level command above skips it entirely. It must be audited from
+# its own directory or it is not audited at all.
+#
+# `--all-targets` is not optional here: plain `cargo check`/`cargo build` compile lib and
+# bins only, so TEST code is never type-checked. That is exactly how D0-R2-03 shipped — a
+# new enum variant broke an exhaustive match in a test, `cargo check` passed, the root
+# `-p delphi-runtime` suite ran 30/30 green, and the E0004 sat in a crate no command
+# touched. Add any future decoupled crate to this list.
+for c in runtime/shell-host; do
+  ( cd "$c" \
+    && cargo clippy --all-targets -- -D warnings \
+    && cargo test --no-run \
+    && cargo test 2>&1 | grep "test result:" ) || { echo "FAILED: $c"; exit 1; }
+done
+
 # Count actual tests by crate (prevent false counts)
 for dir in */; do
   if [ -f "$dir/Cargo.toml" ]; then

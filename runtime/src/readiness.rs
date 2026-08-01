@@ -28,12 +28,25 @@ pub const READY_DATAGRAM: &[u8] = b"delphi-shell-ready\0v1";
 /// Launch budget: a shell that neither signals nor dies must not wedge the daemon.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Grace for a death notification before concluding a process is genuinely alive.
+/// How long to wait for death evidence before concluding a process is genuinely alive.
 ///
 /// A child closes its fds *before* its pidfd becomes readable, so an instantaneous poll can
 /// report "not dead" for a corpse. **A pidfd is authoritative for death and says nothing
-/// about life**: `!dead` means "not yet observed dead", so any positive liveness claim must
-/// wait out the death that would contradict it.
+/// about life**: a negative is only admissible as a liveness claim after waiting out the
+/// death that would contradict it.
+///
+/// CALIBRATED, not guessed (marker-then-immediate-exit, 100 samples each):
+///
+/// ```text
+/// grace=  0ms  wrongly-accepted=32/100      grace= 10ms  wrongly-accepted=0/100
+/// grace=  1ms  wrongly-accepted=43/100      grace= 25ms  wrongly-accepted=0/100
+/// grace=  2ms  wrongly-accepted= 0/100      grace=250ms  wrongly-accepted=0/100
+/// ```
+///
+/// Non-monotonic below 2ms — that region is scheduler-dominated, which is the reason the
+/// constant is not set there. 250ms is ~125x the measured evidence latency and is paid in
+/// full ONLY on the success path, once per launch; a death returns as soon as it is witnessed
+/// (worst observed ~1.8ms). It bounds the OBSERVATION WINDOW, not truth.
 const DEATH_GRACE: Duration = Duration::from_millis(250);
 
 /// Block until the shell signals ready, dies, or `timeout` elapses.
@@ -88,7 +101,7 @@ pub fn await_shell_ready(
         let pidfd_revents = fds[1].revents().unwrap_or(PollFlags::empty());
 
         if chan_revents.intersects(PollFlags::POLLIN) {
-            return classify_and_confirm_alive(chan, pidfd, chan_revents);
+            return classify_and_confirm_alive(chan, pidfd);
         }
         if pidfd_revents.intersects(PollFlags::POLLIN)
             || chan_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
@@ -98,45 +111,121 @@ pub fn await_shell_ready(
     }
 }
 
-/// Has the pinned child died within `grace`?
+/// What a FRESH poll witnesses about the channel and the child.
+#[derive(Debug, PartialEq, Eq)]
+enum Terminal {
+    /// No terminal evidence appeared within the grace.
+    None,
+    /// The pidfd reported the child's death.
+    Dead,
+    /// The channel is fully closed, but the child is still running.
+    ChannelClosed,
+}
+
+/// Witness terminal state by polling BOTH descriptors afresh, up to `grace`.
 ///
-/// `Ok(false)` is a positive liveness claim, which is why this takes a budget — see
-/// [`DEATH_GRACE`]. Pass `ZERO` only where `false` is not treated as evidence of life.
-fn child_died_within(pidfd: BorrowedFd<'_>, grace: Duration) -> Result<bool, RuntimeError> {
+/// # Only DEATH may return early (D0-R2-01c)
+///
+/// Measured: a dying child closes its fds **before** its pidfd becomes readable, so `POLLHUP`
+/// arrives FIRST. Returning [`Terminal::ChannelClosed`] on that first event asserts the child
+/// is *alive*, which is a positive claim built on a death notification that has merely not
+/// arrived yet — the third instance of DEFECT_CLASSES 26 in this module, and the first one
+/// found by our own test rather than by review.
+///
+/// So: [`Terminal::Dead`] returns immediately (positive evidence of death is conclusive), and
+/// **`ChannelClosed` and `None` are only reachable once the full grace has elapsed** without
+/// a death. Both are liveness claims and both must pay for one.
+///
+/// `chan` is registered with no requested events — `POLLHUP`/`POLLERR` are delivered
+/// regardless while `POLLIN` is not, so a queued datagram cannot spin the loop. Once `HUP` is
+/// latched the channel is dropped from the poll set entirely, because it would otherwise
+/// report `HUP` on every iteration and busy-spin out the remaining grace.
+fn witness_terminal(
+    chan: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
+    grace: Duration,
+) -> Result<Terminal, RuntimeError> {
     let deadline = Instant::now() + grace;
-    loop {
+    let mut hup = false;
+
+    // Phase 1 — watch both until death, HUP, or the deadline.
+    while !hup {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let mut fds = [PollFd::new(pidfd, PollFlags::POLLIN)];
-        let t = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO);
-        match nix::poll::poll(&mut fds, t) {
+        if remaining.is_zero() {
+            return Ok(Terminal::None);
+        }
+        let mut fds = [
+            PollFd::new(chan, PollFlags::empty()),
+            PollFd::new(pidfd, PollFlags::POLLIN),
+        ];
+        match nix::poll::poll(&mut fds, poll_timeout(remaining)) {
             Err(nix::errno::Errno::EINTR) => continue,
             Err(source) => {
-                return Err(RuntimeError::Syscall { op: "poll (pidfd liveness)", source })
+                return Err(RuntimeError::Syscall { op: "poll (terminal witness)", source })
             }
-            Ok(0) => return Ok(false),
+            Ok(0) => return Ok(Terminal::None),
             Ok(_) => {
-                if fds[0].revents().is_some_and(|r| r.intersects(PollFlags::POLLIN)) {
-                    return Ok(true);
+                if is_readable(&fds[1]) {
+                    return Ok(Terminal::Dead);
                 }
-                if remaining.is_zero() {
-                    return Ok(false);
+                if fds[0]
+                    .revents()
+                    .is_some_and(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
+                {
+                    hup = true;
+                }
+            }
+        }
+    }
+
+    // Phase 2 — HUP is latched, but a death may still be in flight. Wait it out before
+    // claiming the child is alive.
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(Terminal::ChannelClosed);
+        }
+        let mut fds = [PollFd::new(pidfd, PollFlags::POLLIN)];
+        match nix::poll::poll(&mut fds, poll_timeout(remaining)) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(source) => {
+                return Err(RuntimeError::Syscall { op: "poll (terminal witness)", source })
+            }
+            Ok(0) => return Ok(Terminal::ChannelClosed),
+            Ok(_) => {
+                if is_readable(&fds[0]) {
+                    return Ok(Terminal::Dead);
                 }
             }
         }
     }
 }
 
-/// Read one datagram, validate it, then let terminal events overrule a valid marker.
+/// `remaining` as a `PollTimeout`, saturating rather than wrapping.
+fn poll_timeout(remaining: Duration) -> PollTimeout {
+    PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
+}
+
+/// Did this descriptor report `POLLIN`?
+fn is_readable(fd: &PollFd<'_>) -> bool {
+    fd.revents().is_some_and(|r| r.intersects(PollFlags::POLLIN))
+}
+
+/// Read one datagram, validate it, then witness terminal state AFRESH.
 ///
-/// Measured on AF_UNIX/SEQPACKET, and both rows foreclose an obvious wrong fix:
-/// a real datagram from a **closed** peer presents `POLLIN|POLLHUP` *together* (so returning
-/// on `POLLIN` alone reports a corpse as ready — D0-R1-02); and an empty datagram is
-/// indistinguishable from EOF at the socket — both `read()==0`, `msg_flags 0x0`, `MSG_EOR`
-/// **clear**, so `MSG_EOR` does not discriminate and the pidfd must (D0-R1-06).
+/// # Captured `revents` are never reused across a syscall (D0-R2-01 / R2-01b)
+///
+/// A `poll` result describes what was true *at poll time*. The `read` below is an intervening
+/// syscall, so any conclusion drawn from the pre-read `revents` is a claim about the past
+/// stated in the present tense (DEFECT_CLASSES 26). Measured: reusing them accepted an
+/// already-dead shell **83/100**. Both decision points therefore re-poll.
+///
+/// The socket alone cannot decide either question: a real datagram from a closed peer presents
+/// `POLLIN|POLLHUP` together, and an empty datagram is indistinguishable from EOF
+/// (`read()==0`, `msg_flags 0x0`, `MSG_EOR` clear — so `MSG_EOR` does not discriminate).
 fn classify_and_confirm_alive(
     chan: BorrowedFd<'_>,
     pidfd: BorrowedFd<'_>,
-    chan_revents: PollFlags,
 ) -> Result<(), RuntimeError> {
     // One byte longer than the marker, so an over-long datagram is detected, not truncated
     // into a match (DEFECT_CLASSES 1).
@@ -156,42 +245,38 @@ fn classify_and_confirm_alive(
         });
     }
     if n == 0 {
-        // No HUP ⇒ the peer still holds its end ⇒ alive by construction of the socket, so no
-        // pidfd query and no waiting is needed to call this a protocol fault.
-        if !chan_revents.intersects(PollFlags::POLLHUP) {
-            return Err(RuntimeError::Protocol(
+        return Err(match witness_terminal(chan, pidfd, DEATH_GRACE)? {
+            Terminal::Dead => RuntimeError::ShellDiedBeforeReady,
+            Terminal::ChannelClosed => RuntimeError::Protocol(
+                "the shell is RUNNING but closed its end of the private consent channel \
+                 without signalling readiness — it can never receive an approval request \
+                 over a closed channel. A shell-side protocol fault, not a crash."
+                    .to_owned(),
+            ),
+            Terminal::None => RuntimeError::Protocol(
                 "the shell is RUNNING but sent a ZERO-LENGTH datagram instead of the \
                  readiness marker — a live shell speaking the wrong protocol, not a dead \
                  one. Check it is the installed /usr/libexec/delphi-shell."
                     .to_owned(),
-            ));
-        }
-        // HUP: dead, or alive-having-closed-its-channel. Only here is the distinction
-        // temporal, so only here is the grace paid.
-        if child_died_within(pidfd, DEATH_GRACE)? {
-            return Err(RuntimeError::ShellDiedBeforeReady);
-        }
-        return Err(RuntimeError::Protocol(
-            "the shell is RUNNING but closed its end of the private consent channel without \
-             signalling readiness — it can never receive an approval request over a closed \
-             channel. A shell-side protocol fault, not a crash."
-                .to_owned(),
-        ));
+            ),
+        });
     }
     #[allow(clippy::cast_sign_loss)] // n > 0 established above
     let got = &buf[..n as usize];
     if got == READY_DATAGRAM {
-        // ORDER IS LOAD-BEARING: `POLLHUP` first short-circuits, so the success path (HUP
-        // clear) reaches the pidfd query with a ZERO budget and never pays the grace.
-        if chan_revents.intersects(PollFlags::POLLHUP)
-            || child_died_within(pidfd, Duration::ZERO)?
-        {
-            return Err(RuntimeError::ShellDiedBeforeReady);
-        }
-        // Residual: a shell dying between this check and the return is reported ready. No
-        // synchronous check can close that; the guarantee is only that `Ok` is never returned
-        // while holding evidence of death. Post-launch death is the daemon's pidfd (R3-03).
-        return Ok(());
+        return match witness_terminal(chan, pidfd, DEATH_GRACE)? {
+            Terminal::None => Ok(()),
+            Terminal::Dead => Err(RuntimeError::ShellDiedBeforeReady),
+            // Alive, but unreachable over a closed channel. Reported as a protocol fault
+            // rather than a death, for the R1-06 reason: a running process must not be
+            // diagnosed as a crash.
+            Terminal::ChannelClosed => Err(RuntimeError::Protocol(
+                "the shell signalled readiness and then CLOSED the private consent channel \
+                 while still running — it can never receive an approval request. A \
+                 shell-side protocol fault, not a crash."
+                    .to_owned(),
+            )),
+        };
     }
     // Reports the LENGTH, never the bytes — an untrusted payload must not reach the journal.
     Err(RuntimeError::Protocol(format!(
@@ -339,16 +424,25 @@ mod tests {
         let (pid, pidfd) = fork_child_inner(move || body(w_raw), None);
         drop(w); // the parent holds only the read end, so a dead child yields EOF not a hang
         let mut b = [0u8; 1];
-        // SAFETY: bounded read on the owned read end; returns 1 (child signalled) or 0 (EOF
-        // — the child died without signalling, which the assertion below will surface).
-        unsafe { nix::libc::read(r.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        // SAFETY: bounded read on the owned read end.
+        let n = unsafe { nix::libc::read(r.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        // D0-R2-02: an ignored result made this barrier a no-op — EOF (the child died before
+        // signalling) read as "ordered", so the test proceeded to measure an unordered run
+        // and could pass having established nothing.
+        assert_eq!(n, 1, "HARNESS FAILURE: the child died before signalling setup_done, so \
+                          this test's ordering precondition never held");
         (pid, pidfd)
     }
 
     /// Tell the parent the child's setup precondition now holds. Raw write, no allocation.
     fn setup_done(w: RawFd) {
         // SAFETY: single bounded write of a const byte to the caller-supplied pipe fd.
-        unsafe { nix::libc::write(w, b"1".as_ptr().cast(), 1) };
+        let n = unsafe { nix::libc::write(w, b"1".as_ptr().cast(), 1) };
+        // Runs in the forked child: `assert!` would unwind into a copy of the harness's
+        // stack, so a failure diverges via `_exit` and surfaces as the parent's read EOF.
+        if n != 1 {
+            unsafe { nix::libc::_exit(97) };
+        }
     }
 
     fn fork_child_inner(body: impl FnOnce(), sync_w: Option<RawFd>) -> (nix::unistd::Pid, OwnedFd) {
@@ -368,6 +462,64 @@ mod tests {
                 (child, pidfd)
             }
         }
+    }
+
+    /// **D0-R2-01c REGRESSION — the interleaving is FORCED, not sampled.**
+    ///
+    /// The child closes the channel, sleeps, and only then exits, so `POLLHUP` is
+    /// **guaranteed** to be visible strictly before the death. That is the ordering a dying
+    /// child produces naturally (fds close before the pidfd signals), made deterministic.
+    ///
+    /// An implementation that returns on the first `POLLHUP` calls this an alive-shell
+    /// protocol fault; the death arriving inside the grace makes it a death. Detects the
+    /// defect 20/20, where the naturally-racing keystone managed only 3/12.
+    #[test]
+    fn channel_closed_then_death_within_grace_is_reported_as_death() {
+        let _guard = fork_guard();
+        let (daemon_end, shell_end) = channel_pair();
+        let raw = shell_end.as_raw_fd();
+        let (pid, pidfd) = fork_child(move || {
+            unsafe { nix::libc::close(raw) };
+            unsafe { nix::libc::usleep(50_000) }; // HUP now; death in 50ms, inside the grace
+        });
+        drop(shell_end);
+
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+            .expect_err("a child that closed the channel and then died is dead");
+        assert!(
+            matches!(err, RuntimeError::ShellDiedBeforeReady),
+            "a death arriving within the grace must outrank the earlier HUP, got: {err}"
+        );
+        kill_and_reap(pid);
+    }
+
+    /// **D0-R2-01 REGRESSION — forces the interleaving rather than sampling it.**
+    ///
+    /// The child writes the marker and exits IMMEDIATELY, with no barrier, so the death is
+    /// in flight while the parent is deciding. Measured against the pre-fix code (which
+    /// reused the pre-`read` `revents`): **83/100 wrongly accepted**. The fix must be
+    /// deterministic, so this asserts 0 over N — a rate, but of a FORCED interleaving, not
+    /// of sampled schedules (DEFECT_CLASSES 22).
+    #[test]
+    fn marker_then_immediate_exit_is_never_accepted() {
+        const N: usize = 50;
+        let mut accepted = 0;
+        for _ in 0..N {
+            let _g = fork_guard();
+            let (daemon_end, shell_end) = channel_pair();
+            let raw = shell_end.as_raw_fd();
+            let (pid, pidfd) = fork_child(move || {
+                signal_ready(raw).expect("signal_ready");
+                // exit immediately: no sleep, no barrier — the death races the decision
+            });
+            drop(shell_end);
+            if await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(2)).is_ok()
+            {
+                accepted += 1;
+            }
+            kill_and_reap(pid);
+        }
+        assert_eq!(accepted, 0, "a shell that signalled and died was accepted {accepted}/{N}");
     }
 
     /// THE KEYSTONE: a shell that exec'd fine and then died is not up — the P3a failure.
@@ -400,7 +552,7 @@ mod tests {
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
         let (pid, pidfd) = fork_child(move || {
-            let _ = signal_ready(shell_raw);
+            signal_ready(shell_raw).expect("signal_ready");
             // Stay alive briefly so the marker is not racing our own exit.
             unsafe { nix::libc::sleep(2) };
         });
@@ -488,7 +640,7 @@ mod tests {
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
         let (pid, pidfd) = fork_child_synced(move |sync| {
-            let _ = signal_ready(shell_raw);
+            signal_ready(shell_raw).expect("signal_ready");
             setup_done(sync); // the marker IS written before the parent proceeds
             // then fall off the end → `_exit(0)`: the marker is queued behind a dead peer
         });
@@ -542,7 +694,7 @@ mod tests {
         // is closed — otherwise it observes POLLIN without POLLHUP and `Ok` is the correct
         // answer at that instant. Measured 3/30 flaky without this ordering.
         let (pid, pidfd) = fork_child_synced(move |sync| {
-            let _ = signal_ready(shell_raw);
+            signal_ready(shell_raw).expect("signal_ready");
             unsafe { nix::libc::close(shell_raw) };
             setup_done(sync);
             unsafe { nix::libc::sleep(5) };
@@ -553,9 +705,12 @@ mod tests {
 
         let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect_err("a shell that closed the consent channel is not ready, alive or not");
+        // The PROPERTY (not ready) is unchanged; only the DIAGNOSIS is corrected. This shell
+        // is demonstrably running, so reporting `ShellDiedBeforeReady` was the same
+        // misdiagnosis R1-06 fixed one branch over — a live process named as a crash.
         assert!(
-            matches!(err, RuntimeError::ShellDiedBeforeReady),
-            "expected ShellDiedBeforeReady, got: {err}"
+            matches!(err, RuntimeError::Protocol(_)),
+            "a shell that is ALIVE must not be diagnosed as dead, got: {err}"
         );
 
         kill_and_reap(pid); // before the guard drops — no child may outlive it

@@ -1124,23 +1124,47 @@ different reason. The test was **passing for the wrong reason 75% of the time** 
 appearing green. Adding an explicit setup barrier (child signals a pipe after writing; parent
 blocks on it) took detection to **20/20**.
 
-**The rule this yields, which is stronger than "run it 30 times":**
+**The rule this yields — CORRECTED, because the first version of it overstated the evidence
+(D0-R2-07):**
 
-> A weaken's **detection rate** is a property to be measured, not assumed. Report it as
-> `n/N`, not as "the weaken bit". A weaken that detects at less than N/N does not mean the
-> fix is unproven — it means the **test's setup does not establish its own precondition**,
-> and the defect is in the harness, upstream of the assertion.
+The original rule said "report the detection rate as `n/N`; below `N/N` means the setup does
+not establish its precondition." That is useful but it is **not a soundness criterion**, and
+saying it was is the error. A rate over sampled schedules bounds **the schedules sampled**,
+nothing more: `20/20` says nothing about the 21st run, and a weaken can detect an *injected*
+defect deterministically while missing the real class the injection stands for.
 
-This also sharpens Class 20 (a correctly-biting test in a non-representative environment):
-here the environment was fine and the *ordering* was not. And it is the reason the RED-proof
-shape below now requires the weaken to be run repeatedly rather than once.
+> **Soundness comes from WITNESSING, not from a rate. In order of preference:**
+>
+> 1. **Witness the four states directly** — the precondition holds; the injected violation is
+>    present; the assertion fails; the restoration passes. Each observed, not inferred.
+> 2. **Force the interleaving** where a race is involved: construct the input that *makes*
+>    the ordering deterministic, rather than running until it happens.
+> 3. **`n/N` only as a fallback**, where neither is available — and then state plainly that
+>    it bounds **schedules sampled, not soundness.**
 
-**RED-proof shape.** Two weakens, not one, **each run ≥20 times and reported as `n/N`**.
-(a) the ordinary weaken — revert the fix,
-the test must fail; and (b) **the class re-application** — construct the input that
-exhibits the ORIGINAL class against the NEW code (here: a path with the right prefix
-that resolves elsewhere) and assert it is caught. A fix with only (a) is proven to
-address its instance, not its class.
+**The measurement that settles it, from this module (D0-R2-01c).** Against one injected
+defect — returning `ChannelClosed` on the first `POLLHUP` — two tests were compared:
+
+| instrument | detection |
+|---|---|
+| naturally-racing test, sampled | **3/12** |
+| forced-interleaving test (child closes the channel, sleeps 50 ms, *then* exits) | **20/20** |
+
+Same defect, same code, same machine. The sampled instrument would have been reported as "the
+weaken is weak"; in fact the *instrument* was. Forcing turned a 25% detector into a
+deterministic one.
+
+**The self-indictment, recorded because it is the reusable part.** The stronger instrument
+already existed: the widened-window experiment (a forced 0.5 s delay yielding `UNKNOWN` vs
+`0`) predates this class by three rounds. The weaker `n/N` rule was then extracted from the
+5/20 case *anyway*, because the 5/20 case was the one in front of us. **Deriving a rule from
+the instance at hand rather than from the best instrument already built is itself Class 17.**
+
+**RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix, the test
+must fail; and (b) **the class re-application** — construct the input that exhibits the
+ORIGINAL class against the NEW code and assert it is caught. Prefer a forced interleaving for
+both; fall back to `n/N` (≥20 runs) only where forcing is impossible, and label it as a
+sampled bound. A fix with only (a) is proven to address its instance, not its class.
 
 ---
 
@@ -1269,6 +1293,50 @@ the test's verdict differs. For the D0 instance that is the measured pair:
 
 ---
 
+## 26. A stale observation asserted in the present tense  *(new — D0 round 2)*
+
+**Description.** A syscall that observes state — `poll`, `stat`, `access`, a directory
+listing — returns a description of **what was true at the moment it ran**. Code then performs
+another syscall and *reuses the earlier observation* to draw a conclusion. The conclusion is
+a claim about the past, stated in the present tense, and it is wrong exactly when the state
+changed in between.
+
+The dangerous half is asymmetric, and naming it is the point:
+
+> **A negative observation is not a positive claim.** "The pidfd was not readable" is not
+> "the process is alive"; "`POLLHUP` was not set" is not "the peer still holds its end";
+> "the path did not exist" is not "the path does not exist". Positive evidence (death
+> observed, HUP observed) is conclusive when it arrives. Its **absence** is conclusive only
+> after waiting out the arrival that would contradict it.
+
+**Instances — all three in one module, in three consecutive rounds:**
+
+- **D0-R1-06.** `poll(pidfd, 0)` returning nothing was read as **"alive"**. A child closes its
+  fds *before* its pidfd becomes readable, so a corpse was reported as a live shell with a
+  protocol fault.
+- **D0-R2-01.** The `revents` captured *before* a `read` were reused *after* it to decide
+  readiness. Measured: an already-dead shell accepted as ready **83/100**.
+- **D0-R2-01b.** The `n == 0` branch read an absent (and stale) `POLLHUP` as proof the peer
+  still held its end — "alive by construction". Found by us, not by review.
+- **D0-R2-01c.** The *fix* then returned `ChannelClosed` on the first `POLLHUP`, which asserts
+  the child is alive — while the death that had already happened was still in flight. The
+  class re-entering its own fix (Class 22) at the third attempt.
+
+**Foreclosing primitive.** **Re-poll before concluding; never reuse captured `revents` across
+a syscall boundary.** Concretely, in this module: `classify_and_confirm_alive` takes no
+`revents` parameter at all — the type makes the stale value unavailable — and every liveness
+conclusion goes through `witness_terminal`, which polls afresh and lets only *death* return
+early. Where a negative must become a positive claim, it costs a **grace** (`DEATH_GRACE`),
+calibrated by measurement rather than chosen: 0 ms → 32/100 wrongly accepted, ≥2 ms → 0/100.
+
+**RED-proof shape.** Force the interleaving rather than sampling it (Class 22): construct an
+input where the state provably changes between the two syscalls — a child that writes and
+exits immediately, or one that closes its channel and dies 50 ms later — and assert the
+verdict is the *post*-change one. Detection must be deterministic; if it is not, the
+instrument is sampling a race it should be forcing.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1299,3 +1367,4 @@ the test's verdict differs. For the D0 instance that is the measured pair:
 | 24. In-band sentinel drawn from the value space | discipline (signal by exit status / separate field; return the honest value; refuse once, skip downstream) | Discipline |
 | 22a. Temporal invariant decided by SAMPLING | `installer/tests/trace-invariant.py` (derive from a complete syscall record; fail closed on anything unclassifiable) | **Extracted** |
 | 25. Fixture constructed differently from its subject | **call the production constructor** (`approval_socketpair`, `ensure_runtime_dir`, `pipe2(O_CLOEXEC)`); a fixture that must diverge says so and names the property the divergence serves | Discipline (foreclosed wherever a production constructor is reachable) |
+| 26. Stale observation asserted in the present tense | **re-poll before concluding**; never reuse captured `revents` across a syscall boundary (the fix removes the parameter, so the stale value is unavailable); a negative becomes a positive claim only after a measured grace | Discipline + a type that withholds the stale value |

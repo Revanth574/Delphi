@@ -206,6 +206,20 @@ and reaping every child before the guard drops → **30/30**. Production foreclo
 interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
 the AI is not a third), so this is a harness artifact — **shown, not asserted**.
 
+**A COUNTEREXAMPLE WORTH RECORDING: the first correction this session that ran the OTHER
+WAY.** Every prior fix was corrected for being too weak — a missed branch, an unwitnessed
+claim, a precondition never established. D0-R3-04's first implementation was corrected for
+being **too aggressive**: it reported `ShellSetupAmbiguous` for *any* already-exited child,
+which is defensible in the abstract and wrong in practice, because an exec'd-then-aborted
+shell **is P3a** — the case whose specific readiness diagnosis is the most valuable error the
+system produces. Trading that for a vague ambiguity message would have destroyed real
+diagnostic value to close a theoretical gap. The narrowed version uses the existing distinct
+exit code (126) and reserves the ambiguity for signal death, where it is irreducible.
+
+It was caught because the flag "this touches B2A-C-R1-01, I will verify rather than assume"
+was made *before* implementing and then honoured. The failure was **2/25** — small enough to
+dismiss as flakiness, and it was the signal the fix was wrong.
+
 **THE n/N RULE APPLIED TO ITSELF, ONE ROUND AFTER IT WAS EXTRACTED.** The flake fix went
 **1/30 → 1/50 → 50/50**, and that sequence is the finding: the first two "fixes" were
 **partial**, and only the third established the precondition. `FORK_LOCK` closed

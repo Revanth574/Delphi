@@ -1172,6 +1172,16 @@ defect, same code, same machine, only the instrument differing:
 | child's timing forced (50ms gap) | 20/20 — but still *sampling*, with a wider window |
 | **observation sequence injected into a factored state machine** | 20/20 **by construction** |
 
+**READ ROWS TWO AND THREE TOGETHER — THEY SHOW THE SAME NUMBER AND CATEGORICALLY DIFFERENT
+EVIDENCE.** Both say 20/20. Row two is a *sample* of 20 schedules that happened to land inside
+a widened window; run it on a loaded box, or narrow the gap, and it decays — it bounds the
+schedules observed, nothing more. Row three is not a sample at all: the sequence IS the input,
+so 20/20 is 20 repetitions of a decided fact and the 21st run cannot differ.
+
+**A reader comparing counts alone would call them equivalent. That comparison is precisely the
+error this class exists to prevent** — and it is the error that produced the weak `n/N` rule in
+the first place. When reporting, state the instrument, never just the ratio.
+
 **A forced interleaving is deterministic only when the observer's entry into the window is
 synchronized.** Where it is not, report it as what it is — stronger sampling.
 

@@ -258,79 +258,73 @@ pub fn launch(spec: &LaunchSpec) -> Result<Children, RuntimeError> {
     let (daemon_end, shell_end) = approval_socketpair()?;
 
     let shell_pid = fork_shell(spec, &shell_end)?;
+
+    // D0-R3-02: from here to `Ok(Children)` the shell is a TRANSACTION. Cleanup used to hang
+    // off the readiness error path alone, so `pidfd::open()?` and `fork_ai()?` could each
+    // return with the shell still alive — holding its logind session and the seat's VT, which
+    // systemd would then restart the daemon into. The guard makes cleanup structural: every
+    // early return, `?` included, runs `Drop`.
+    let mut shell_tx = ShellGuard::arm(shell_pid);
+
     let shell_pidfd = pidfd::open(Pid::from_raw(shell_pid))?;
-    // The daemon closes its copy of the shell's end BEFORE the readiness wait. This is
-    // load-bearing, not tidiness: while the daemon holds a copy of the shell's end, the
-    // channel never reaches EOF, so a dead shell would present as silence and the wait
-    // would burn the full timeout instead of returning at once. (The pidfd leg still
-    // catches it — this makes the fast path fast and the diagnosis correct.)
+    // Drop the daemon's copy of the shell's end BEFORE the readiness wait: while it holds
+    // one, the channel never reaches EOF, so a dead shell would present as silence and burn
+    // the full timeout instead of returning at once.
     drop(shell_end);
 
-    // Phase 2 — the shell must SAY it is up.
-    //
-    // D0-R1-04: on failure the shell must be REAPED, not merely dropped. The first draft
-    // returned the error and let `shell_pidfd` fall out of scope, which closes a descriptor
-    // and does nothing else — so the two failure modes leaked:
-    //   * `ShellReadyTimeout` (the shell is WEDGED, not dead) left a live process holding
-    //     the seat's VT, with an OPEN logind session, forever. systemd would restart the
-    //     daemon into a VT that is still taken.
-    //   * `ShellDiedBeforeReady` left a ZOMBIE, because nothing ever `waitpid`s it.
-    // Under leader == shell (R3-01c) the shell's death IS its session's teardown, so
-    // killing it is also what releases the logind session and the VT.
-    if let Err(e) = readiness::await_shell_ready(
+    // Phase 2 — the shell must SAY it is up (see the two-phase contract above). Under
+    // leader == shell (R3-01c) killing it is also what releases its logind session and VT.
+    readiness::await_shell_ready(
         daemon_end.as_fd(),
         shell_pidfd.as_fd(),
         readiness::DEFAULT_READY_TIMEOUT,
-    ) {
-        kill_and_reap_shell(&shell_pidfd, shell_pid);
-        return Err(e);
-    }
+    )?;
 
     let ai_pid = fork_ai(spec)?;
 
+    shell_tx.disarm();
     Ok(Children { daemon_channel: daemon_end, shell_pid, shell_pidfd, ai_pid })
 }
 
-/// Kill and reap a shell that failed the readiness contract (D0-R1-04).
+/// Kills and reaps a launched shell unless the launch ran to completion (D0-R3-02).
 ///
-/// # Why the signal goes through the PIDFD and never through the pid
+/// # Why signalling the raw pid is reuse-safe here
 ///
-/// `kill(pid, SIGKILL)` on a pid the daemon has not reaped is a **pid-reuse race**: between
-/// the readiness failure and the signal, the pid can in principle be recycled and the
-/// daemon would SIGKILL an unrelated process. `pidfd_send_signal` targets the *handle* the
-/// daemon has held since the fork (R3-03's race-free pin), so it can only ever signal the
-/// process that handle refers to — or fail with `ESRCH` if it already exited.
-///
-/// Best-effort by design: every failure here is already on an error path, and the typed
-/// readiness error is what the caller must see. A failed kill is logged, never substituted
-/// for the real diagnosis.
-fn kill_and_reap_shell(shell_pidfd: &OwnedFd, shell_pid: i32) {
-    // SAFETY: `pidfd_send_signal(pidfd, sig, NULL, 0)` — the fd is owned and valid for the
-    // call; a null `siginfo` means "as if from kill(2)". Returns 0 or -1.
-    let rc = unsafe {
-        nix::libc::syscall(
-            nix::libc::SYS_pidfd_send_signal,
-            shell_pidfd.as_raw_fd(),
-            nix::libc::SIGKILL,
-            std::ptr::null::<nix::libc::siginfo_t>(),
-            0,
-        )
-    };
-    if rc < 0 {
-        let e = io::Error::last_os_error();
-        // ESRCH is the ordinary case for `ShellDiedBeforeReady` — it is already gone, and
-        // the `waitpid` below is then the whole job.
-        if e.raw_os_error() != Some(nix::libc::ESRCH) {
-            tracing::warn!(shell_pid, error = %e, "could not SIGKILL the unready shell");
-        }
+/// The shell is this process's **direct child and is not reaped until this guard reaps it**,
+/// so a zombie holds the pid and it cannot be recycled while the guard is armed. That is what
+/// makes the guard sound in the window *before* `pidfd::open` succeeds — precisely the window
+/// the previous readiness-only cleanup could not cover.
+struct ShellGuard {
+    pid: i32,
+    armed: bool,
+}
+
+impl ShellGuard {
+    fn arm(pid: i32) -> Self {
+        Self { pid, armed: true }
     }
-    // BOUNDED reap (D0-R2-04) — see `reap_within`.
-    if !reap_within(shell_pid, REAP_TIMEOUT) {
-        tracing::warn!(
-            shell_pid,
-            "unready shell did not exit within {REAP_TIMEOUT:?} of SIGKILL — leaking a zombie \
-             rather than blocking the daemon. A task in uninterruptible sleep is the usual cause."
-        );
+
+    /// The launch completed; ownership of the shell passes to [`Children`].
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShellGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: signalling an unreaped direct child — see the type docs on reuse-safety.
+        unsafe { nix::libc::kill(self.pid, nix::libc::SIGKILL) };
+        if !reap_within(self.pid, REAP_TIMEOUT) {
+            tracing::warn!(
+                shell_pid = self.pid,
+                "shell did not exit within {REAP_TIMEOUT:?} of SIGKILL — leaving it UNREAPED \
+                 rather than blocking the daemon. A task in uninterruptible sleep is the \
+                 usual cause."
+            );
+        }
     }
 }
 
@@ -339,7 +333,7 @@ fn kill_and_reap_shell(shell_pidfd: &OwnedFd, shell_pid: i32) {
 /// A blocking `waitpid` here can wedge the daemon's launch path: `SIGKILL` does not dislodge
 /// a task in uninterruptible sleep, the kill may have failed outright, and `EINTR` would
 /// restart an unbounded wait indefinitely. Bounded polling makes the worst case a logged,
-/// leaked zombie instead of a hung service.
+/// leaked UNREAPED CHILD instead of a hung service.
 fn reap_within(pid: i32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -361,7 +355,7 @@ fn reap_within(pid: i32, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// How long [`kill_and_reap_shell`] waits for a SIGKILLed shell before giving up.
+/// How long [`ShellGuard`] waits for a SIGKILLed shell before giving up.
 const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Poll interval while waiting for the corpse.
 const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -442,7 +436,29 @@ fn wait_for_child_setup(sync_r: OwnedFd, child: Pid) -> Result<i32, RuntimeError
     // until the write end delivers a byte (failure) or closes (EOF = successful execve).
     let n = unsafe { nix::libc::read(sync_r.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
     if n == 0 {
-        return Ok(child.as_raw()); // EOF: the write end closed on a successful `execve`.
+        // D0-R3-04. EOF means only "no process holds the write end any more". That is TRUE
+        // for a successful `execve` (CLOEXEC closed it) and EQUALLY true for a pre-`execve`
+        // child that died without writing its failure byte — a SIGKILL, a SIGSEGV in PAM.
+        // Reporting `Ok` picked one branch and pointed the operator at WebKit for a PAM
+        // crash. The fd cannot distinguish them, so ask the child instead of assuming.
+        return match nix::sys::wait::waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => Ok(child.as_raw()),
+            // The child's OWN distinct code is a reliable discriminator, so use it rather
+            // than declaring everything ambiguous: this is a pre-exec failure, precisely.
+            Ok(WaitStatus::Exited(_, CHILD_SETUP_FAILED)) => Err(RuntimeError::ShellSetupFailed),
+            // Exited with any other code: it got PAST the exec (only the shell can choose
+            // that code) and then exited. Report success here and let the readiness contract
+            // produce the specific diagnosis — which is far better than this site's, and is
+            // exactly the P3a case (`exec'd, then aborted during rendering`).
+            Ok(WaitStatus::Exited(..)) => Ok(child.as_raw()),
+            // Signal death is the IRREDUCIBLE case: a SIGKILL before the exec and one after
+            // it are indistinguishable from here, because neither wrote the failure byte.
+            Ok(status) => Err(RuntimeError::ShellSetupAmbiguous { detail: format!("{status:?}") }),
+            Err(nix::errno::Errno::ECHILD) => {
+                Err(RuntimeError::ShellSetupAmbiguous { detail: "already reaped".to_owned() })
+            }
+            Err(e) => Err(RuntimeError::ShellSetupAmbiguous { detail: format!("waitpid: {e}") }),
+        };
     }
     // n >= 1 (a failure byte) or n < 0 (read error): the child did NOT become the shell.
     let _ = nix::sys::wait::waitpid(child, None);
@@ -1009,6 +1025,72 @@ fn priv_to_io(e: RuntimeError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// **D0-R3-02 — cleanup is structural, not per-error-path.**
+    ///
+    /// Root-free: exercises the guard itself rather than `launch()` (which needs PAM), so the
+    /// mechanism is proven on every box. The composition — `launch()` with a bad `ai_path` —
+    /// is asserted in `leader_is_shell.rs` and runs only on the root lane.
+    #[test]
+    fn an_armed_shell_guard_kills_its_child_on_drop() {
+        // SAFETY: the child only calls `pause`/`_exit` — raw syscalls, no allocation.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => {
+                unsafe { nix::libc::pause() };
+                unsafe { nix::libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+        };
+
+        drop(ShellGuard::arm(pid));
+
+        // Reaped by the guard, so the pid is gone: a second wait must report ECHILD rather
+        // than a live child. Checking `kill(pid, 0)` instead would be unsound — the pid may
+        // already have been recycled by the time we look.
+        let again = nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG));
+
+        // Clean up BEFORE asserting. A `pause()`ing child that outlives a failed assertion
+        // holds cargo's captured stdout/stderr open, so the harness never sees EOF and WEDGES
+        // instead of reporting the failure — measured while weakening this very test. A test
+        // whose failure mode is a hang cannot be used as evidence (Iron Law 15 clause 2's
+        // intermittent case, in its worst form).
+        if !matches!(again, Err(nix::errno::Errno::ECHILD)) {
+            unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
+            let _ = nix::sys::wait::waitpid(Pid::from_raw(pid), None);
+        }
+        assert!(
+            matches!(again, Err(nix::errno::Errno::ECHILD)),
+            "guard must have killed AND reaped the shell, got: {again:?}"
+        );
+    }
+
+    /// A disarmed guard leaves the child alone — otherwise a SUCCESSFUL launch would kill the
+    /// shell it just started, and `an_armed_shell_guard_kills_its_child_on_drop` could pass
+    /// against a guard that kills unconditionally.
+    #[test]
+    fn a_disarmed_shell_guard_leaves_its_child_running() {
+        // SAFETY: as above.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => {
+                unsafe { nix::libc::pause() };
+                unsafe { nix::libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+        };
+
+        let mut g = ShellGuard::arm(pid);
+        g.disarm();
+        drop(g);
+
+        let status = nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG));
+        assert!(
+            matches!(status, Ok(WaitStatus::StillAlive)),
+            "a disarmed guard must not touch the child, got: {status:?}"
+        );
+
+        unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
+        let _ = nix::sys::wait::waitpid(Pid::from_raw(pid), None);
+    }
+
 
     /// **D0-R2-04.** `reap_within` must return on a child that outlives the budget rather
     /// than blocking. The forced shape: a child that ignores nothing but is simply still

@@ -1160,6 +1160,27 @@ already existed: the widened-window experiment (a forced 0.5 s delay yielding `U
 5/20 case *anyway*, because the 5/20 case was the one in front of us. **Deriving a rule from
 the instance at hand rather than from the best instrument already built is itself Class 17.**
 
+**AMENDMENT (D0-R3-03) — forcing is not automatically deterministic.** "Force the
+interleaving" was stated as if controlling the *subject's* timing were enough. It is not: a
+test that makes the child close-then-sleep-then-die has forced when the CHILD acts, while the
+window is only entered if the OBSERVER is scheduled inside it. Measured against one injected
+defect, same code, same machine, only the instrument differing:
+
+| instrument | detection |
+|---|---|
+| naturally-racing, sampled | 3/12 |
+| child's timing forced (50ms gap) | 20/20 — but still *sampling*, with a wider window |
+| **observation sequence injected into a factored state machine** | 20/20 **by construction** |
+
+**A forced interleaving is deterministic only when the observer's entry into the window is
+synchronized.** Where it is not, report it as what it is — stronger sampling.
+
+**The move that actually worked, for the third time this session: separate the state machine
+from the I/O.** `TerminalWitness::observe` split the decision from the polling; every timing
+defect in that file had lived in the entanglement. The same shape as replacing the trace
+*sampler* with a complete-record derivation. When an instrument keeps producing ambiguous
+results, the answer has been "the instrument is wrong", never "the instrument needs tuning".
+
 **RED-proof shape.** Two weakens, not one. (a) the ordinary weaken — revert the fix, the test
 must fail; and (b) **the class re-application** — construct the input that exhibits the
 ORIGINAL class against the NEW code and assert it is caught. Prefer a forced interleaving for
@@ -1337,6 +1358,53 @@ instrument is sampling a race it should be forcing.
 
 ---
 
+## 26. A captured observation read as a present-tense claim  *(new — D0 rounds 1-3)*
+
+**Description.** A `poll`/`read`/`waitpid` result witnesses what was true **at the moment of
+the call**. Any conclusion drawn *after* an intervening syscall is a claim about the past
+stated in the present tense. The dangerous half is asymmetric: **a negative observation is not
+a positive claim.** "pidfd not readable" ≠ alive; "`POLLHUP` not set" ≠ the peer still holds
+its end; "`WNOHANG` → `StillAlive`" ≠ the process will be alive when it matters.
+
+**Four instances, three review rounds, and the last two were introduced by fixes for the
+previous ones:**
+
+| # | site | the false positive claim |
+|---|---|---|
+| R1-06 | `poll(pidfd, 0)` | not-readable ⇒ "alive" |
+| R2-01 | pre-`read` `revents` reused post-`read` | stale absence of HUP ⇒ "open"; **83/100** wrongly accepted |
+| R2-01b | the `n == 0` branch | absent (and stale) HUP ⇒ "alive by construction" |
+| R2-01c | the R2-01b **fix** | first HUP ⇒ `ChannelClosed`, i.e. "alive", while death was in flight |
+
+**Foreclosing primitive — a MECHANISM, after three rules failed.** R1-06, R2-01 and R2-01b
+were each fixed by a rule ("re-poll here"), and the class recurred. R2-01c was fixed by
+**removing the parameter**: `classify_and_confirm_alive` no longer *receives* `revents`, so
+the stale value is not available to misuse, and every liveness verdict goes through one
+re-polling witness in which **only death may return early**. Independently confirmed by
+review: no captured events cross the read, the latched HUP is monotonic and records channel
+closure rather than process life, and `StillAlive` never authorizes a launch.
+
+**It is older and wider than D0.** `launcher::wait_for_child_setup` predates the increment and
+read setup-pipe EOF as "the `execve` succeeded" — identical for a pre-exec child killed before
+it could write its failure byte, so a PAM crash was reported as a WebKit problem (D0-R3-04).
+
+**A SWEEP IS OWED, and it needs the discriminating question or it yields noise.** EOF-as-signal
+is **not** a defect in itself. The question is *what is being claimed*, never *whether EOF is
+read*:
+
+- `wait_for_child_setup` claimed "`execve` succeeded" — something the fd cannot know. **Defect.**
+- A relay reading EOF as "the peer closed" is reading exactly what EOF means. **Correct.**
+
+Candidate sites for the sweep, to be judged by that question rather than by grep:
+`runtime/src/service.rs`, `runtime/src/consent_relay.rs` (deny-on-EOF), `runtime/src/channel.rs`.
+Expect most to be correct; the sweep's value is the one that is not.
+
+**RED-proof shape.** Inject the observation *sequence* rather than racing a real subject — see
+class 22's D0-R3-03 amendment. `[Hup, Death]` must yield `Dead`; a fix that decides on the
+first `Hup` yields `ChannelClosed`, deterministically, every run.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1368,3 +1436,4 @@ instrument is sampling a race it should be forcing.
 | 22a. Temporal invariant decided by SAMPLING | `installer/tests/trace-invariant.py` (derive from a complete syscall record; fail closed on anything unclassifiable) | **Extracted** |
 | 25. Fixture constructed differently from its subject | **call the production constructor** (`approval_socketpair`, `ensure_runtime_dir`, `pipe2(O_CLOEXEC)`); a fixture that must diverge says so and names the property the divergence serves | Discipline (foreclosed wherever a production constructor is reachable) |
 | 26. Stale observation asserted in the present tense | **re-poll before concluding**; never reuse captured `revents` across a syscall boundary (the fix removes the parameter, so the stale value is unavailable); a negative becomes a positive claim only after a measured grace | Discipline + a type that withholds the stale value |
+| 26. Captured observation read as a present-tense claim | **remove the stale value from scope** (do not pass `revents` across a syscall); one re-polling witness where only death returns early; inject sequences to test it | **Extracted** (mechanism, after three rules failed) |

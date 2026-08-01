@@ -196,6 +196,24 @@ pub enum RuntimeError {
     )]
     ShellDiedBeforeReady,
 
+    /// The setup-sync pipe reached EOF but the child had ALREADY EXITED, so the signal
+    /// cannot say whether the `execve` succeeded (Increment D0, D0-R3-04).
+    ///
+    /// EOF means only that no process holds the write end. A successful `execve` produces it
+    /// via `CLOEXEC`; so does a pre-`execve` child killed before it could write its failure
+    /// byte. Reporting success here sent operators to debug WebKit for PAM crashes.
+    #[error(
+        "the shell child's setup pipe closed AND the child had already exited ({detail}), so \
+         it cannot be determined whether the execve succeeded. Either the child died before \
+         exec (a signal during PAM/priv-drop — check the daemon journal for `shell child \
+         failed before execve`), or it exec'd and the shell exited immediately (check the \
+         shell's own diagnostics). The readiness contract is the authority on which."
+    )]
+    ShellSetupAmbiguous {
+        /// How the child exited, for the journal.
+        detail: String,
+    },
+
     /// The shell neither signalled readiness nor died within the launch budget
     /// (Increment D0, `readiness::DEFAULT_READY_TIMEOUT`).
     ///

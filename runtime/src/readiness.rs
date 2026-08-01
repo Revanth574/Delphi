@@ -44,9 +44,18 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// ```
 ///
 /// Non-monotonic below 2ms — that region is scheduler-dominated, which is the reason the
-/// constant is not set there. 250ms is ~125x the measured evidence latency and is paid in
-/// full ONLY on the success path, once per launch; a death returns as soon as it is witnessed
-/// (worst observed ~1.8ms). It bounds the OBSERVATION WINDOW, not truth.
+/// constant is not set near the evidence latency. A death returns as soon as it is witnessed
+/// (worst observed ~1.8ms); the grace is paid in full only when no death arrives.
+///
+/// TWO LIMITS, both real:
+///
+/// * **An engineering margin, not a portable bound.** 0/100 at 2ms was measured on one
+///   unloaded box and one kernel. It cannot bound a stressed VM, a different scheduler, or a
+///   CPU-starved container. 250ms is ~125x margin on *this* measurement, which is a bet, not
+///   a proof; a system that misses it degrades to a false READY.
+/// * **It is not only the success path that pays.** Every liveness verdict costs the full
+///   grace — including the live-shell `Protocol` outcomes (empty datagram, closed channel),
+///   which are error paths. Only `Dead` returns early.
 const DEATH_GRACE: Duration = Duration::from_millis(250);
 
 /// Block until the shell signals ready, dies, or `timeout` elapses.
@@ -122,81 +131,117 @@ enum Terminal {
     ChannelClosed,
 }
 
-/// Witness terminal state by polling BOTH descriptors afresh, up to `grace`.
+/// One thing the observer saw. The kernel interaction produces these; the state machine
+/// consumes them, and nothing else couples the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    /// The channel reported `POLLHUP`/`POLLERR`.
+    Hup,
+    /// The pidfd reported the child's death.
+    Death,
+    /// The grace elapsed with nothing further to see.
+    Timeout,
+}
+
+/// The terminal-state decision, factored OUT of the polling (D0-R3-03).
 ///
-/// # Only DEATH may return early (D0-R2-01c)
+/// # Why this is a separate type and not an inlined `bool`
 ///
-/// Measured: a dying child closes its fds **before** its pidfd becomes readable, so `POLLHUP`
-/// arrives FIRST. Returning [`Terminal::ChannelClosed`] on that first event asserts the child
-/// is *alive*, which is a positive claim built on a death notification that has merely not
-/// arrived yet — the third instance of DEFECT_CLASSES 26 in this module, and the first one
-/// found by our own test rather than by review.
+/// The state machine and the kernel interaction were entangled from D0's first commit, and
+/// **every timing defect in this file has lived in that entanglement** — R2-01, R2-01b and
+/// R2-01c were all decisions about observations, testable only by racing a real child.
+/// Separated, the decision is exercised by injecting an exact sequence, and the polling is
+/// tested for representativeness on its own.
 ///
-/// So: [`Terminal::Dead`] returns immediately (positive evidence of death is conclusive), and
-/// **`ChannelClosed` and `None` are only reachable once the full grace has elapsed** without
-/// a death. Both are liveness claims and both must pay for one.
+/// `hup` is monotonic: it records that **the channel closed**, which stays true, and never
+/// that the process is alive.
+#[derive(Debug, Default)]
+struct TerminalWitness {
+    hup: bool,
+}
+
+impl TerminalWitness {
+    /// Feed one observation. `Some` ends the witness; `None` means keep watching.
+    fn observe(&mut self, o: Observation) -> Option<Terminal> {
+        match o {
+            // Positive evidence of death is conclusive and outranks a latched HUP.
+            Observation::Death => Some(Terminal::Dead),
+            // NOT conclusive: a dying child closes its fds before its pidfd signals, so a HUP
+            // here may be the leading edge of a death still in flight (D0-R2-01c).
+            Observation::Hup => {
+                self.hup = true;
+                None
+            }
+            // Only after the grace has elapsed without a death may a liveness claim be made.
+            Observation::Timeout => Some(if self.hup {
+                Terminal::ChannelClosed
+            } else {
+                Terminal::None
+            }),
+        }
+    }
+
+    /// Should the channel still be in the poll set?
+    ///
+    /// Once `HUP` is latched the channel would report it on every iteration and busy-spin out
+    /// the remaining grace, so it is dropped from the set.
+    fn watching_channel(&self) -> bool {
+        !self.hup
+    }
+}
+
+/// Drive [`TerminalWitness`] from real descriptors for up to `grace`.
 ///
-/// `chan` is registered with no requested events — `POLLHUP`/`POLLERR` are delivered
-/// regardless while `POLLIN` is not, so a queued datagram cannot spin the loop. Once `HUP` is
-/// latched the channel is dropped from the poll set entirely, because it would otherwise
-/// report `HUP` on every iteration and busy-spin out the remaining grace.
+/// This function owns only the kernel interaction: poll, map `revents` to an
+/// [`Observation`], feed. Every decision lives in the state machine.
 fn witness_terminal(
     chan: BorrowedFd<'_>,
     pidfd: BorrowedFd<'_>,
     grace: Duration,
 ) -> Result<Terminal, RuntimeError> {
     let deadline = Instant::now() + grace;
-    let mut hup = false;
+    let mut witness = TerminalWitness::default();
 
-    // Phase 1 — watch both until death, HUP, or the deadline.
-    while !hup {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(Terminal::None);
-        }
-        let mut fds = [
-            PollFd::new(chan, PollFlags::empty()),
-            PollFd::new(pidfd, PollFlags::POLLIN),
-        ];
-        match nix::poll::poll(&mut fds, poll_timeout(remaining)) {
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(source) => {
-                return Err(RuntimeError::Syscall { op: "poll (terminal witness)", source })
-            }
-            Ok(0) => return Ok(Terminal::None),
-            Ok(_) => {
-                if is_readable(&fds[1]) {
-                    return Ok(Terminal::Dead);
-                }
-                if fds[0]
-                    .revents()
-                    .is_some_and(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
-                {
-                    hup = true;
-                }
-            }
-        }
-    }
-
-    // Phase 2 — HUP is latched, but a death may still be in flight. Wait it out before
-    // claiming the child is alive.
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(Terminal::ChannelClosed);
+        if remaining.is_zero()
+            && let Some(t) = witness.observe(Observation::Timeout)
+        {
+            return Ok(t);
         }
-        let mut fds = [PollFd::new(pidfd, PollFlags::POLLIN)];
-        match nix::poll::poll(&mut fds, poll_timeout(remaining)) {
+
+        // `chan` carries no requested events: POLLHUP/POLLERR arrive regardless while POLLIN
+        // does not, so a queued datagram cannot spin this loop.
+        let mut fds = Vec::with_capacity(2);
+        if witness.watching_channel() {
+            fds.push(PollFd::new(chan, PollFlags::empty()));
+        }
+        fds.push(PollFd::new(pidfd, PollFlags::POLLIN));
+        let pidfd_idx = fds.len() - 1;
+
+        let observation = match nix::poll::poll(&mut fds, poll_timeout(remaining)) {
             Err(nix::errno::Errno::EINTR) => continue,
             Err(source) => {
                 return Err(RuntimeError::Syscall { op: "poll (terminal witness)", source })
             }
-            Ok(0) => return Ok(Terminal::ChannelClosed),
+            Ok(0) => Observation::Timeout,
             Ok(_) => {
-                if is_readable(&fds[0]) {
-                    return Ok(Terminal::Dead);
+                if is_readable(&fds[pidfd_idx]) {
+                    Observation::Death
+                } else if witness.watching_channel()
+                    && fds[0]
+                        .revents()
+                        .is_some_and(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
+                {
+                    Observation::Hup
+                } else {
+                    continue; // spurious wakeup: nothing decidable was seen
                 }
             }
+        };
+
+        if let Some(t) = witness.observe(observation) {
+            return Ok(t);
         }
     }
 }
@@ -378,6 +423,26 @@ mod tests {
         let _ = nix::sys::wait::waitpid(pid, None);
     }
 
+    /// Exit code a forked child uses when it could not write the readiness marker.
+    ///
+    /// A DISTINCT value, and the distinctness is load-bearing (D0-R3-01): a child that dies
+    /// of a signal before reaching `signal_ready` yields neither 0 nor this, so a test must
+    /// assert the EXACT value rather than treating "not 98" as success.
+    const CHILD_MARKER_WRITE_FAILED: i32 = 98;
+
+    /// Reap `pid` and return its exit code, or `-signal` if it died of one.
+    ///
+    /// The parent, not the child, must witness what the child did. A child's `expect` is
+    /// invisible here: it kills only the child, and the parent's `await_shell_ready` reads
+    /// that death as the very `Err` the test expects (D0-R3-01).
+    fn reap_status(pid: nix::unistd::Pid) -> i32 {
+        match nix::sys::wait::waitpid(pid, None) {
+            Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
+            Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => -(sig as i32),
+            other => panic!("unexpected wait status for {pid}: {other:?}"),
+        }
+    }
+
     /// A SOCK_SEQPACKET pair standing in for the real private channel.
     ///
     /// `SOCK_CLOEXEC` mirrors `channel::approval_socketpair`. It is not incidental: with
@@ -464,6 +529,66 @@ mod tests {
         }
     }
 
+    /// **D0-R3-01 — the exit code actually discriminates.**
+    ///
+    /// Makes the *absence* of 98 load-bearing in the test above: unless a failed write really
+    /// produces exactly 98, asserting 0 there proves nothing. The child closes the channel
+    /// before writing, so `signal_ready` fails with `EBADF`.
+    #[test]
+    fn child_that_cannot_write_the_marker_exits_with_the_distinct_code() {
+        let _guard = fork_guard();
+        let (_daemon_end, shell_end) = channel_pair();
+        let raw = shell_end.as_raw_fd();
+        let (pid, _pidfd) = fork_child(move || {
+            unsafe { nix::libc::close(raw) };
+            if signal_ready(raw).is_err() {
+                unsafe { nix::libc::_exit(CHILD_MARKER_WRITE_FAILED) };
+            }
+        });
+        drop(shell_end);
+        assert_eq!(
+            reap_status(pid),
+            CHILD_MARKER_WRITE_FAILED,
+            "a failed marker write must be distinguishable from BOTH a clean exit and a \
+             signal death"
+        );
+    }
+
+    /// **D0-R3-03 — the state machine, exercised by INJECTION.** No kernel, no scheduler:
+    /// the sequence is the input, so the HUP-without-death window is entered by construction
+    /// rather than by the observer happening to be scheduled inside it.
+    #[test]
+    fn terminal_witness_decides_injected_sequences() {
+        use Observation::{Death, Hup, Timeout};
+        let run = |seq: &[Observation]| {
+            let mut w = TerminalWitness::default();
+            seq.iter().find_map(|o| w.observe(*o))
+        };
+
+        // Death is conclusive wherever it appears — INCLUDING after a latched HUP, which is
+        // the R2-01c defect stated as a sequence.
+        assert_eq!(run(&[Death]), Some(Terminal::Dead));
+        assert_eq!(run(&[Hup, Death]), Some(Terminal::Dead));
+        assert_eq!(run(&[Hup, Hup, Death]), Some(Terminal::Dead), "latch stays monotonic");
+
+        // A liveness claim is only reachable through Timeout — i.e. after the grace.
+        assert_eq!(run(&[Hup, Timeout]), Some(Terminal::ChannelClosed));
+        assert_eq!(run(&[Timeout]), Some(Terminal::None));
+
+        // HUP alone decides nothing.
+        assert_eq!(run(&[Hup]), None, "HUP must not end the witness by itself");
+    }
+
+    /// The channel leaves the poll set once HUP latches, or it would report HUP every
+    /// iteration and busy-spin out the grace.
+    #[test]
+    fn latched_hup_removes_the_channel_from_the_poll_set() {
+        let mut w = TerminalWitness::default();
+        assert!(w.watching_channel());
+        assert_eq!(w.observe(Observation::Hup), None);
+        assert!(!w.watching_channel());
+    }
+
     /// **D0-R2-01c REGRESSION — the interleaving is FORCED, not sampled.**
     ///
     /// The child closes the channel, sleeps, and only then exits, so `POLLHUP` is
@@ -509,7 +634,12 @@ mod tests {
             let (daemon_end, shell_end) = channel_pair();
             let raw = shell_end.as_raw_fd();
             let (pid, pidfd) = fork_child(move || {
-                signal_ready(raw).expect("signal_ready");
+                // NOT `expect`: a panic here unwinds into a forked copy of the harness stack
+                // (the post-fork contract), and worse, the parent would read the resulting
+                // death as the Err it is expecting — a green proof with no marker written.
+                if signal_ready(raw).is_err() {
+                    unsafe { nix::libc::_exit(CHILD_MARKER_WRITE_FAILED) };
+                }
                 // exit immediately: no sleep, no barrier — the death races the decision
             });
             drop(shell_end);
@@ -517,7 +647,14 @@ mod tests {
             {
                 accepted += 1;
             }
-            kill_and_reap(pid);
+            // EXACTLY 0: the child reached the end of its body, so the marker WAS written.
+            // `!= 98` would accept a SIGSEGV before `signal_ready` ever ran.
+            assert_eq!(
+                reap_status(pid),
+                0,
+                "the child did not exit cleanly, so this iteration proved nothing about a \
+                 marker that may never have been written"
+            );
         }
         assert_eq!(accepted, 0, "a shell that signalled and died was accepted {accepted}/{N}");
     }

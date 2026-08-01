@@ -96,7 +96,7 @@ pub fn await_shell_ready(
             PollFd::new(chan, PollFlags::POLLIN),
             PollFd::new(pidfd, PollFlags::POLLIN),
         ];
-        match nix::poll::poll(&mut fds, PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX))
+        match nix::poll::poll(&mut fds, poll_timeout(remaining))
         {
             Err(nix::errno::Errno::EINTR) => continue, // re-arm on the remaining budget
             Err(source) => {
@@ -224,7 +224,17 @@ fn witness_terminal(
             Err(source) => {
                 return Err(RuntimeError::Syscall { op: "poll (terminal witness)", source })
             }
-            Ok(0) => Observation::Timeout,
+            // D0-R4-04: `poll` returning 0 is not proof the grace elapsed — it is another
+            // observation, and the clock is the authority. Rounding up makes an early return
+            // unlikely; this makes it harmless. (Class 26: do not read `Ok(0)` as a claim
+            // about time that only the clock can make.)
+            Ok(0) => {
+                if Instant::now() >= deadline {
+                    Observation::Timeout
+                } else {
+                    continue;
+                }
+            }
             Ok(_) => {
                 if is_readable(&fds[pidfd_idx]) {
                     Observation::Death
@@ -246,9 +256,14 @@ fn witness_terminal(
     }
 }
 
-/// `remaining` as a `PollTimeout`, saturating rather than wrapping.
+/// `remaining` as a `PollTimeout`, rounded **UP** to whole milliseconds (D0-R4-04).
+///
+/// `PollTimeout::try_from(Duration)` truncates: 249.9ms becomes a 249ms poll, which returns
+/// `Ok(0)` while ~0.9ms of grace remains. Treating that as the grace elapsing let a death
+/// arriving in the truncated window be classified as liveness.
 fn poll_timeout(remaining: Duration) -> PollTimeout {
-    PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
+    let ms = remaining.as_nanos().div_ceil(1_000_000);
+    PollTimeout::from(u16::try_from(ms.min(u128::from(u16::MAX))).unwrap_or(u16::MAX))
 }
 
 /// Did this descriptor report `POLLIN`?
@@ -409,7 +424,7 @@ mod tests {
             );
             let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
             // `poll` does not consume the queued datagram, so the measurement is unaffected.
-            let _ = nix::poll::poll(&mut fds, PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO));
+            let _ = nix::poll::poll(&mut fds, poll_timeout(remaining));
             if fds[0].revents().is_some_and(|r| r.intersects(PollFlags::POLLHUP)) {
                 return;
             }
@@ -417,11 +432,7 @@ mod tests {
     }
 
     /// SIGKILL and reap `pid`, so it cannot outlive the [`FORK_LOCK`] guard.
-    fn kill_and_reap(pid: nix::unistd::Pid) {
-        // SAFETY: signalling a child this process forked and has not yet reaped.
-        unsafe { nix::libc::kill(pid.as_raw(), nix::libc::SIGKILL) };
-        let _ = nix::sys::wait::waitpid(pid, None);
-    }
+    use crate::test_child_guard::ChildGuard;
 
     /// Exit code a forked child uses when it could not write the readiness marker.
     ///
@@ -430,18 +441,6 @@ mod tests {
     /// assert the EXACT value rather than treating "not 98" as success.
     const CHILD_MARKER_WRITE_FAILED: i32 = 98;
 
-    /// Reap `pid` and return its exit code, or `-signal` if it died of one.
-    ///
-    /// The parent, not the child, must witness what the child did. A child's `expect` is
-    /// invisible here: it kills only the child, and the parent's `await_shell_ready` reads
-    /// that death as the very `Err` the test expects (D0-R3-01).
-    fn reap_status(pid: nix::unistd::Pid) -> i32 {
-        match nix::sys::wait::waitpid(pid, None) {
-            Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
-            Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => -(sig as i32),
-            other => panic!("unexpected wait status for {pid}: {other:?}"),
-        }
-    }
 
     /// A SOCK_SEQPACKET pair standing in for the real private channel.
     ///
@@ -468,7 +467,7 @@ mod tests {
     ///
     /// **Build every buffer before `fork_child`** — allocation after `fork` in a
     /// multithreaded harness can deadlock on an allocator lock (D0-R1-05).
-    fn fork_child(body: impl FnOnce()) -> (nix::unistd::Pid, OwnedFd) {
+    fn fork_child(body: impl FnOnce()) -> (ChildGuard, OwnedFd) {
         fork_child_inner(body, None)
     }
 
@@ -480,13 +479,13 @@ mod tests {
     ///
     /// `body` receives the sync fd and MUST call [`setup_done`] at the exact point its
     /// precondition holds — which is generally *before* any sleep, not after it.
-    fn fork_child_synced(body: impl FnOnce(RawFd)) -> (nix::unistd::Pid, OwnedFd) {
+    fn fork_child_synced(body: impl FnOnce(RawFd)) -> (ChildGuard, OwnedFd) {
         // `pipe2(O_CLOEXEC)` mirrors `launcher.rs`'s setup-sync pipe. Harmless either way here
         // (this child never execs), but a hand-rolled fixture that differs from the
         // production constructor is the divergence class (DEFECT_CLASSES 25).
         let (r, w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("sync pipe");
         let w_raw = w.as_raw_fd();
-        let (pid, pidfd) = fork_child_inner(move || body(w_raw), None);
+        let (guard, pidfd) = fork_child_inner(move || body(w_raw), None);
         drop(w); // the parent holds only the read end, so a dead child yields EOF not a hang
         let mut b = [0u8; 1];
         // SAFETY: bounded read on the owned read end.
@@ -496,7 +495,7 @@ mod tests {
         // and could pass having established nothing.
         assert_eq!(n, 1, "HARNESS FAILURE: the child died before signalling setup_done, so \
                           this test's ordering precondition never held");
-        (pid, pidfd)
+        (guard, pidfd)
     }
 
     /// Tell the parent the child's setup precondition now holds. Raw write, no allocation.
@@ -510,7 +509,7 @@ mod tests {
         }
     }
 
-    fn fork_child_inner(body: impl FnOnce(), sync_w: Option<RawFd>) -> (nix::unistd::Pid, OwnedFd) {
+    fn fork_child_inner(body: impl FnOnce(), sync_w: Option<RawFd>) -> (ChildGuard, OwnedFd) {
         // SAFETY: the child arm performs only raw syscalls and diverges via `_exit`, never
         // unwinding into a forked copy of the test harness's stack.
         match unsafe { nix::unistd::fork() }.expect("fork") {
@@ -523,10 +522,43 @@ mod tests {
                 unsafe { nix::libc::_exit(0) };
             }
             nix::unistd::ForkResult::Parent { child } => {
+                // ARM ON THE NEXT LINE (D0-R4-05): every later `?`/assert unwinds through it.
+                let guard = ChildGuard::arm(child);
                 let pidfd = crate::pidfd::open(child).expect("pidfd_open");
-                (child, pidfd)
+                (guard, pidfd)
             }
         }
+    }
+
+    /// **D0-R4-04 — a liveness verdict may not be reached before the grace elapses.**
+    ///
+    /// `Duration -> PollTimeout` truncates, so a 249.9ms remainder polled for 249ms and its
+    /// `Ok(0)` was read as "the grace elapsed". This is the SEAM the injected state-machine
+    /// test cannot see: it assumes every `Timeout` it is handed is genuine, and the defect is
+    /// in what hands it one.
+    #[test]
+    fn no_liveness_verdict_before_the_grace_actually_elapses() {
+        let _guard = fork_guard();
+        let (daemon_end, shell_end) = channel_pair();
+        // A live, silent peer: no HUP, no death — the only route to a verdict is the grace.
+        let (_child, pidfd) = fork_child(|| unsafe {
+            nix::libc::sleep(30);
+        });
+
+        for grace_ms in [7u64, 13, 29, 250] {
+            let grace = Duration::from_micros(grace_ms * 1000 + 900); // deliberately fractional
+            let t0 = Instant::now();
+            let verdict = witness_terminal(daemon_end.as_fd(), pidfd.as_fd(), grace)
+                .expect("witness");
+            let elapsed = t0.elapsed();
+            assert_eq!(verdict, Terminal::None, "a live silent peer is not terminal");
+            assert!(
+                elapsed >= grace,
+                "returned a LIVENESS verdict after {elapsed:?}, before the {grace:?} grace \
+                 elapsed — a death arriving in that window would be misread as life"
+            );
+        }
+        drop(shell_end);
     }
 
     /// **D0-R3-01 — the exit code actually discriminates.**
@@ -539,7 +571,7 @@ mod tests {
         let _guard = fork_guard();
         let (_daemon_end, shell_end) = channel_pair();
         let raw = shell_end.as_raw_fd();
-        let (pid, _pidfd) = fork_child(move || {
+        let (child, _pidfd) = fork_child(move || {
             unsafe { nix::libc::close(raw) };
             if signal_ready(raw).is_err() {
                 unsafe { nix::libc::_exit(CHILD_MARKER_WRITE_FAILED) };
@@ -547,7 +579,7 @@ mod tests {
         });
         drop(shell_end);
         assert_eq!(
-            reap_status(pid),
+            child.reap_status(),
             CHILD_MARKER_WRITE_FAILED,
             "a failed marker write must be distinguishable from BOTH a clean exit and a \
              signal death"
@@ -603,7 +635,7 @@ mod tests {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
         let raw = shell_end.as_raw_fd();
-        let (pid, pidfd) = fork_child(move || {
+        let (_child, pidfd) = fork_child(move || {
             unsafe { nix::libc::close(raw) };
             unsafe { nix::libc::usleep(50_000) }; // HUP now; death in 50ms, inside the grace
         });
@@ -615,7 +647,6 @@ mod tests {
             matches!(err, RuntimeError::ShellDiedBeforeReady),
             "a death arriving within the grace must outrank the earlier HUP, got: {err}"
         );
-        kill_and_reap(pid);
     }
 
     /// **D0-R2-01 REGRESSION — forces the interleaving rather than sampling it.**
@@ -633,7 +664,7 @@ mod tests {
             let _g = fork_guard();
             let (daemon_end, shell_end) = channel_pair();
             let raw = shell_end.as_raw_fd();
-            let (pid, pidfd) = fork_child(move || {
+            let (_child, pidfd) = fork_child(move || {
                 // NOT `expect`: a panic here unwinds into a forked copy of the harness stack
                 // (the post-fork contract), and worse, the parent would read the resulting
                 // death as the Err it is expecting — a green proof with no marker written.
@@ -650,7 +681,7 @@ mod tests {
             // EXACTLY 0: the child reached the end of its body, so the marker WAS written.
             // `!= 98` would accept a SIGSEGV before `signal_ready` ever ran.
             assert_eq!(
-                reap_status(pid),
+                _child.reap_status(),
                 0,
                 "the child did not exit cleanly, so this iteration proved nothing about a \
                  marker that may never have been written"
@@ -666,7 +697,7 @@ mod tests {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
-        let (pid, pidfd) = fork_child(|| {
+        let (_child, pidfd) = fork_child(|| {
             // Die immediately, exactly like the aborting WRY host: no marker, no write.
             let _ = shell_raw;
         });
@@ -678,7 +709,6 @@ mod tests {
             matches!(err, RuntimeError::ShellDiedBeforeReady),
             "expected ShellDiedBeforeReady, got: {err}"
         );
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// The positive leg: without it the keystone could pass against an always-`Err` impl
@@ -688,7 +718,7 @@ mod tests {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
-        let (pid, pidfd) = fork_child(move || {
+        let (_child, pidfd) = fork_child(move || {
             signal_ready(shell_raw).expect("signal_ready");
             // Stay alive briefly so the marker is not racing our own exit.
             unsafe { nix::libc::sleep(2) };
@@ -697,7 +727,6 @@ mod tests {
 
         await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect("a shell that signalled must be reported ready");
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// A live shell speaking a different protocol is a config error, not a death.
@@ -706,7 +735,7 @@ mod tests {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
-        let (pid, pidfd) = fork_child(move || {
+        let (_child, pidfd) = fork_child(move || {
             let junk = b"hello";
             unsafe { nix::libc::write(shell_raw, junk.as_ptr().cast(), junk.len()) };
             unsafe { nix::libc::sleep(2) };
@@ -716,7 +745,6 @@ mod tests {
         let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect_err("a non-marker datagram is not readiness");
         assert!(matches!(err, RuntimeError::Protocol(_)), "expected Protocol, got: {err}");
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// A prefix test would accept a `v2` shell against a `v1` daemon (DEFECT_CLASSES 1).
@@ -727,7 +755,7 @@ mod tests {
         let shell_raw = shell_end.as_raw_fd();
         // D0-R1-05: allocated in the PARENT, before the fork. The child only reads it.
         let longer: Vec<u8> = READY_DATAGRAM.iter().copied().chain(*b"X").collect();
-        let (pid, pidfd) = fork_child(move || {
+        let (_child, pidfd) = fork_child(move || {
             unsafe { nix::libc::write(shell_raw, longer.as_ptr().cast(), longer.len()) };
             unsafe { nix::libc::sleep(2) };
         });
@@ -736,7 +764,6 @@ mod tests {
         let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
             .expect_err("a superset of the marker is not the marker");
         assert!(matches!(err, RuntimeError::Protocol(_)), "expected Protocol, got: {err}");
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// A wedged shell must be given up on: a wait without a bound would trade a silent
@@ -745,7 +772,7 @@ mod tests {
     fn shell_that_neither_signals_nor_dies_times_out() {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
-        let (pid, pidfd) = fork_child(|| {
+        let (_child, pidfd) = fork_child(|| {
             unsafe { nix::libc::sleep(30) };
         });
         drop(shell_end);
@@ -759,7 +786,6 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5), "the bound must actually bound");
 
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// **D0-R1-02 REGRESSION.** A shell that writes a VALID marker and then dies is DEAD,
@@ -776,13 +802,12 @@ mod tests {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
-        let (pid, pidfd) = fork_child_synced(move |sync| {
+        let (_child, pidfd) = fork_child_synced(move |sync| {
             signal_ready(shell_raw).expect("signal_ready");
             setup_done(sync); // the marker IS written before the parent proceeds
             // then fall off the end → `_exit(0)`: the marker is queued behind a dead peer
         });
         drop(shell_end);
-        kill_and_reap(pid); // now unambiguously AFTER the write
 
         wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
 
@@ -801,7 +826,7 @@ mod tests {
         let _guard = fork_guard();
         let (daemon_end, shell_end) = channel_pair();
         let shell_raw = shell_end.as_raw_fd();
-        let (pid, pidfd) = fork_child(move || {
+        let (_child, pidfd) = fork_child(move || {
             // A zero-length SEQPACKET datagram — permitted by the socket type.
             unsafe { nix::libc::write(shell_raw, c"".as_ptr().cast(), 0) };
             unsafe { nix::libc::sleep(5) };
@@ -816,7 +841,6 @@ mod tests {
              ShellDiedBeforeReady — got: {err}"
         );
 
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// Class-22 weaken (b) for D0-R1-02: separates the two legs of
@@ -830,7 +854,7 @@ mod tests {
         // SYNCED: the parent must not poll until the marker is written AND the channel end
         // is closed — otherwise it observes POLLIN without POLLHUP and `Ok` is the correct
         // answer at that instant. Measured 3/30 flaky without this ordering.
-        let (pid, pidfd) = fork_child_synced(move |sync| {
+        let (_child, pidfd) = fork_child_synced(move |sync| {
             signal_ready(shell_raw).expect("signal_ready");
             unsafe { nix::libc::close(shell_raw) };
             setup_done(sync);
@@ -850,7 +874,6 @@ mod tests {
             "a shell that is ALIVE must not be diagnosed as dead, got: {err}"
         );
 
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// Class-22 weaken (b) for D0-R1-06: the other ambiguous `read()==0` — a live shell that
@@ -862,7 +885,7 @@ mod tests {
         let shell_raw = shell_end.as_raw_fd();
         // SYNCED for the same reason as the sibling above — order the close before the poll
         // so the test measures the state it names rather than whatever the scheduler left.
-        let (pid, pidfd) = fork_child_synced(move |sync| {
+        let (_child, pidfd) = fork_child_synced(move |sync| {
             unsafe { nix::libc::close(shell_raw) };
             setup_done(sync);
             unsafe { nix::libc::sleep(5) };
@@ -880,7 +903,6 @@ mod tests {
              ShellDiedBeforeReady — got: {err}"
         );
 
-        kill_and_reap(pid); // before the guard drops — no child may outlive it
     }
 
     /// Keeps the marker distinguishable from the 32-byte digest that follows it on the wire.

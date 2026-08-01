@@ -1182,6 +1182,16 @@ so 20/20 is 20 repetitions of a decided fact and the 21st run cannot differ.
 error this class exists to prevent** — and it is the error that produced the weak `n/N` rule in
 the first place. When reporting, state the instrument, never just the ratio.
 
+**THIRD AMENDMENT (D0-R4-04) — factoring buys determinism for the factored half and MOVES THE
+BURDEN TO THE SEAM.** The injected state-machine test is sound and proves what it claims: given
+a sequence, the decision is right. It says **nothing** about whether the polling layer maps real
+`revents` into the right `Observation` — and that is exactly where the next defect landed.
+`Duration -> PollTimeout` truncates, so a 249.9ms remainder polled for 249ms and its `Ok(0)` was
+handed to the machine as a genuine `Timeout`. The machine then decided *correctly* on a *false*
+input, and the injected test could not see it because it assumes every `Timeout` it is given is
+real. Factoring is still the right move — but the seam needs its own test, at the mapper
+boundary, with the clock as the authority rather than the poll's return value.
+
 **A forced interleaving is deterministic only when the observer's entry into the window is
 synchronized.** Where it is not, report it as what it is — stronger sampling.
 
@@ -1415,6 +1425,46 @@ first `Hup` yields `ChannelClosed`, deterministically, every run.
 
 ---
 
+## 27. Two independently-correct fixes whose INTERACTION is unsound  *(new — D0 round 4)*
+
+**Description.** Two changes land together. Each is correct against the code as it stood, each
+is reviewed and approved, and neither is wrong in isolation — but one **removes an invariant
+the other depends on**. Distinct from class 22 (a fix inheriting the class it was closing):
+nothing here inherited anything, and no single fix is defective. The defect exists only at the
+seam, which is exactly where nobody looked.
+
+**Instance (grounded).** D0-R3-02 and D0-R3-04, approved in one message:
+
+- R3-02's `ShellGuard` signalled a raw pid, resting on *"an unreaped zombie holds the pid"* —
+  true when written, and stated explicitly as the reason it was reuse-safe.
+- R3-04 added a **consuming** `waitpid(WNOHANG)` that reaped that zombie first.
+
+Jointly: `pidfd::open` normally returned `ESRCH`, so **the P3a diagnosis R3-04 was narrowed to
+protect never fired at all**, and under pid churn the guard could root-`SIGKILL` an unrelated
+process. Both properties were destroyed by the pairing, not by either change.
+
+**The discriminating question, to be asked of every multi-fix change:**
+
+> **Does this fix rely on an invariant another fix in the same change removes?**
+
+Ask it per pair, and ask it of the *reviewer's* approvals too — the invariant here was stated
+by the reviewer in the approving message and removed two paragraphs later.
+
+**Foreclosing primitive — the same one that has worked every time it was available:
+turn the maintained invariant into a kernel guarantee.** The guard now owns a **pidfd** and
+signals through it, so "signal the right process" is enforced by the kernel rather than by a
+property this code has to keep true. Compare `DEFECT_CLASSES` 26, where removing the `revents`
+parameter made the stale value unavailable rather than merely forbidden. **Three rule-based
+fixes failed in a row; both mechanism-based fixes held.** Where a mechanism is available,
+prefer it — a rule is only as good as the next change that does not know about it.
+
+**RED-proof shape.** Exercise the *composition*, not each fix: a shell that execs and exits
+immediately must produce the readiness diagnosis, not an `ESRCH` syscall error. Then check the
+seam mechanically — extract the window between the two fixes and assert the invariant textually
+(here: no consuming wait exists between `fork()` and `pidfd::open`).
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1447,3 +1497,4 @@ first `Hup` yields `ChannelClosed`, deterministically, every run.
 | 25. Fixture constructed differently from its subject | **call the production constructor** (`approval_socketpair`, `ensure_runtime_dir`, `pipe2(O_CLOEXEC)`); a fixture that must diverge says so and names the property the divergence serves | Discipline (foreclosed wherever a production constructor is reachable) |
 | 26. Stale observation asserted in the present tense | **re-poll before concluding**; never reuse captured `revents` across a syscall boundary (the fix removes the parameter, so the stale value is unavailable); a negative becomes a positive claim only after a measured grace | Discipline + a type that withholds the stale value |
 | 26. Captured observation read as a present-tense claim | **remove the stale value from scope** (do not pass `revents` across a syscall); one re-polling witness where only death returns early; inject sequences to test it | **Extracted** (mechanism, after three rules failed) |
+| 27. Two correct fixes, unsound interaction | ask per pair: **does this fix rely on an invariant another fix in the same change removes?**; prefer a kernel guarantee (pidfd) over a maintained invariant (raw pid + zombie); check the seam mechanically | Discipline + mechanism |

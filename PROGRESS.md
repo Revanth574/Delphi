@@ -206,6 +206,25 @@ and reaping every child before the guard drops → **30/30**. Production foreclo
 interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
 the AI is not a third), so this is a harness artifact — **shown, not asserted**.
 
+**OWED ON THE LANE — now THREE items, not two.** Beside the B-1 / FD-01 / B-3 serial >=30
+re-run, D0 adds:
+
+* `leader_is_shell.rs::launch_kills_the_shell_when_a_later_step_fails_d0_r4_02` — **the only
+  test of the `launch()` transaction boundary**, root-gated and therefore SKIPped on every
+  developer box. Its SKIP message says so in those words. Until the lane runs it, that
+  boundary is **UNTESTED, not passing** — the third class-6 composition gap this increment,
+  and it must not be closed by a test nobody has watched pass.
+* The WRY host's readiness path, still unrun on a display.
+
+**OBSERVABILITY ITEMS FILED (not built):**
+
+1. **`ShellGuard` is not a progress guarantee.** It ensures the shell does not *outlive* a
+   failed launch; it does nothing about a launch that never finishes. A permanently blocked
+   `Command::spawn` retains the guard without ever running it.
+2. **Production `Protocol` frequency needs a structured counter**, keyed by readiness outcome
+   and elapsed grace. `DEATH_GRACE`'s cost on live-`Protocol` paths cannot be derived from
+   source — it needs a measurement from a running deployment.
+
 **A COUNTEREXAMPLE WORTH RECORDING: the first correction this session that ran the OTHER
 WAY.** Every prior fix was corrected for being too weak — a missed branch, an unwitnessed
 claim, a precondition never established. D0-R3-04's first implementation was corrected for

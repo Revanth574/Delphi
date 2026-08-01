@@ -806,6 +806,72 @@ fn shell_child_drops_to_the_session_user_b3() {
 /// (ENOENT) → `child_bail` → sync byte → the parent must return `Err`, not a false `Ok` with a
 /// dead shell (the Codex round-1 P1 regression). RED-proof: against the pre-fix launcher (which
 /// returned `Ok` immediately after `fork`) this asserts `Err` and FAILS.
+/// **D0-R4-02 — the COMPOSITION, which the guard-mechanism unit test does not prove.**
+///
+/// `an_armed_shell_guard_kills_its_child_on_drop` proves the guard works. It does NOT prove
+/// `launch()` uses it, and that gap was described as covered twice before Codex named it —
+/// the third class-6 occurrence in this increment. This is the boundary test: a valid shell
+/// with an INVALID `ai_path`, so `fork_ai` fails AFTER the shell is up, and the shell must
+/// be gone by the time `launch()` returns `Err`.
+///
+/// **UNTESTED UNTIL THE LANE RUNS IT.** It needs root for PAM and SKIPs everywhere else, so
+/// on any developer box this boundary has no coverage at all. Recorded in PROGRESS as an
+/// owed lane item beside the B-1 / FD-01 / B-3 serial >=30.
+#[test]
+fn launch_kills_the_shell_when_a_later_step_fails_d0_r4_02() {
+    if geteuid().as_raw() != 0 {
+        eprintln!(
+            "SKIP launch_kills_the_shell_when_a_later_step_fails: requires root (PAM). \
+             A SKIP PROVES NOTHING — and this is the ONLY test of the launch() transaction \
+             boundary, so until the lane runs it that boundary is UNTESTED, not passing."
+        );
+        return;
+    }
+    let setup = Setup::new("r402");
+    let (uid, gid) = setup.ids();
+
+    let base = PathBuf::from(format!("/run/delphi-r402-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let Some(shell_bin) = shell_fixtures::signalling_c_sleeper(&work) else {
+        eprintln!("SKIP r402: signalling_c_sleeper failed — see its diagnostic above.");
+        return;
+    };
+    let shell_bin = shell_bin.canonicalize().expect("canonical sleeper path");
+
+    // The shell is valid and DOES signal readiness; the AI path does not exist, so `fork_ai`
+    // fails only after the shell is fully up — the exact window the guard exists to cover.
+    let missing_ai = work.join("does-not-exist-ai");
+    let spec = LaunchSpec {
+        shell_path: &shell_bin,
+        ai_path: &missing_ai,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        tty: &test_vt(),
+        shell_env: &[],
+        ai_env: &[],
+    };
+
+    let res = launch(&spec);
+    assert!(res.is_err(), "a missing ai_path must fail the launch");
+
+    // The shell must be GONE. `launch()` returned `Err`, so it handed back no pid — the
+    // check is that NOTHING owned by the session uid is executing the shell binary.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let survivors = pids_executing(&shell_bin);
+    assert!(
+        survivors.is_empty(),
+        "launch() returned Err but left {survivors:?} executing {} — the shell escaped the \
+         transaction guard with its logind session and VT",
+        shell_bin.display()
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01() {
     if geteuid().as_raw() != 0 {

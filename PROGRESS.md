@@ -23,6 +23,30 @@ hit-testing and `render.rs`'s surface path are unreached code; the winit backend
 over a permanently empty stacking order. The 28 unit tests are pure-function tests (colors, hit
 zones, mode cycling) and none exercises a client.
 
+### 🚩 FINDING — VERIFICATION COVERAGE: two crates whose results were ABSENT, not passing
+
+Two independent holes, recorded together because they are **one observation**: a gate that
+cannot run is not a gate that succeeded, and in both cases the session-level reporting said
+"tests pass" while a whole crate was outside the command set.
+
+**(1) `runtime/shell-host` — 19 tests were never compiled by any verification command, for
+this increment's entire duration.** The crate has its own `[workspace]` table and is
+`exclude`d from the root manifest, so every `--workspace` / `-p delphi-runtime` command skips
+it. The one command run against it was `cargo check`, which builds lib and bins only — test
+targets were never type-checked. Surfaced as D0-R2-03: a new `RendererMsg` variant broke an
+exhaustive match in a test with `E0004`, while `delphi-runtime` reported 30/30 green.
+
+**This is not "one match arm."** For the whole increment, shell-host's test results were
+**absent**. The 19 tests were neither passing nor failing — nothing ran them. The match arm
+is what made the absence visible; it is not the size of what was missed.
+
+Closed in `CLAUDE.md` §13.4 with a per-decoupled-crate loop (`clippy --all-targets`,
+`test --no-run`, `test`) so the next session inherits the coverage instead of rediscovering
+the hole, plus an instruction to add future decoupled crates to the list.
+
+**(2) `cargo check --workspace` is not runnable on this box at all** — detail below. Same
+shape: absent, not passing.
+
 ### 🚩 FINDING (its own item, not a footnote) — `cargo check --workspace` has NOT been runnable on the WSL dev box, so §13.4's self-audit has been silently scoped to individual crates
 
 ```

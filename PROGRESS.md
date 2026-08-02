@@ -5,7 +5,7 @@ Current phase: **Display arc — D-0 recorded, D0 built on `phase-3b/d0-readines
 Current task: **D0 — the readiness contract** (`runtime/src/readiness.rs` + `launch()` wiring + the three shell binaries). D1–D5 scoped in `scratch/display-arc-scoping.md`; D1 is framed as the arc's go/no-go feasibility probe, with `scratch/d1-drm-probe.sh` as its lane instrument. PRIOR: **B2a lane-dependent half — security core MERGED (`71ce87d`); composition + gate-POSITIVE + long-lived-shell lifecycle PENDING.** Recon closed on a real seated VM (Ubuntu 26.04, systemd 259, seat0): A-1 (resolution is by cgroup, not leadership; `PAM_TTY=ttyN` is the whole seat obligation), the first gate-POSITIVE, R3-01c leader == shell PROVEN 9x, A-2.1-A-2.4 lifecycle, and a 3-round Codex gate on the recon binary whose FD-01 (P1) changed the DESIGN (mandatory pre-`execve` fd sweep, now in §4). See the 2026-07-19 milestone section. Remaining (the BUILD): **PENDING.** Original scope statement: Prerequisite: a real seated Linux desktop (`seat0` `CanGraphical=yes` + a greeter; the A-0 probe validates any candidate — WSL2 does NOT qualify). Comprises: shape-(b) manual-fork launcher restructure (Command/pre_exec → manual `fork()` so the child opens its own session, CARRYING its re-run 1b sibling-fd-theft + fd-discipline/privdrop RED-proofs — the proven launcher properties must survive the restructure); the real `pam_open_session` provisioning (shape b — child opens, unambiguous leader); the gate-POSITIVE (a real seated session PASSES the tightened gate); the long-lived-shell lifecycle (the deferred B1-ism — the daemon doesn't block on a shell that never exits); the composition (the host drawing the real React bundle through the consent path). **SHAPE DECISION SETTLED — shape (b) FORCED BY SOURCE** (pam_systemd leader = `getpid_cached`, its own pid, no parent-for-child mechanism; logind rejects a 2nd session per leader — SESSION_BUSY); residual observation (does `for_pid(cgroup-member-but-not-leader shell)` resolve the session, since `sd_pid_get_session` resolves by cgroup) the lane-pending CONFIRMATION — a RESOLVED decision, not an open question.
 Current step: **D0 built + RED-proven off-lane; the lane legs are OWED before merge** — the WRY host readiness signal (custom-scheme page-load callback, UNVERIFIED) and the serial ≥30 re-run of B-1/FD-01/B-3 against the marker-writing sleeper (all four SKIP without root here — 'A SKIP PROVES NOTHING'). PRIOR: **B2a composition BUILT; Codex sweep CLOSED after 7 rounds; root-lane gate PENDING before merge.** PRIOR: **B2a lane-dependent security core CLOSED (merged `71ce87d`, Codex-converged, runtime-verified).** THE HONEST BOUNDARY (load-bearing): the security property = C1 restructure + three RED-proven regression tests (B-1, FD-01, B-3/B′), each verified to bite via weaken/restore; the setup-sync pipe's success/failure discrimination is RUNTIME-PROVEN (`launch_returns_err…` PASSED), not just read by Codex; C2 install is real (systemd unit + PAM stack). This is the SECURITY-CORE **lane-dependent** half merged, **NOT B2a complete** — the COMPOSITION (host drawing the real bundle) + the gate-POSITIVE-via-real-shell + the long-lived-shell LIFECYCLE remain PENDING. Next: build the composition on the seated lane.
 Status: **D0 on `phase-3b/d0-readiness-contract`, not merged.** Codex review REQUIRED (it touches the launcher's trust-boundary child-spawn path). PRIOR: **B2a composition on `phase-3b/b2a-composition`, sweep closed, merge gate in progress.** PRIOR: **B2a WSL2-provable half MERGED + reviewed-sound (`3e40e22`).** 7 commits (5 GREEN + 2 fixes): keystone RED `877e220`, gate-tightening `1e712fe`, channel-driving + deny-on-EOF `cefda93`, WRY host `73a2853`, R-3 dialog `78bbf85`, B2A-R2-01 fail-closed CLOEXEC `3961ef0`, B2A-R2-02 terminal contract `f760d12`. Codex implementation review: round-1 REVISE (2 findings — B2A-R2-01 P2-med CLOEXEC best-effort = relay-bypass; B2A-R2-02 P2-low terminal-contract wedge; BOTH composition AROUND the core, the core APPROVED) → both FIXED at root + RED-proven (verified-to-bite) → round-2 APPROVE, 0 findings. The lane-dependent half gets its OWN review when built against the seated lane. (B1 detail preserved in the B1 milestone sections below.)
-Tests passing: `delphi-runtime` **105** (was 99; +6 `readiness::` — keystone verified-to-bite via weaken/restore, 30/30 DEFAULT PARALLEL). `cargo clippy -p delphi-runtime --all-targets -- -D warnings` clean; `delphi-shell-host` compiles. NOTE: a workspace-wide count cannot be produced on this box — see the `cargo check --workspace` finding below. PRIOR: B2a adds — `consent_relay` **7** lib tests (4 stub + 3 real-channel; keystone verified-to-bite on a real SOCK_SEQPACKET socketpair); `delphi-shell-host` (decoupled crate) **2** (fail-closed CLOEXEC containment); `b1_integration` **+1** non-root (`terminal_contract_release_produces_eof_no_wedge`); `logind_gate` **+1** (live gate-negative — WSL2's real seatless session "3" fails the seated gate); the gate decision test now covers the seat axis. Shell Vitest **94 → 98** (+4 PAM consent dialog); `tsc -b` clean. All `clippy --all-targets -- -D warnings` clean. (Full runtime lib/integration recount folds in at the lane-dependent merge.)
+Tests passing: `delphi-runtime` **102 EXECUTED / 19 SKIPPED** (121 reported), 30/30 DEFAULT PARALLEL; `delphi-shell-host` **12 EXECUTED / 7 SKIPPED** (19 reported — the 7 are all of `real_webkit_load`, which cannot run against an unprofiled binary). Counts are stated executed/skipped because **a skipped test reports as `ok`** and a bare total is not a coverage claim (`DEFECT_CLASSES` 10); produce them with `scripts/test-count.sh`, never by summing `test result:` lines. `cargo clippy --all-targets -- -D warnings` clean on both crates. NOTE: a workspace-wide count cannot be produced on this box — see the `cargo check --workspace` finding below. PRIOR: B2a adds — `consent_relay` **7** lib tests (4 stub + 3 real-channel; keystone verified-to-bite on a real SOCK_SEQPACKET socketpair); `delphi-shell-host` (decoupled crate) **2** (fail-closed CLOEXEC containment); `b1_integration` **+1** non-root (`terminal_contract_release_produces_eof_no_wedge`); `logind_gate` **+1** (live gate-negative — WSL2's real seatless session "3" fails the seated gate); the gate decision test now covers the seat axis. Shell Vitest **94 → 98** (+4 PAM consent dialog); `tsc -b` clean. All `clippy --all-targets -- -D warnings` clean. (Full runtime lib/integration recount folds in at the lane-dependent merge.)
 
 ## Display arc — SCOPED; D-0 topology decision RECORDED; D0 readiness contract BUILT + weaken-proven (2026-07-30)
 
@@ -22,6 +22,36 @@ client has ever connected to this compositor or can**. `handlers.rs`'s xdg_shell
 hit-testing and `render.rs`'s surface path are unreached code; the winit backend paints `#1a1a2e`
 over a permanently empty stacking order. The 28 unit tests are pure-function tests (colors, hit
 zones, mode cycling) and none exercises a client.
+
+### 🚩 RETROACTIVE CORRECTION — every test count in this arc overstates executed coverage
+
+**A skipped test reports as `ok`.** The project's gated tests return early after an
+`eprintln!("SKIP …")`, and libtest scores an early return as a pass; the reason is invisible
+without `--nocapture`, because stderr is captured for passing tests. So `cargo test` printed
+`test result: ok. 121 passed` while **19 of those never ran**.
+
+**This applies retroactively to every count written during the D0 rounds and the B2a
+composition record, and those numbers were cited as evidence for merges that have landed.**
+Measured on the dev box, 2026-08-02:
+
+| crate | reported | **skipped** | **executed** |
+|---|---|---|---|
+| `delphi-runtime` | 121 | 19 | **102** |
+| `runtime/shell-host` | 19 | 7 | **12** |
+
+Read every earlier figure in this file — 105, 109, 118, 120, 121, and the B2a-era counts —
+as **reported**, with roughly 19 of them skips on any non-root box. The trend they were used
+to show (tests added per round) is unaffected; the *coverage* they implied is not.
+
+**Worse than the three prior "absent, not passing" findings**, which were invisible — a suite
+nothing compiled, a workspace command that could not run. This one **actively displayed
+green while running nothing**: a false positive in the strict sense, the harness asserting
+success about work it did not do.
+
+**Foreclosed mechanically, not by a rule** (`scripts/test-count.sh`): it always passes
+`--nocapture`, always subtracts the skips, and has no mode that emits a bare total. A count
+that needs someone to remember to look is the same shape as every rule-based fix that failed
+in this arc. `CLAUDE.md` §13.4 now mandates it.
 
 ### 🚩 FINDING — VERIFICATION COVERAGE: two crates whose results were ABSENT, not passing
 
@@ -254,7 +284,8 @@ third measurement here to notice.
 both guards, R1-06 **20/20** on both, R1-01 bites (only the new test fails). Weaken (b), the
 class re-application, shipped as two new second-form tests
 (`marker_then_channel_close_while_alive`, `silent_channel_close_while_alive`) that separate
-the `POLLHUP` and pidfd legs a one-legged fix would still pass. `delphi-runtime` **109** tests,
+the `POLLHUP` and pidfd legs a one-legged fix would still pass. `delphi-runtime` **109 reported** (of which ~19 were skips — see the
+retroactive correction below),
 **30/30 DEFAULT PARALLEL**; clippy `-D warnings` clean; shell **108** Vitest (+1) and `tsc -b`
 clean.
 

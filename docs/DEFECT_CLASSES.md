@@ -300,6 +300,25 @@ executed-test-count drops (CI baseline-count artifact — P4).
 
 ---
 
+**THE SHELL MANGLING ITS OWN EVIDENCE — third instance, same class (D0).** Output plumbing
+has now corrupted this project's evidence three times, each time making a result mean
+something other than what it said:
+
+1. `cargo clippy … | tee log` reported `tee`'s exit `0` and masked a real `-D warnings`
+   failure (the SVC-2 sweep; already in §13.4's exit-code note).
+2. `cargo test … | grep "test result:" | awk` summed *passes* and was structurally blind to a
+   target that failed to build — how the shell-host `E0004` survived.
+3. `cargo test … 2>&1 > log` — the redirect order is backwards. `2>&1` points stderr at the
+   *current* stdout (the terminal) and only then does `> log` move stdout, so stderr escapes
+   the file. `compile_fail` doc-tests then printed `E0614`/`E0599`/`E0423` to the terminal and
+   looked like three real compile errors in a suite that had in fact passed. Caught before it
+   was reported, by re-running with `&>`; use `&>` or `> log 2>&1`, never `2>&1 > log`.
+
+The common shape: **the instrument reported on itself rather than on the subject**, and in
+every case the wrong answer was the *reassuring* one — a masked failure, an invisible failure,
+and a fabricated failure. Prefer `&> file` plus an explicit `$?`, and never let a pipeline's
+last stage speak for the command.
+
 **A SKIPPED TEST REPORTS AS `ok`, SO THE COUNT OVERSTATES EXECUTED COVERAGE (D0).** The
 project's gated tests return early after an `eprintln!("SKIP …")`, and libtest scores an early
 return as a pass. `cargo test` therefore prints `test result: ok. 121 passed` when **19 of

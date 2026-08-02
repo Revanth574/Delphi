@@ -1786,8 +1786,17 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Tests must actually run and pass (not just compile)
-cargo test --workspace 2>&1 | tee /tmp/test_results.txt
-grep "test result:" /tmp/test_results.txt
+# ── NEVER SUM `test result:` LINES. USE THE EXTRACTOR. ──────────────────────────────
+# A SKIPPED TEST REPORTS AS `ok`. The gated tests here return early after an
+# `eprintln!("SKIP …")`, and libtest scores an early return as a PASS — so `cargo test`
+# prints `ok. 121 passed` when 19 of those never ran, and the reason is invisible because
+# stderr is captured for passing tests. Summing `test result:` lines therefore yields a
+# count of functions that returned, not a coverage claim (DEFECT_CLASSES 10).
+#
+# `scripts/test-count.sh` always runs with `--nocapture`, always subtracts the skips, and
+# has NO mode that emits a bare total. It is mechanical because a rule ("remember to pass
+# --nocapture and look") is the shape that has failed every time a mechanism was available.
+scripts/test-count.sh --workspace          # -> EXECUTED n / SKIPPED m / reported n+m
 
 # ── DECOUPLED WORKSPACES — `--workspace` DOES NOT REACH THEM ────────────────────────
 # `runtime/shell-host` has its own `[workspace]` table and is `exclude`d from the root
@@ -1803,7 +1812,7 @@ for c in runtime/shell-host; do
   ( cd "$c" \
     && cargo clippy --all-targets -- -D warnings \
     && cargo test --no-run \
-    && cargo test 2>&1 | grep "test result:" ) || { echo "FAILED: $c"; exit 1; }
+    && ../../scripts/test-count.sh ) || { echo "FAILED: $c"; exit 1; }
 done
 
 # Count actual tests by crate (prevent false counts)
@@ -1819,7 +1828,15 @@ done
 
 **Exit-code capture (build discipline — never trust an exit code through a pipe).** `cmd | tee log` and `cmd | tail` report the *last* pipeline stage's status (`tee`/`tail`, almost always `0`), silently masking a failed `cmd`. A verification that can pass for the wrong reason is worse than none — it is false confidence, the same failure shape as a security gate tested only in isolation. To gate on success, capture the command's OWN status: either `set -o pipefail` before any pipeline (as in the block above), or redirect with `cmd &> log; rc=$?` and check `$rc` explicitly. This applies to **every** cargo invocation (`check` / `clippy` / `test`) — local self-audits and CI alike. (Discovered in the SVC-2 services sweep: a `cargo clippy … | tee log` reported `tee`'s exit `0` and masked a real `-D warnings` lint that had shipped several batches earlier. The lesson generalizes to the orchestrator and fortress sweeps that follow.)
 
-**Report the OUTPUT of these commands, not a summary. If you claim "950 tests pass," include the literal test result line showing that count. Any discrepancy between claimed and actual is a hallucination that must be corrected immediately.**
+**Report the OUTPUT of these commands, not a summary.**
+
+**And report it as EXECUTED / SKIPPED, never as a bare total.** "950 tests pass" is not a
+claim this project can make from `test result:` lines, because a skipped test is scored as a
+pass — the number is *a count of functions that returned*. Quote `scripts/test-count.sh`'s
+`EXECUTED n / SKIPPED m / reported n+m` instead. A bare total offered as evidence is the
+false-positive form of DEFECT_CLASSES 10: the harness asserting success about work it did not
+do. Any discrepancy between claimed and actual is a hallucination that must be corrected
+immediately.
 
 ### 13.5 Session report integrity
 

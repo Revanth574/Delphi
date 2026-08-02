@@ -316,7 +316,16 @@ something other than what it said:
 
 The common shape: **the instrument reported on itself rather than on the subject**, and in
 every case the wrong answer was the *reassuring* one — a masked failure, an invisible failure,
-and a fabricated failure. Prefer `&> file` plus an explicit `$?`, and never let a pipeline's
+and a fabricated failure.
+
+**That bias is what makes this a class rather than three anecdotes, and it is not
+coincidence.** A plumbing fault that produces *alarming* output gets investigated within
+minutes, because something visibly broke; a plumbing fault that produces *calm* output is
+never investigated at all, because nothing asks to be. The failures therefore survive
+selectively — the reassuring ones accumulate and the alarming ones are gone by lunchtime. Any
+sample of surviving plumbing faults will look biased toward false confidence, and the
+inference to draw is not "we were unlucky" but **"this is what the survivors look like; assume
+the calm ones are still there."** Prefer `&> file` plus an explicit `$?`, and never let a pipeline's
 last stage speak for the command.
 
 **A SKIPPED TEST REPORTS AS `ok`, SO THE COUNT OVERSTATES EXECUTED COVERAGE (D0).** The

@@ -300,6 +300,20 @@ executed-test-count drops (CI baseline-count artifact — P4).
 
 ---
 
+**A SKIPPED TEST REPORTS AS `ok`, SO THE COUNT OVERSTATES EXECUTED COVERAGE (D0).** The
+project's gated tests return early after an `eprintln!("SKIP …")`, and libtest scores an early
+return as a pass. `cargo test` therefore prints `test result: ok. 121 passed` when **19 of
+those skipped**, and the reason is invisible without `--nocapture` (stderr is captured for
+passing tests). Measured on the dev box: `delphi-runtime` 121 reported / **19 skipped** / ~102
+executed; `runtime/shell-host` 19 reported / **7 skipped** (the whole `real_webkit_load`
+suite).
+
+This is how "compiles clean, 19 tests" was reported for a suite that had never run. **Any test
+count quoted as evidence must state executed-vs-skipped**, obtained with `--nocapture`, or it
+is not a coverage claim — it is a count of functions that returned.
+
+---
+
 ## 11. Error-message oracles at validation boundaries
 
 **Description.** Varying a rejection message by *why* validation failed leaks
@@ -1317,6 +1331,29 @@ was "just a socketpair". A second, harmless instance was found in the same pass
 (`nix::unistd::pipe()` in a test helper against `pipe2(O_CLOEXEC)` in `launcher.rs`) and
 aligned.
 
+**THE PROBE FORM — a diagnostic that exercises a WEAKER operation than its subject
+(D0 / real_webkit_load).** The stand-in need not be a fixture; a *probe* stands in for the
+subject too, and can be constructed weaker in exactly the same way. Two instances from one
+diagnosis:
+
+- **`unshare -U` where the subject needs `unshare -r` + `bwrap`.** Creating a user namespace
+  is permitted more widely than creating one *and mapping root into it*, which is what
+  `bwrap` requires. The probe's success was read as "userns is fine here", and that negative
+  was then taken to **refute a true hypothesis** — the profile explanation — sending the
+  diagnosis down three more dead ends.
+- **`aa-exec -p delphi-shell -- bwrap` failing does NOT refute the mechanism.** Applying the
+  profile's label to `bwrap` is not the same as `delphi-shell` holding the grant and spawning
+  `bwrap`. The probe tested a different topology than the one under investigation.
+
+**And the sharpest part, because it generalises past both instances:** on the implementer's
+box all three of `unshare -U`, `unshare -r` and `bwrap --unshare-user` succeeded, so the weak
+probe returned the *correct* answer — for the wrong reason. **A probe that is right by luck is
+indistinguishable from one that is right by construction until the environment changes.** It
+had already been wrong on the operator's box, where the two operations diverge.
+
+**The discriminating question for any probe: does it exercise the SAME operation the subject
+performs, or a weaker one that happens to be nearby?**
+
 **Deliberate divergence is not this class, and must not be "fixed".** `fdsec.rs`'s tests
 create **non-`CLOEXEC`** pipes on purpose: the subject under test is the CLOEXEC-marking
 sweep, so a non-`CLOEXEC` fixture is the correct input. The discriminating question is
@@ -1482,6 +1519,46 @@ seam mechanically — extract the window between the two fixes and assert the in
 
 ---
 
+## 28. Re-deriving a mechanism the repo already documents  *(new — D0 / real_webkit_load)*
+
+**Description.** A mechanism is investigated from symptoms — hypotheses, probes, eliminations —
+while the answer sits written down in the tree, in a comment placed there *specifically so the
+next reader would not have to re-derive it*.
+
+**Instance (grounded).** `real_webkit_load` aborting with `Died(6)`. Diagnosed across **four
+dead hypotheses** (icon theme, build age, debug-vs-release, environmental drift) and **two
+review rounds**. `installer/apparmor/delphi-shell:10-22` already carried:
+
+- the mechanism (`apparmor_restrict_unprivileged_userns=1` denies userns to *unprofiled*
+  processes; a named profile granting `userns,` is exempt);
+- the consequence (glycin's `bwrap` loader fails → GTK's `image-missing` fallback fails →
+  `gtkiconhelper.c:495` asserts → SIGABRT);
+- the **measurement** (0/24 launches abort from a profiled shell; deterministic from an
+  unprofiled one); and
+- the sentence that killed the leading candidate fix before it was proposed: *"This is not
+  avoidable in our code: the icon request comes from GTK3 window creation itself — identical
+  with our bundle, with about:blank, and with a bare GtkWindow containing no WebKit at all."*
+
+Both participants missed it. The operator proposed the icon-theme measurement as the
+discriminator; the implementer designed a fix option around avoiding icons. **Both reasoned
+from the symptom instead of checking whether the project had already answered it.**
+
+**Name the failure precisely, because the obvious lesson is the wrong one.** It is not "write
+it down" — it *was* written down, deliberately and well. It is:
+
+> **The answer being written down does not help if nobody greps for it.**
+
+**Foreclosing discipline.** Before diagnosing a mechanism, grep the repo for it. The
+highest-value grep is **the component name plus the error string** (`delphi-shell` + `userns`,
+`SIGABRT`, `bwrap`) — and it must be **formed before the first hypothesis, not after the third
+one dies.** By then the search is shaped by the surviving hypotheses and looks for
+confirmation rather than for prior art.
+
+**RED-proof shape.** Procedural. The check is that the grep happened first and is recorded in
+the diagnosis, alongside the hypotheses it pre-empted.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1515,3 +1592,4 @@ seam mechanically — extract the window between the two fixes and assert the in
 | 26. Stale observation asserted in the present tense | **re-poll before concluding**; never reuse captured `revents` across a syscall boundary (the fix removes the parameter, so the stale value is unavailable); a negative becomes a positive claim only after a measured grace | Discipline + a type that withholds the stale value |
 | 26. Captured observation read as a present-tense claim | **remove the stale value from scope** (do not pass `revents` across a syscall); one re-polling witness where only death returns early; inject sequences to test it | **Extracted** (mechanism, after three rules failed) |
 | 27. Two correct fixes, unsound interaction | ask per pair: **does this fix rely on an invariant another fix in the same change removes?**; prefer a kernel guarantee (pidfd) over a maintained invariant (raw pid + zombie); check the seam mechanically | Discipline + mechanism |
+| 28. Re-deriving a documented mechanism | discipline: grep the repo (**component name + error string**) BEFORE the first hypothesis, not after the third dies | Discipline |

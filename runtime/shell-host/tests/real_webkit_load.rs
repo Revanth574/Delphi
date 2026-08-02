@@ -43,10 +43,63 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The binary built from THIS source tree — not whatever happens to be installed. A cargo
-/// test must exercise the code in the tree; the INSTALLED artifact is covered separately by
-/// `installer/p3-preflight.sh` (freshness, seam-freedom, profile attachment).
-const HOST_BIN: &str = env!("CARGO_BIN_EXE_delphi-shell");
+/// The binary cargo built from this tree. NOT what these tests run — see [`resolve_host_bin`].
+const BUILT_HOST: &str = env!("CARGO_BIN_EXE_delphi-shell");
+
+/// The deployed path, and the ONLY path AppArmor grants `userns` to.
+const INSTALLED_HOST: &str = "/usr/libexec/delphi-shell";
+
+/// Which binary these tests can actually run, or why they cannot run at all.
+///
+/// # Why not the freshly-built one (D0 / real_webkit_load coverage gap)
+///
+/// `installer/apparmor/delphi-shell` attaches **by path** to [`INSTALLED_HOST`] and grants
+/// `userns`. Under Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1`, an unprofiled
+/// process is denied the user namespace glycin's `bwrap` image loader needs; GTK3 then fails
+/// its `image-missing` fallback for the same reason and `gtkiconhelper.c:495` asserts —
+/// SIGABRT. That icon load comes from **GTK3 window creation itself**, so it cannot be
+/// avoided in our code (measured; see the profile's own header, and its 0/24 result).
+///
+/// Establshed by controlled comparison: the same binary, identical md5, renders at
+/// [`INSTALLED_HOST`] and SIGABRTs at the build path. The only variable is the path.
+///
+/// So these tests run the INSTALLED binary — but **only when it is byte-identical to this
+/// build**, because a green from a stale artifact would be evidence about code that is not
+/// under test. Nothing is copied and nothing is written: `/usr/libexec` is read, never
+/// mutated (a test that overwrote the operator's installed shell would be `DEFECT_CLASSES`
+/// 16 verbatim).
+fn resolve_host_bin() -> &'static Result<PathBuf, String> {
+    static RESOLVED: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let digest = |p: &str| -> Option<String> {
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read(p).ok()?;
+            Some(format!("{:x}", Sha256::digest(&bytes)))
+        };
+        let built = digest(BUILT_HOST).ok_or_else(|| {
+            format!("the built host is missing at {BUILT_HOST} — run `cargo build`")
+        })?;
+        let Some(installed) = digest(INSTALLED_HOST) else {
+            return Err(format!(
+                "the profiled host is NOT INSTALLED at {INSTALLED_HOST}. These tests cannot \
+                 run the freshly-built binary: AppArmor grants `userns` by PATH, and without \
+                 it glycin's bwrap loader fails and GTK aborts the host (SIGABRT). \
+                 FIX: `sudo installer/install.sh`, then re-run."
+            ));
+        };
+        if installed != built {
+            return Err(format!(
+                "the installed host at {INSTALLED_HOST} DIFFERS from this build (installed \
+                 sha256 {}…, built {}…), so running it would test code that is not in this \
+                 tree. FIX: `sudo installer/install.sh` to reinstall the current build, then \
+                 re-run.",
+                &installed[..12],
+                &built[..12]
+            ));
+        }
+        Ok(PathBuf::from(INSTALLED_HOST))
+    })
+}
 /// Posting this from a page makes the host exit 0 — the one signal that proves execution.
 const CANCEL_JS: &str =
     r#"window.ipc&&window.ipc.postMessage(JSON.stringify({kind:"cancel"}));"#;
@@ -68,6 +121,12 @@ fn have_display() -> bool {
 
 /// Preconditions, reported loudly. Returns false when the test cannot run at all.
 fn preconditions_met() -> bool {
+    // Reported per-test, not once: cargo captures each test's output separately, so a
+    // OnceLock-printed reason would reach exactly one skipping test and leave six silent.
+    if let Err(why) = resolve_host_bin() {
+        eprintln!("SKIP real_webkit_load: {why}");
+        return false;
+    }
     if !have_display() {
         eprintln!(
             "SKIP real_webkit_load: no DISPLAY/WAYLAND_DISPLAY. The host panics at GTK init \
@@ -104,7 +163,10 @@ fn run_host_inner(
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let child_fd = theirs.as_raw_fd();
 
-    let mut cmd = Command::new(HOST_BIN);
+    let host = resolve_host_bin()
+        .as_ref()
+        .expect("preconditions_met() gates every caller");
+    let mut cmd = Command::new(host);
     cmd.env("DELPHI_SHELL_URL", url)
         .env("DELPHI_BUNDLE_ROOT", bundle_root)
         .env("DELPHI_CHANNEL_FD", child_fd.to_string())

@@ -709,6 +709,28 @@ instance itself.
 
 ---
 
+**A GREP THAT FOUND INSTANCES IS NOT EVIDENCE IT FOUND ALL OF THEM (D0).** Four incomplete
+enumerations in one arc, each corrected only by enumerating properly — never by re-running the
+original grep:
+
+| claimed | actual | how the gap closed |
+|---|---|---|
+| 2 PAM-deleting fixtures | 3 | reading every fixture, not grepping the one pattern |
+| `real_webkit_load` temp dirs: 0 | 3 | reading the file while there for another reason |
+| R4-04 at 1 site | 3 | checking the *other* callers of the same conversion |
+| 15 hand-rolled temp paths | **28** | enumerating every file x every pattern variant |
+
+The failure is not a bad regex; it is treating *"the grep returned results"* as *"the grep
+returned the set"*. A pattern is written from the instances already in mind, so it finds those
+and is silent about the variants nobody thought of — and that silence is indistinguishable
+from absence.
+
+**Enumerate by construction before claiming a set:** every file in scope x every spelling of
+the pattern (`/tmp/x`, `env::temp_dir()`, `PathBuf::from(format!(…))`), then state the count
+and the method. When a count is later corrected, **re-derive it — do not patch the old
+number**: the 15 -> 28 correction came from a fresh enumeration, and a further pass then cut
+the *actionable* set to 5, which no amount of re-running the first grep would have found.
+
 ## 18. The verification loop mutates the thing under test  *(new — B2a composition)*
 
 **Description.** A verification procedure — a weaken/restore cycle, a bisect, a
@@ -926,6 +948,21 @@ scheme, using the only machine-checkable signal the host offers
 there is evidence about production because production is what ran.
 
 ---
+
+**ONE LEVEL OUT — THE REPLACEMENT INSTRUMENT THAT CANNOT RUN (D0 / `real_webkit_load`).**
+The jsdom test could not see the real property, so it was replaced with real WebKit against
+the real binary. The replacement then could not **run** on any box with
+`apparmor_restrict_unprivileged_userns=1`, because the AppArmor profile granting `userns`
+attaches by PATH to the installed binary while the tests ran a build-tree path. Seven tests,
+never executed, reported as `ok`.
+
+The instrument got better and the blindness moved from the instrument to the environment.
+
+**When you replace an instrument because it could not see the property, verify the replacement
+can RUN where the evidence is needed** — otherwise you have traded a test that sees the wrong
+thing for one that sees nothing, **and the second is harder to notice because it looks like
+infrastructure trouble.** Not a figure of speech: `Died(6)` was read as a build problem across
+two rounds of diagnosis before a profiled/unprofiled A/B settled it.
 
 ## 21. A warning banner is not an enforcement mechanism  *(new — B2a composition)*
 
@@ -1358,6 +1395,26 @@ can diverge. The only divergent fixture was the one that hand-rolled the resourc
 was "just a socketpair". A second, harmless instance was found in the same pass
 (`nix::unistd::pipe()` in a test helper against `pipe2(O_CLOEXEC)` in `launcher.rs`) and
 aligned.
+
+**A FIXTURE DESCRIBING AN EXTERNAL TOOL'S OUTPUT MUST BE CAPTURED FROM THAT TOOL, NEVER
+WRITTEN FROM MEMORY (D0 — the sharpest instance in this class).** `scripts/test-count.test.sh`
+RED-proved the count extractor against libtest logs **invented from memory**. libtest actually
+prints `test <name> ... SKIP …`; the invented fixtures put the marker at column 0. The parser
+therefore passed six synthetic cases while matching **zero of 19 markers in real output**.
+
+**Where it sat is what makes it the worst instance: inside the RED-proof of a TIER-1
+artifact** — the proof that licenses quoting the tool's counts as evidence. An invented
+fixture there means the proof measured *a format that does not exist*, so the licence was
+issued against nothing.
+
+The demonstration is clean because only the fixture's provenance changed: against the same
+injected bug, in the same suite, **captured fixtures catch it in 4 of 7 cases; invented
+fixtures caught it in 0.**
+
+Same shape as the three stub-permissiveness findings and the `SockFlag::empty()` divergence —
+a stand-in built differently from its subject — but those were in *tests*. This one was in a
+*proof*, which is strictly worse: a wrong test fails to catch a defect; a wrong proof
+manufactures permission to stop looking.
 
 **THE PROBE FORM — a diagnostic that exercises a WEAKER operation than its subject
 (D0 / real_webkit_load).** The stand-in need not be a fixture; a *probe* stands in for the

@@ -1798,6 +1798,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 # --nocapture and look") is the shape that has failed every time a mechanism was available.
 scripts/test-count.sh --workspace          # -> EXECUTED n / SKIPPED m / reported n+m
 
+# Free space FIRST — four filesystems, and each fails as someone else's bug.
+# /tmp filling made protoc fail as a BUILD error in an unrelated crate; /run's stale dirs cost
+# an hour of misattribution. The check names WHICH path is short.
+scripts/check-free-space.sh || exit 1
+
 # ── DECOUPLED WORKSPACES — `--workspace` DOES NOT REACH THEM ────────────────────────
 # `runtime/shell-host` has its own `[workspace]` table and is `exclude`d from the root
 # manifest, so EVERY root-level command above skips it entirely. It must be audited from

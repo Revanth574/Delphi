@@ -236,7 +236,27 @@ and reaping every child before the guard drops → **30/30**. Production foreclo
 interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
 the AI is not a third), so this is a harness artifact — **shown, not asserted**.
 
-**OWED ON THE LANE — now THREE items, not two.** Beside the B-1 / FD-01 / B-3 serial >=30
+**OWED ON THE LANE — now FIVE items.** This list is this branch's honest record of what it
+cannot prove on this box.
+
+1. **B-1 / FD-01 / B-3 serial >=30** against the marker-writing sleeper (fork+PAM carve-out).
+2. **`launch_kills_the_shell_when_a_later_step_fails_d0_r4_02`** — the ONLY test of the
+   `launch()` transaction boundary. Root-gated, SKIPs here, and its SKIP message says the
+   boundary is untested rather than passing.
+3. **The WRY host's readiness path**, still unrun on a display.
+4. **`real_webkit_load` (7 tests)** — now runs the installed profiled binary when it is
+   byte-identical to the build, so it becomes evidence after `sudo installer/install.sh`.
+   Until then it SKIPs, and those 7 are inside every "19 reported" for `shell-host`.
+5. **DEFERRED: RAII conversion of the remaining ~23 hand-rolled temp paths** (root-gated
+   tests + `real_webkit_load`'s bundle dirs). **The gap is panic-path cleanup only** — those
+   sites already clean up on the success path, so nothing accumulates from a passing run. It
+   was deferred rather than done because it is 23 lifetime-sensitive edits verified by
+   nothing on this box, and the premise had already moved twice (15 -> 28 -> one real leak
+   plus four panic-path improvements). A third revision arriving *after* the edits would be
+   indistinguishable from the first two, except the edits would already be in. Cheaper with
+   the lane than carried unverified.
+
+**PRIOR (superseded):**  Beside the B-1 / FD-01 / B-3 serial >=30
 re-run, D0 adds:
 
 * `leader_is_shell.rs::launch_kills_the_shell_when_a_later_step_fails_d0_r4_02` — **the only

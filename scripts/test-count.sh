@@ -37,7 +37,12 @@ else
     log=$(mktemp -t delphi-testcount-XXXXXX) || REFUSE "mktemp failed"
     trap 'rm -f "$log"' EXIT
     # --nocapture is NOT optional: it is the only way SKIP lines reach the output at all.
-    cargo test "$@" -- --nocapture &> "$log"
+    # --test-threads=1 is NOT optional either: with parallel threads, a test's SKIP (stderr)
+    # interleaves with libtest's `test NAME ... ok` (stdout), so the marker lands at column 0
+    # on some runs and mid-line on others. That made the count DRIFT run to run (measured:
+    # 17/18/19 for the same tree). Serial output is deterministic. This is a counting run, not
+    # a stability run — parallel stability is measured separately.
+    cargo test "$@" -- --nocapture --test-threads=1 &> "$log"
     rc=$?
 fi
 
@@ -57,9 +62,11 @@ reported=$(grep -E '^test result:' "$log" \
   | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}')
 [[ "$reported" =~ ^[0-9]+$ ]] || REFUSE "could not extract a passed-count ('$reported')"
 
-# Column-0 anchored so a SKIP *described* in a doc comment or assertion message cannot
-# inflate the count.
-skipped=$(grep -cE '^(SKIP|DEFER) ' "$log")
+# Anchored to libtest's OWN line format — `test <name> ... SKIP…` — not to column 0. The
+# column-0 anchor was wrong twice over: it missed every marker in serial output (where libtest
+# prefixes the line) and it made the parallel count depend on interleaving. Matching the
+# harness's format also keeps a SKIP *described* in prose from inflating the count.
+skipped=$(grep -cE '^test .+ \.\.\. (SKIP|DEFER)' "$log")
 [[ "$skipped" =~ ^[0-9]+$ ]] || REFUSE "could not extract a skip-count ('$skipped')"
 
 if [ "$skipped" -gt "$reported" ]; then

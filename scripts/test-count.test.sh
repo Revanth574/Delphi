@@ -39,8 +39,9 @@ echo "test-count.sh RED-proof"
 # ── 1. THE KEYSTONE: a known skip count must be subtracted ──────────────────────────────
 # 5 reported, 2 skipped => 3 executed. A tool that reports the total says 5.
 run_on_log 'running 5 tests
-SKIP alpha: requires root
-SKIP beta: requires a display
+test alpha ... SKIP alpha: requires root
+test beta ... SKIP beta: requires a display
+test gamma ... ok
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 '
 check "known 5-reported/2-skipped yields EXECUTED 3" "EXECUTED 3 / SKIPPED 2 / reported 5" "$OUT" 0 "$RC"
@@ -53,7 +54,7 @@ check "no skips yields EXECUTED 3 / SKIPPED 0" "EXECUTED 3 / SKIPPED 0 / reporte
 
 # ── 3. Multiple result lines (several test binaries) sum ────────────────────────────────
 run_on_log 'test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-SKIP gamma: requires root
+test gamma ... SKIP gamma: requires root
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 '
 check "sums across binaries" "EXECUTED 9 / SKIPPED 1 / reported 10" "$OUT" 0 "$RC"
@@ -62,7 +63,7 @@ check "sums across binaries" "EXECUTED 9 / SKIPPED 1 / reported 10" "$OUT" 0 "$R
 # This is the one that matters most. A libtest format change must not silently degrade this
 # tool into the bare-total reporter it exists to replace.
 run_on_log 'running 5 tests
-SKIP alpha: requires root
+test alpha ... SKIP alpha: requires root
 == 5 tests succeeded ==
 '
 check "unrecognised format REFUSES (no fallback)" "REFUSING" "$OUT" 2 "$RC"
@@ -71,9 +72,9 @@ if [[ "$OUT" == *"EXECUTED"* ]]; then
 fi
 
 # ── 5. An impossible parse (more skips than passes) REFUSES rather than going negative ──
-run_on_log 'SKIP a: x
-SKIP b: x
-SKIP c: x
+run_on_log 'test a ... SKIP a: x
+test b ... SKIP b: x
+test c ... SKIP c: x
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 '
 check "skips > passes REFUSES" "REFUSING" "$OUT" 2 "$RC"
@@ -83,7 +84,16 @@ run_on_log 'running 2 tests
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 note: a SKIP here would prove nothing, see the SKIP discussion above
 '
-check "indented/embedded SKIP text is not counted" "EXECUTED 2 / SKIPPED 0 / reported 2" "$OUT" 0 "$RC"
+check "prose mentioning SKIP is not counted" "EXECUTED 2 / SKIPPED 0 / reported 2" "$OUT" 0 "$RC"
+
+# ── 7. THE ANTI-CLASS-25 CASE: parse a REAL captured libtest log ───────────────────────
+# The first version of this file invented its fixture format, and the invented format did not
+# match libtest's. The parser passed six synthetic cases while missing every marker in real
+# serial output, because libtest prefixes the line with `test <name> ... `. A fixture that is
+# constructed differently from the thing it stands in for is DEFECT_CLASSES 25 — here inside
+# the RED-proof of a tier-1 artifact.
+OUT=$(DELPHI_TESTCOUNT_LOG=testdata/real-libtest-serial.log "$EXTRACTOR" 2>&1); RC=$?
+check "parses REAL captured libtest output" "EXECUTED 2 / SKIPPED 3 / reported 5" "$OUT" 0 "$RC"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES ABOVE"; fi

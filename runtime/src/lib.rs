@@ -60,8 +60,8 @@ pub mod readiness;
 pub mod sandbox;
 pub mod service;
 pub mod store;
-#[cfg(test)]
-pub(crate) mod test_child_guard;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_child_guard;
 pub mod token;
 pub mod wire;
 
@@ -191,30 +191,17 @@ pub enum RuntimeError {
     /// `GTK INIT: ok`, aborted during rendering, and the daemon serviced an action against
     /// a corpse.
     #[error(
-        "the shell exec'd but died before signalling readiness — it is NOT running. \
+        "the shell is NOT running: it died before signalling readiness. Whether it got as \
+         far as `execve` is NOT known here — a pre-exec failure (a signal during PAM or the \
+         privilege drop) and an exec'd shell that aborted are indistinguishable at this \
+         point, so check the daemon journal for BOTH `shell child failed before execve` and \
+         the shell's own diagnostics. \
          Check the daemon journal for the shell's own diagnostics (it inherits the daemon's \
          stderr): a WebKit/GTK abort, a missing AppArmor profile, or an absent display are \
          the observed causes. Verify with `installer/p3-preflight.sh`."
     )]
     ShellDiedBeforeReady,
 
-    /// The setup-sync pipe reached EOF but the child had ALREADY EXITED, so the signal
-    /// cannot say whether the `execve` succeeded (Increment D0, D0-R3-04).
-    ///
-    /// EOF means only that no process holds the write end. A successful `execve` produces it
-    /// via `CLOEXEC`; so does a pre-`execve` child killed before it could write its failure
-    /// byte. Reporting success here sent operators to debug WebKit for PAM crashes.
-    #[error(
-        "the shell child's setup pipe closed AND the child had already exited ({detail}), so \
-         it cannot be determined whether the execve succeeded. Either the child died before \
-         exec (a signal during PAM/priv-drop — check the daemon journal for `shell child \
-         failed before execve`), or it exec'd and the shell exited immediately (check the \
-         shell's own diagnostics). The readiness contract is the authority on which."
-    )]
-    ShellSetupAmbiguous {
-        /// How the child exited, for the journal.
-        detail: String,
-    },
 
     /// The shell neither signalled readiness nor died within the launch budget
     /// (Increment D0, `readiness::DEFAULT_READY_TIMEOUT`).
@@ -223,7 +210,7 @@ pub enum RuntimeError {
     /// shell have different causes and different fixes, and collapsing them would make the
     /// journal say the wrong thing about which one happened.
     #[error(
-        "the shell exec'd but neither signalled readiness nor exited within {secs}s — it is \
+        "the shell neither signalled readiness nor exited within {secs}s — it is \
          wedged, not dead. A shell that cannot say it is up is indistinguishable from one \
          that never came up, so the launch is refused rather than proceeding against it."
     )]

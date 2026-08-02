@@ -981,6 +981,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "delphi-hardening",
+ "delphi-runtime",
  "hmac",
  "nix",
  "pam-client2",

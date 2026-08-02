@@ -33,7 +33,6 @@ use pam_client2::conv_null::Conversation as NullConv;
 use pam_client2::{Context, Flag, SessionToken};
 
 use crate::channel::approval_socketpair;
-use crate::pidfd;
 use crate::privdrop::{drop_privileges, RealPrivDropOps};
 use crate::readiness;
 use crate::RuntimeError;
@@ -281,6 +280,71 @@ pub fn launch(spec: &LaunchSpec) -> Result<Children, RuntimeError> {
     Ok(Children { daemon_channel: daemon_end, shell_pid, shell_pidfd, ai_pid })
 }
 
+/// A child created together with its pidfd — the parent arm never sees a bare pid.
+enum SpawnResult {
+    Parent { child: Pid, pidfd: OwnedFd },
+    Child,
+}
+
+/// `clone3(CLONE_PIDFD)` — create the child and its pidfd **atomically** (D0-R5-01).
+///
+/// # Why not `fork()` + `pidfd_open`, and why there is no fallback to it
+///
+/// The pair leaves a window in which only a pid exists, and R4-01 justified that window with
+/// "nothing has waited on the child yet, so its pid is reserved". **That is not sufficient on
+/// Linux.** Measured: with `SIGCHLD` set to `SIG_IGN` the kernel auto-reaps, and
+/// `pidfd_open` returns `ESRCH` while `waitpid` returns `ECHILD` — for a child nothing ever
+/// waited on. `SA_NOCLDWAIT` and an async reaping handler do the same. The daemon does not
+/// control every module that might set those.
+///
+/// The consequence was the defect R4-01 set out to remove: `pidfd_open` fails, the `?`
+/// unwinds through an armed guard, and the guard signals a **raw pid that may already have
+/// been recycled** — as root.
+///
+/// `clone3` closes it by construction: there is no interval to reason about, so no
+/// precondition to be wrong about. **A fallback to `fork()` + `pidfd_open` is deliberately
+/// NOT provided** — it would reinstate the exact defect this removes, and would do so on
+/// precisely the systems whose kernel or seccomp policy is unusual. Refusing is fail-closed;
+/// falling back is fail-open on the platforms least likely to be tested.
+fn spawn_with_pidfd() -> Result<SpawnResult, RuntimeError> {
+    let mut pidfd_raw: nix::libc::c_int = -1;
+    let mut args: nix::libc::clone_args = unsafe { std::mem::zeroed() };
+    args.flags = nix::libc::CLONE_PIDFD as u64;
+    args.pidfd = std::ptr::addr_of_mut!(pidfd_raw) as u64;
+    // Without this the child is not a SIGCHLD child and `waitpid` cannot reap it.
+    args.exit_signal = nix::libc::SIGCHLD as u64;
+
+    // SAFETY: `clone3` with a zeroed-then-populated `clone_args` of the size passed. No
+    // CLONE_VM/CLONE_THREAD, so this has `fork` semantics: 0 in the child, pid in the parent.
+    let rc = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_clone3,
+            std::ptr::addr_of!(args),
+            std::mem::size_of::<nix::libc::clone_args>(),
+        )
+    };
+    if rc < 0 {
+        let errno = nix::errno::Errno::last();
+        if errno == nix::errno::Errno::ENOSYS {
+            return Err(RuntimeError::Config {
+                what: "clone3(CLONE_PIDFD) is unavailable (ENOSYS). Delphi requires Linux \
+                       5.3+ with clone3 permitted by the seccomp policy — container runtimes \
+                       with an older default profile block it. There is deliberately NO \
+                       fallback: fork()+pidfd_open leaves a window in which a recycled pid \
+                       could be SIGKILLed as root, so the launch refuses instead.",
+            });
+        }
+        return Err(RuntimeError::Syscall { op: "clone3 (shell, shape (b))", source: errno });
+    }
+    if rc == 0 {
+        return Ok(SpawnResult::Child);
+    }
+    // SAFETY: the kernel wrote a fresh owned descriptor into `pidfd_raw` on the parent path.
+    let pidfd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(pidfd_raw) };
+    #[allow(clippy::cast_possible_truncation)] // a pid fits in i32 by definition
+    Ok(SpawnResult::Parent { child: Pid::from_raw(rc as i32), pidfd })
+}
+
 /// Kills and reaps a launched shell unless the launch ran to completion (D0-R3-02/R4-01).
 ///
 /// # The invariant became a kernel guarantee (D0-R4-01)
@@ -304,13 +368,8 @@ struct ShellGuard {
 
 impl ShellGuard {
     /// Arm on a freshly forked child, before anything observes it.
-    fn arm(pid: i32) -> Self {
-        Self { pid, pidfd: None, armed: true }
-    }
-
-    /// Upgrade to pidfd signalling once the handle exists.
-    fn attach_pidfd(&mut self, pidfd: OwnedFd) {
-        self.pidfd = Some(pidfd);
+    fn arm(pid: i32, pidfd: OwnedFd) -> Self {
+        Self { pid, pidfd: Some(pidfd), armed: true }
     }
 
     /// The pidfd, for the readiness wait.
@@ -335,10 +394,14 @@ impl Drop for ShellGuard {
         if !self.armed {
             return;
         }
-        match self.pidfd.as_ref() {
-            // SAFETY: `pidfd_send_signal(pidfd, sig, NULL, 0)` on an owned, valid fd. Immune
-            // to pid reuse by construction.
-            Some(fd) => unsafe {
+        // SAFETY: `pidfd_send_signal(pidfd, sig, NULL, 0)` on an owned, valid fd — immune to
+        // pid reuse by construction. There is no raw-pid arm: since D0-R5-01 the handle
+        // arrives WITH the child, so a guard without one cannot exist. The previous fallback
+        // justified itself with "nothing has waited, so the pid is reserved", which is false
+        // under SIGCHLD=SIG_IGN (measured) — leaving it as dead code would have preserved a
+        // disproven claim for the next reader to trust.
+        if let Some(fd) = self.pidfd.as_ref() {
+            unsafe {
                 nix::libc::syscall(
                     nix::libc::SYS_pidfd_send_signal,
                     fd.as_raw_fd(),
@@ -346,12 +409,7 @@ impl Drop for ShellGuard {
                     std::ptr::null::<nix::libc::siginfo_t>(),
                     0,
                 );
-            },
-            // SAFETY: the fork→pidfd_open window only. Nothing has waited on this child, so
-            // the pid is still reserved by its own (possibly zombie) entry.
-            None => unsafe {
-                nix::libc::kill(self.pid, nix::libc::SIGKILL);
-            },
+            }
         }
         if !reap_within(self.pid, REAP_TIMEOUT) {
             tracing::warn!(
@@ -444,23 +502,16 @@ fn fork_shell(spec: &LaunchSpec, shell_end: &OwnedFd) -> Result<ShellGuard, Runt
     // path publishes the sync fd and runs the never-returning sequence — every child exit is an
     // `_exit(2)` (never `panic!`/`return`, which would unwind into a forked copy of the
     // daemon's stack and run its destructors twice).
-    match unsafe { nix::unistd::fork() }.map_err(|source| RuntimeError::Syscall {
-        op: "fork (shell, shape (b))",
-        source,
-    })? {
-        nix::unistd::ForkResult::Parent { child } => {
+    match spawn_with_pidfd()? {
+        SpawnResult::Parent { child, pidfd } => {
             drop(sync_w); // the parent holds ONLY the read end
-            // ARM FIRST (D0-R4-02): before this, a `?` below could return with the child
-            // alive, holding its PAM session and the seat's VT with nothing to clean it up.
-            let mut guard = ShellGuard::arm(child.as_raw());
-            // PIDFD BEFORE ANY WAIT (D0-R4-01): nothing has waited on the child yet, so the
-            // pid is still reserved and this handle provably refers to our shell. From here
-            // the guard signals through the handle, not the number.
-            guard.attach_pidfd(pidfd::open(child)?);
+            // The pidfd arrived WITH the child (D0-R5-01), so the guard is armed on a handle
+            // from its first instant — there is no window in which only a pid exists.
+            let guard = ShellGuard::arm(child.as_raw(), pidfd);
             wait_for_child_setup(sync_r, child)?;
             Ok(guard)
         }
-        nix::unistd::ForkResult::Child => {
+        SpawnResult::Child => {
             drop(sync_r); // the child holds ONLY the write end
             // Publish the write end so every `child_diag` can signal a failure. In the daemon
             // (and the tests' launch caller) fd 3 is already held, so `pipe2` returns fds > 3
@@ -1065,22 +1116,103 @@ fn priv_to_io(e: RuntimeError) -> io::Error {
 mod tests {
     /// **D0-R3-02 — cleanup is structural, not per-error-path.**
     ///
+    /// The NON-ATOMIC pair, kept as a weaken twin and never called in production.
+    ///
+    /// Mirrors the pre-R5-01 `fork()` + `pidfd_open`, including the interval between them.
+    /// The interval is the point: production had one too, it was simply short.
+    #[cfg(test)]
+    fn spawn_pair_nonatomic_twin() -> Result<(), nix::errno::Errno> {
+        // SAFETY: the child diverges via `_exit`; the parent only opens a pidfd.
+        match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => unsafe { nix::libc::_exit(0) },
+            nix::unistd::ForkResult::Parent { child } => {
+                unsafe { nix::libc::usleep(20_000) }; // let the child exit first
+                let rc = unsafe {
+                    nix::libc::syscall(nix::libc::SYS_pidfd_open, child.as_raw(), 0)
+                };
+                if rc < 0 {
+                    return Err(nix::errno::Errno::last());
+                }
+                unsafe { nix::libc::close(rc as nix::libc::c_int) };
+                let _ = nix::sys::wait::waitpid(child, None);
+                Ok(())
+            }
+        }
+    }
+
+    /// **D0-R5-01 — the pid-reservation precondition does not hold, so it is gone.**
+    ///
+    /// MEASURED: with `SIGCHLD` = `SIG_IGN` the kernel auto-reaps, so a child nothing ever
+    /// waited on yields `pidfd_open` → `ESRCH` and `waitpid` → `ECHILD`.
+    ///
+    /// **BOTH LEGS ARE REQUIRED.** The first draft asserted only that `spawn_with_pidfd`
+    /// succeeds, and PASSED against the weakened `fork()`+`pidfd_open` implementation — the
+    /// parent simply won the race, because the draft had no interval where production has a
+    /// short one. Asserting the twin FAILS under the same disposition is what makes the pair
+    /// discriminating rather than decorative.
+    ///
+    /// Run in a SUBPROCESS: `SIG_IGN` is process-wide and would break every other test's
+    /// `waitpid`.
+    #[test]
+    fn spawn_with_pidfd_survives_sigchld_ignored_where_the_pair_does_not() {
+        let (r, w) = nix::unistd::pipe().expect("pipe");
+        // SAFETY: the child performs raw syscalls only and diverges via `_exit`.
+        match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => {
+                unsafe { nix::libc::signal(nix::libc::SIGCHLD, nix::libc::SIG_IGN) };
+                // bit 0: the atomic spawn produced a handle. bit 1: the twin FAILED, i.e.
+                // the hazard is real on this kernel and the test is not vacuous.
+                let mut bits = 0u8;
+                match spawn_with_pidfd() {
+                    Ok(SpawnResult::Child) => unsafe { nix::libc::_exit(0) },
+                    Ok(SpawnResult::Parent { .. }) => bits |= 1,
+                    Err(_) => {}
+                }
+                if spawn_pair_nonatomic_twin().is_err() {
+                    bits |= 2;
+                }
+                unsafe { nix::libc::write(w.as_raw_fd(), std::ptr::addr_of!(bits).cast(), 1) };
+                unsafe { nix::libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                drop(w);
+                let mut got = [0u8; 1];
+                // SAFETY: bounded read on the owned read end.
+                let n = unsafe { nix::libc::read(r.as_raw_fd(), got.as_mut_ptr().cast(), 1) };
+                let _ = nix::sys::wait::waitpid(child, None);
+                assert_eq!(n, 1, "the probe child did not report");
+                assert_eq!(
+                    got[0] & 2,
+                    2,
+                    "the non-atomic twin SUCCEEDED under SIGCHLD=SIG_IGN — the hazard did not \
+                     reproduce, so this run cannot certify the atomic spawn either"
+                );
+                assert_eq!(
+                    got[0] & 1,
+                    1,
+                    "spawn_with_pidfd failed under SIGCHLD=SIG_IGN, where the pair also fails \
+                     — atomicity is exactly what should make it survive"
+                );
+            }
+        }
+    }
+
     /// Root-free: exercises the guard itself rather than `launch()` (which needs PAM), so the
     /// mechanism is proven on every box. The composition — `launch()` with a bad `ai_path` —
     /// is asserted in `leader_is_shell.rs` and runs only on the root lane.
     #[test]
     fn an_armed_shell_guard_kills_its_child_on_drop() {
-        // SAFETY: the child only calls `pause`/`_exit` — raw syscalls, no allocation.
-        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Child => {
+        // Built with the REAL primitive, so these tests exercise the atomic pair rather than
+        // a `fork` the production path no longer uses.
+        let (pid, pidfd) = match spawn_with_pidfd().expect("clone3") {
+            SpawnResult::Child => {
                 unsafe { nix::libc::pause() };
                 unsafe { nix::libc::_exit(0) };
             }
-            nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+            SpawnResult::Parent { child, pidfd } => (child.as_raw(), pidfd),
         };
+        let g = ShellGuard::arm(pid, pidfd);
 
-        let mut g = ShellGuard::arm(pid);
-        g.attach_pidfd(pidfd::open(Pid::from_raw(pid)).expect("pidfd"));
         drop(g);
 
         // Reaped by the guard, so the pid is gone: a second wait must report ECHILD rather
@@ -1108,17 +1240,17 @@ mod tests {
     /// against a guard that kills unconditionally.
     #[test]
     fn a_disarmed_shell_guard_leaves_its_child_running() {
-        // SAFETY: as above.
-        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Child => {
+        // Built with the REAL primitive, so these tests exercise the atomic pair rather than
+        // a `fork` the production path no longer uses.
+        let (pid, pidfd) = match spawn_with_pidfd().expect("clone3") {
+            SpawnResult::Child => {
                 unsafe { nix::libc::pause() };
                 unsafe { nix::libc::_exit(0) };
             }
-            nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+            SpawnResult::Parent { child, pidfd } => (child.as_raw(), pidfd),
         };
+        let g = ShellGuard::arm(pid, pidfd);
 
-        let mut g = ShellGuard::arm(pid);
-        g.attach_pidfd(pidfd::open(Pid::from_raw(pid)).expect("pidfd"));
         drop(g.into_parts()); // completing the launch disarms
 
         let status = nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG));
@@ -1199,6 +1331,10 @@ mod tests {
                 },
                 ForkResult::Parent { child } => {
                     drop(w);
+                    // D0-R5-05: guard on the line after the fork. R4-03 removed the callee's
+                    // wait, so without this the child is never reaped and leaks a zombie —
+                    // and the earlier "a guard after every test fork" claim was simply false.
+                    let _child = crate::test_child_guard::ChildGuard::arm(child);
                     let res = wait_for_child_setup(r, child);
                     assert!(res.is_err(), "a child that writes a failure byte must yield Err");
                 }

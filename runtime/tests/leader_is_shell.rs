@@ -101,7 +101,7 @@ use std::process::Command;
 
 use delphi_runtime::launcher::{launch, LaunchSpec, VtName, SHELL_CHANNEL_FD};
 use delphi_runtime::logind::session_id_for_pid;
-use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
+use delphi_runtime::{bind_approval_socket, ensure_runtime_dir, RuntimeError};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{geteuid, Gid, Pid, Uid, User};
 
@@ -856,8 +856,38 @@ fn launch_kills_the_shell_when_a_later_step_fails_d0_r4_02() {
         ai_env: &[],
     };
 
-    let res = launch(&spec);
-    assert!(res.is_err(), "a missing ai_path must fail the launch");
+    // D0-R5-03: assert the EXACT error, not merely `is_err()`. PAM, setup and readiness
+    // failures all produce an Err with no surviving shell — the same two observations this
+    // test makes — *before* `fork_ai` is ever evaluated. So `is_err()` would have passed on
+    // the root lane while proving the boundary was never crossed, which is worse than not
+    // having run: it manufactures confidence at the moment someone finally runs it.
+    //
+    // `Filesystem { op: "spawn child", path: <the missing AI>, source: NotFound }` is
+    // constructed at exactly one site (`spawn_pid`, via `fork_ai`) and is reachable only
+    // after readiness has already succeeded.
+    // `Children` is not Debug, so unwrap the Result by hand rather than via expect_err.
+    let err = match launch(&spec) {
+        Err(e) => e,
+        Ok(_) => panic!("a missing ai_path must fail the launch"),
+    };
+    match &err {
+        RuntimeError::Filesystem { path, source, .. } => {
+            assert_eq!(
+                path, &missing_ai,
+                "failed on the wrong path — the launch died before reaching fork_ai"
+            );
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::NotFound,
+                "expected ENOENT from spawning the missing AI, got: {source}"
+            );
+        }
+        other => panic!(
+            "expected a Filesystem error from fork_ai (proving readiness SUCCEEDED and the \
+             failure came after it); got {other:?} — the launch failed earlier, so this run \
+             says nothing about the transaction boundary"
+        ),
+    }
 
     // The shell must be GONE. `launch()` returned `Err`, so it handed back no pid — the
     // check is that NOTHING owned by the session uid is executing the shell binary.

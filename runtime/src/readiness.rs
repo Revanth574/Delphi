@@ -102,7 +102,14 @@ pub fn await_shell_ready(
             Err(source) => {
                 return Err(RuntimeError::Syscall { op: "poll (shell readiness)", source })
             }
-            Ok(0) => return Err(RuntimeError::ShellReadyTimeout { secs: timeout.as_secs() }),
+            // D0-R5-02: the clock decides, not the poll. This was the one R4-04 site whose
+            // CONVERSION was fixed while its VERDICT still trusted `Ok(0)`.
+            Ok(0) => {
+                if Instant::now() >= deadline {
+                    return Err(RuntimeError::ShellReadyTimeout { secs: timeout.as_secs() });
+                }
+                continue;
+            }
             Ok(_) => {}
         }
 
@@ -263,7 +270,12 @@ fn witness_terminal(
 /// arriving in the truncated window be classified as liveness.
 fn poll_timeout(remaining: Duration) -> PollTimeout {
     let ms = remaining.as_nanos().div_ceil(1_000_000);
-    PollTimeout::from(u16::try_from(ms.min(u128::from(u16::MAX))).unwrap_or(u16::MAX))
+    // i32, not u16 (D0-R5-02): a u16 cap is ~65.5s, and a grace longer than that produced a
+    // short poll whose `Ok(0)` was read as the grace elapsing. The cap is now beyond any
+    // plausible launch budget — and no caller may treat `Ok(0)` as a statement about time
+    // without checking the clock, which is what makes a residual cap harmless.
+    PollTimeout::try_from(i32::try_from(ms.min(i32::MAX as u128)).unwrap_or(i32::MAX))
+        .unwrap_or(PollTimeout::MAX)
 }
 
 /// Did this descriptor report `POLLIN`?

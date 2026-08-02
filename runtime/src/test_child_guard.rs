@@ -2,6 +2,20 @@
 
 //! RAII cleanup for forked children in unit tests (D0-R4-05).
 //!
+//! # If this module is ever compiled into a non-test build
+//!
+//! It is behind the `test-fixtures` feature so integration-test crates can reach it —
+//! `#[cfg(test)]` items are invisible across crate boundaries, which is why the first version
+//! did not cover `runtime/tests/*` at all (D0-R5-05).
+//!
+//! **If the feature were accidentally enabled in a production build, this module does
+//! nothing**: it defines a type that nothing in `src/bin` or the library path constructs, so
+//! no `Drop` is ever registered and no signal is ever sent. It is inert, not dormant. That is
+//! deliberately weaker than the `insecure-test-seams` precedent — that feature opens a
+//! gate-bypass and therefore carries an installer pre-flight check that production binaries do
+//! not ship it. A cleanup helper with no constructor on any production path needs no such
+//! check, and adding one would imply a hazard that does not exist.
+//!
 //! # Why this is a type and not a rule
 //!
 //! A `pause()`ing child that outlives a failed assertion holds cargo's captured stdout/stderr
@@ -20,21 +34,21 @@ use nix::unistd::Pid;
 ///
 /// Arm it on the line after `fork()` returns in the parent. Do not defer it past an assertion:
 /// deferring is precisely what fails, because the assertion is what diverges.
-pub(crate) struct ChildGuard {
+pub struct ChildGuard {
     pid: Pid,
     armed: bool,
 }
 
 impl ChildGuard {
     /// Guard `pid` until this value drops.
-    pub(crate) fn arm(pid: Pid) -> Self {
+    pub fn arm(pid: Pid) -> Self {
         Self { pid, armed: true }
     }
 
     /// Reap now and disarm, for a test that needs the child's exit status.
     ///
     /// Returns the exit code, or `-signal` if it died of one.
-    pub(crate) fn reap_status(mut self) -> i32 {
+    pub fn reap_status(mut self) -> i32 {
         self.armed = false;
         match nix::sys::wait::waitpid(self.pid, None) {
             Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,

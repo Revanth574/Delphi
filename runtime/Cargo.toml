@@ -30,6 +30,11 @@ path = "src/bin/delphi-minimal-shell.rs"
 name = "delphi-minimal-ai"
 path = "src/bin/delphi-minimal-ai.rs"
 
+[dev-dependencies]
+# Self-dependency so the integration tests get the fixture feature without it ever being
+# a default of the shipped library.
+delphi-runtime = { path = ".", features = ["test-fixtures"] }
+
 [dependencies]
 # Syscall layer (§13.7: reuse the workspace's existing nix 0.30; add the feature
 # gates 1a needs — `user` for set{groups,gid,uid}/geteuid, `fs` for chown/unlink,
@@ -68,3 +73,7 @@ prost-build = "0.13"
 # no active session). COMPILE-TIME EXCLUDED from production builds — the seam does
 # not exist in the shipped daemon; the privileged lane builds the test with it.
 insecure-test-seams = []
+# D0-R5-05: exposes `test_child_guard` to the integration-test crates, which cannot see
+# `#[cfg(test)]` items. INERT if accidentally enabled in a production build — the module
+# defines a type nothing on a production path constructs. See its module docs.
+test-fixtures = []

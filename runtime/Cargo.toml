@@ -34,6 +34,8 @@ path = "src/bin/delphi-minimal-ai.rs"
 # Self-dependency so the integration tests get the fixture feature without it ever being
 # a default of the shipped library.
 delphi-runtime = { path = ".", features = ["test-fixtures"] }
+# RAII temp dirs: cleanup on Drop, INCLUDING the panic path. Test-only.
+tempfile = { workspace = true }
 
 [dependencies]
 # Syscall layer (§13.7: reuse the workspace's existing nix 0.30; add the feature

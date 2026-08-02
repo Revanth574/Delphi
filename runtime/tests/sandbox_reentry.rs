@@ -99,11 +99,14 @@ fn probe_reaches_socket(
 
 /// Set up a real "daemon" listener socket under a per-test-unique dir; return
 /// (dir, socket_path, listener).
-fn daemon_socket(tag: &str) -> (PathBuf, PathBuf, UnixListener) {
-    let dir = PathBuf::from(format!("/tmp/delphi-reentry-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let sock = dir.join("approve.sock");
+fn daemon_socket(tag: &str) -> (tempfile::TempDir, PathBuf, UnixListener) {
+    // The TempDir is RETURNED, not dropped here: the caller binds it, so the directory
+    // lives exactly as long as the test and is removed even if the test panics.
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("delphi-reentry-{tag}-"))
+        .tempdir()
+        .expect("tempdir");
+    let sock = dir.path().join("approve.sock");
     let listener = UnixListener::bind(&sock).expect("bind daemon socket");
     (dir, sock, listener)
 }
@@ -118,8 +121,7 @@ fn jailed_tool_cannot_reach_the_daemon_socket() {
     }
     let (dir, sock, _listener) = daemon_socket("correct");
     let profile = SandboxProfile::derive(&default_deny_action());
-    let reached = probe_reaches_socket(&profile, &dir, &sock, false);
-    let _ = std::fs::remove_dir_all(&dir);
+    let reached = probe_reaches_socket(&profile, dir.path(), &sock, false);
     assert!(
         !reached,
         "reentry containment: the jailed tool must NOT reach the daemon approval socket — it is \
@@ -138,8 +140,7 @@ fn red_proof_binding_the_daemon_socket_lets_the_tool_reenter() {
     }
     let (dir, sock, _listener) = daemon_socket("red");
     let profile = SandboxProfile::derive(&default_deny_action());
-    let reached = probe_reaches_socket(&profile, &dir, &sock, true);
-    let _ = std::fs::remove_dir_all(&dir);
+    let reached = probe_reaches_socket(&profile, dir.path(), &sock, true);
     assert!(
         reached,
         "RED-proof: binding the daemon socket into the jail lets the jailed tool CONNECT back to \

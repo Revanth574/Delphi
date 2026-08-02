@@ -285,9 +285,10 @@ mod tests {
             eprintln!("SKIP outcome_records_the_real_execution_result: requires bwrap + unprivileged userns");
             return;
         }
-        let dir = PathBuf::from(format!("/tmp/delphi-audit-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        // RAII: removes itself on drop, INCLUDING when an assertion below panics. The
+        // hand-rolled version cleaned up only on the success path.
+        let tmp = tempfile::Builder::new().prefix("delphi-audit-").tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let exe = dir.join("tool.sh");
         let action = exit7_action(&exe);
         let profile = SandboxProfile::derive(&action);

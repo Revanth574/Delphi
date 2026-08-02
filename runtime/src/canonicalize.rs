@@ -206,7 +206,7 @@ mod tests {
     fn canonicalize_binary_hashes_through_the_held_fd() {
         let dir = tempdir();
         let content = b"\x7fELF not-really but binary-ish";
-        let exe = write_exe(&dir, "tool", content);
+        let exe = write_exe(dir.path(), "tool", content);
         let action = canonicalize(&base_proposal(exe.to_str().unwrap()), "act-1".into()).unwrap();
 
         assert_eq!(action.executable_digest, sha256(content), "digest = content hash through fd");
@@ -221,7 +221,7 @@ mod tests {
     fn canonicalize_script_builds_a_sealed_scriptpin() {
         let dir = tempdir();
         let script = b"#!/bin/sh\necho hi\n";
-        let exe = write_exe(&dir, "tool.sh", script);
+        let exe = write_exe(dir.path(), "tool.sh", script);
         let action = canonicalize(&base_proposal(exe.to_str().unwrap()), "act-2".into()).unwrap();
 
         let sp = action.script.as_ref().expect("shebang → ScriptPin");
@@ -244,13 +244,13 @@ mod tests {
     #[test]
     fn canonicalize_parses_the_shebang_interpreter_arg() {
         let dir = tempdir();
-        let exe = write_exe(&dir, "iso.py", b"#!/usr/bin/python3 -I\nprint(1)\n");
+        let exe = write_exe(dir.path(), "iso.py", b"#!/usr/bin/python3 -I\nprint(1)\n");
         let action = canonicalize(&base_proposal(exe.to_str().unwrap()), "act-arg".into()).unwrap();
         let sp = action.script.as_ref().expect("shebang → ScriptPin");
         assert_eq!(sp.interpreter_arg.as_deref(), Some("-I"), "the interpreter arg is bound, not dropped");
 
         // No arg → None.
-        let plain = write_exe(&dir, "plain.sh", b"#!/bin/sh\n:\n");
+        let plain = write_exe(dir.path(), "plain.sh", b"#!/bin/sh\n:\n");
         let a2 = canonicalize(&base_proposal(plain.to_str().unwrap()), "act-na".into()).unwrap();
         assert_eq!(a2.script.as_ref().unwrap().interpreter_arg, None);
     }
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn out_of_range_wire_enum_is_rejected() {
         let dir = tempdir();
-        let exe = write_exe(&dir, "tool", b"binary");
+        let exe = write_exe(dir.path(), "tool", b"binary");
         let mut p = base_proposal(exe.to_str().unwrap());
         p.required_tier = 99; // not a valid RequiredTier
         assert!(
@@ -272,9 +272,17 @@ mod tests {
         assert!(matches!(canonicalize(&p2, "y".into()), Err(RuntimeError::Protocol(_))), "invalid net_policy rejected");
     }
 
-    fn tempdir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("delphi-canon-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&d);
-        d
+    /// A temp dir that removes itself on drop — including when a test panics.
+    ///
+    /// The previous version built `/tmp/delphi-canon-<pid>` by hand and **never removed it**,
+    /// on any path. It was the only site in this crate with no cleanup at all, and it is the
+    /// source of the `delphi-canon-*` accumulation on `/tmp` (8 present when this was fixed).
+    /// Callers bind the returned `TempDir`, so the directory lives exactly as long as the
+    /// test does.
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("delphi-canon-")
+            .tempdir()
+            .expect("tempdir")
     }
 }

@@ -58,14 +58,18 @@ fn logind_trust_denies_same_uid_forge() {
 /// source flipped from logind to a same-uid-writable file → outcome flips to PASS.
 #[test]
 fn red_proof_same_uid_signal_trust_lets_forge_succeed() {
-    let path = PathBuf::from(format!("/tmp/delphi-forge-session-{}", std::process::id()));
-    let _ = fs::remove_file(&path);
+    // NamedTempFile: removed on drop, so a failing assertion below cannot leave the forged
+    // signal behind for the next run to pick up.
+    let forged = tempfile::Builder::new()
+        .prefix("delphi-forge-session-")
+        .tempfile()
+        .expect("tempfile");
+    let path = forged.path().to_path_buf();
     // The same-uid attacker forges the FULL verdict (active + local + seated) by writing
     // the signal it can reach — the B2a seat axis is forgeable too when the source is a
     // same-uid file, which is precisely why the source must be logind.
     fs::write(&path, "active seated").expect("same-uid write to the forgeable signal");
     let passed = session_passes_gate(&FileAssertedVerdict { path: path.clone() });
-    let _ = fs::remove_file(&path);
     assert!(
         passed,
         "RED-proof: trusting a same-uid-writable signal lets the attacker forge \

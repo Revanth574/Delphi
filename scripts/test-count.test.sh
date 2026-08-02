@@ -86,7 +86,35 @@ note: a SKIP here would prove nothing, see the SKIP discussion above
 '
 check "prose mentioning SKIP is not counted" "EXECUTED 2 / SKIPPED 0 / reported 2" "$OUT" 0 "$RC"
 
-# ── 7. THE ANTI-CLASS-25 CASE: parse a REAL captured libtest log ───────────────────────
+# ── 7. THE PHYSICAL FLOOR: the skip-shaped false green, caught WITHOUT the SKIP parse ───
+# The real event: `cargo test --release` reported "7 passed" for real_webkit_load in 0.02s.
+# Seven WebKit launches cannot happen in 20ms. These cases carry NO skip markers, so only the
+# timing can catch them — which is the point: two independent signals, and the SKIP parse has
+# already been wrong once.
+run_with_floor() { # <floor-ms> <log-content>
+    local f; f=$(mktemp); printf '%s' "$2" > "$f"
+    OUT=$(DELPHI_MIN_MS_PER_TEST="$1" DELPHI_TESTCOUNT_LOG="$f" "$EXTRACTOR" 2>&1); RC=$?
+    rm -f "$f"
+}
+
+run_with_floor 100 'running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+'
+check "impossible rate REFUSES even with NO skip markers" "below the" "$OUT" 2 "$RC"
+
+run_with_floor 100 'running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+'
+check "plausible rate passes the same floor" "EXECUTED 7 / SKIPPED 0" "$OUT" 0 "$RC"
+
+run_with_floor 100 'running 2 tests
+test a ... SKIP a: x
+test b ... SKIP b: x
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+'
+check "floor declared but nothing executed REFUSES" "NOTHING executed" "$OUT" 2 "$RC"
+
+# ── 8. THE ANTI-CLASS-25 CASE: parse a REAL captured libtest log ───────────────────────
 # The first version of this file invented its fixture format, and the invented format did not
 # match libtest's. The parser passed six synthetic cases while missing every marker in real
 # serial output, because libtest prefixes the line with `test <name> ... `. A fixture that is

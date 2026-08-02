@@ -19,7 +19,18 @@
 # built to prevent. So every parse step is checked and every failure REFUSES. There is no
 # fallback path and no mode that prints the total alone.
 #
+# A PHYSICAL FLOOR CATCHES THE SKIP-SHAPED FALSE GREEN INDEPENDENTLY OF THE SKIP PARSE
+# ------------------------------------------------------------------------------------
+# `cargo test --release` once reported "7 passed" for real_webkit_load in 0.02s. Seven real
+# WebKit launches cannot complete in 20ms — they had all SKIPPED. The count said ok; the
+# TIMING said impossible. That is a second, independent signal, and it matters because the
+# SKIP parse has already been wrong once (it was anchored to column 0 and matched nothing).
+#
+# So the rate is ALWAYS reported, and `DELPHI_MIN_MS_PER_TEST` turns it into an assertion for
+# suites with a known floor. When a measurement has a physical floor, assert the floor.
+#
 # Usage:  scripts/test-count.sh -p delphi-runtime
+#         DELPHI_MIN_MS_PER_TEST=100 scripts/test-count.sh --release   # WebKit-launching suite
 #         DELPHI_TESTCOUNT_LOG=<file> scripts/test-count.sh   # parse a captured log (tests)
 # Exits non-zero if the tests failed OR if the output could not be parsed.
 
@@ -76,12 +87,39 @@ fi
 
 executed=$(( reported - skipped ))
 
+# Test-execution time only (libtest's own per-binary figure), not build time.
+elapsed_ms=$(grep -oE 'finished in [0-9]+\.[0-9]+s' "$log" \
+  | grep -oE '[0-9]+\.[0-9]+' | awk '{s+=$1} END {printf "%d", s*1000}')
+[[ "$elapsed_ms" =~ ^[0-9]+$ ]] || REFUSE "could not extract an elapsed time ('$elapsed_ms')"
+
 if [ "$rc" -ne 0 ]; then
     echo "TESTS FAILED (cargo exit $rc) — the count below is NOT a coverage claim:" >&2
     grep -E '^test result:|^error|panicked at' "$log" | head -20 >&2
 fi
 
-printf 'EXECUTED %d / SKIPPED %d / reported %d\n' "$executed" "$skipped" "$reported"
+if [ "$executed" -gt 0 ]; then
+    rate=$(( elapsed_ms / executed ))
+    printf 'EXECUTED %d / SKIPPED %d / reported %d   (%dms total, %dms per executed test)\n' \
+        "$executed" "$skipped" "$reported" "$elapsed_ms" "$rate"
+else
+    rate=0
+    printf 'EXECUTED %d / SKIPPED %d / reported %d   (%dms total)\n' \
+        "$executed" "$skipped" "$reported" "$elapsed_ms"
+fi
+
+# THE PHYSICAL FLOOR. Independent of the SKIP parse by construction: it asks whether the work
+# could have happened in the time taken, not whether a marker was printed.
+if [ -n "${DELPHI_MIN_MS_PER_TEST:-}" ]; then
+    if [ "$executed" -eq 0 ]; then
+        REFUSE "a floor of ${DELPHI_MIN_MS_PER_TEST}ms/test was declared but NOTHING executed"
+    fi
+    if [ "$rate" -lt "$DELPHI_MIN_MS_PER_TEST" ]; then
+        REFUSE "$executed test(s) completed in ${elapsed_ms}ms (${rate}ms each), below the \
+declared floor of ${DELPHI_MIN_MS_PER_TEST}ms. The work this suite names cannot happen that \
+fast, so it reported on something else — skipped tests are the usual cause, and they score \
+as passes."
+    fi
+fi
 
 if [ "$skipped" -gt 0 ]; then
     echo "--- the $skipped skipped test(s) returned early and were scored as passes ---"

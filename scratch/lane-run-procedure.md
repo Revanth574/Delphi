@@ -6,17 +6,36 @@ operator on the seated lane.
 
 ---
 
-## 0. Preconditions — check all five before starting
+## 0. GO / NO-GO — run this block FIRST, in full, before anything expensive
 
-| # | Precondition | Check | Why |
-|---|---|---|---|
-| P1 | **root** | `id -u` = 0 for the install + the gated suites | PAM, `/run` anchor, `/usr/libexec` |
-| P2 | **a free VT matching the unit** | `DELPHI_SHELL_VT` in `delphi-runtimed@.service` is `tty3`; confirm nothing holds it | a taken VT gives `VirtualTerminalAlreadyTaken` |
-| P3 | **a display** | `echo $DISPLAY $WAYLAND_DISPLAY` non-empty | `real_webkit_load` skips without one, and that skip reports as `ok` |
-| P4 | **free space on all four** | `scripts/check-free-space.sh` | `/tmp` filling surfaces as a protoc *build* error in an unrelated crate |
-| P5 | **no stale P3 marker** | `rm -f /tmp/delphi-p3-marker` | a surviving marker makes a FAILED run read as success |
+Build + install is minutes. Discovering a stale marker or an occupied VT *after* it costs the
+whole sequence, and this session has already spent a day on failures that were preconditions
+misattributed to code. **One block, all five, before the first build.**
 
-If P4 fails it names which path is short. Do not proceed on "probably enough".
+```bash
+{
+  echo "P1 root:      $([ "$(id -u)" = 0 ] && echo OK || echo 'NO — re-run under sudo -E')"
+  echo "P2 VT free:   $(grep -oE 'DELPHI_SHELL_VT=tty[0-9]+' installer/staging/delphi-runtimed@.service) \
+                       -> $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $NF}' | grep -qx tty3 && echo 'OCCUPIED — STOP' || echo free)"
+  echo "P3 display:   ${DISPLAY:-<none>} ${WAYLAND_DISPLAY:-}"
+  echo "P4 space:"; scripts/check-free-space.sh || echo "  *** STOP ***"
+  echo "P5 marker:    $([ -e /tmp/delphi-p3-marker ] && echo 'PRESENT — rm -f /tmp/delphi-p3-marker' || echo absent)"
+  echo "P6 userns:    restrict=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null) \
+                       profile=$(aa-status 2>/dev/null | grep -c delphi-shell)"
+}
+```
+
+**Every line must read OK / free / absent before proceeding.** P6 is informational: `restrict=1`
+with `profile=0` means `real_webkit_load` will abort rather than skip — install has not run yet,
+which is expected at this point but must be true again *after* step 1.
+
+| # | Precondition | Why it stops the run |
+|---|---|---|
+| P1 | root | PAM, `/run` anchor, `/usr/libexec` |
+| P2 | `tty3` free | an occupied VT gives `VirtualTerminalAlreadyTaken`, one layer below the gate |
+| P3 | a display | `real_webkit_load` skips without one — **and the skip reports as `ok`** |
+| P4 | free space on all four | `/tmp` filling surfaces as a protoc *build* error in an unrelated crate |
+| P5 | no stale `/tmp/delphi-p3-marker` | a surviving marker makes a FAILED run read as success |
 
 ---
 
@@ -64,8 +83,14 @@ They answer different questions and must not be merged in the report.
 scripts/test-count.sh -p delphi-runtime
 ```
 ```bash
-cd runtime/shell-host && CARGO_TARGET_DIR=$HOME/delphi-target/shell-host ../../scripts/test-count.sh --release
+cd runtime/shell-host && CARGO_TARGET_DIR=$HOME/delphi-target/shell-host \
+  DELPHI_MIN_MS_PER_TEST=100 ../../scripts/test-count.sh --release
 ```
+
+`DELPHI_MIN_MS_PER_TEST=100` is the **physical floor**, and it is the reason a repeat of the
+0.02s incident cannot pass silently: seven WebKit launches cannot average under 100ms, so a
+skipped suite REFUSES on the timing even if the SKIP parse misses every marker. Two independent
+signals — which matters, because the SKIP parse has already been wrong once.
 
 Report as `EXECUTED n / SKIPPED m / reported n+m`. A bare total is not a coverage claim.
 
@@ -125,6 +150,38 @@ sudo -E cargo test -p delphi-runtime --test leader_is_shell -- --test-threads=1 
 ```
 
 If it passes under the weaken, the test is decorative and the boundary is still untested.
+
+### 3a. MANDATORY cleanup after the weaken — it deliberately leaks a root shell
+
+The weaken disarms the guard, so **the point of the run is that the shell survives**: a
+root-spawned process holding a **logind session and `tty3`**. Left there it will make the next
+test fail for an entirely unrelated reason — the misattribution shape this session has spent a
+day on. Clean up before running anything else:
+
+```bash
+# 1. Revert the source edit FIRST, so nothing rebuilds against the weakened guard.
+git -C /home/revanth-aditya/Delphi diff --stat runtime/src/launcher.rs   # expect: empty
+```
+```bash
+# 2. Find and kill the survivor. It is the sleeper, owned by the test's throwaway user.
+ps -eo pid,user,tty,args | grep -E 'sleeper|delphi' | grep -v grep
+```
+```bash
+# 3. Kill by pid, then confirm the session and the VT are released.
+sudo kill -9 <pid> ; loginctl list-sessions --no-legend | awk '{print $NF}' | grep -x tty3 && echo "STILL HELD"
+```
+
+**If the session does not clear** — `loginctl` still lists a session on `tty3`, or
+`STILL HELD` prints — the session is `closing` with a member that will not die:
+
+```bash
+sudo loginctl terminate-session <session-id>   # then re-check; if it persists, reboot the lane
+```
+
+Do **not** start the next suite until `tty3` is free. A held VT makes every subsequent
+launch fail at `pam_open_session`, which looks exactly like a PAM regression and is not one.
+
+
 
 ---
 

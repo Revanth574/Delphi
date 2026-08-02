@@ -1450,6 +1450,23 @@ process. Both properties were destroyed by the pairing, not by either change.
 Ask it per pair, and ask it of the *reviewer's* approvals too — the invariant here was stated
 by the reviewer in the approving message and removed two paragraphs later.
 
+**THE COUNTEREXAMPLE, and it is load-bearing — R4-03 ↔ R4-01, same round, opposite outcome.**
+Round 4 changed five things on the same path in one commit, which is *structurally identical*
+to the situation that produced this class. One of those pairs went the other way: R4-03 removed
+`wait_for_child_setup`'s own `waitpid`, and that removal **strengthened** R4-01's precondition —
+with no consuming wait left anywhere before `pidfd::open`, the raw-pid window provably contains
+none. The same removal also eliminated a double-reap race against the guard. Two fixes, one
+path, one change, *mutually reinforcing*.
+
+**Without this counterexample the class reads as "many fixes in one change are dangerous",
+which is the wrong lesson and would push toward smaller changes rather than better questions.**
+Change size is not the variable. The variable is:
+
+> does one fix remove an invariant another fix needs?
+
+A ten-fix change where none touches another's preconditions is safe; a two-fix change where one
+does is not. Ask the question per *pair*, not per *count*.
+
 **Foreclosing primitive — the same one that has worked every time it was available:
 turn the maintained invariant into a kernel guarantee.** The guard now owns a **pidfd** and
 signals through it, so "signal the right process" is enforced by the kernel rather than by a

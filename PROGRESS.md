@@ -236,7 +236,46 @@ and reaping every child before the guard drops → **30/30**. Production foreclo
 interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
 the AI is not a third), so this is a harness artifact — **shown, not asserted**.
 
-**OWED ON THE LANE — now FIVE items.** This list is this branch's honest record of what it
+**LANE RUN COMPLETE (2026-08-02) — ITEMS 1-4 DISCHARGED.**
+
+| # | Item | Result |
+|---|---|---|
+| 1 | B-1 / FD-01 / B-3 serial ≥30 | **30/30**, accounts delta **0**, sessions delta **0** (baseline accounts=1 sessions=2, final identical). Assertion markers confirmed under `--nocapture`: B-1 `pinned_pid=115830` three legs equal; B-3 uid/gid 1377 ×4, groups empty; FD-01 exact allowlist, `injected_in_child=false`. |
+| 2 | Transaction boundary | **All three conditions.** Ran (no SKIP), passed at 1.26s, and **failed under the weaken naming a specific survivor** — `launch() returned Err but left [41839] executing …/sleeper`. First evidence the test discriminates. |
+| 3 | WRY host readiness path | Discharged on the corrected criterion: `Denied { reason: "logind: shell session not active+local" }`, **no** `ShellDiedBeforeReady`, **no** `ShellReadyTimeout`, marker correctly absent. Reaching a gate verdict proves `launch()` returned `Ok`. |
+| 4 | `real_webkit_load` | **EXECUTED 19 / SKIPPED 0**, 400ms/test, `--release` against the installed binary with hashes matching. The physical floor corroborated it independently. |
+
+**R5-03's assertion vindicated itself, unprompted.** On the exhausted iterations it refused to
+score a pass: *"expected a Filesystem error from fork_ai (proving readiness SUCCEEDED and the
+failure came after it); got ShellSetupFailed — the launch failed earlier, so this run says
+nothing about the transaction boundary."* Codex's finding, fixed, then proving itself on first
+real exposure.
+
+**THE RUN'S FINDING — a stale session on the wrong VT, and it cost three wrong diagnoses.**
+After the P3a-2 daemon run a session `c523` owned by `delphi-r402-119101` survived **on tty1**,
+left by the earlier weaken. Every subsequent failure was `VirtualTerminalAlreadyTaken` at
+`pam_open_session`. The just-landed cleanup fix was blamed first (0/30 immediately after it
+merged), then PAM. Ground truth came from the journal. The post-weaken cleanup had checked for
+**processes on tty3** — wrong resource, wrong VT — because it was written for the weaken's
+scenario. Closed by `scripts/check-stale-test-sessions.sh`, used by BOTH the go/no-go block (P7)
+and the cleanup; recorded as `DEFECT_CLASSES` 29a.
+
+**MEASURED HERE WHILE BUILDING THAT CHECK: 333 stale test accounts on the dev box**, uid
+1001–1377 (`db1f` 120, `db1h`/`db1e`/`db1b` 69 each, `db1l` 5, one `delphi-fd01-`). These are the
+`b1_integration` naive-`Drop` leak accumulated across the project's history — the same leak the
+lane measured, present here, from before the fix. The bulk-removal command is in the script's
+output.
+
+**OWED ON THE LANE — ONE item remains.**
+
+1. **Item 5 — the panic-path DIRECTORY conversions** (~23 sites in root-gated tests and
+   `real_webkit_load`'s bundle dirs). **The account-leak half of item 5 is CLOSED** by the
+   `loginctl terminate-user` fix, which is what unblocked item 1's ≥30. What remains is the
+   weaker half: those sites already clean up on the success path, so nothing accumulates from a
+   passing run; the gap is cleanup when a test panics. **Now verifiable against a green lane**,
+   which was the entire argument for deferring it.
+
+**PRIOR (superseded):**  This list is this branch's honest record of what it
 cannot prove on this box.
 
 1. **B-1 / FD-01 / B-3 serial >=30** against the marker-writing sleeper (fork+PAM carve-out).

@@ -1683,6 +1683,40 @@ the delta is zero. A green suite is not evidence of no leak; only the count is.
 
 ---
 
+## 29a. A resource-holder check must name the resource the SUBJECT uses  *(D0 lane run)*
+
+**Description.** A cleanup or precondition check is written while diagnosing one failure, and
+silently inherits that failure's specifics — its resource type, its VT, its path. It then
+reports clean for a *different* holder of the *same* resource, and the next failure is
+attributed to code.
+
+**Instance (grounded).** The weaken-cleanup section checked for **processes on tty3**, because
+it was written for the weaken's tty3 scenario. The real survivor was a **session on tty1**
+(`c523`, `delphi-r402-119101`) — tty1 being the VT the tests actually use. Two errors in one
+check, and each alone was enough:
+
+- **wrong resource** — a logind session outlives its last process in `closing`, and it is the
+  *session*, not the process, that holds the VT;
+- **wrong VT** — hard-coded from the scenario being debugged rather than read from the subject.
+
+Cost: **three wrong diagnoses.** A just-landed cleanup fix was blamed first (0/30 immediately
+after it merged — a coincidence in time reading as causation), then PAM. Ground truth came from
+the journal.
+
+**The discriminating question:** *does this check name the resource the SUBJECT acquires, or the
+resource the LAST FAILURE happened to expose?* A check written during a diagnosis is
+fitted to that diagnosis unless deliberately generalised.
+
+**Foreclosing primitive.** `scripts/check-stale-test-sessions.sh` — one script, used by both the
+go/no-go block and the post-weaken cleanup, matching **any** session owned by a test-account
+pattern on **any** VT. One construction site, so the two callers cannot disagree; and it names
+sessions first because only a session holds the VT.
+
+**RED-proof shape.** Replay the real survivor's `loginctl` line through the check and require a
+non-zero exit naming it. Verified against `c523 1377 delphi-r402-119101 seat0 119101 user tty1`.
+
+---
+
 ## 30. The stale binary — a rebuild that does not rebuild  *(new — D0 lane run)*
 
 **Description.** A test binary is re-run after a source change and silently exercises the OLD
@@ -1751,3 +1785,4 @@ the crate) and confirm by `mtime` before believing the run.
 | 28. Re-deriving a documented mechanism | discipline: grep the repo (**component name + error string**) BEFORE the first hypothesis, not after the third dies | Discipline |
 | 29. Exhaustion presents as flakiness | tear down at the layer that OWNS the resource (`loginctl terminate-user` before `userdel`); count the resource across N PASSING iterations and assert delta 0 | Discipline |
 | 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |
+| 29a. Holder-check names the wrong resource | one shared checker matching the SUBJECT's resource on ANY location (`scripts/check-stale-test-sessions.sh`), used by every caller | **Extracted** |

@@ -22,6 +22,7 @@ misattributed to code. **One block, all five, before the first build.**
   echo "P5 marker:    $([ -e /tmp/delphi-p3-marker ] && echo 'PRESENT — rm -f /tmp/delphi-p3-marker' || echo absent)"
   echo "P6 userns:    restrict=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null) \
                        profile=$(aa-status 2>/dev/null | grep -c delphi-shell)"
+  echo "P7 stale:"; scripts/check-stale-test-sessions.sh || echo "  *** STOP ***"
 }
 ```
 
@@ -36,6 +37,7 @@ which is expected at this point but must be true again *after* step 1.
 | P3 | a display | `real_webkit_load` skips without one — **and the skip reports as `ok`** |
 | P4 | free space on all four | `/tmp` filling surfaces as a protoc *build* error in an unrelated crate |
 | P5 | no stale `/tmp/delphi-p3-marker` | a surviving marker makes a FAILED run read as success |
+| P7 | **no surviving test session on ANY VT** | a session left by a previous run makes every launch fail `VirtualTerminalAlreadyTaken` — **a precondition failure that presents as a code regression.** Measured: it cost three wrong diagnoses (blamed a just-landed cleanup fix, then PAM) before the journal gave ground truth. |
 
 ---
 
@@ -151,37 +153,37 @@ sudo -E cargo test -p delphi-runtime --test leader_is_shell -- --test-threads=1 
 
 If it passes under the weaken, the test is decorative and the boundary is still untested.
 
-### 3a. MANDATORY cleanup after the weaken — it deliberately leaks a root shell
+### 3a. MANDATORY cleanup after the weaken — check the SESSION, on ANY VT
 
-The weaken disarms the guard, so **the point of the run is that the shell survives**: a
-root-spawned process holding a **logind session and `tty3`**. Left there it will make the next
-test fail for an entirely unrelated reason — the misattribution shape this session has spent a
-day on. Clean up before running anything else:
+The weaken disarms the guard, so **a surviving shell is the point of the run**: a root-spawned
+process holding a **logind session**. Left there, every subsequent launch fails
+`VirtualTerminalAlreadyTaken` at `pam_open_session`.
+
+**THE FIRST VERSION OF THIS SECTION LOOKED FOR THE WRONG RESOURCE ON THE WRONG VT.** It checked
+for *processes on tty3*, because it was written for the weaken's tty3 scenario. The actual
+survivor was a **session on tty1** — `c523`, owned by `delphi-r402-119101` — and tty1 is the VT
+the tests actually use. The check found nothing, reported clean, and three wrong diagnoses
+followed. Sessions outlive their last process; the session, not the process, holds the VT.
 
 ```bash
-# 1. Revert the source edit FIRST, so nothing rebuilds against the weakened guard.
-git -C /home/revanth-aditya/Delphi diff --stat runtime/src/launcher.rs   # expect: empty
+git -C /home/revanth-aditya/Delphi diff --stat runtime/src/launcher.rs   # expect: empty — revert FIRST
 ```
 ```bash
-# 2. Find and kill the survivor. It is the sleeper, owned by the test's throwaway user.
-ps -eo pid,user,tty,args | grep -E 'sleeper|delphi' | grep -v grep
-```
-```bash
-# 3. Kill by pid, then confirm the session and the VT are released.
-sudo kill -9 <pid> ; loginctl list-sessions --no-legend | awk '{print $NF}' | grep -x tty3 && echo "STILL HELD"
+scripts/check-stale-test-sessions.sh
 ```
 
-**If the session does not clear** — `loginctl` still lists a session on `tty3`, or
-`STILL HELD` prints — the session is `closing` with a member that will not die:
+The script is the check: it matches **any logind session owned by a `delphi-*` or `db1*` user on
+any VT**, prints the `terminate-user` command per user, and also reports leftover accounts as a
+secondary signal. Run it until it prints `no stale test sessions or accounts`.
+
+**If a session will not clear** — it is `closing` with a member that will not die:
 
 ```bash
 sudo loginctl terminate-session <session-id>   # then re-check; if it persists, reboot the lane
 ```
 
-Do **not** start the next suite until `tty3` is free. A held VT makes every subsequent
-launch fail at `pam_open_session`, which looks exactly like a PAM regression and is not one.
-
-
+Do **not** start the next suite until the script is clean. A held VT makes every launch fail at
+`pam_open_session`, which looks exactly like a PAM regression and is not one.
 
 ---
 

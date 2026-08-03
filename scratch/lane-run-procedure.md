@@ -191,7 +191,7 @@ launch fail at `pam_open_session`, which looks exactly like a PAM regression and
 |---|---|---|
 | 1 | **B-1 / FD-01 / B-3 serial ≥30** | 30/30 pass under `--test-threads=1`, 0 failures, against the marker-writing sleeper. A parallel failure is a harness artifact **only if shown** to be pre-`execve` child death (read the lines; do not assume). |
 | 2 | **Transaction boundary** | runs (not SKIP) **and** passes **and** fails under the weaken in §3. Two of three is not discharge. |
-| 3 | **WRY host readiness path** | the daemon launches the real shell and `launch()` returns `Ok` — i.e. `readiness::READY_DATAGRAM` arrived. Confirm the P3 marker `/tmp/delphi-p3-marker` exists after the run, and that the journal shows no `ShellDiedBeforeReady` / `ShellReadyTimeout`. |
+| 3 | **WRY host readiness path** | **CORRECTED.** `sudo -E bash scratch/p3-daemon-run.sh tty3 <session-user>`. Discharged when there is **no** `ShellDiedBeforeReady` / `ShellReadyTimeout` **and** the run reaches a gate verdict with an explicit deny reason — reaching the gate proves `launch()` returned `Ok`, i.e. the marker arrived. **NO MARKER FILE IS WRITTEN and that is correct:** tty3 is not seat0's `ActiveSession`, so the gate denies by design; a marker would be a gate-POSITIVE, which is P3b and still blocked. The earlier "confirm the marker exists" criterion was wrong. |
 | 4 | **`real_webkit_load` (7)** | all 7 **run** (no `SKIP` on their lines under `--nocapture`) and pass, in `--release`. |
 | 5 | **Deferred temp paths** | **NOT discharged by this run.** It becomes verifiable afterwards: with the lane green, the ~23 conversions can be made and re-verified against a suite that actually executes them. |
 

@@ -160,7 +160,29 @@ impl Drop for Setup {
         if self.provisioned {
             let _ = std::fs::remove_file(PAM_FILE);
         }
-        let _ = Command::new("userdel").arg(&self.user).status();
+        // Same three layers as leader_is_shell's Setup::drop, which was fixed after
+        // measuring 1 leaked account per passing iteration on the lane. This one was the
+        // NAIVE version — no session teardown, no wait, and a DISCARDED status, so a failure
+        // here was invisible. It leaks the same way for the same reason.
+        let _ = Command::new("loginctl").args(["terminate-user", &self.user]).status();
+        match Command::new("userdel").arg(&self.user).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+                let forced = Command::new("userdel").args(["-f", &self.user]).output();
+                match forced {
+                    Ok(f) if f.status.success() => {
+                        eprintln!("WARN: `userdel {}` failed ({why}); -f succeeded.", self.user)
+                    }
+                    _ => eprintln!(
+                        "WARN: `userdel {}` failed ({why}) and -f did not recover — ACCOUNT \
+                         LEAKED. Remove by hand: `sudo userdel -f {}`.",
+                        self.user, self.user
+                    ),
+                }
+            }
+            Err(e) => eprintln!("WARN: could not run userdel for {}: {e}", self.user),
+        }
     }
 }
 

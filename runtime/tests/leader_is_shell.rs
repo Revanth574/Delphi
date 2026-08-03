@@ -176,6 +176,16 @@ impl Drop for Setup {
         // Ask anything still running as this uid to leave, including processes we cannot
         // `waitpid` (under the weaken the real shell is a GRANDCHILD, reparented to init,
         // so it is not ours to reap — but it is ours to signal).
+        // SESSION-LEVEL TEARDOWN FIRST — the layer the previous fix was missing.
+        // `userdel` refuses while the user is REGISTERED AS LOGGED IN, which is logind/utmp
+        // state, not process state. Signalling pids cannot clear it: a session survives its
+        // last process briefly in `closing`, and utmp still names the user. Measured on the
+        // lane: 1 account leaked per PASSING iteration for exactly the four tests that leave
+        // a shell holding a PAM session (b1, b3, fd01, p1) — and NOT for r402, which asserts
+        // the shell is gone before this runs. `/run` dirs stayed at 0 throughout, so the
+        // directory cleanup was fine and only the account cleanup was short a layer.
+        let _ = Command::new("loginctl").args(["terminate-user", &self.user]).status();
+
         if let Some(uid) = uid {
             for pid in pids_owned_by(uid) {
                 let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
@@ -197,13 +207,36 @@ impl Drop for Setup {
             }
         }
 
-        match Command::new("userdel").arg(&self.user).status() {
-            Ok(st) if st.success() => {}
-            Ok(st) => eprintln!(
-                "WARN: `userdel {}` exited {st} — THE ACCOUNT MAY HAVE LEAKED. Check \
-                 `getent passwd | grep delphi-b1` and remove it by hand.",
-                self.user
-            ),
+        // `.output()` not `.status()`: userdel's REASON goes to stderr, and inheriting it
+        // buried the message in the surrounding test output. Capturing it makes the next
+        // failure name its own cause instead of being rediscovered.
+        let del = |extra: &[&str]| {
+            let mut c = Command::new("userdel");
+            c.args(extra).arg(&self.user);
+            c.output()
+        };
+        match del(&[]) {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                // One escalation: -f removes the account even if logind/utmp still claims a
+                // login. Reported either way — a forced removal means the teardown above did
+                // not finish, which is information, not a success.
+                let why = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+                match del(&["-f"]) {
+                    Ok(f) if f.status.success() => eprintln!(
+                        "WARN: `userdel {}` failed ({why}); `userdel -f` SUCCEEDED. The account \
+                         is gone, but the session teardown above did not complete — if this \
+                         recurs, the bounded wait is too short or a session is stuck `closing`.",
+                        self.user
+                    ),
+                    Ok(f) => eprintln!(
+                        "WARN: `userdel {}` failed ({why}) AND `userdel -f` exited {} ({}) — \
+                         THE ACCOUNT HAS LEAKED. Remove by hand: `sudo userdel -f {}`.",
+                        self.user, f.status, String::from_utf8_lossy(&f.stderr).trim(), self.user
+                    ),
+                    Err(e) => eprintln!("WARN: could not run `userdel -f` for {}: {e}", self.user),
+                }
+            }
             Err(e) => eprintln!("WARN: could not run userdel for {}: {e}", self.user),
         }
     }

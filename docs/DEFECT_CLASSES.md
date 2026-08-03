@@ -1644,6 +1644,77 @@ the diagnosis, alongside the hypotheses it pre-empted.
 
 ---
 
+## 29. Resource exhaustion presents as flakiness  *(new — D0 lane run)*
+
+**Description.** A per-iteration resource leak accumulates until the resource runs out. The
+run then fails in a batch, and the batch reads as *intermittency* — because the failures are
+consecutive, unrelated to the assertions, and disappear when the resource is replenished.
+
+**Instance (grounded).** `leader_is_shell`, 30 serial iterations: **9 consecutive failures,
+then 21 passes.** That shape is not a flaky test — a flaky test scatters. It was **exhaustion
+from the previous run's debris**, cleared partway through. From a clean baseline the same
+suite ran **10/10**.
+
+The leak: **one system account per PASSING iteration**, from four of the five tests
+(`delphi-b1`, `-b3`, `-fd01`, `-p1`) and not the fifth (`-r402`). `/run` dirs stayed at **0**
+throughout — the directory cleanup was RAII and worked; the account cleanup depended on a
+layer nobody had touched.
+
+**Two diagnostic tells, both cheap:**
+
+- **Consecutive-then-clean** beats scattered. `9 then 21` is a baseline problem;
+  `1 in 10, randomly placed` is instability. Read the *positions* of failures, not the rate.
+- **The passing runs are the leakers.** A leak on the success path is invisible to every
+  assertion, so the suite that reports green is the one filling the resource. Count the
+  resource before and after a *passing* run.
+
+**Foreclosing primitive.** **Tear down at the layer that owns the resource.** The leak here
+survived a careful fix that signalled *processes* and waited on pids, because `userdel`
+refuses while the user is registered as **logged in** — logind/utmp state, not process state.
+`loginctl terminate-user` is the missing layer. The general form: when cleanup fails,
+establish *which layer* holds the resource before adding force to the layer you already have.
+
+**And capture the failure's reason.** Both `Setup::drop`s discarded `userdel`'s stderr (one
+discarded its exit status entirely), so the cause was rediscovered from the outside instead of
+being printed at the moment it happened.
+
+**RED-proof shape.** Count the resource before and after **N passing iterations** and assert
+the delta is zero. A green suite is not evidence of no leak; only the count is.
+
+---
+
+## 30. The stale binary — a rebuild that does not rebuild  *(new — D0 lane run)*
+
+**Description.** A test binary is re-run after a source change and silently exercises the OLD
+code, because the change was in a *linked library* rather than in the test crate, and the
+apparent identity checks (a reported hash, "it recompiled") do not distinguish the two.
+
+**Instance (grounded).** After reverting the `ShellGuard` weaken, 30 iterations were run
+against a binary **built before the revert** — so the weakened guard was still under test.
+`cargo test --no-run` reported **the same hash** for the test binary, because only the linked
+library had changed.
+
+**The tell is `mtime`, not the hash.** Compare the test binary's modification time against the
+source file you changed:
+
+```bash
+stat -c '%y %n' runtime/src/launcher.rs "$CARGO_TARGET_DIR"/debug/deps/leader_is_shell-*
+```
+
+If the binary is older than the source, the run is measuring the previous state — whatever any
+hash says.
+
+**Why it belongs beside DEFECT_CLASSES 18.** The verification loop's weaken/restore step is
+exactly where this bites: restore, re-run, observe green, conclude the restore worked — when
+what was measured was the un-restored build. **A restore verified only by "the test is green
+again" was already known to be unproven; this is a second way for the same green to lie.**
+
+**Foreclosing primitive.** Discipline: after any weaken/restore that touches a *library*
+crate, force the dependent test binary to rebuild (touch the test source, or `cargo clean -p`
+the crate) and confirm by `mtime` before believing the run.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1678,3 +1749,5 @@ the diagnosis, alongside the hypotheses it pre-empted.
 | 26. Captured observation read as a present-tense claim | **remove the stale value from scope** (do not pass `revents` across a syscall); one re-polling witness where only death returns early; inject sequences to test it | **Extracted** (mechanism, after three rules failed) |
 | 27. Two correct fixes, unsound interaction | ask per pair: **does this fix rely on an invariant another fix in the same change removes?**; prefer a kernel guarantee (pidfd) over a maintained invariant (raw pid + zombie); check the seam mechanically | Discipline + mechanism |
 | 28. Re-deriving a documented mechanism | discipline: grep the repo (**component name + error string**) BEFORE the first hypothesis, not after the third dies | Discipline |
+| 29. Exhaustion presents as flakiness | tear down at the layer that OWNS the resource (`loginctl terminate-user` before `userdel`); count the resource across N PASSING iterations and assert delta 0 | Discipline |
+| 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |

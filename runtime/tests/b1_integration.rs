@@ -257,8 +257,11 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     let setup = Setup::new("h");
     let (uid, gid) = setup.ids();
 
-    let base = PathBuf::from(format!("/run/delphi-b1-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-b1-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
 
@@ -330,8 +333,11 @@ fn b1_token_expiry_blocks_the_assembled_loop() {
     }
     let setup = Setup::new("e");
     let (uid, gid) = setup.ids();
-    let base = PathBuf::from(format!("/run/delphi-b1exp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-b1exp-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");
@@ -400,8 +406,11 @@ fn b1_approve_a_execute_b_is_rejected() {
         eprintln!("SKIP b1_approve_a_execute_b: requires bwrap + unprivileged userns");
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/delphi-b1-aeb-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // RAII: removed on drop, INCLUDING the panic path. `dir` stays a PathBuf, so
+    // nothing downstream changes.
+    let _dir_tmp = tempfile::Builder::new().prefix("delphi-b1-aeb-")
+        .tempdir_in(std::env::temp_dir()).expect("tempdir");
+    let dir = _dir_tmp.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let result_a = dir.join("res_a");
     let result_b = dir.join("res_b");
@@ -457,8 +466,11 @@ fn b1_swap_after_canonicalize_runs_the_pinned_content() {
         eprintln!("SKIP b1_swap_proof: requires bwrap + unprivileged userns");
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/delphi-b1-swap-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // RAII: removed on drop, INCLUDING the panic path. `dir` stays a PathBuf, so
+    // nothing downstream changes.
+    let _dir_tmp = tempfile::Builder::new().prefix("delphi-b1-swap-")
+        .tempdir_in(std::env::temp_dir()).expect("tempdir");
+    let dir = _dir_tmp.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let result = dir.join("res");
     let exe = write_marker_exe(&dir, &result); // #!/bin/sh echo "$1" > result
@@ -500,8 +512,11 @@ fn b1_wrong_token_does_not_burn_the_approval() {
         eprintln!("SKIP b1_wrong_token: requires bwrap + unprivileged userns");
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/delphi-b1-burn-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // RAII: removed on drop, INCLUDING the panic path. `dir` stays a PathBuf, so
+    // nothing downstream changes.
+    let _dir_tmp = tempfile::Builder::new().prefix("delphi-b1-burn-")
+        .tempdir_in(std::env::temp_dir()).expect("tempdir");
+    let dir = _dir_tmp.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let result = dir.join("res");
     let exe = write_marker_exe(&dir, &result);
@@ -591,8 +606,11 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
         eprintln!("SKIP b1_shebang_arg: requires bwrap + unprivileged userns");
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/delphi-b1-arg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // RAII: removed on drop, INCLUDING the panic path. `dir` stays a PathBuf, so
+    // nothing downstream changes.
+    let _dir_tmp = tempfile::Builder::new().prefix("delphi-b1-arg-")
+        .tempdir_in(std::env::temp_dir()).expect("tempdir");
+    let dir = _dir_tmp.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let result = dir.join("res");
     // The "interpreter" records its FIRST arg — so if our exec passes the shebang arg,
@@ -655,8 +673,11 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
     let setup = Setup::new("b");
     // World-accessible staging: the dropped user execs the side bins; the daemon (root)
     // opens the exe + binds the work dir.
-    let stage = PathBuf::from(format!("/tmp/delphi-b1bin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
+    // RAII: removed on drop, INCLUDING the panic path. `stage` stays a PathBuf, so
+    // nothing downstream changes.
+    let _stage_tmp = tempfile::Builder::new().prefix("delphi-b1bin-")
+        .tempdir_in(std::env::temp_dir()).expect("tempdir");
+    let stage = _stage_tmp.path().to_path_buf();
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o777)).unwrap();
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &stage, "mshell");
@@ -706,8 +727,11 @@ fn b1_launcher_keeps_the_channel_out_of_the_ai() {
     }
     let setup = Setup::new("f");
     let (uid, gid) = setup.ids();
-    let base = PathBuf::from(format!("/run/delphi-b1fd-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-b1fd-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
 
@@ -777,8 +801,11 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
     }
     let setup = Setup::new("l");
     let (uid, gid) = setup.ids();
-    let base = PathBuf::from(format!("/run/delphi-b1l-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-b1l-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
 

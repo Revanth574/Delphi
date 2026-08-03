@@ -1683,6 +1683,47 @@ the delta is zero. A green suite is not evidence of no leak; only the count is.
 
 ---
 
+## 31. A teardown whose failure is unobservable is not cleanup — it is a hope  *(new — D0)*
+
+**Description.** Cleanup runs, fails, and says nothing. The failure is invisible **not because
+it is rare but because nothing looks**: the exit status is discarded, or the error text is
+inherited into a stream nobody reads. The leak then accumulates for as long as the code exists,
+and surfaces only when some *other* thing breaks against the exhausted resource.
+
+**Instance (grounded).** `b1_integration`'s `Setup::drop` ran
+`let _ = Command::new("userdel").arg(&self.user).status();`. The `let _` discarded the status.
+`userdel` had been failing — silently — **for the entire life of B1**. Measured when it finally
+surfaced: **333 stale accounts**, uid 1001–1377, across every tag the suite uses. They were
+removed in one bulk pass with **no refusals**, which confirms nothing had ever been holding
+them: they had simply never been removed.
+
+It surfaced only because a *different* failure (a stale session on the wrong VT) sent someone
+looking at system state at all.
+
+**Same family as the skip-count problem, and worse in degree.** Both are a green reporting on
+work not done. The skip count at least printed something a reader could have checked; this
+printed nothing, so there was no green to disbelieve — only an absence, and absences are not
+noticed.
+
+**Foreclosing rule — two clauses, and the second is what makes it a rule rather than advice:**
+
+> **A teardown that can fail MUST report its failure. If it cannot report, it must ASSERT.**
+
+A `Drop` cannot return a `Result`, which is exactly why `let _ =` is so tempting there — and
+exactly why the reporting obligation has to be stated: the language will not enforce it.
+
+**And capture the REASON, not just the fact.** The fix takes `userdel`'s stderr via `.output()`
+and prints it. Previously stderr was *inherited*, so the message existed but was buried in
+surrounding test output — which is why the cause had to be rediscovered from outside instead of
+being read at the moment it happened. **The difference between a reported failure and a
+self-diagnosing one is whether the next reader has to reproduce it.**
+
+**RED-proof shape.** Force the teardown to fail (hold the resource, revoke the permission) and
+assert the run *says so*. A teardown tested only on the path where it succeeds is untested —
+and that path is the common one, which is why this survives so long.
+
+---
+
 ## 29a. A resource-holder check must name the resource the SUBJECT uses  *(D0 lane run)*
 
 **Description.** A cleanup or precondition check is written while diagnosing one failure, and
@@ -1786,3 +1827,4 @@ the crate) and confirm by `mtime` before believing the run.
 | 29. Exhaustion presents as flakiness | tear down at the layer that OWNS the resource (`loginctl terminate-user` before `userdel`); count the resource across N PASSING iterations and assert delta 0 | Discipline |
 | 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |
 | 29a. Holder-check names the wrong resource | one shared checker matching the SUBJECT's resource on ANY location (`scripts/check-stale-test-sessions.sh`), used by every caller | **Extracted** |
+| 31. Teardown failure unobservable | a teardown that CAN fail must REPORT its failure; if it cannot report, it must ASSERT. Capture the reason (`.output()`), never `let _ = …status()` | Discipline |

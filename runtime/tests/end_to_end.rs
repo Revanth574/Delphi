@@ -128,8 +128,11 @@ fn one_biometric_action_through_1a_to_1d() {
     let (uid, gid) = setup.ids();
 
     // ---- 1a: the root daemon establishes the root-owned anchor. ----
-    let base = PathBuf::from(format!("/run/delphi-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-e2e-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let anchor_dir = ensure_runtime_dir(&base, &setup.user).expect("1a: anchor dir");
     let (_anchor, _listener) = bind_approval_socket(&anchor_dir, gid.as_raw()).expect("1a: anchor socket");
 

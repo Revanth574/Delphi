@@ -407,8 +407,11 @@ fn session_leader_is_the_shell_itself_r3_01c() {
     let setup = Setup::new("b1");
     let (uid, gid) = setup.ids();
 
-    let base = PathBuf::from(format!("/run/delphi-b1leader-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-b1leader-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
 
@@ -584,8 +587,11 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
 
     let setup = Setup::new("fd01");
     let (uid, gid) = setup.ids();
-    let base = PathBuf::from(format!("/run/delphi-fd01-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-fd01-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");
@@ -758,8 +764,11 @@ fn shell_child_drops_to_the_session_user_b3() {
 
     let setup = Setup::new("b3");
     let (uid, gid) = setup.ids();
-    let base = PathBuf::from(format!("/run/delphi-b3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-b3-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");
@@ -863,8 +872,11 @@ fn launch_kills_the_shell_when_a_later_step_fails_d0_r4_02() {
     let setup = Setup::new("r402");
     let (uid, gid) = setup.ids();
 
-    let base = PathBuf::from(format!("/run/delphi-r402-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-r402-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");
@@ -958,8 +970,11 @@ fn launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01() {
 
     let setup = Setup::new("p1");
     let (uid, gid) = setup.ids();
-    let base = PathBuf::from(format!("/run/delphi-p1-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
+    // nothing downstream changes.
+    let _base_tmp = tempfile::Builder::new().prefix("delphi-p1-")
+        .tempdir_in("/run").expect("tempdir");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
     let work = base.join("work");

@@ -21,7 +21,7 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{chown, fork, geteuid, ForkResult, Gid, Uid};
@@ -48,12 +48,15 @@ fn skip_if_not_root(name: &str) -> bool {
     false
 }
 
-fn unique_base(tag: &str) -> PathBuf {
-    PathBuf::from(format!("/run/delphi-anchor-test-{tag}-{}", std::process::id()))
-}
-
-fn cleanup(base: &Path) {
-    let _ = std::fs::remove_dir_all(base);
+/// A per-test base under `/run` that removes itself on drop, panic path included.
+///
+/// Returns the `TempDir` so the CALLER binds it — a returned path would drop the guard at
+/// the end of this function and delete the directory before the test could use it.
+fn unique_base(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("delphi-anchor-test-{tag}-"))
+        .tempdir_in("/run")
+        .expect("tempdir in /run")
 }
 
 /// Fork, drop to the test user in the child, run `attack`, and return the child's
@@ -109,8 +112,8 @@ fn anchor_is_unsubstitutable_yet_connectable() {
         return;
     }
 
-    let base = unique_base("both");
-    cleanup(&base);
+    let _base_tmp = unique_base("both");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, "session").expect("establish root-owned dir");
     let (paths, _listener) = bind_approval_socket(&dir, TEST_GID).expect("bind approval socket");
 
@@ -134,7 +137,6 @@ fn anchor_is_unsubstitutable_yet_connectable() {
         code
     });
 
-    cleanup(&base);
     assert_eq!(
         code, 0,
         "both halves must hold (bit0=unlink-breach, bit1=connect-failed); \
@@ -153,8 +155,8 @@ fn red_proof_user_owned_dir_lets_attacker_unlink() {
         return;
     }
 
-    let base = unique_base("red");
-    cleanup(&base);
+    let _base_tmp = unique_base("red");
+    let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, "session").expect("establish dir");
     let (paths, _listener) = bind_approval_socket(&dir, TEST_GID).expect("bind approval socket");
 
@@ -177,7 +179,6 @@ fn red_proof_user_owned_dir_lets_attacker_unlink() {
         }
     });
 
-    cleanup(&base);
     assert_eq!(
         code, 0,
         "RED-proof: with a user-owned directory the same-uid attacker MUST be able to \

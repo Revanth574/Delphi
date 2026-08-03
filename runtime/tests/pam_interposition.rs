@@ -259,11 +259,13 @@ fn run_pam_shared(user: &str, conv: SharedSurfaceConversation) -> bool {
 /// Run the experiment for one routing. Returns `(auth_ok, attacker_observed)`.
 fn run_experiment(routing: Routing, setup: &Setup) -> (bool, bool) {
     let pid = std::process::id();
-    let prompt_path = PathBuf::from(format!("/tmp/delphi-consent-prompt-{pid}-{}", routing.tag()));
-    let response_path =
-        PathBuf::from(format!("/tmp/delphi-consent-response-{pid}-{}", routing.tag()));
-    let _ = std::fs::remove_file(&prompt_path);
-    let _ = std::fs::remove_file(&response_path);
+    // Both files live inside ONE guarded dir, so the panic path removes them together.
+    let _tmp = tempfile::Builder::new()
+        .prefix(&format!("delphi-consent-{pid}-{}-", routing.tag()))
+        .tempdir()
+        .expect("tempdir");
+    let prompt_path = _tmp.path().join("prompt");
+    let response_path = _tmp.path().join("response");
     let (uid, gid) = setup.ids();
 
     let chan = matches!(routing, Routing::PrivateChannel).then(|| approval_socketpair().unwrap());

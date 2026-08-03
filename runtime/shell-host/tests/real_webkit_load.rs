@@ -224,15 +224,20 @@ fn run_host_inner(
 /// Build a bundle root containing `index.html` (+ optional asset) and return its path.
 /// The host serves these from its startup snapshot over the custom scheme — the production
 /// path, not a `file://` stand-in.
-fn bundle(name: &str, index_html: &str, asset: Option<(&str, &str)>) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("delphi-bundle-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&d);
+fn bundle(name: &str, index_html: &str, asset: Option<(&str, &str)>) -> tempfile::TempDir {
+    // Returned, not a path: the CALLER binds the guard, so the directory lives exactly as
+    // long as the test and is removed even when an assertion panics.
+    let t = tempfile::Builder::new()
+        .prefix(&format!("delphi-bundle-{name}-"))
+        .tempdir()
+        .expect("tempdir");
+    let d = t.path().to_path_buf();
     std::fs::create_dir_all(d.join("assets")).expect("mkdir");
     std::fs::write(d.join("index.html"), index_html).expect("write index");
     if let Some((n, body)) = asset {
         std::fs::write(d.join("assets").join(n), body).expect("write asset");
     }
-    d
+    t
 }
 
 const URL: &str = "delphi://shell/index.html";
@@ -251,7 +256,7 @@ fn control_inline_script_executes() {
         None,
     );
     assert_eq!(
-        run_host_with_bundle(URL, &d),
+        run_host_with_bundle(URL, d.path()),
         Outcome::Executed,
         "the harness itself is broken: an inline script did not reach native"
     );
@@ -277,7 +282,7 @@ fn external_module_script_executes() {
         Some(("mod.js", CANCEL_JS)),
     );
     assert_eq!(
-        run_host_with_bundle(URL, &d),
+        run_host_with_bundle(URL, d.path()),
         Outcome::Executed,
         "an external ES module did not execute — the emitted bundle would render a BLANK page \
          with no error anywhere. This is the fifth silent failure mode."
@@ -305,7 +310,7 @@ fn postmessage_reaches_native_without_aborting() {
         &format!("<!doctype html><body><script>{CANCEL_JS}</script></body>"),
         None,
     );
-    let outcome = run_host_with_bundle(URL, &d);
+    let outcome = run_host_with_bundle(URL, d.path());
     assert_ne!(
         outcome,
         Outcome::Died(6),
@@ -345,9 +350,9 @@ setTimeout(function () {{
 </script></body>"#
     );
     let d = bundle("snapshot-auth", &html, None);
-    let sneak = d.join("sneaked.js");
+    let sneak = d.path().join("sneaked.js");
     assert_eq!(
-        run_host_mutating_root_after_start(URL, &d, move || {
+        run_host_mutating_root_after_start(URL, d.path(), move || {
             let _ = std::fs::write(&sneak, "0;");
         }),
         Outcome::Executed,
@@ -367,8 +372,10 @@ fn empty_bundle_refuses_to_start() {
     if !preconditions_met() {
         return;
     }
-    let d = std::env::temp_dir().join(format!("delphi-bundle-empty-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+    let _t = tempfile::Builder::new().prefix("delphi-bundle-empty-").tempdir().expect("tempdir");
+    let d = _t.path().to_path_buf();
+    // NOTE: `d` is a PathBuf here (not a TempDir), so callers below pass `&d`, unlike the
+    // `bundle()` sites which hand back the guard itself.
     std::fs::create_dir_all(&d).expect("mkdir");
     let outcome = run_host_with_bundle(URL, &d);
     assert!(
@@ -384,8 +391,8 @@ fn bundle_without_index_refuses_to_start() {
     if !preconditions_met() {
         return;
     }
-    let d = std::env::temp_dir().join(format!("delphi-bundle-noindex-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+    let _t = tempfile::Builder::new().prefix("delphi-bundle-noindex-").tempdir().expect("tempdir");
+    let d = _t.path().to_path_buf();
     std::fs::create_dir_all(d.join("assets")).expect("mkdir");
     std::fs::write(d.join("assets/x.js"), "0;").expect("write");
     let outcome = run_host_with_bundle(URL, &d);
@@ -440,8 +447,8 @@ fn the_real_vite_bundle_executes_and_registers_the_consent_surface() {
         return;
     };
 
-    let d = std::env::temp_dir().join(format!("delphi-realbundle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+    let _t = tempfile::Builder::new().prefix("delphi-realbundle-").tempdir().expect("tempdir");
+    let d = _t.path().to_path_buf();
     std::fs::create_dir_all(d.join("assets")).expect("mkdir");
     for entry in std::fs::read_dir(src.join("assets")).expect("read assets") {
         let e = entry.expect("entry");

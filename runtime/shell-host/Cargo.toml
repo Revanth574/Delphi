@@ -41,4 +41,8 @@ serde_json = "1"
 sha2 = "0.10"
 
 # Own workspace root — decouples this crate (and its GUI dep tree) from the main workspace.
+[dev-dependencies]
+# RAII temp dirs for the test bundles: cleanup on Drop, panic path included.
+tempfile = "3"
+
 [workspace]

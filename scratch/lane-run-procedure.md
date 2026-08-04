@@ -169,10 +169,12 @@ followed. Sessions outlive their last process; the session, not the process, hol
 git -C /home/revanth-aditya/Delphi diff --stat runtime/src/launcher.rs   # expect: empty — revert FIRST
 ```
 ```bash
-scripts/check-stale-test-sessions.sh
+scripts/check-stale-test-sessions.sh --vt tty1
 ```
 
-The script is the check: it matches **any logind session owned by a `delphi-*` or `db1*` user on
+`--vt tty1` because the tests run on tty1 — the weaken's survivor was on tty1 while the old
+cleanup looked at tty3. The bare form (any VT, keyed on our PAM service) is the go/no-go gate;
+this per-VT form is the one to use here. The script is the check: it matches **any logind session owned by a `delphi-*` or `db1*` user on
 any VT**, prints the `terminate-user` command per user, and also reports leftover accounts as a
 secondary signal. Run it until it prints `no stale test sessions or accounts`.
 
@@ -184,6 +186,36 @@ sudo loginctl terminate-session <session-id>   # then re-check; if it persists, 
 
 Do **not** start the next suite until the script is clean. A held VT makes every launch fail at
 `pam_open_session`, which looks exactly like a PAM regression and is not one.
+
+---
+
+## 3b. R6-03 — Codex's acceptance criterion, verbatim
+
+`pam_interposition`'s shared consent dir was moved into a `tempfile::TempDir` (item 5) and
+regressed: `tempdir()` is **0700 root-owned**, and the privilege-dropped child could no longer
+create the response file. The fix (`chown` to the session uid/gid, `chmod 0770`) was reviewed
+in round 7 and judged **mechanically sound by inspection, with the mechanics cited** — uid
+ownership plus `0770` gives write+execute; `setgroups([])` clears only *supplementary* groups
+while `setgid(gid)` sets the primary; nothing is created in the dir before the `chown`; and
+`Service=` is retained through `closing`.
+
+**That is inspection judgement, NOT behavioural evidence, and it was stated as such.** The
+settling measurement is below — and it is a better acceptance criterion than "the tests pass",
+because a skip also passes:
+
+```bash
+sudo -E cargo test -p delphi-runtime --test pam_interposition -- --nocapture --test-threads=1
+```
+
+**Discharged only when ALL of these hold:**
+
+1. **both** `pam_interposition` tests **execute** — no `SKIP` on either line;
+2. the **privilege-dropped child creates `response`** in the shared dir;
+3. **PAM authenticates** over the private channel;
+4. the **RED attacker observes the prompt** (the red-proof leg still bites);
+5. the **temp dir is absent afterward** — check the parent of the path named in the output.
+
+Any one of these missing means the fix is unproven, whatever the test result line says.
 
 ---
 

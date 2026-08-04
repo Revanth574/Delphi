@@ -57,9 +57,26 @@ jobs:
           actual=$(scripts/test-count.sh --workspace | grep -oE '^EXECUTED [0-9]+' | grep -oE '[0-9]+')
           [ -z "$actual" ] && { echo "::error::count extraction yielded empty — output format changed?"; exit 1; }
           echo "$actual" | grep -qE '^[0-9]+$' || { echo "::error::count not an integer: '$actual'"; exit 1; }
-          baseline=$(grep -oE '^[0-9]+' .github/rust-test-count-baseline | head -1)
-          [ "$actual" -lt "$baseline" ] && { echo "::error::count $actual dropped below floor $baseline — a test silently disappeared (DEFECT_CLASSES 7 & 10). If intentional, lower .github/rust-test-count-baseline with a justification (see its protocol header)"; exit 1; }
-          echo "test count $actual >= floor $baseline ✓"
+          # D0-R7-01 — EQUALITY, not a floor. A floor with "count goes up freely" cannot
+          # detect a disappearance while the total is above it, and the recorded 1891 predates
+          # the entire runtime crate, so the margin was scores of tests wide: one newly
+          # SKIPPED test stayed green indefinitely. The mechanism was fixed in D0-R6 (executed,
+          # not reported) and the blindness survived in the THRESHOLD — the third form of this
+          # bug in one file. Equality makes every change to the executed count deliberate.
+          expected=$(grep -oE '^[0-9]+' .github/rust-test-count-baseline | head -1)
+          if [ -z "$expected" ]; then
+            echo "::error::.github/rust-test-count-baseline holds no number. It must record the"
+            echo "::error::EXACT executed-test count. This run measured: $actual"
+            exit 1
+          fi
+          if [ "$actual" -ne "$expected" ]; then
+            echo "::error::executed-test count is $actual, recorded is $expected."
+            echo "::error::LOWER than recorded => a test disappeared or started SKIPPING."
+            echo "::error::HIGHER => tests were added; update the file in the same commit."
+            echo "::error::Either way this is deliberate work, not a threshold to drift past."
+            exit 1
+          fi
+          echo "executed-test count $actual == recorded $expected ✓"
 
       - name: Install cargo-audit + cargo-deny (prebuilt)
         uses: taiki-e/install-action@v2

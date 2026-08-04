@@ -120,7 +120,10 @@ fi
 if [ -n "${DELPHI_MIN_MS_PER_TEST:-}" ]; then
     # A mistyped, zero or negative floor previously disabled the check while still exiting 0
     # (D0-R6-07) — the caller believes a floor is enforced and none is.
-    if ! [[ "$DELPHI_MIN_MS_PER_TEST" =~ ^[0-9]+$ ]] || [ "$DELPHI_MIN_MS_PER_TEST" -le 0 ]; then
+    # D0-R7-06: `^[0-9]+$` accepts a 30-digit value, and the `-le` comparison then fails with
+    # "integer expected" — a shell error, not a refusal, so the script CONTINUED and exited 0
+    # with the floor silently disabled. Bound the length before comparing.
+    if ! [[ "$DELPHI_MIN_MS_PER_TEST" =~ ^[0-9]{1,9}$ ]] || [ "$DELPHI_MIN_MS_PER_TEST" -le 0 ]; then
         REFUSE "DELPHI_MIN_MS_PER_TEST='$DELPHI_MIN_MS_PER_TEST' is not a positive integer. \
 A floor that silently does not apply is worse than none, because the caller believes it does."
     fi

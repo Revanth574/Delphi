@@ -61,16 +61,26 @@ while read -r sid _rest; do
     [ -n "$sid" ] || continue
     props=$(loginctl show-session "$sid" -p Service -p TTY -p Name -p State 2>&1)
     if [ $? -ne 0 ]; then
-        # A session that vanished between listing and inspection is fine; anything else is not.
-        printf '%s' "$props" | grep -qi 'not.*known\|No such' && continue
-        REFUSE "loginctl show-session $sid failed: ${props}"
+        # A session that vanished between listing and inspection is benign; ANYTHING else is a
+        # refusal. D0-R7-02: the first version matched the substring `No such`, which also
+        # matches `Failed to connect to bus: No such file or directory` — a total loss of
+        # logind was classified as "the session went away" and the script exited 0. The match
+        # is now anchored to the exact message logind emits for an unknown session.
+        if printf '%s' "$props" | grep -qiE '^(Failed to get session:|.*Unit .* not loaded).*[Nn]o such (session|unit)'; then
+            continue
+        fi
+        REFUSE "loginctl show-session $sid failed — cannot determine whether it holds a VT: ${props}"
     fi
     svc=$(printf '%s\n' "$props" | sed -n 's/^Service=//p')
     tty=$(printf '%s\n' "$props" | sed -n 's/^TTY=//p')
     who=$(printf '%s\n' "$props" | sed -n 's/^Name=//p')
     state=$(printf '%s\n' "$props" | sed -n 's/^State=//p')
-    # Parse must succeed. An empty Service on a real session means the format moved.
-    [ -n "$svc$tty" ] || REFUSE "could not parse session $sid (Service/TTY both empty)"
+    # D0-R7-03: this was `[ -n "$svc$tty" ]` — CONCATENATION, satisfied by EITHER field, so a
+    # session with no `Service=` sailed through the check meant to catch exactly that. Both
+    # properties are required, because Service is the key the match relies on.
+    [ -n "$svc" ] || REFUSE "session $sid reports no Service= — the property this check keys \
+on is missing, so its verdict would be meaningless. Format change, or a logind too old."
+    [ -n "$tty" ] || tty="(none)"
 
     match=""
     [ "$svc" = "$PAM_SERVICE" ] && match="service=$svc"

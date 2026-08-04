@@ -34,7 +34,7 @@ path = "src/bin/delphi-minimal-ai.rs"
 # Self-dependency so the integration tests get the fixture feature without it ever being
 # a default of the shipped library.
 delphi-runtime = { path = ".", features = ["test-fixtures"] }
-# RAII temp dirs: cleanup on Drop, INCLUDING the panic path. Test-only.
+# (also declared as an OPTIONAL dependency below so the `test-fixtures` lib module can use it)
 tempfile = { workspace = true }
 
 [dependencies]
@@ -64,6 +64,10 @@ pam-client2 = "0.5"
 # B1: the AI↔daemon general-socket wire is protobuf (the project's IPC law; B2's
 # real Brain reuses the wire unchanged). prost-generated message types.
 prost = { workspace = true }
+# OPTIONAL, enabled only by `test-fixtures`: the ReportingTempDir helper lives in the lib
+# (so integration crates can reach it) and therefore cannot use a dev-dependency. Not built
+# for production, because the feature is not default.
+tempfile = { workspace = true, optional = true }
 
 [build-dependencies]
 # B1: compile runtime/proto/runtime_wire.proto into Rust types.
@@ -78,4 +82,4 @@ insecure-test-seams = []
 # D0-R5-05: exposes `test_child_guard` to the integration-test crates, which cannot see
 # `#[cfg(test)]` items. INERT if accidentally enabled in a production build — the module
 # defines a type nothing on a production path constructs. See its module docs.
-test-fixtures = []
+test-fixtures = ["dep:tempfile"]

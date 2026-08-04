@@ -133,6 +133,9 @@ impl Setup {
     /// presents as a bare panic easily misread as the test's own verdict. Observed exactly
     /// once, as FD-01 "failing" with no `B1-ASSERTION-EXECUTED(FD-01)` line at all.
     fn new(tag: &str) -> Self {
+        // Centralised here rather than at each call site (D0-R7-05) — one construction site,
+        // and a new test cannot omit it.
+        crate::assert_no_stale_session_on_test_vt();
         let user = format!("delphi-{tag}-{}", std::process::id());
         // A previous run that failed to reap may have leaked this exact account; clear it so
         // a stale leftover cannot fail an otherwise-valid run. GUARD on existence first: an
@@ -189,11 +192,22 @@ impl Drop for Setup {
         // covers processes; this covers the SESSION, which is the thing that holds the VT and
         // the thing `userdel` refuses over.
         for _ in 0..40 {
-            let busy = Command::new("loginctl")
+            // D0-R7-04: `.unwrap_or(false)` mapped a FAILED loginctl to "no session", so a
+            // spawn failure or a dead bus read as clean and userdel proceeded immediately.
+            // An unknown answer is treated as BUSY — the poll then times out and the
+            // userdel path reports, which is the loud outcome rather than the quiet one.
+            //
+            // The match is on the WHOLE user field, not a substring: `db1f16` is a substring
+            // of `db1f1605`, so `contains` could report a different test's session as ours.
+            let busy = match Command::new("loginctl")
                 .args(["list-sessions", "--no-legend"])
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains(self.user.as_str()))
-                .unwrap_or(false);
+            {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(2) == Some(self.user.as_str())),
+                _ => true, // unknown => assume busy, never "clean"
+            };
             if !busy {
                 break;
             }
@@ -343,6 +357,11 @@ fn reap_children(shell_pid: i32, ai_pid: i32, uid: Uid) {
 /// The VT handed to PAM as `PAM_TTY`. Overridable because VT availability is a property of
 /// the machine, not of the test; `tty1` is the default since the dev lane's own session sits
 /// on `tty2` (§4 R3-02a: naming a VT does not take it over — it only labels the session).
+/// Entry assertion for this binary's VT — see `test_child_guard::assert_no_stale_session_on`.
+fn assert_no_stale_session_on_test_vt() {
+    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
+}
+
 fn test_vt() -> VtName {
     let name = std::env::var("DELPHI_TEST_VT").unwrap_or_else(|_| "tty1".to_string());
     VtName::new(&name).expect("DELPHI_TEST_VT must be a valid ttyN")
@@ -418,14 +437,14 @@ fn session_leader_is_the_shell_itself_r3_01c() {
         return;
     }
 
-    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("b1");
     let (uid, gid) = setup.ids();
 
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
     // nothing downstream changes.
-    let _base_tmp = tempfile::Builder::new().prefix("delphi-b1leader-")
-        .tempdir_in("/run").expect("tempdir");
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-b1leader-")
+        .tempdir_in("/run").expect("tempdir"));
     let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
@@ -600,13 +619,13 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
         return;
     }
 
-    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("fd01");
     let (uid, gid) = setup.ids();
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
     // nothing downstream changes.
-    let _base_tmp = tempfile::Builder::new().prefix("delphi-fd01-")
-        .tempdir_in("/run").expect("tempdir");
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-fd01-")
+        .tempdir_in("/run").expect("tempdir"));
     let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
@@ -778,13 +797,13 @@ fn shell_child_drops_to_the_session_user_b3() {
         return;
     }
 
-    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("b3");
     let (uid, gid) = setup.ids();
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
     // nothing downstream changes.
-    let _base_tmp = tempfile::Builder::new().prefix("delphi-b3-")
-        .tempdir_in("/run").expect("tempdir");
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-b3-")
+        .tempdir_in("/run").expect("tempdir"));
     let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
@@ -886,14 +905,14 @@ fn launch_kills_the_shell_when_a_later_step_fails_d0_r4_02() {
         );
         return;
     }
-    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("r402");
     let (uid, gid) = setup.ids();
 
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
     // nothing downstream changes.
-    let _base_tmp = tempfile::Builder::new().prefix("delphi-r402-")
-        .tempdir_in("/run").expect("tempdir");
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-r402-")
+        .tempdir_in("/run").expect("tempdir"));
     let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
@@ -986,13 +1005,13 @@ fn launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01() {
         return;
     }
 
-    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("p1");
     let (uid, gid) = setup.ids();
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
     // nothing downstream changes.
-    let _base_tmp = tempfile::Builder::new().prefix("delphi-p1-")
-        .tempdir_in("/run").expect("tempdir");
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-p1-")
+        .tempdir_in("/run").expect("tempdir"));
     let base = _base_tmp.path().to_path_buf();
     let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
     let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");

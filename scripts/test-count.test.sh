@@ -146,6 +146,13 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 '
 check "the skipped-test LIST is populated, not empty" "SKIP alpha" "$OUT" 0 "$RC"
 
+# D0-R7-06: an oversized numeric floor passed the regex, then `-le` errored with "integer
+# expected" and the script CONTINUED — exiting 0 with the floor silently disabled.
+run_with_floor 999999999999999999999999999999 'running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+'
+check "an oversized floor REFUSES (must not disable itself)" "not a positive integer" "$OUT" 2 "$RC"
+
 # ── 8. THE ANTI-CLASS-25 CASE: parse a REAL captured libtest log ───────────────────────
 # The first version of this file invented its fixture format, and the invented format did not
 # match libtest's. The parser passed six synthetic cases while missing every marker in real

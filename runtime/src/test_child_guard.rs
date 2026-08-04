@@ -103,3 +103,53 @@ pub fn assert_no_stale_session_on(vt: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A temp dir whose cleanup FAILURE is reported (D0-R7-07).
+///
+/// # Why a reporting Drop rather than an explicit `TempDir::close()`
+///
+/// `close()` returns a `Result` and is the stronger check — but it only runs on the path
+/// where it is called, i.e. the success path, and putting it before a test's assertions is
+/// exactly the cleanup-before-assert ordering that once left a `pause()`ing child holding
+/// cargo's capture pipes and WEDGED the harness. Twenty-plus call sites each needing it as
+/// the last statement is a rule that will be forgotten, and forgotten silently.
+///
+/// So the removal is attempted on **every** path, including panics, and a failure is
+/// **reported** rather than discarded — which is what `DEFECT_CLASSES` 31 requires ("a
+/// teardown that can fail must report its failure"). `TempDir`'s own `Drop` discards the
+/// error; that discard is the whole defect.
+pub struct ReportingTempDir(Option<tempfile::TempDir>);
+
+impl ReportingTempDir {
+    /// Wrap a `TempDir` so its removal failure becomes visible.
+    #[must_use]
+    pub fn new(inner: tempfile::TempDir) -> Self {
+        Self(Some(inner))
+    }
+
+    /// The path, for handing to the code under test.
+    ///
+    /// # Panics
+    ///
+    /// If called after the value was consumed — a programming error.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        self.0.as_ref().expect("ReportingTempDir used after close").path()
+    }
+}
+
+impl Drop for ReportingTempDir {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            let p = inner.path().to_path_buf();
+            if let Err(e) = inner.close() {
+                eprintln!(
+                    "WARN: could not remove the temp dir {} — it has LEAKED: {e}. \
+                     Left unreported this is DEFECT_CLASSES 31 (a teardown whose failure is \
+                     unobservable); reported, it is a fact you can act on.",
+                    p.display()
+                );
+            }
+        }
+    }
+}

@@ -1,47 +1,62 @@
-# Lane run — scoped procedure (D0 branch `phase-3b/d0-readiness-contract`)
+# Lane run 2 — scoped procedure (branch `phase-3b/d0-readiness-contract`, HEAD `c61fc1a`)
 
-Discharges owed items 1–4. Item 5 (deferred temp paths) is **not** discharged here; it becomes
-*verifiable* afterwards. Nothing below has been run — this is the plan, to be executed by the
-operator on the seated lane.
+**Run 1 discharged items 1–4.** This run exists because rounds 6 and 7 landed **behaviour
+claims with no behavioural evidence** — root-gated fixes that were compile-verified only, which
+is the same route by which the regression they fix arrived. Nothing below re-litigates run 1;
+it settles what has changed since.
+
+What this run settles, in priority order:
+
+| | Claim | Why it needs a lane |
+|---|---|---|
+| **A** | **R6-03** — `chown`+`0770` on the `pam_interposition` temp dir | the fix for a review-found regression, returning by the same compile-only route |
+| **B** | **R7-05 / R6-11** — the per-test entry assertion attributes a leak to its *causer* | the whole point is what happens at the SECOND test after a leak; unobservable off-lane |
+| **C** | **R6-04 / R7-04** — `Setup::drop` polls the session away before `userdel` | run 1 leaked one account per iteration; this is the fix, unproven |
+| **D** | **R7-02/03** — the checker's anchored `Service=`/`TTY=` parse against a REAL seat | off-lane it has no real session to parse; a spurious refusal here is a defect |
+| **E** | **R7-07** — `ReportingTempDir` reports a removal failure | root-created, uid-owned children under a root temp dir |
+| **F** | **regression** — B-1 / FD-01 / B-3 still 30/30 serial at this HEAD | item 5 rewrote 22 temp-dir sites underneath them |
+| **G** | *conditional* — the workspace test-count pair | fills `.github/rust-test-count-baseline`, which is deliberately UNRECORDED |
 
 ---
 
 ## 0. GO / NO-GO — run this block FIRST, in full, before anything expensive
 
-Build + install is minutes. Discovering a stale marker or an occupied VT *after* it costs the
-whole sequence, and this session has already spent a day on failures that were preconditions
-misattributed to code. **One block, all five, before the first build.**
+Build + install is minutes; discovering an occupied VT after it costs the sequence. Run 1 spent
+a day on preconditions misattributed to code.
 
 ```bash
 {
+  VT=$(grep -oE 'DELPHI_SHELL_VT=tty[0-9]+' installer/staging/delphi-runtimed@.service | cut -d= -f2)
+  TVT=${DELPHI_TEST_VT:-tty1}   # what Setup::new asserts on; leader_is_shell.rs:366
   echo "P1 root:      $([ "$(id -u)" = 0 ] && echo OK || echo 'NO — re-run under sudo -E')"
-  echo "P2 VT free:   $(grep -oE 'DELPHI_SHELL_VT=tty[0-9]+' installer/staging/delphi-runtimed@.service) \
-                       -> $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $NF}' | grep -qx tty3 && echo 'OCCUPIED — STOP' || echo free)"
+  echo "P2 VT free:   unit=$VT  tests=$TVT"
+  for v in "$VT" "$TVT"; do
+    loginctl list-sessions --no-legend 2>/dev/null | awk '{print $NF}' | grep -qx "$v" \
+      && echo "   $v OCCUPIED — STOP" || echo "   $v free"
+  done
   echo "P3 display:   ${DISPLAY:-<none>} ${WAYLAND_DISPLAY:-}"
-  echo "P4 space:"; scripts/check-free-space.sh || echo "  *** STOP ***"
+  echo "P4 space:";  scripts/check-free-space.sh || echo "  *** STOP ***"
   echo "P5 marker:    $([ -e /tmp/delphi-p3-marker ] && echo 'PRESENT — rm -f /tmp/delphi-p3-marker' || echo absent)"
   echo "P6 userns:    restrict=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null) \
                        profile=$(aa-status 2>/dev/null | grep -c delphi-shell)"
-  echo "P7 stale:"; scripts/check-stale-test-sessions.sh || echo "  *** STOP ***"
+  echo "P7 stale:";  scripts/check-stale-test-sessions.sh || echo "  *** STOP ***"
+  echo "P8 accounts: $(getent passwd | grep -cE '^(delphi-|db1|dsmoke|dpam|de2e)') leftover (record it — it is the DELTA that matters)"
 }
 ```
 
-**Every line must read OK / free / absent before proceeding.** P6 is informational: `restrict=1`
-with `profile=0` means `real_webkit_load` will abort rather than skip — install has not run yet,
-which is expected at this point but must be true again *after* step 1.
+**Every line must read OK / free / absent before proceeding.** Two notes:
 
-| # | Precondition | Why it stops the run |
-|---|---|---|
-| P1 | root | PAM, `/run` anchor, `/usr/libexec` |
-| P2 | `tty3` free | an occupied VT gives `VirtualTerminalAlreadyTaken`, one layer below the gate |
-| P3 | a display | `real_webkit_load` skips without one — **and the skip reports as `ok`** |
-| P4 | free space on all four | `/tmp` filling surfaces as a protoc *build* error in an unrelated crate |
-| P5 | no stale `/tmp/delphi-p3-marker` | a surviving marker makes a FAILED run read as success |
-| P7 | **no surviving test session on ANY VT** | a session left by a previous run makes every launch fail `VirtualTerminalAlreadyTaken` — **a precondition failure that presents as a code regression.** Measured: it cost three wrong diagnoses (blamed a just-landed cleanup fix, then PAM) before the journal gave ground truth. |
+- **P2 now checks two VTs.** The unit's VT and `tty1` are different resources and run 1's
+  survivor was on the one the old block did not check.
+- **P8 is a baseline, not a gate.** Run 1's finding was 1 account leaked *per iteration*; claim
+  C is discharged by the **delta being 0**, so the number before matters as much as after.
+
+P6 is informational here: `restrict=1` with `profile=0` means `real_webkit_load` **aborts**
+rather than skips — expected before install, and must be non-zero after step 1.
 
 ---
 
-## 1. Ordering — and the one that will silently waste the run
+## 1. Ordering — and the one thing that will silently waste the run
 
 **`build.sh` → `sudo install.sh` → suites, with NO source edit in between.**
 
@@ -60,23 +75,19 @@ compares `env!("CARGO_BIN_EXE_delphi-shell")` against `/usr/libexec/delphi-shell
 - A plain `cargo test` resolves `CARGO_BIN_EXE` to the **debug** binary.
 
 So **`cargo test` without `--release` can never match, and all 7 tests skip — reporting `ok`.**
-Measured here: `built 4f03d5620e5b…` vs `installed 7b0250295a04…`. The suite must run as:
+Measured: `built 4f03d5620e5b…` vs `installed 7b0250295a04…`. The suite must run as:
 
 ```bash
 cd runtime/shell-host && CARGO_TARGET_DIR=$HOME/delphi-target/shell-host cargo test --release
 ```
 
-with the **same `CARGO_TARGET_DIR` `build.sh` used**, because that is what makes the test's
-binary the very file that was installed — byte-identical by construction, not by luck. Confirmed:
-`cargo test --release` resolved to `4f03d5620e5be427`, the exact file `build.sh` stages.
-
-Any source edit between build and test invalidates the match and re-skips all seven.
+with the **same `CARGO_TARGET_DIR` `build.sh` used** — that is what makes the tested binary the
+installed file by construction rather than by luck. Any source edit between build and test
+invalidates the match and re-skips all seven.
 
 ---
 
 ## 2. Counting and stability are DIFFERENT measurements — keep them apart
-
-They answer different questions and must not be merged in the report.
 
 **Counting — serial, once.** Serial because SKIP (stderr) interleaves with `test NAME ... ok`
 (stdout) under parallelism, which made the count drift 17/18/19 for one unchanged tree.
@@ -89,118 +100,30 @@ cd runtime/shell-host && CARGO_TARGET_DIR=$HOME/delphi-target/shell-host \
   DELPHI_MIN_MS_PER_TEST=100 ../../scripts/test-count.sh --release
 ```
 
-`DELPHI_MIN_MS_PER_TEST=100` is the **physical floor**, and it is the reason a repeat of the
-0.02s incident cannot pass silently: seven WebKit launches cannot average under 100ms, so a
-skipped suite REFUSES on the timing even if the SKIP parse misses every marker. Two independent
-signals — which matters, because the SKIP parse has already been wrong once.
+`DELPHI_MIN_MS_PER_TEST=100` is the **physical floor**: seven WebKit launches cannot average
+under 100ms, so an all-skipped suite REFUSES on timing even if the SKIP parse misses every
+marker. Two independent signals, because that parse has already been wrong once.
 
 Report as `EXECUTED n / SKIPPED m / reported n+m`. A bare total is not a coverage claim.
 
-**Stability — default parallel, ≥30.** Except the fork+PAM tests, which are **serial-only** per
-CLAUDE.md §6's carve-out: forking PAM from the multithreaded test runner is a harness hazard
-production does not have (production's daemon is single-threaded).
-
-```bash
-for i in $(seq 1 30); do cargo test -p delphi-runtime --lib || echo "FAIL $i"; done
-```
-```bash
-for i in $(seq 1 30); do cargo test -p delphi-runtime --test leader_is_shell -- --test-threads=1 || echo "FAIL $i"; done
-```
-
-Report the two separately, with the thread setting stated for each.
+**Stability — default parallel, ≥30**, except the fork+PAM tests, which are **serial-only** per
+CLAUDE.md §6's carve-out (forking PAM from the multithreaded test runner is a harness hazard
+production's single-threaded daemon does not have).
 
 ---
 
-## 3. The transaction-boundary test — the item that matters most
+## 3. Claim A — R6-03, in Codex's words
 
-`leader_is_shell::launch_kills_the_shell_when_a_later_step_fails_d0_r4_02`. It is the **only**
-test of the `launch()` transaction boundary, it has **never executed**, and Codex found (D0-R5-03)
-that its original form could pass without ever reaching `fork_ai`. R5-03's fix has also never run.
-
-**So this run is not "does it pass" — it is the first evidence the test discriminates at all.**
-
-```bash
-sudo -E cargo test -p delphi-runtime --test leader_is_shell -- --nocapture --test-threads=1 \
-  launch_kills_the_shell_when_a_later_step_fails
-```
-
-**A VALID PASS looks like:**
-- the line reads `test launch_kills_… ... ok` with **no `SKIP` on it**; and
-- no panic naming `expected a Filesystem error from fork_ai`.
-
-A pass means the assertion `Filesystem { path == missing_ai, source == NotFound }` matched — an
-error constructed at exactly one site (`spawn_pid`, via `fork_ai`) and reachable **only after
-readiness has already succeeded**. That is what proves the boundary was crossed.
-
-**A PASS THAT PROVES NOTHING looks like:**
-- `test launch_kills_… ... ok` **with `SKIP` on the same line** — a skip scores as a pass, so
-  without `--nocapture` this is indistinguishable from success. This is the single most likely
-  way to come away believing the item is discharged when it is not; and
-- a pass whose panic-free path was reached because the launch failed *earlier* (PAM, setup,
-  readiness) — which the pre-R5-03 `is_err()` form accepted. If the assertion has been reverted,
-  a pass is vacuous.
-
-**RECOMMENDED, and it is what turns the test from green into evidence — the weaken.** The test
-has never been RED-proven. Disarm the guard and confirm the test FAILS:
-
-```bash
-# in runtime/src/launcher.rs, ShellGuard::drop — make it return immediately:
-#     fn drop(&mut self) { return; ... }
-sudo -E cargo test -p delphi-runtime --test leader_is_shell -- --test-threads=1 \
-  launch_kills_the_shell_when_a_later_step_fails
-# EXPECT: FAILED, naming a surviving pid executing the sleeper. Then REVERT the edit.
-```
-
-If it passes under the weaken, the test is decorative and the boundary is still untested.
-
-### 3a. MANDATORY cleanup after the weaken — check the SESSION, on ANY VT
-
-The weaken disarms the guard, so **a surviving shell is the point of the run**: a root-spawned
-process holding a **logind session**. Left there, every subsequent launch fails
-`VirtualTerminalAlreadyTaken` at `pam_open_session`.
-
-**THE FIRST VERSION OF THIS SECTION LOOKED FOR THE WRONG RESOURCE ON THE WRONG VT.** It checked
-for *processes on tty3*, because it was written for the weaken's tty3 scenario. The actual
-survivor was a **session on tty1** — `c523`, owned by `delphi-r402-119101` — and tty1 is the VT
-the tests actually use. The check found nothing, reported clean, and three wrong diagnoses
-followed. Sessions outlive their last process; the session, not the process, holds the VT.
-
-```bash
-git -C /home/revanth-aditya/Delphi diff --stat runtime/src/launcher.rs   # expect: empty — revert FIRST
-```
-```bash
-scripts/check-stale-test-sessions.sh --vt tty1
-```
-
-`--vt tty1` because the tests run on tty1 — the weaken's survivor was on tty1 while the old
-cleanup looked at tty3. The bare form (any VT, keyed on our PAM service) is the go/no-go gate;
-this per-VT form is the one to use here. The script is the check: it matches **any logind session owned by a `delphi-*` or `db1*` user on
-any VT**, prints the `terminate-user` command per user, and also reports leftover accounts as a
-secondary signal. Run it until it prints `no stale test sessions or accounts`.
-
-**If a session will not clear** — it is `closing` with a member that will not die:
-
-```bash
-sudo loginctl terminate-session <session-id>   # then re-check; if it persists, reboot the lane
-```
-
-Do **not** start the next suite until the script is clean. A held VT makes every launch fail at
-`pam_open_session`, which looks exactly like a PAM regression and is not one.
-
----
-
-## 3b. R6-03 — Codex's acceptance criterion, verbatim
-
-`pam_interposition`'s shared consent dir was moved into a `tempfile::TempDir` (item 5) and
-regressed: `tempdir()` is **0700 root-owned**, and the privilege-dropped child could no longer
-create the response file. The fix (`chown` to the session uid/gid, `chmod 0770`) was reviewed
-in round 7 and judged **mechanically sound by inspection, with the mechanics cited** — uid
-ownership plus `0770` gives write+execute; `setgroups([])` clears only *supplementary* groups
-while `setgid(gid)` sets the primary; nothing is created in the dir before the `chown`; and
+Item 5 replaced hand-rolled temp paths with `tempfile::TempDir`. Round 6 found the regression:
+`tempdir()` is **0700 root-owned**, so `pam_interposition`'s privilege-dropped child could no
+longer create the response file. The fix — `chown` to the session uid/gid, `chmod 0770` — was
+reviewed in round 7 and judged **mechanically sound by inspection, with the mechanics cited**:
+uid ownership plus `0770` gives write+execute; `setgroups([])` clears only *supplementary*
+groups while `setgid(gid)` sets the primary; nothing is created in the dir before the `chown`;
 `Service=` is retained through `closing`.
 
 **That is inspection judgement, NOT behavioural evidence, and it was stated as such.** The
-settling measurement is below — and it is a better acceptance criterion than "the tests pass",
+settling measurement is below, and it is a better acceptance criterion than "the tests pass",
 because a skip also passes:
 
 ```bash
@@ -215,26 +138,141 @@ sudo -E cargo test -p delphi-runtime --test pam_interposition -- --nocapture --t
 4. the **RED attacker observes the prompt** (the red-proof leg still bites);
 5. the **temp dir is absent afterward** — check the parent of the path named in the output.
 
-Any one of these missing means the fix is unproven, whatever the test result line says.
+Any one of these missing means the fix is unproven, whatever the result line says.
 
 ---
 
-## 4. Discharge criteria — what each owed item needs
+## 4. Claim B — the entry assertion, RED-proven on the lane
 
-| # | Item | Discharged when |
-|---|---|---|
-| 1 | **B-1 / FD-01 / B-3 serial ≥30** | 30/30 pass under `--test-threads=1`, 0 failures, against the marker-writing sleeper. A parallel failure is a harness artifact **only if shown** to be pre-`execve` child death (read the lines; do not assume). |
-| 2 | **Transaction boundary** | runs (not SKIP) **and** passes **and** fails under the weaken in §3. Two of three is not discharge. |
-| 3 | **WRY host readiness path** | **CORRECTED.** `sudo -E bash scratch/p3-daemon-run.sh tty3 <session-user>`. Discharged when there is **no** `ShellDiedBeforeReady` / `ShellReadyTimeout` **and** the run reaches a gate verdict with an explicit deny reason — reaching the gate proves `launch()` returned `Ok`, i.e. the marker arrived. **NO MARKER FILE IS WRITTEN and that is correct:** tty3 is not seat0's `ActiveSession`, so the gate denies by design; a marker would be a gate-POSITIVE, which is P3b and still blocked. The earlier "confirm the marker exists" criterion was wrong. |
-| 4 | **`real_webkit_load` (7)** | all 7 **run** (no `SKIP` on their lines under `--nocapture`) and pass, in `--release`. |
-| 5 | **Deferred temp paths** | **NOT discharged by this run.** It becomes verifiable afterwards: with the lane green, the ~23 conversions can be made and re-verified against a suite that actually executes them. |
+**This is the one measurement that cannot be faked off-lane, and it costs nothing extra**
+because §5's weaken already produces the survivor it needs.
+
+The claim under test is *not* "the assertion doesn't fire on a clean lane" (that is the negative
+and it proves little). It is: **after a leak, the NEXT test fails by NAME at entry, attributed
+to the previous test — instead of dying at `pam_open_session` with
+`VirtualTerminalAlreadyTaken`, which names neither cause nor culprit.** That failure mode cost
+run 1 nine consecutive red tests and three wrong diagnoses.
+
+Sequence, in this order, and **do not clean up between the two commands**:
+
+```bash
+# 1. the weaken from §5 leaves a live shell holding a session. Run it.
+# 2. THEN, with the survivor still there, run any other root test in the same crate:
+sudo -E cargo test -p delphi-runtime --test leader_is_shell -- --nocapture --test-threads=1 \
+  shell_child_drops_to_the_session_user_b3
+```
+
+**Discharged when** the failure message is the checker's — naming the stale session, its VT and
+the `terminate-session` command — and **not** `VirtualTerminalAlreadyTaken`. Record the literal
+message either way; if it is the PAM one, the assertion is not doing its job and that is the
+finding.
+
+Then clean up per §5a before anything else.
 
 ---
 
-## 5. Report back
+## 5. Claim F — the three regression tests, re-proven at this HEAD
 
-For each: the command, the literal `EXECUTED/SKIPPED/reported` or `n/30`, and — for item 2 —
-both the pass line **and** the weaken's failure line. Per §13.5, quote the output rather than
-summarising it, and state executed-vs-skipped rather than a total.
+Item 5 rewrote 22 temp-dir sites underneath these, and rounds 6–7 changed `Setup`. The ≥30
+serial run is the standing evidence for the security core; re-establish it here.
 
-If anything fails, the failure is the result; do not re-run to green.
+```bash
+for t in leader_is_shell; do
+  for i in $(seq 1 30); do
+    sudo -E cargo test -p delphi-runtime --test $t -- --test-threads=1 || echo "FAIL $i"
+  done
+done
+```
+
+Report `n/30` and the failure count, not "tests pass". A parallel failure is a harness artifact
+**only if shown** to be pre-`execve` child death — read the lines, do not assume.
+
+**The weaken (also feeding §4).** `ShellGuard::drop` in `runtime/src/launcher.rs` → make it
+return immediately, then:
+
+```bash
+sudo -E cargo test -p delphi-runtime --test leader_is_shell -- --test-threads=1 \
+  launch_kills_the_shell_when_a_later_step_fails
+# EXPECT: FAILED, naming a surviving pid executing the sleeper.
+```
+
+Confirm the edit is present before believing the result (`git diff --stat runtime/src/launcher.rs`
+must be non-empty). A weaken that silently did not apply reports on the shipped code.
+
+### 5a. MANDATORY cleanup after the weaken — check the SESSION, on ANY VT
+
+The weaken disarms the guard, so **a surviving shell is the point**: a root-spawned process
+holding a **logind session**. Left there, every later launch fails `VirtualTerminalAlreadyTaken`.
+
+**Run 1's version of this section looked for the wrong resource on the wrong VT** — processes on
+tty3, when the survivor was a *session* on tty1. Sessions outlive their last process; the
+session, not the process, holds the VT.
+
+```bash
+git -C /home/revanth-aditya/Delphi diff --stat runtime/src/launcher.rs   # expect EMPTY — revert FIRST
+```
+```bash
+scripts/check-stale-test-sessions.sh --vt "${DELPHI_TEST_VT:-tty1}"
+```
+
+Run until it prints `no stale session on …`. If one will not clear:
+
+```bash
+sudo loginctl terminate-session <session-id>   # then re-check; if it persists, reboot the lane
+```
+
+Do **not** start the next suite until it is clean.
+
+---
+
+## 6. Claims C, D, E — read off the runs above, no extra commands
+
+**C — teardown.** After §5's 30 iterations, re-run P8:
+
+```bash
+getent passwd | grep -cE '^(delphi-|db1|dsmoke|dpam|de2e)'
+scripts/check-stale-test-sessions.sh
+```
+
+**Discharged when both deltas are 0** against P8's baseline. Run 1 leaked one account per
+iteration, so 30 iterations is the measurement that has teeth. If `Setup::drop`'s poll times out
+it now REPORTS rather than proceeding silently (R7-04) — quote any such line; a timeout is a
+finding, not noise.
+
+**D — the checker against a real seat.** It ran in P7, P8 and §5a against a lane with real
+sessions on a real seat. **Discharged when it never refused spuriously** and its `Service=` /
+`TTY=` parse produced a verdict every time. A `REFUSING to certify` on a healthy lane is a
+defect in the checker (its parse), not a stale session — report the literal output.
+
+**E — `ReportingTempDir`.** Root creates the dir; the dropped child creates uid-owned files in
+it. **Discharged when no `TEMP DIR REMOVAL FAILED` line appears** across the runs above and §3's
+criterion 5 holds. If one does appear, it has done its job and the path it names is the finding.
+
+---
+
+## 7. Claim G — *conditional*, and only if the workspace builds here
+
+`.github/rust-test-count-baseline` deliberately records **no** counts: the old floor (1891)
+predates the `runtime` crate and is known wrong, and `cargo test --workspace` cannot run on the
+dev box because `compositor` needs graphics headers absent there. The lane may have them.
+
+```bash
+cargo test --workspace --no-run 2>&1 | tail -5    # if this fails on libudev/libseat/gbm, SKIP claim G
+```
+```bash
+scripts/ci-test-count-gate.sh --workspace         # will FAIL and print the pair to record
+```
+
+If it builds, paste the printed `EXECUTED=` / `SKIPPED=` pair into the baseline file. If it does
+not, say so — CI records it on its next run and that is the designed path, not a fallback.
+
+---
+
+## 8. Report back
+
+For each claim: the command, the literal `EXECUTED/SKIPPED/reported` or `n/30`, and for §4 and
+§5 the weaken's failure line as well. Per §13.5 quote the output rather than summarising, and
+state executed-vs-skipped rather than a total.
+
+**If anything fails, the failure is the result. Do not re-run to green** — and if a red looks
+like a harness problem, it is one only when *shown* to be (Iron Law #15 clause 5).

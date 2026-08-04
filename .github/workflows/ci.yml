@@ -38,7 +38,7 @@ jobs:
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: test (workspace) + executed-count floor guard
+      - name: test (workspace) + executed/skipped count gate
         # The count-guard catches silent test disappearance, so it must not have a
         # silent-failure mode of its own. Each cause is reported distinctly:
         # tests-failed (real exit via PIPESTATUS, not pipefail alone — the tee+grep
@@ -50,33 +50,10 @@ jobs:
           cargo test --workspace 2>&1 | tee test-output.log
           test_rc=${PIPESTATUS[0]}
           [ "$test_rc" -ne 0 ] && { echo "::error::cargo test failed (exit $test_rc) — not a count issue"; exit 1; }
-          # THE BARE TOTAL, in the gate built to catch disappearing tests (found in D0-R6).
-          # Summing `passed` counts SKIPS AS PASSES, so a test that starts skipping keeps the
-          # floor satisfied — exactly the disappearance this guard exists to catch. Use the
-          # extractor, which subtracts skips and refuses on an unparseable format.
-          actual=$(scripts/test-count.sh --workspace | grep -oE '^EXECUTED [0-9]+' | grep -oE '[0-9]+')
-          [ -z "$actual" ] && { echo "::error::count extraction yielded empty — output format changed?"; exit 1; }
-          echo "$actual" | grep -qE '^[0-9]+$' || { echo "::error::count not an integer: '$actual'"; exit 1; }
-          # D0-R7-01 — EQUALITY, not a floor. A floor with "count goes up freely" cannot
-          # detect a disappearance while the total is above it, and the recorded 1891 predates
-          # the entire runtime crate, so the margin was scores of tests wide: one newly
-          # SKIPPED test stayed green indefinitely. The mechanism was fixed in D0-R6 (executed,
-          # not reported) and the blindness survived in the THRESHOLD — the third form of this
-          # bug in one file. Equality makes every change to the executed count deliberate.
-          expected=$(grep -oE '^[0-9]+' .github/rust-test-count-baseline | head -1)
-          if [ -z "$expected" ]; then
-            echo "::error::.github/rust-test-count-baseline holds no number. It must record the"
-            echo "::error::EXACT executed-test count. This run measured: $actual"
-            exit 1
-          fi
-          if [ "$actual" -ne "$expected" ]; then
-            echo "::error::executed-test count is $actual, recorded is $expected."
-            echo "::error::LOWER than recorded => a test disappeared or started SKIPPING."
-            echo "::error::HIGHER => tests were added; update the file in the same commit."
-            echo "::error::Either way this is deliberate work, not a threshold to drift past."
-            exit 1
-          fi
-          echo "executed-test count $actual == recorded $expected ✓"
+          # The guard is a SCRIPT so it can be RED-proven against itself: inline shell can
+          # only be tested through a copy, and a copy that drifts is DEFECT_CLASSES 25.
+          # scripts/ci-test-count-gate.test.sh runs the same file this line runs.
+          scripts/ci-test-count-gate.sh --workspace
 
       - name: Install cargo-audit + cargo-deny (prebuilt)
         uses: taiki-e/install-action@v2

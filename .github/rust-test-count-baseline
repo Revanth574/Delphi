@@ -1,25 +1,27 @@
-# Rust workspace EXECUTED-test count — an EXACT value, not a floor.
+# Rust workspace test counts — EXACT values, not floors.
 #
-# CI requires `scripts/test-count.sh --workspace`'s EXECUTED figure to EQUAL this number.
+# Read by scripts/ci-test-count-gate.sh, which requires BOTH numbers from
+# `scripts/test-count.sh --workspace` to EQUAL what is recorded here.
 #
-# WHY EQUALITY (D0-R7-01). This was a FLOOR whose protocol said "count goes UP freely", and
-# the recorded 1891 predated the entire `runtime` crate — so the actual sat scores of tests
-# above it. One test that started SKIPPING stayed green indefinitely: exactly the
-# disappearance this file exists to catch. D0-R6 had already fixed the MEASUREMENT (executed,
-# not reported, since a skip scores as a pass) and the blindness simply moved into the
-# THRESHOLD. Third form of one bug in one file.
+#     EXECUTED=<n>
+#     SKIPPED=<n>
 #
-# Protocol:
-#   * Any change to the executed count — up OR down — updates this number IN THE SAME COMMIT,
-#     with the reason in the commit message. Additions are not exempt: an unexplained increase
-#     is as much a signal as a decrease.
-#   * A DECREASE needs an explicit justification (tests removed on purpose vs. tests that
-#     started skipping — the second is a defect wearing the first's clothes).
+# WHY EQUALITY, AND WHY BOTH (D0-R7-01)
+# This was a FLOOR whose protocol said "count goes UP freely", recorded as 1891 — a number
+# predating the entire `runtime` crate, so the actual sat scores of tests above it. A test that
+# started SKIPPING kept the floor satisfied forever: exactly the disappearance the guard exists
+# to catch. D0-R6 had already fixed the MEASUREMENT (executed, not reported — a skip scores as
+# a pass) and the blindness merely moved into the THRESHOLD. Third form of one bug in one file.
+# SKIPPED is recorded too because a lone total is satisfiable two ways: one test deleted while
+# another stops skipping leaves EXECUTED unchanged.
 #
-# VALUE UNMEASURED. The previous 1891 is known WRONG (pre-`runtime`), and `cargo test
-# --workspace` cannot run on the dev box — `compositor` needs graphics headers that are not
-# installed, so a workspace-wide count is not obtainable there. CI itself is the first
-# environment that can measure it: its next run will FAIL and print the actual figure, which
-# is then recorded here. Failing loudly with the real number beats carrying a number known to
-# be wrong.
-UNMEASURED
+# PROTOCOL
+#   * Any change to either number — up OR down — updates this file IN THE SAME COMMIT, with the
+#     reason in the message. An unexplained increase is as much a signal as a decrease.
+#   * A drop in EXECUTED needs the specific test named: removed on purpose, or started skipping?
+#     The second is a defect wearing the first's clothes.
+#
+# NOT YET RECORDED — DELIBERATE. 1891 is known wrong, and `cargo test --workspace` cannot run on
+# the dev box (`compositor` needs graphics headers that are absent there), so a workspace count
+# is not obtainable outside CI. With no keys below, the gate FAILS and prints the measured pair
+# to paste in. Failing loudly with the real number beats carrying one known to be wrong.

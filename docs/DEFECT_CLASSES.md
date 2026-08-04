@@ -317,6 +317,25 @@ it names**, exactly as a test must be RED-proven: this one had never been shown 
 test disappeared, so it had never been shown to work. CI now calls `scripts/test-count.sh`,
 which subtracts skips and refuses on an unparseable format.
 
+**AND THE FIX LEFT THE BLINDNESS IN PLACE, ONE COMPONENT OVER (D0-R7-01) — the third form of
+one bug in one file.** R6 fixed the **measurement** (executed, not reported) and left the
+**threshold** untouched: a FLOOR whose own protocol read "count goes UP freely", recorded as
+`1891`, a number predating the entire `runtime` crate. The actual sat scores of tests above it,
+so the newly-correct measurement was compared against a number it could not fall below — and a
+test that started skipping still passed. **Fixing the instrument does not fix the comparison
+the instrument feeds.** When a guard is found blind, ask which of its *stages* was blind and
+audit the others, because they were written under the same assumption.
+
+Now equality on **both** counts, extracted to `scripts/ci-test-count-gate.sh` — inline shell
+cannot be RED-proven except through a copy (Class 25), so the guard was moved into a file the
+RED suite can execute. **SKIPPED is compared too**: a single total is satisfiable two ways, and
+one test deleted while another stops skipping leaves EXECUTED unchanged. That is weaken (b) in
+`scripts/ci-test-count-gate.test.sh`; weaken (a) restores the floor and shows it passing a
+disappearance. **The recorded value is deliberately absent rather than guessed** — the old one
+is known wrong and a workspace count is not obtainable off-CI, so the gate fails on the next
+run and prints the pair to record. A number known to be wrong is worse than no number: it
+answers the question the guard was built to ask.
+
 **SURVIVORSHIP APPEARS INSIDE ITS OWN REMEDY (D0-R6-06).** The physical floor was added as a
 *second, independent* signal precisely because the SKIP parse had already been wrong. Its first
 implementation matched `finished in` **anywhere** in the output — so nested or quoted output

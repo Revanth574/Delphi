@@ -55,9 +55,12 @@ adoption is deferred to its own isolated `style(workspace)` commit.
 - Unit tests live with the code (`#[cfg(test)]`); integration tests in `crate/tests/`.
 - Every fix ships a regression test **proven to fail against the pre-fix code** and pass
   after. A test that passes against the buggy code is worse than no test.
-- CI enforces a workspace test-count floor ([`.github/rust-test-count-baseline`](.github/rust-test-count-baseline)):
-  the count may rise freely; a drop fails CI (a test silently disappeared). Lowering it
-  requires an explicit, justified commit.
+- CI enforces the workspace test counts EXACTLY
+  ([`.github/rust-test-count-baseline`](.github/rust-test-count-baseline)): both the EXECUTED
+  and the SKIPPED count must equal what is recorded, so **adding tests updates the file too**.
+  It was a floor until D0-R7-01, and a floor cannot see a test that starts skipping while the
+  total stays above it — which is what happened. Counts come from `scripts/test-count.sh`,
+  which subtracts skips, because libtest scores a skipped test as a pass.
 
 ## Git workflow
 

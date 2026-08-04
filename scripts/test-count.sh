@@ -69,6 +69,11 @@ if [ "$result_lines" -eq 0 ]; then
 This script does NOT fall back to a total (DEFECT_CLASSES 22)."
 fi
 
+# Every summary line must yield a passed-count. A malformed one silently contributed 0
+# before (D0-R6-05), which reads as a smaller suite rather than as a parse failure.
+malformed=$(grep -E '^test result:' "$log" | grep -cvE '[0-9]+ passed')
+[ "$malformed" -eq 0 ] || REFUSE "$malformed 'test result:' line(s) carry no passed-count — \
+the format may have changed; this script does not guess."
 reported=$(grep -E '^test result:' "$log" \
   | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}')
 [[ "$reported" =~ ^[0-9]+$ ]] || REFUSE "could not extract a passed-count ('$reported')"
@@ -88,7 +93,10 @@ fi
 executed=$(( reported - skipped ))
 
 # Test-execution time only (libtest's own per-binary figure), not build time.
-elapsed_ms=$(grep -oE 'finished in [0-9]+\.[0-9]+s' "$log" \
+# Only from `test result:` SUMMARY lines (D0-R6-06). Matching `finished in` anywhere let
+# nested or quoted output inflate the elapsed time, which RAISES the rate and so WEAKENS the
+# floor — a guard that fails open under noise.
+elapsed_ms=$(grep -E '^test result:' "$log" | grep -oE 'finished in [0-9]+\.[0-9]+s' \
   | grep -oE '[0-9]+\.[0-9]+' | awk '{s+=$1} END {printf "%d", s*1000}')
 [[ "$elapsed_ms" =~ ^[0-9]+$ ]] || REFUSE "could not extract an elapsed time ('$elapsed_ms')"
 
@@ -110,6 +118,12 @@ fi
 # THE PHYSICAL FLOOR. Independent of the SKIP parse by construction: it asks whether the work
 # could have happened in the time taken, not whether a marker was printed.
 if [ -n "${DELPHI_MIN_MS_PER_TEST:-}" ]; then
+    # A mistyped, zero or negative floor previously disabled the check while still exiting 0
+    # (D0-R6-07) — the caller believes a floor is enforced and none is.
+    if ! [[ "$DELPHI_MIN_MS_PER_TEST" =~ ^[0-9]+$ ]] || [ "$DELPHI_MIN_MS_PER_TEST" -le 0 ]; then
+        REFUSE "DELPHI_MIN_MS_PER_TEST='$DELPHI_MIN_MS_PER_TEST' is not a positive integer. \
+A floor that silently does not apply is worse than none, because the caller believes it does."
+    fi
     if [ "$executed" -eq 0 ]; then
         REFUSE "a floor of ${DELPHI_MIN_MS_PER_TEST}ms/test was declared but NOTHING executed"
     fi
@@ -123,7 +137,10 @@ fi
 
 if [ "$skipped" -gt 0 ]; then
     echo "--- the $skipped skipped test(s) returned early and were scored as passes ---"
-    grep -E '^(SKIP|DEFER) ' "$log" | cut -c1-110 | sed 's/^/  /'
+    # SAME anchor as the counting path above (D0-R6-09). It was fixed there and left here,
+    # so counts were right while this list was silently EMPTY under real serial output —
+    # one defect, two consumers, one of them fixed.
+    grep -E '^test .+ \.\.\. (SKIP|DEFER)' "$log" | cut -c1-110 | sed 's/^/  /'
 fi
 
 exit "$rc"

@@ -39,6 +39,7 @@
 use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -267,6 +268,14 @@ fn run_experiment(routing: Routing, setup: &Setup) -> (bool, bool) {
     let prompt_path = _tmp.path().join("prompt");
     let response_path = _tmp.path().join("response");
     let (uid, gid) = setup.ids();
+    // D0-R6-03. `tempdir()` is 0700 ROOT-OWNED; the previous bare `/tmp/...` paths inherited
+    // permissive defaults, and the child writes the response AFTER dropping to `uid`. That
+    // permissiveness was load-bearing and nobody had written it down, so a mechanically
+    // correct substitution broke it (DEFECT_CLASSES 32). Grant it explicitly.
+    std::os::unix::fs::chown(_tmp.path(), Some(uid.as_raw()), Some(gid.as_raw()))
+        .expect("chown the shared consent dir to the session user");
+    std::fs::set_permissions(_tmp.path(), std::fs::Permissions::from_mode(0o770))
+        .expect("chmod the shared consent dir");
 
     let chan = matches!(routing, Routing::PrivateChannel).then(|| approval_socketpair().unwrap());
 

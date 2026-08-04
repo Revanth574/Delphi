@@ -165,6 +165,20 @@ impl Drop for Setup {
         // NAIVE version — no session teardown, no wait, and a DISCARDED status, so a failure
         // here was invisible. It leaks the same way for the same reason.
         let _ = Command::new("loginctl").args(["terminate-user", &self.user]).status();
+        // D0-R6-04: `terminate-user` RETURNS BEFORE the sessions are gone. Deleting straight
+        // after it meant `userdel` raced the teardown and the `-f` escalation covered for it —
+        // which is an escalation masking a problem it should have reported.
+        for _ in 0..40 {
+            let busy = Command::new("loginctl")
+                .args(["list-sessions", "--no-legend"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(self.user.as_str()))
+                .unwrap_or(false);
+            if !busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         match Command::new("userdel").arg(&self.user).output() {
             Ok(o) if o.status.success() => {}
             Ok(o) => {

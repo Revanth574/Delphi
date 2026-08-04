@@ -50,7 +50,11 @@ jobs:
           cargo test --workspace 2>&1 | tee test-output.log
           test_rc=${PIPESTATUS[0]}
           [ "$test_rc" -ne 0 ] && { echo "::error::cargo test failed (exit $test_rc) — not a count issue"; exit 1; }
-          actual=$(grep -E 'test result: ok' test-output.log | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          # THE BARE TOTAL, in the gate built to catch disappearing tests (found in D0-R6).
+          # Summing `passed` counts SKIPS AS PASSES, so a test that starts skipping keeps the
+          # floor satisfied — exactly the disappearance this guard exists to catch. Use the
+          # extractor, which subtracts skips and refuses on an unparseable format.
+          actual=$(scripts/test-count.sh --workspace | grep -oE '^EXECUTED [0-9]+' | grep -oE '[0-9]+')
           [ -z "$actual" ] && { echo "::error::count extraction yielded empty — output format changed?"; exit 1; }
           echo "$actual" | grep -qE '^[0-9]+$' || { echo "::error::count not an integer: '$actual'"; exit 1; }
           baseline=$(grep -oE '^[0-9]+' .github/rust-test-count-baseline | head -1)

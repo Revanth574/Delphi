@@ -1779,6 +1779,12 @@ Before declaring any task, subtask, or phase complete, run this audit:
 ```bash
 set -o pipefail   # a piped cargo's failure must not be masked by tee/tail — see the exit-code note below
 
+# Free space FIRST — four filesystems, and each fails as someone else's bug.
+# /tmp filling made protoc fail as a BUILD error in an unrelated crate; /run's stale dirs cost
+# an hour of misattribution. The check names WHICH path is short.
+scripts/check-free-space.sh || exit 1
+
+
 # Compile check
 cargo check --workspace
 
@@ -1797,11 +1803,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 # has NO mode that emits a bare total. It is mechanical because a rule ("remember to pass
 # --nocapture and look") is the shape that has failed every time a mechanism was available.
 scripts/test-count.sh --workspace          # -> EXECUTED n / SKIPPED m / reported n+m
-
-# Free space FIRST — four filesystems, and each fails as someone else's bug.
-# /tmp filling made protoc fail as a BUILD error in an unrelated crate; /run's stale dirs cost
-# an hour of misattribution. The check names WHICH path is short.
-scripts/check-free-space.sh || exit 1
 
 # ── DECOUPLED WORKSPACES — `--workspace` DOES NOT REACH THEM ────────────────────────
 # `runtime/shell-host` has its own `[workspace]` table and is `exclude`d from the root

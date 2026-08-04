@@ -1790,6 +1790,43 @@ the crate) and confirm by `mtime` before believing the run.
 
 ---
 
+## 32. A mechanically-correct substitution, semantically wrong through an undocumented property  *(new — D0-R6)*
+
+**Description.** Code is replaced by something that is *the same kind of thing* — a temp dir
+for a temp dir, a socket for a socket — and the replacement is correct in every respect anyone
+wrote down. It breaks because the **original had a property nobody recorded as load-bearing**,
+usually one it got for free from a default.
+
+**Instances (grounded), and the pair is the point:**
+
+| replaced | with | the unrecorded property |
+|---|---|---|
+| `PathBuf::from("/tmp/…")` | `tempfile::tempdir()` | bare `/tmp` paths inherited permissive modes; `tempdir()` is **0700 root-owned**, and a privilege-dropped child could no longer write the shared file (D0-R6-03) |
+| `socketpair(… SockFlag::empty())` | (production used `SOCK_CLOEXEC`) | the *absence* of `CLOEXEC` let sibling `Command::spawn` children inherit the fd and suppress `POLLHUP` |
+
+Both substitutions were mechanical, reviewed, and wrong. Neither property appeared in a
+comment, a test name, or an assertion — they were **accidents of a default** that the
+surrounding code had quietly come to depend on.
+
+**Why it evades review.** A reviewer checks that the replacement does what the original *said*
+it did. The defect lives in what the original *also happened to do*. Nothing in the diff points
+at it, and the substitution reads as an improvement — which it is, on every axis anyone named.
+
+**Foreclosing question, to be asked at the moment of substitution:**
+
+> **What unstated property of the thing being replaced is the caller relying on?**
+
+Permissions, ownership, CLOEXEC, buffering, lifetime, ordering, and mode are the usual answers.
+Where such a property is found, **make it explicit in the replacement** (`chown`/`chmod` the
+temp dir, pass `SOCK_CLOEXEC`) rather than trusting the new default to coincide.
+
+**RED-proof shape.** Exercise the path that consumed the property — here, the privilege-dropped
+child actually writing the file. Both instances were invisible until something *downstream of
+the property* ran: the priv-drop for one, a concurrent `Command::spawn` for the other. A test
+that only constructs the resource will not see it.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -1828,3 +1865,4 @@ the crate) and confirm by `mtime` before believing the run.
 | 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |
 | 29a. Holder-check names the wrong resource | one shared checker matching the SUBJECT's resource on ANY location (`scripts/check-stale-test-sessions.sh`), used by every caller | **Extracted** |
 | 31. Teardown failure unobservable | a teardown that CAN fail must REPORT its failure; if it cannot report, it must ASSERT. Capture the reason (`.output()`), never `let _ = …status()` | Discipline |
+| 32. Mechanical substitution, undocumented property | ask at substitution: **what unstated property is the caller relying on?**; make it explicit in the replacement rather than trusting the new default | Discipline |

@@ -185,6 +185,20 @@ impl Drop for Setup {
         // the shell is gone before this runs. `/run` dirs stayed at 0 throughout, so the
         // directory cleanup was fine and only the account cleanup was short a layer.
         let _ = Command::new("loginctl").args(["terminate-user", &self.user]).status();
+        // D0-R6-04: `terminate-user` returns BEFORE the sessions are gone. The pid wait below
+        // covers processes; this covers the SESSION, which is the thing that holds the VT and
+        // the thing `userdel` refuses over.
+        for _ in 0..40 {
+            let busy = Command::new("loginctl")
+                .args(["list-sessions", "--no-legend"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(self.user.as_str()))
+                .unwrap_or(false);
+            if !busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         if let Some(uid) = uid {
             for pid in pids_owned_by(uid) {
@@ -404,6 +418,7 @@ fn session_leader_is_the_shell_itself_r3_01c() {
         return;
     }
 
+    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("b1");
     let (uid, gid) = setup.ids();
 
@@ -585,6 +600,7 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
         return;
     }
 
+    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("fd01");
     let (uid, gid) = setup.ids();
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
@@ -762,6 +778,7 @@ fn shell_child_drops_to_the_session_user_b3() {
         return;
     }
 
+    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("b3");
     let (uid, gid) = setup.ids();
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so
@@ -869,6 +886,7 @@ fn launch_kills_the_shell_when_a_later_step_fails_d0_r4_02() {
         );
         return;
     }
+    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("r402");
     let (uid, gid) = setup.ids();
 
@@ -968,6 +986,7 @@ fn launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01() {
         return;
     }
 
+    delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
     let setup = Setup::new("p1");
     let (uid, gid) = setup.ids();
     // RAII: removed on drop, INCLUDING the panic path. `base` stays a PathBuf, so

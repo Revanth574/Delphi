@@ -39,11 +39,15 @@ short=()
 printf '%-42s %10s %10s  %s\n' "PATH" "FREE" "FLOOR" "STATUS"
 for path in "${!FLOOR_MB[@]}"; do
     floor=${FLOOR_MB[$path]}
-    if [ ! -e "$path" ]; then
-        printf '%-42s %10s %10s  %s\n' "$path" "-" "${floor}M" "ABSENT (not checked)"
-        continue
-    fi
-    free_mb=$(df -Pm "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+    # D0-R6-08: an output path that does not exist YET still lands on a filesystem. Treating
+    # it as "not checked" reported success for the one path a run was about to fill. Walk up
+    # to the nearest existing ancestor, which is the filesystem it will actually be created on.
+    probe="$path"
+    while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do
+        probe=$(dirname "$probe")
+    done
+    [ "$probe" = "$path" ] || printf '%-42s %10s %10s  %s\n' "$path" "-" "-" "absent → checking $probe"
+    free_mb=$(df -Pm "$probe" 2>/dev/null | awk 'NR==2 {print $4}')
     if ! [[ "$free_mb" =~ ^[0-9]+$ ]]; then
         printf '%-42s %10s %10s  %s\n' "$path" "?" "${floor}M" "UNREADABLE — treating as SHORT"
         short+=("$path")

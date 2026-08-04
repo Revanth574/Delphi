@@ -69,3 +69,37 @@ impl Drop for ChildGuard {
         let _ = nix::sys::wait::waitpid(self.pid, None);
     }
 }
+
+/// Assert no previous run's session still holds `vt` — a PER-TEST ENTRY assertion (D0-R6-11).
+///
+/// # Why per-test and not once before the run
+///
+/// A go/no-go check cannot see mid-run leakage by construction, and running it more often at
+/// that level does not help: mid-run session *creation* is normal (every `launch()` opens
+/// one); mid-run *leakage* is the hazard. When one test's teardown fails, every later test
+/// dies at `pam_open_session` with `VirtualTerminalAlreadyTaken` — a message naming neither
+/// the cause nor the culprit. That is the 9-consecutive-failures shape.
+///
+/// Called at test entry, this attributes the failure to the PREVIOUS test, at the point of
+/// entry, by name. It shells out to `scripts/check-stale-test-sessions.sh --vt` rather than
+/// reimplementing the query: the last checker's defect was two callers with divergent
+/// assumptions, so there is exactly one construction site.
+///
+/// # Panics
+///
+/// If a stale session holds `vt`, or if the checker cannot determine the answer — it fails
+/// closed, and so does this.
+pub fn assert_no_stale_session_on(vt: &str) {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/check-stale-test-sessions.sh");
+    let out = match std::process::Command::new(script).args(["--vt", vt]).output() {
+        Ok(o) => o,
+        Err(e) => panic!("could not run {script}: {e} — the environment is UNKNOWN, not clean"),
+    };
+    assert!(
+        out.status.success(),
+        "PRECONDITION FAILED before this test ran — a previous test leaked a session on {vt}. \
+         This test has not started; the fault is upstream.\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

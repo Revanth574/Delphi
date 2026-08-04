@@ -114,6 +114,38 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 '
 check "floor declared but nothing executed REFUSES" "NOTHING executed" "$OUT" 2 "$RC"
 
+# ── 7a. D0-R6-05/06/07/09 — the guards added after round 6 ──────────────────────────────
+# A summary line with no passed-count silently contributed 0, reading as a smaller suite.
+run_on_log 'test result: ok. 3 passed; 0 failed
+test result: FAILED. some other shape
+'
+check "summary without a passed-count REFUSES" "REFUSING" "$OUT" 2 "$RC"
+
+# `finished in` matched ANYWHERE let nested output inflate elapsed — which RAISES the rate and
+# so WEAKENS the floor. A guard that fails open under noise is not a guard.
+run_with_floor 100 'note: a nested harness said finished in 99.00s somewhere
+running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+'
+check "elapsed is taken ONLY from summary lines" "below the" "$OUT" 2 "$RC"
+
+# A mistyped/zero/negative floor previously disabled the check while exiting 0.
+run_with_floor 10O 'running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+'
+check "a non-numeric floor REFUSES (typo must not disable it)" "not a positive integer" "$OUT" 2 "$RC"
+run_with_floor 0 'running 7 tests
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s
+'
+check "a zero floor REFUSES" "not a positive integer" "$OUT" 2 "$RC"
+
+# R6-09: the LISTING path had the column-0 anchor the counting path shed two rounds ago, so
+# counts were right while the list was silently empty.
+run_on_log 'test alpha ... SKIP alpha: requires root
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+'
+check "the skipped-test LIST is populated, not empty" "SKIP alpha" "$OUT" 0 "$RC"
+
 # ── 8. THE ANTI-CLASS-25 CASE: parse a REAL captured libtest log ───────────────────────
 # The first version of this file invented its fixture format, and the invented format did not
 # match libtest's. The parser passed six synthetic cases while missing every marker in real

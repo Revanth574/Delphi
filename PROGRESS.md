@@ -236,6 +236,22 @@ and reaping every child before the guard drops → **30/30**. Production foreclo
 interference (the channel has exactly two holders; `fork_ai`'s FD-01 sweep is what guarantees
 the AI is not a third), so this is a harness artifact — **shown, not asserted**.
 
+### 🚩 FINDING (D0-R6) — the CI count guard was blind to the thing it guarded
+
+`.github/workflows/ci.yml:53` summed `test result: ok` **passes** against a floor, to catch
+tests silently disappearing. **A skipped test scores as a pass**, so a test that starts
+skipping keeps the floor satisfied indefinitely. The single automated mechanism that would
+have caught the 19-skipped problem was structurally unable to see it — and it had been running
+green on every push throughout.
+
+**Fifth "absent, not passing" of the arc, and the FIRST THAT WAS SUPPOSED TO BE WATCHING.** The
+prior four (`--workspace`, `shell-host`, `real_webkit_load`, the 19 skips) were silent for want
+of a checker. This one *had* a checker. It surfaced from a grep for a different pattern, in a
+file neither participant had thought to open.
+
+**Consequence for future rounds: a "CI is green" claim from before this fix carries less weight
+than it appears to.** CI now calls `scripts/test-count.sh`.
+
 **LANE RUN COMPLETE (2026-08-02) — ITEMS 1-4 DISCHARGED.**
 
 | # | Item | Result |

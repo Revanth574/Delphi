@@ -300,6 +300,32 @@ executed-test-count drops (CI baseline-count artifact — P4).
 
 ---
 
+**AND THE AUTOMATED GATE MEANT TO CATCH THIS WAS ITSELF BLIND TO IT (D0-R6).**
+`.github/workflows/ci.yml` guarded against tests silently disappearing by summing
+`test result: ok` **passes** against a floor. A skipped test scores as a pass, so **a test
+that starts skipping keeps the floor satisfied forever** — precisely the disappearance the
+guard exists to catch. The one mechanism that would have caught the 19-skipped problem
+automatically was structurally incapable of seeing it.
+
+**This is the fifth "absent, not passing" of the arc, and the first that was supposed to be
+watching.** The other four were silent for want of a checker; this one had a checker, running
+on every push, reporting green. It surfaced only from a grep for a *different* pattern, in a
+file neither participant had thought to open.
+
+The lesson is not "fix the CI line". It is that **a guard must be checked against the failure
+it names**, exactly as a test must be RED-proven: this one had never been shown to fail when a
+test disappeared, so it had never been shown to work. CI now calls `scripts/test-count.sh`,
+which subtracts skips and refuses on an unparseable format.
+
+**SURVIVORSHIP APPEARS INSIDE ITS OWN REMEDY (D0-R6-06).** The physical floor was added as a
+*second, independent* signal precisely because the SKIP parse had already been wrong. Its first
+implementation matched `finished in` **anywhere** in the output — so nested or quoted output
+**inflates** the elapsed total, which **raises** ms-per-test and therefore **weakens** the
+floor. The independent signal degraded under exactly the noise it existed to survive, and it
+degraded in the reassuring direction: a weaker floor passes. Fixed by taking elapsed only from
+`test result:` summary lines. **A guard that fails open under noise is not a guard**, and the
+bias toward calm failures documented above does not spare the instruments built to answer it.
+
 **THE SHELL MANGLING ITS OWN EVIDENCE — third instance, same class (D0).** Output plumbing
 has now corrupted this project's evidence three times, each time making a result mean
 something other than what it said:

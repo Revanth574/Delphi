@@ -109,11 +109,48 @@ frozen verdict, a `chvt` **after** daemon start cannot flip `active`. The dev SE
 gate-POSITIVE was understood to be reachable by switching to the shell's VT; it is not, and that
 is an additional blocker independent of the display one P3b is attributed to.
 
-**Fix sketch.** Make the verdict a live query per gate evaluation (`for_pid` on each request, or
-a `SessionVerdict` impl that queries on call). The trait already supports it — only the
-concrete `LogindVerdict` snapshots. **RED:** a verdict whose `active` flips between construction
-and evaluation; the gate must follow the flip. Correct the comment either way — a comment
-asserting a mechanism that does not exist is the failure Iron Law #12 names.
+**RESOLVED.** `ServiceCtx` now holds a `SessionSource`, and `service::gate_allows` — one
+function, one site — reads `source.current()` at each decision. `LogindSource` re-queries
+logind per call and fail-closes on an unresolvable session; `FixedVerdict` is both a verdict
+and a source of itself, so the tests and the insecure seam need no adapter.
+
+**Why a source rather than a live-querying `SessionVerdict`.** `session_passes_gate` reads the
+three axes as three calls, so an impl that queried per method could **tear**: `active` from one
+instant, `seated` from another, producing a verdict that never described any actual moment. One
+`current()` per decision yields a triple that was simultaneously true, which is what
+"active-local-seated now" means. **This is `DEFECT_CLASSES` 26 one level up** — R2-01/R2-01b/c
+were a captured `revents` reused after a syscall; this is a captured verdict reused across the
+decision it authorizes. Same asymmetry, different altitude.
+
+**Proofs** (`runtime/src/logind.rs` tests):
+
+- *both flip directions*, and which one is the security property: **true → false is the
+  dangerous one** — the seat's foreground moved away and a consent minted after that point is
+  one no human at the seat authorized, which is exactly what R3-02's `active` axis exists to
+  prevent. false → true is a false DENY: annoying, never dangerous, and it is what lets a
+  `chvt` to the shell's VT take effect without a daemon restart.
+- *the simultaneity law* — against a source whose state advances per read, a conforming
+  `current()` returns exactly one of the two states, never a mixture.
+- **The tearing case is a permanent `#[should_panic]` test, not a weaken run once.** A future
+  refactor to per-method queries fails it forever. That is stronger than a weaken, and it is why
+  the design's central argument is not left as prose.
+
+**Measured.** Weaken (a) — freeze the verdict (`OnceLock` memo, the pre-A3 semantics) → the
+flip test fails at the true→false leg, naming it: *"a stored verdict is what makes this ALLOW,
+minting consent while the seat points elsewhere."* Weaken (b) — weaken the law's assertion to a
+tautology → the tearing case stops panicking and the `should_panic` test fails, proving the law
+is what catches tearing rather than the harness.
+
+**A decision whose premise was false is now a decision whose premise is true.** When review
+asked for an abort on a false startup verdict, the accepted counter-argument was *"the `active`
+axis is dynamic and the gate re-checks per request"* — and the gate did not re-check. The
+conclusion survives on its other half (aborting would false-positive on the dev SECONDARY shape
+and on boot races), but it survives for a reason that now holds. **A decision resting on a false
+premise and a decision resting on a true one are different objects even when they reach the same
+answer**, and only the second is one a later reader can rely on.
+
+**Consequence for P3b:** a `chvt` after daemon start now flips `active`, so the second blocker
+this finding surfaced is removed. P3b remains blocked on the display path alone.
 
 ---
 

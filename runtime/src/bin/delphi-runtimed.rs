@@ -34,7 +34,7 @@ use nix::unistd::{Pid, User};
 use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
 use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
-use delphi_runtime::logind::{LogindVerdict, SessionVerdict};
+use delphi_runtime::logind::{LogindSource, SessionSource};
 use delphi_runtime::service::{accept_requester, serve_one_action, ServiceCtx, SystemClock};
 use delphi_runtime::store::PendingStore;
 use delphi_runtime::token::MintingKey;
@@ -42,23 +42,6 @@ use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 
 const PAM_SERVICE: &str = "delphi-runtime";
 
-/// A fixed active/local/seated verdict (the fail-closed default, or the real query result).
-struct FixedVerdict {
-    active: bool,
-    remote: bool,
-    seated: bool,
-}
-impl SessionVerdict for FixedVerdict {
-    fn is_active(&self) -> bool {
-        self.active
-    }
-    fn is_remote(&self) -> bool {
-        self.remote
-    }
-    fn is_seated(&self) -> bool {
-        self.seated
-    }
-}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -125,17 +108,16 @@ fn main() -> Result<()> {
         "B1: anchor + launcher up; serving one action"
     );
 
-    let verdict = logind_verdict(children.shell_pid);
+    let session_source = logind_source(children.shell_pid);
     // B2A-C-R3-02: surface a false startup verdict LOUDLY — but do NOT abort, because for a
     // valid `ttyN` the only axis that can be false here is ACTIVE, and that one tracks which VT
-    // holds the seat's foreground.
+    // holds the seat's foreground, so it is a race at boot rather than a config error.
     //
-    // THIS VERDICT IS A SNAPSHOT AND THE GATE DOES NOT RE-QUERY IT (D0-A finding A3;
-    // docs/READINESS_CONTRACT.md). `LogindVerdict` captures three bools at construction and
-    // `session_passes_gate` re-reads those same bools. Harmless only because B1 services ONE
-    // action and exits — snapshot and live differ by milliseconds. P4's service loop is what
-    // makes it a real weakening, and a `chvt` after this point cannot flip `active`.
-    if !delphi_runtime::logind::session_passes_gate(verdict.as_ref()) {
+    // THE PREMISE OF THAT DECISION IS NOW TRUE (D0-A A3): the counter-argument accepted against
+    // aborting was "the gate re-checks per request" — and until A3 it did not. This read and
+    // every gate read now go through `gate_allows`, so a VT switch after this point does change
+    // the answer. Same conclusion, different standing. docs/READINESS_CONTRACT.md A3.
+    if !delphi_runtime::service::gate_allows(session_source.as_ref()) {
         tracing::warn!(
             shell_pid = children.shell_pid,
             vt = %vt,
@@ -153,7 +135,7 @@ fn main() -> Result<()> {
     let mut ai = accept_requester(&listener, user.uid.as_raw()).context("accepting the requester")?;
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
-        session_verdict: verdict.as_ref(),
+        session: session_source.as_ref(),
         key: &key,
         pam_service: PAM_SERVICE,
         session_user: &session,
@@ -183,26 +165,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The logind active-session verdict for the pidfd-pinned shell — **fail-closed**:
-/// a shell with no active-and-local session is treated as not active. (A compile-
-/// time test seam, excluded from production, lets the binary-flow test pass on a
-/// seatless WSL2 where no real session exists.)
-fn logind_verdict(shell_pid: i32) -> Box<dyn SessionVerdict> {
+/// Where the shell's logind verdict is read from — **fail-closed**, and re-read at every
+/// gate decision rather than captured once (D0-A A3). (A compile-time test seam, excluded
+/// from production, lets the binary-flow test pass on a seatless WSL2.)
+fn logind_source(shell_pid: i32) -> Box<dyn SessionSource> {
     #[cfg(feature = "insecure-test-seams")]
     if std::env::var("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION").is_ok() {
         tracing::error!(
             "INSECURE TEST SEAM ACTIVE — logind gate overridden by \
              DELPHI_INSECURE_ASSUME_ACTIVE_SESSION; this MUST NOT appear in production"
         );
-        // The seam also asserts `seated` — the B2a gate requires it, so an override that
-        // stopped at active+local would fail the tightened gate on a seatless WSL2.
-        return Box::new(FixedVerdict { active: true, remote: false, seated: true });
+        // The seam also asserts `seated` — the B2a gate requires it.
+        return Box::new(delphi_runtime::logind::FixedVerdict {
+            active: true,
+            remote: false,
+            seated: true,
+        });
     }
-    match LogindVerdict::for_pid(shell_pid) {
-        Some(v) => Box::new(v),
-        // No logind session for the shell ⇒ fail-closed (not active, not seated).
-        None => Box::new(FixedVerdict { active: false, remote: false, seated: false }),
-    }
+    Box::new(LogindSource::for_pid(shell_pid))
 }
 
 /// 32 random bytes from `/dev/urandom` (no `rand` dependency).

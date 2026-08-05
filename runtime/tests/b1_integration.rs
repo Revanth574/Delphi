@@ -37,7 +37,6 @@ use delphi_runtime::action::{
 use delphi_runtime::canonicalize::canonicalize;
 use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
-use delphi_runtime::logind::SessionVerdict;
 use delphi_runtime::service::{
     accept_requester, present_and_execute, propose_msg, serve_one_action, Clock, Outcome,
     ServiceCtx,
@@ -72,25 +71,11 @@ const PASSWORD: &str = "Delphi-B1-Spine!";
 const NOW: u64 = 1_000;
 const KEY: [u8; 32] = [0x5B; 32];
 
-/// A logind verdict mock — the GATE is composed in the loop; the verdict source is
-/// injected (WSL2 sessions are ephemeral, so a real `for_pid` query is unreliable —
-/// the `logind_gate` test proves the real `LogindVerdict`).
-struct Verdict {
-    active: bool,
-    remote: bool,
-    seated: bool,
-}
-impl SessionVerdict for Verdict {
-    fn is_active(&self) -> bool {
-        self.active
-    }
-    fn is_remote(&self) -> bool {
-        self.remote
-    }
-    fn is_seated(&self) -> bool {
-        self.seated
-    }
-}
+/// The verdict the gate reads, injected as a SOURCE (WSL2 sessions are ephemeral, so a real
+/// `for_pid` query is unreliable — the `logind_gate` test proves the real `LogindVerdict`).
+/// `FixedVerdict` is both the verdict and a source of it, so these sites need no adapter.
+type Verdict = delphi_runtime::logind::FixedVerdict;
+
 const PASS: Verdict = Verdict { active: true, remote: false, seated: true };
 
 /// A fixed-time clock (every read returns the same second).
@@ -332,7 +317,7 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     let key = MintingKey::from_bytes(KEY);
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
-        session_verdict: &PASS,
+        session: &PASS,
         key: &key,
         pam_service: SERVICE,
         session_user: &setup.user,
@@ -410,7 +395,7 @@ fn b1_token_expiry_blocks_the_assembled_loop() {
     };
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
-        session_verdict: &PASS,
+        session: &PASS,
         key: &key,
         pam_service: SERVICE,
         session_user: &setup.user,
@@ -876,7 +861,7 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
     let deny_verdict = Verdict { active: false, remote: false, seated: false };
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
-        session_verdict: &deny_verdict,
+        session: &deny_verdict,
         key: &key,
         pam_service: SERVICE,
         session_user: &setup.user,
@@ -952,7 +937,7 @@ fn terminal_contract_release_produces_eof_no_wedge() {
     let deny = Verdict { active: false, remote: false, seated: false };
     let mut ctx = ServiceCtx {
         channel_fd: daemon_ch.as_raw_fd(),
-        session_verdict: &deny,
+        session: &deny,
         key: &key,
         pam_service: SERVICE,
         session_user: "nobody",

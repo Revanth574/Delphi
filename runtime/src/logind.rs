@@ -169,6 +169,95 @@ fn session_is_seated(session: &CStr) -> bool {
     true
 }
 
+/// A source of the shell session's verdict, queried **at** the decision it authorizes.
+///
+/// # Why a source and not a stored verdict (D0-A finding A3)
+///
+/// `active` means "is this session the foreground one on its seat **now**". A verdict captured
+/// at daemon start answers about daemon-start time forever, so the axis the gate exists to
+/// enforce stops tracking anything. `docs/READINESS_CONTRACT.md` A3.
+///
+/// # Why the source returns a verdict rather than the trait querying per method
+///
+/// [`session_passes_gate`] reads `is_active`, `is_remote`, `is_seated` as three calls. An impl
+/// that queried logind per method could TEAR — `active` from one instant, `seated` from
+/// another — producing a verdict that never described any actual moment. One `current()` per
+/// decision yields a triple that was simultaneously true, which is what "active-local-seated
+/// now" means. `DEFECT_CLASSES` 26 one level up: there, a captured `revents` reused after a
+/// syscall; here, a captured verdict reused across the decision it authorizes.
+///
+/// Implementations MUST return a verdict describing ONE instant. `verdict_triple_is_simultaneous`
+/// in this module's tests is that law, and it is proven discriminating against a tearing impl.
+pub trait SessionSource {
+    /// The session's verdict as of now. Fail-closed: unresolvable ⇒ a denying verdict.
+    fn current(&self) -> Box<dyn SessionVerdict>;
+}
+
+/// A verdict fixed at construction — the fail-closed default, and the test seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedVerdict {
+    /// Foreground on its seat.
+    pub active: bool,
+    /// Remote (SSH) rather than local.
+    pub remote: bool,
+    /// Attached to a physical seat.
+    pub seated: bool,
+}
+
+impl FixedVerdict {
+    /// The fail-closed verdict: fails every axis the gate reads.
+    pub const DENIED: Self = Self { active: false, remote: false, seated: false };
+}
+
+impl SessionVerdict for FixedVerdict {
+    fn is_active(&self) -> bool {
+        self.active
+    }
+    fn is_remote(&self) -> bool {
+        self.remote
+    }
+    fn is_seated(&self) -> bool {
+        self.seated
+    }
+}
+
+impl SessionSource for FixedVerdict {
+    fn current(&self) -> Box<dyn SessionVerdict> {
+        Box::new(*self)
+    }
+}
+
+/// The production source: re-queries logind for `pid`'s session on every call.
+pub struct LogindSource {
+    pid: i32,
+}
+
+impl LogindSource {
+    /// Query the session of `pid` at each [`SessionSource::current`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use delphi_runtime::logind::{LogindSource, SessionSource};
+    /// let src = LogindSource::for_pid(std::process::id() as i32);
+    /// let _ = src.current(); // resolvable or not, never panics
+    /// ```
+    #[must_use]
+    pub fn for_pid(pid: i32) -> Self {
+        Self { pid }
+    }
+}
+
+impl SessionSource for LogindSource {
+    fn current(&self) -> Box<dyn SessionVerdict> {
+        match LogindVerdict::for_pid(self.pid) {
+            Some(v) => Box::new(v),
+            // No resolvable session ⇒ deny. Unknown is never "fine" at a gate.
+            None => Box::new(FixedVerdict::DENIED),
+        }
+    }
+}
+
 impl SessionVerdict for LogindVerdict {
     fn is_active(&self) -> bool {
         self.active
@@ -223,5 +312,120 @@ mod tests {
             !session_passes_gate(&Mock { active: true, remote: true, seated: true }),
             "remote → deny"
         );
+    }
+
+    /// A source whose state advances on every READ of the underlying cell.
+    ///
+    /// Snapshot impls read the cell ONCE per `current()`, so their triple is one instant.
+    /// A per-method-querying impl reads it three times and mixes instants.
+    struct Advancing {
+        reads: std::cell::Cell<usize>,
+    }
+    impl Advancing {
+        const A: FixedVerdict = FixedVerdict { active: true, remote: false, seated: true };
+        const B: FixedVerdict = FixedVerdict { active: false, remote: true, seated: false };
+        fn read(&self) -> FixedVerdict {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            if n.is_multiple_of(2) { Self::A } else { Self::B }
+        }
+    }
+    /// CORRECT shape: one read per decision.
+    impl SessionSource for Advancing {
+        fn current(&self) -> Box<dyn SessionVerdict> {
+            Box::new(self.read())
+        }
+    }
+
+    /// The forbidden shape, kept so the law below is PROVEN discriminating rather than
+    /// merely asserted: each axis is read at a different instant.
+    struct Tearing {
+        inner: Advancing,
+    }
+    struct TornVerdict {
+        active: bool,
+        remote: bool,
+        seated: bool,
+    }
+    impl SessionSource for Tearing {
+        fn current(&self) -> Box<dyn SessionVerdict> {
+            Box::new(TornVerdict {
+                active: self.inner.read().active,
+                remote: self.inner.read().remote,
+                seated: self.inner.read().seated,
+            })
+        }
+    }
+    impl SessionVerdict for TornVerdict {
+        fn is_active(&self) -> bool {
+            self.active
+        }
+        fn is_remote(&self) -> bool {
+            self.remote
+        }
+        fn is_seated(&self) -> bool {
+            self.seated
+        }
+    }
+
+    /// THE LAW every `SessionSource` owes: the triple describes ONE instant.
+    ///
+    /// Against a source whose state advances per read, a conforming `current()` returns
+    /// exactly `A` or exactly `B` — never a mixture. A verdict assembled from three instants
+    /// never described any actual moment, which is not a thing the gate can act on.
+    fn assert_triple_is_simultaneous(src: &dyn SessionSource) {
+        for _ in 0..8 {
+            let v = src.current();
+            let got = FixedVerdict {
+                active: v.is_active(),
+                remote: v.is_remote(),
+                seated: v.is_seated(),
+            };
+            assert!(
+                got == Advancing::A || got == Advancing::B,
+                "TORN verdict {got:?} — assembled from more than one instant, so it describes \
+                 no actual moment (D0-A A3; DEFECT_CLASSES 26 one level up)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshotting_source_yields_a_simultaneous_triple() {
+        assert_triple_is_simultaneous(&Advancing { reads: std::cell::Cell::new(0) });
+    }
+
+    /// The law's discrimination, PROVEN — not a weaken run once and reported, but a case that
+    /// fails forever if `current()` is ever refactored into per-method queries.
+    #[test]
+    #[should_panic(expected = "TORN verdict")]
+    fn the_law_rejects_a_source_that_reads_each_axis_at_a_different_instant() {
+        assert_triple_is_simultaneous(&Tearing { inner: Advancing { reads: std::cell::Cell::new(0) } });
+    }
+
+    /// A source read at the decision follows a flip. Both directions, because only one of
+    /// them is the security property.
+    #[test]
+    fn the_gate_follows_the_session_state_in_both_directions() {
+        // true -> false is THE SECURITY PROPERTY: the seat's foreground moved away, and a
+        // consent minted after that point is one no human at the seat authorized. A stored
+        // verdict answers `true` forever and mints it.
+        let s = Advancing { reads: std::cell::Cell::new(0) };
+        assert!(crate::service::gate_allows(&s), "first decision: active+local+seated → ALLOW");
+        assert!(
+            !crate::service::gate_allows(&s),
+            "after the flip the gate must DENY — a stored verdict is what makes this ALLOW, \
+             minting consent while the seat points elsewhere (R3-02's whole subject)"
+        );
+        // false -> true: a false DENY. Annoying, never dangerous — and it is what makes a
+        // `chvt` to the shell's VT take effect without restarting the daemon.
+        let s = Advancing { reads: std::cell::Cell::new(1) };
+        assert!(!crate::service::gate_allows(&s), "first decision: not active → DENY");
+        assert!(crate::service::gate_allows(&s), "after the flip back the gate must ALLOW");
+    }
+
+    #[test]
+    fn an_unresolvable_session_denies() {
+        // LogindSource fail-closes on a pid with no session. pid 1 (init) has none.
+        assert!(!crate::service::gate_allows(&LogindSource::for_pid(1)));
     }
 }

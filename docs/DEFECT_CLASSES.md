@@ -1592,6 +1592,15 @@ first `Hup` yields `ChannelClosed`, deterministically, every run.
 
 ---
 
+**THE SAME ASYMMETRY AT A HIGHER ALTITUDE (D0-A A3).** R2-01/R2-01b/R2-01c were a captured
+`revents` reused after a syscall. A3 is a captured **verdict** reused across the decision it
+authorizes: `LogindVerdict` snapshots three bools, the daemon captured one at startup, and the
+consent gate re-read those same bools per request while a comment claimed a live re-check. The
+axis in question — `active`, "is this session the seat's foreground **now**" — is precisely the
+kind of fact a capture destroys. Foreclosed by a `SessionSource` queried at the decision, with
+the tearing shape (three axes read at three instants) rejected by a permanent `#[should_panic]`
+law rather than by a comment.
+
 ## 27. Two independently-correct fixes whose INTERACTION is unsound  *(new — D0 round 4)*
 
 **Description.** Two changes land together. Each is correct against the code as it stood, each

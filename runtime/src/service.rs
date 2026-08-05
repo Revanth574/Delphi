@@ -31,7 +31,7 @@ use nix::sys::socket::getsockopt;
 use crate::action::{canonical_action_digest, preview};
 use crate::canonicalize::canonicalize;
 use crate::execute::{execute_approved, ConsumptionLedger};
-use crate::logind::{session_passes_gate, SessionVerdict};
+use crate::logind::{session_passes_gate, SessionSource};
 use crate::pam::authenticate_over_channel;
 use crate::store::{PendingState, PendingStore};
 use crate::token::{mint, ApprovalToken, MintingKey};
@@ -70,9 +70,9 @@ impl Clock for SystemClock {
 pub struct ServiceCtx<'a> {
     /// The daemon's end of the private `SOCK_SEQPACKET` channel to the pinned shell.
     pub channel_fd: RawFd,
-    /// The logind active-session verdict for the shell (real `LogindVerdict::for_pid`
-    /// in the daemon; a mock in tests — the GATE is composed either way).
-    pub session_verdict: &'a dyn SessionVerdict,
+    /// Where the shell's logind verdict comes from, queried AT each gate decision rather
+    /// than stored (D0-A finding A3 — a stored verdict answers about daemon-start time).
+    pub session: &'a dyn SessionSource,
     /// The root-held HMAC minting key.
     pub key: &'a MintingKey,
     /// PAM service name (`delphi-runtime`).
@@ -86,6 +86,24 @@ pub struct ServiceCtx<'a> {
     /// The clock — read FRESH at mint and at Present-verify so the token TTL is a real
     /// control (B1-R2-01), not a frozen-`now` no-op.
     pub clock: &'a dyn Clock,
+}
+
+/// Evaluate the gate against a verdict read **now**.
+///
+/// One function, one read: the timing IS the mechanism (D0-A A3), so it lives at exactly one
+/// site where a test can reach it.
+///
+/// # Examples
+///
+/// ```
+/// use delphi_runtime::logind::FixedVerdict;
+/// use delphi_runtime::service::gate_allows;
+/// assert!(gate_allows(&FixedVerdict { active: true, remote: false, seated: true }));
+/// assert!(!gate_allows(&FixedVerdict::DENIED));
+/// ```
+#[must_use]
+pub fn gate_allows(source: &dyn SessionSource) -> bool {
+    session_passes_gate(source.current().as_ref())
 }
 
 /// The terminal outcome of one serviced action.
@@ -145,7 +163,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     send_approval_request(ctx.channel_fd, &digest, &preview_text)?;
 
     // 3. logind gate (composed), then live PAM over the private channel.
-    if !session_passes_gate(ctx.session_verdict) {
+    if !gate_allows(ctx.session) {
         return deny(ai, &id, "logind: shell session not active+local");
     }
     if authenticate_over_channel(ctx.pam_service, ctx.session_user, ctx.channel_fd).is_err() {

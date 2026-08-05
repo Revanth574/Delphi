@@ -88,11 +88,17 @@ fn resolve_host_bin() -> &'static Result<PathBuf, String> {
             ));
         };
         if installed != built {
+            // Both paths, not just one: lane run 2 read four correct refusals as a false
+            // positive because the message never said WHERE the "built" bytes came from, and
+            // the two sides can be different target dirs rather than a stale install.
             return Err(format!(
-                "the installed host at {INSTALLED_HOST} DIFFERS from this build (installed \
-                 sha256 {}…, built {}…), so running it would test code that is not in this \
-                 tree. FIX: `sudo installer/install.sh` to reinstall the current build, then \
-                 re-run.",
+                "the installed host DIFFERS from this build, so running it would test code \
+                 that is not in this tree.\n  installed {}…  {INSTALLED_HOST}\n  built     \
+                 {}…  {BUILT_HOST}\nIf those two paths sit under DIFFERENT target dirs, \
+                 reinstalling will not fix it — the suite and installer/build.sh must share \
+                 one CARGO_TARGET_DIR (a run under `sudo` without `-E` resolves $HOME to \
+                 /root and silently builds a second copy). Otherwise: `sudo \
+                 installer/install.sh`, then re-run.",
                 &installed[..12],
                 &built[..12]
             ));

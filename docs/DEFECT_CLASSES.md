@@ -1872,6 +1872,42 @@ that only constructs the resource will not see it.
 
 ---
 
+## 33. The diagnostic path is the least-executed code in the tool  *(new — lane run 2)*
+
+**Both defects lane run 2 found are this class, and neither is in a mechanism — both are in
+what a mechanism SAYS when it fires.**
+
+1. `scripts/check-stale-test-sessions.sh`'s **report branch** — the code that runs only when a
+   stale session IS found — had never been executed by anything. A backtick inside a
+   double-quoted `echo` therefore shipped: `` `closing` `` ran as a command, printing
+   `closing: command not found` and leaving a hole in the sentence. The tool exists to make an
+   obscure `VirtualTerminalAlreadyTaken` legible, and the code that does the making-legible was
+   its only untested part.
+2. `real_webkit_load`'s staleness guard printed the **installed** path and two hash prefixes,
+   but never the **built** path. It refused four times, correctly, and was read as a false
+   positive — because the operator could not see that the two sides came from different target
+   dirs. Its suggested FIX (`sudo installer/install.sh`) was also wrong for that cause, so
+   following the message could not converge.
+
+**Why this class is not just "test your code".** Success paths are exercised constantly by
+ordinary use; diagnostic paths run only during failures, which are rare, unrepeatable, and
+happen when attention is on the failure rather than the message. So the message accumulates
+defects that nothing removes — and it is the artifact a human acts on. A wrong diagnostic is
+worse than a silent failure: it spends the operator's attention in the wrong place. Lane run 2
+spent four attempts and a manual `cp` on one.
+
+**Foreclosing primitive: none — a discipline.** A tool that reports MUST have its reporting
+branch executed by a test that asserts the TEXT, and any message naming one side of a
+comparison must name both. Instance: `scripts/check-stale-test-sessions.test.sh` stubs
+`loginctl` from a fixture so both branches are reachable without a seat, and asserts the
+survivor's id, user, VT, the `terminate-session` command, and the literal sentence.
+
+**RED-proof shape.** Reintroduce the defect in the message and confirm the suite fails on the
+text — done for the backtick (suite rc=1 with it, rc=0 without). For a comparison message,
+assert both operands appear.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

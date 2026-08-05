@@ -111,5 +111,5 @@ done
 echo
 echo "  Clear with:"
 printf '%s' "$hits" | awk -F'|' 'NF{print "    sudo loginctl terminate-session " $1}'
-echo "  If a session stays `closing`, reboot the lane."
+echo '  If a session stays `closing`, reboot the lane.'
 exit 1

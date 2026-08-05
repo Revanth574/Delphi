@@ -15,6 +15,13 @@
 # SKIPPED is recorded too because a lone total is satisfiable two ways: one test deleted while
 # another stops skipping leaves EXECUTED unchanged.
 #
+# THE PAIR IS ENVIRONMENT-SPECIFIC — MEASURE IT WHERE THE GATE RUNS, WHICH IS CI.
+# Most of this project's gated tests skip on "requires root". CI runs unprivileged, so they
+# SKIP there; a privileged lane EXECUTES them. A pair measured on the lane is therefore a
+# different, larger EXECUTED and a smaller SKIPPED, and recording it here would make CI fail
+# on every run until someone pasted CI's numbers over it. Use DELPHI_TEST_COUNT_BASELINE to
+# point the gate at a different file for any other environment.
+#
 # PROTOCOL
 #   * Any change to either number — up OR down — updates this file IN THE SAME COMMIT, with the
 #     reason in the message. An unexplained increase is as much a signal as a decrease.

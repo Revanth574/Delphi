@@ -24,18 +24,43 @@ STAGE="installer/staging"
 TARGET="${CARGO_TARGET_DIR:-$HOME/delphi-target}"
 mkdir -p "$STAGE"
 
+# Stage a build product and PROVE the staged bytes are the built bytes.
+#
+# Lane run 2 installed a binary this invocation had not built, and the shell-host staleness
+# guard then refused four times while looking like a false positive — because nothing on
+# either side ever printed WHICH tree its bytes came from. The sha is printed so the three
+# numbers that matter (built / staged / what the test resolves via CARGO_BIN_EXE) can be
+# compared instead of assumed.
+stage() {  # stage <src> <name-in-staging>
+    local src=$1 dst="$STAGE/$2" a b
+    [ -f "$src" ] || { echo "MISSING BUILD PRODUCT: $src" >&2; exit 1; }
+    cp -f "$src" "$dst"
+    a=$(sha256sum "$src" | cut -d" " -f1)
+    b=$(sha256sum "$dst" | cut -d" " -f1)
+    [ "$a" = "$b" ] || {
+        echo "STAGING MISMATCH for $2 — the staged bytes are NOT the built bytes." >&2
+        echo "  built  $a  $src" >&2
+        echo "  staged $b  $dst" >&2
+        exit 1
+    }
+    printf "  staged %-18s sha256 %s…  <- %s\n" "$2" "${a:0:12}" "$src"
+    STAGED_SHAS+=("$2 ${a:0:12}… $src")
+}
+STAGED_SHAS=()
+echo "target-dir: $TARGET   (CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-<unset>})"
+
 echo "== [1/3] root daemon + B1 AI scaffold (main workspace, release) =="
 CARGO_TARGET_DIR="$TARGET" cargo build --release -p delphi-runtime \
     --bin delphi-runtimed --bin delphi-minimal-ai
-cp -f "$TARGET/release/delphi-runtimed"   "$STAGE/delphi-runtimed"
-cp -f "$TARGET/release/delphi-minimal-ai" "$STAGE/delphi-minimal-ai"
+stage "$TARGET/release/delphi-runtimed" delphi-runtimed
+stage "$TARGET/release/delphi-minimal-ai" delphi-minimal-ai
 
 echo "== [2/3] REAL WRY shell host (decoupled crate — own workspace, own target) =="
 # shell-host has its own [workspace]; give it its own target dir so its wry/WebKit tree
 # never mixes with the boundary workspace's.
 CARGO_TARGET_DIR="$TARGET/shell-host" cargo build --release \
     --manifest-path runtime/shell-host/Cargo.toml
-cp -f "$TARGET/shell-host/release/delphi-shell" "$STAGE/delphi-shell"
+stage "$TARGET/shell-host/release/delphi-shell" delphi-shell
 
 echo "== [3/3] REAL React shell bundle (P1 — what the WRY host actually draws) =="
 # The host loads `file:///usr/share/delphi/shell/index.html`. Without this the host starts
@@ -94,5 +119,13 @@ find "$STAGE/shell" -type f -exec chmod 0644 {} +
 echo
 echo "staged (UNPRIVILEGED build complete):"
 ls -la "$STAGE"
+echo
+echo "staged from target-dir: $TARGET"
+printf "  %s\n" "${STAGED_SHAS[@]}"
+echo
+echo "If runtime/shell-host's tests then report the installed host DIFFERS from this build,"
+echo "compare delphi-shell's sha above against the path the test prints. A mismatch there is"
+echo "two DIFFERENT target dirs (e.g. a suite run under sudo without -E resolves \$HOME to"
+echo "/root), not a stale install — reinstalling will not fix it."
 echo
 echo "next, as ROOT:  sudo bash installer/install.sh"

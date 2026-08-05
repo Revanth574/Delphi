@@ -126,23 +126,23 @@ fn main() -> Result<()> {
     );
 
     let verdict = logind_verdict(children.shell_pid);
-    // B2A-C-R3-02: surface a false startup verdict LOUDLY — but do NOT abort. For a valid
-    // `ttyN` the session is always SEATED (pam_systemd seats any valid VT), so the only axis
-    // that can be false here is ACTIVE — which is DYNAMIC (it tracks which VT holds the seat's
-    // foreground). Aborting on it would false-positive on the dev SECONDARY shape (§4 R3-02a,
-    // where a gate-POSITIVE is reached only by `chvt` to the shell's VT) and on any boot where
-    // the shell's VT is not yet the foreground (a race). The consent GATE re-checks this
-    // per-request (`service.rs` `session_passes_gate`); the warning just makes a misconfigured
-    // `DELPHI_SHELL_VT` visible at STARTUP instead of only in a denied action's reason. Under
-    // the insecure test seam the verdict passes, so this is silent in the binary-flow test.
+    // B2A-C-R3-02: surface a false startup verdict LOUDLY — but do NOT abort, because for a
+    // valid `ttyN` the only axis that can be false here is ACTIVE, and that one tracks which VT
+    // holds the seat's foreground.
+    //
+    // THIS VERDICT IS A SNAPSHOT AND THE GATE DOES NOT RE-QUERY IT (D0-A finding A3;
+    // docs/READINESS_CONTRACT.md). `LogindVerdict` captures three bools at construction and
+    // `session_passes_gate` re-reads those same bools. Harmless only because B1 services ONE
+    // action and exits — snapshot and live differ by milliseconds. P4's service loop is what
+    // makes it a real weakening, and a `chvt` after this point cannot flip `active`.
     if !delphi_runtime::logind::session_passes_gate(verdict.as_ref()) {
         tracing::warn!(
             shell_pid = children.shell_pid,
             vt = %vt,
-            "shell session is NOT active-local-seated at startup — every consent will be DENIED \
-             until it becomes so. If this persists, check DELPHI_SHELL_VT names the seat's \
-             FOREGROUND VT (§4 R3-02a PRIMARY shape). NOT aborting: the `active` axis is dynamic \
-             (foreground), not a static config error — the gate re-checks it per request."
+            "shell session is NOT active-local-seated at startup — every consent will be DENIED. \
+             Check DELPHI_SHELL_VT names the seat's FOREGROUND VT (§4 R3-02a PRIMARY shape). NOT \
+             aborting, but note this verdict is a STARTUP SNAPSHOT: switching VTs later will not \
+             change it (D0-A finding A3)."
         );
     }
     // Real wall-clock — read fresh at mint and at Present-verify so the token TTL is a

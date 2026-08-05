@@ -1889,6 +1889,13 @@ what a mechanism SAYS when it fires.**
    dirs. Its suggested FIX (`sudo installer/install.sh`) was also wrong for that cause, so
    following the message could not converge.
 
+**THE DURABLE FORM, because it generalises past both instances: a diagnostic that names one
+side of a comparison cannot diagnose a divergence in the other.** The staleness guard compared
+two binaries and printed one path; nothing on screen could reveal that the two sides came from
+different target dirs, and its suggested fix (reinstall) could not converge for that cause. A
+message about a mismatch owes BOTH operands — a comparison reported half is not a comparison
+reported, it is an assertion the reader cannot check.
+
 **Why this class is not just "test your code".** Success paths are exercised constantly by
 ordinary use; diagnostic paths run only during failures, which are rare, unrepeatable, and
 happen when attention is on the failure rather than the message. So the message accumulates

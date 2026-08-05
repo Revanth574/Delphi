@@ -26,11 +26,10 @@ mkdir -p "$STAGE"
 
 # Stage a build product and PROVE the staged bytes are the built bytes.
 #
-# Lane run 2 installed a binary this invocation had not built, and the shell-host staleness
-# guard then refused four times while looking like a false positive — because nothing on
-# either side ever printed WHICH tree its bytes came from. The sha is printed so the three
-# numbers that matter (built / staged / what the test resolves via CARGO_BIN_EXE) can be
-# compared instead of assumed.
+# Lane run 2 installed a binary this invocation had not built. THE MECHANISM IS UNKNOWN and
+# the stated suspect was ruled out by measurement — see PROGRESS.md "UNEXPLAINED — build.sh
+# staged a binary it had not built". This assertion makes the next occurrence self-diagnosing;
+# it is not a diagnosis. If it fires, capture the three shas before clearing it.
 stage() {  # stage <src> <name-in-staging>
     local src=$1 dst="$STAGE/$2" a b
     [ -f "$src" ] || { echo "MISSING BUILD PRODUCT: $src" >&2; exit 1; }

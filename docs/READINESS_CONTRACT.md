@@ -69,10 +69,26 @@ and silently break the relay: requests hit an unregistered surface and are dropp
 as a hung or denied consent far from its cause. That is D0-R1-01's defect returning through the
 contract's own wording.
 
-**Fix sketch.** State the contract at the strong level — *"a consent request delivered now will
-reach a live surface"* — and mark the entry-signalling fixtures as an explicitly weaker
-test-scaffold class. **RED:** a fixture that signals at entry and never registers; the first
-relayed request must fail loudly, not be dropped.
+**RESOLVED.** The contract in `readiness.rs` now states the property the relay depends on —
+*a consent request delivered now will reach a live surface* — and says what a producer must do
+to satisfy it: signal **after** the point where an inbound request stops being discarded.
+
+The enforcement is a **second marker**, not a doc. `READY_DATAGRAM` is the surface claim;
+`SCAFFOLD_READY_DATAGRAM` is "the process is up". `LaunchSpec.ready` declares which the caller
+requires, and a scaffold marker where `SurfaceLive` is required is refused by name. **A shell
+signalling at process entry is therefore visibly non-conforming**: it either writes the weaker
+marker and is refused in production, or writes the surface marker while having no surface —
+an explicit false claim in its own source rather than a gap a reader must notice. The prose
+table of which fixtures signal (`launcher.rs:172`) is replaced by the field; every fixture in
+the tree now declares `ScaffoldEntry`, and the daemon declares `SurfaceLive`.
+
+**Proofs** (`runtime/src/readiness.rs`): the refusal fires and names both the fault and its
+consequence; **the same marker is ACCEPTED under a scaffold requirement**, so the refusal is
+about the REQUIREMENT and not about the scaffold marker being unparseable — without that leg
+the first test passes just as happily for a parsing bug; the surface marker satisfies both
+requirements; and neither marker is a prefix of the other, so a truncated read cannot match the
+shorter. Weaken (a) — drop the requirement check → the refusal test fails at its named line.
+Weaken (b) — respell the scaffold marker as a suffix of the surface one → the prefix test fails.
 
 ### A2 — the race-free handle is obtained and then not used
 
@@ -83,9 +99,20 @@ calls, so the pid cannot be recycled. **P4 (the long-lived service loop) is the 
 removes that accident** — a loop that reaps and relaunches makes the pid recyclable between
 resolution and use.
 
-**Fix sketch.** Resolve through the pidfd (`pidfd_getfd`/`/proc/self/fdinfo` → pid read once,
-under the pidfd's guarantee) or state in the type why a raw pid is sound here. **RED:** reap the
-shell, spin pids to recycle, assert the verdict does not resolve to the impostor.
+**RESOLVED.** `LogindSource` holds the **pidfd** and resolves the pid through
+`/proc/self/fdinfo/<fd>` at each `current()`; `Pid: -1` (reaped) or a non-positive value denies.
+A3's shape is what made this a change *inside* the source rather than a rewiring of `launch()`.
+
+**MEASURED, not assumed** (kernel 7.0.0-28): `Pid:` reports the pid while the process is alive,
+**still reports it while dead-but-unreaped**, and reports **`-1` once reaped** — which is
+precisely when the pid becomes recyclable. `None` here and "this number may now name someone
+else" are the same instant.
+
+**Proof**: both legs, because "denies after reaping" passes on an unseated dev box for the wrong
+reason — nothing resolves to a session there at all. The discriminating claim is about the pid
+RESOLUTION: `Some(child)` while alive, `None` once reaped. Weaken — accept `-1` as if it still
+named the process — fails with `left: Some(1)`, i.e. **the reaped shell resolves to init's
+session**, which is the impostor case in its most literal form.
 
 ### A3 — the gate's dynamic axis is frozen, and a comment asserts otherwise
 

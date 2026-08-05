@@ -161,28 +161,18 @@ impl VtName {
 pub struct LaunchSpec<'a> {
     /// The shell binary to exec (B1: the minimal shell).
     ///
-    /// # OBLIGATION — this binary MUST signal readiness (D0)
+    /// # OBLIGATION — this binary must signal the readiness [`LaunchSpec::ready`] requires
     ///
-    /// Whatever is named here must write [`crate::readiness::READY_DATAGRAM`] to
-    /// [`SHELL_CHANNEL_FD`] once it is up, or [`launch`] refuses it after
-    /// [`crate::readiness::DEFAULT_READY_TIMEOUT`] and kills it. **Adding a new shell
-    /// fixture without the marker produces a timeout far from its cause**, which is exactly
-    /// how D0-R1-03 was missed.
+    /// It writes [`crate::readiness::READY_DATAGRAM`] (a request delivered now reaches a live
+    /// surface) or [`crate::readiness::SCAFFOLD_READY_DATAGRAM`] (the process is up) to
+    /// [`SHELL_CHANNEL_FD`], or [`launch`] refuses it after
+    /// [`crate::readiness::DEFAULT_READY_TIMEOUT`] and kills it.
     ///
-    /// THE COMPLETE SET OF CALLERS, enumerated by `grep -rn 'shell_path' --include=*.rs`
-    /// rather than recalled — the recall is what failed:
-    ///
-    /// | site | fixture | signals? |
-    /// |---|---|---|
-    /// | `bin/delphi-runtimed.rs` | the real `/usr/libexec/delphi-shell` | yes — on consent bootstrap |
-    /// | `bin/delphi-minimal-shell.rs` (via `b1_integration`, 3 sites) | `signal_ready` at entry | yes |
-    /// | `tests/b1_integration.rs` fd-test | `sleeper.sh` (`cat marker >&3`) | yes |
-    /// | `tests/leader_is_shell.rs` (3 sites) | the C `pause()` sleeper | yes |
-    /// | `tests/leader_is_shell.rs` missing-shell | a path that does not exist | **no, correctly** — `execve` fails, so readiness is never reached |
-    ///
-    /// The structural foreclosure (one shared fixture helper every test must go through, so
-    /// a silent shell is unconstructible) is **deferred, not solved** — this table is
-    /// documentation, which is weaker. Recorded in PROGRESS.
+    /// **The prose table that used to live here is now the `ready` field.** It listed which
+    /// fixtures signal and which do not, which is documentation — weaker than a type, and D0-A
+    /// A1 is the reason: an entry-signalling shell satisfied `launch()` identically to a
+    /// surface-registering one, so it broke consent silently. Declaring the requirement makes
+    /// the weaker producer REFUSED rather than merely undocumented.
     pub shell_path: &'a Path,
     /// The AI binary to exec (B1: the minimal AI).
     pub ai_path: &'a Path,
@@ -203,6 +193,11 @@ pub struct LaunchSpec<'a> {
     /// would widen the diff B-3's re-run REDs must bite against. C1 takes what the caller
     /// supplies.
     pub tty: &'a VtName,
+    /// What the caller requires of the shell's readiness signal. Production (the daemon)
+    /// requires [`crate::readiness::ReadySemantics::SurfaceLive`]; fixtures that signal at
+    /// process entry declare `ScaffoldEntry` and are refused anywhere `SurfaceLive` is asked
+    /// for (D0-A A1).
+    pub ready: crate::readiness::ReadySemantics,
     /// Extra env passed only to the shell child (B1 test scaffolding: the scripted
     /// password — in production the human types it, never env).
     pub shell_env: &'a [(&'a str, &'a str)],
@@ -272,6 +267,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<Children, RuntimeError> {
         daemon_end.as_fd(),
         shell_tx.pidfd(),
         readiness::DEFAULT_READY_TIMEOUT,
+        spec.ready,
     )?;
 
     let ai_pid = fork_ai(spec)?;

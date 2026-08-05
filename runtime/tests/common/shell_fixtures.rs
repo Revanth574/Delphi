@@ -22,7 +22,8 @@
 //! achievable in the type system and should not be claimed. What IS achieved:
 //!
 //! 1. **One construction site.** Both sleeper shapes are built here, from
-//!    [`READY_DATAGRAM`], so a change to the constant reaches every fixture. Previously two
+//!    the SCAFFOLD marker (these sleepers have no surface — D0-A A1), so a change to the
+//!    constant reaches every fixture. Previously two
 //!    files generated their own and a third wrote none.
 //! 2. **The obligation is named where a fixture is created.** These functions say
 //!    `signalling_` in their names; reaching for one is how a test author learns the
@@ -42,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use delphi_runtime::launcher::SHELL_CHANNEL_FD;
-use delphi_runtime::readiness::READY_DATAGRAM;
+use delphi_runtime::readiness::SCAFFOLD_READY_DATAGRAM as READY_DATAGRAM;
 
 /// The readiness marker as C string-literal octal escapes (`\144\145...`).
 ///

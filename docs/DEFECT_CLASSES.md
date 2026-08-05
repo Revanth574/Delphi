@@ -1333,6 +1333,20 @@ sampled bound. A fix with only (a) is proven to address its instance, not its cl
 
 ---
 
+**VERIFY-IT-APPLIED IS NOT ENOUGH — VERIFY WHERE IT FAILED (D0-A A3).** The existing rule catches
+a weaken whose substitution matched nothing. It does not catch a weaken that *did* apply and then
+failed **for an adjacent reason**. A3's weaken (a) froze the gate verdict behind a
+process-global `OnceLock`; the flip test duly failed — at its FIRST assertion, because a sibling
+test in the same binary had already seeded the memo. The weaken was real, the failure was real,
+and the failure was **not** the one the test names. Re-run with `--exact`, it failed at the
+true→false leg quoting the intended message.
+
+**"The weaken failed" and "the weaken failed for its stated reason" are different observations,
+and only the second is evidence.** So the obligation is: read the failing assertion's line and
+message, not the exit code. Shared process state — statics, `OnceLock`, env, the filesystem — is
+the usual reason the two diverge, and a weaken that introduces shared state is exactly the kind
+most likely to be read wrong.
+
 ## 23. Forecasting your own code instead of interrogating it  *(new — B2a composition)*
 
 **Description.** Asked where a defect is likely to be, an author predicts — and the

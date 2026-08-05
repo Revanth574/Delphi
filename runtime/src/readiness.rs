@@ -9,8 +9,27 @@
 //! Readiness rides the existing consent channel rather than a second inherited fd; rationale
 //! in `docs/TRUST_MODEL.md` §4 R3-01e (a new fd would need an FD-01 allowlist exemption).
 //!
-//! **"Ready" does not mean "drew anything."** It means the process reached the marker.
-//! Tightening it to "a client buffer reached scanout" needs a compositor (D2/D4).
+//! # What "ready" MEANS — the property, and what a producer must do to satisfy it
+//!
+//! **A consent request delivered now will reach a live surface.** That is what the consent
+//! relay depends on, so that is what the contract states (D0-A finding A1). It is NOT "the
+//! process started": a shell that exec'd, or even one that painted, but whose surface is not
+//! yet registered will have its approval request DROPPED — silently, since the renderer has
+//! nothing to drop it into.
+//!
+//! To satisfy it, a producer signals **after** the point where an inbound request stops being
+//! discarded. For `delphi-shell` that is `window.__delphiConsent`'s registration, and the
+//! signal rides the renderer's own `{kind:"ready"}` message so native cannot claim it alone.
+//!
+//! A producer that signals at process ENTRY does not satisfy this and must say so, by writing
+//! [`SCAFFOLD_READY_DATAGRAM`] instead. `launch()` then REFUSES it wherever the caller
+//! requires [`ReadySemantics::SurfaceLive`] — which the daemon does. Before A1 both shapes
+//! wrote the same bytes, so an entry-signalling shell satisfied `launch()` and broke consent
+//! silently; the two markers make that shell visibly non-conforming rather than something a
+//! reader has to notice.
+//!
+//! **It still does not mean "drew anything."** Tightening it to "a client buffer reached
+//! scanout" needs a compositor (D2/D4).
 
 use std::os::fd::BorrowedFd;
 use std::time::{Duration, Instant};
@@ -19,11 +38,27 @@ use nix::poll::{PollFd, PollFlags, PollTimeout};
 
 use crate::RuntimeError;
 
-/// The datagram a shell writes to claim it is up.
+/// The datagram a shell writes to claim **a request delivered now reaches a live surface**.
 ///
 /// Versioned so a future tightening of what readiness *means* is a marker the daemon can
 /// distinguish rather than a silent reinterpretation — hence exact-match, not prefix, below.
 pub const READY_DATAGRAM: &[u8] = b"delphi-shell-ready\0v1";
+
+/// The datagram a fixture writes to claim only **the process is up** — no surface.
+///
+/// A distinct marker, not a flag, so the weaker claim cannot be made by accident: a producer
+/// signalling at entry must name the weaker constant, and every caller requiring
+/// [`ReadySemantics::SurfaceLive`] refuses it (D0-A A1).
+pub const SCAFFOLD_READY_DATAGRAM: &[u8] = b"delphi-shell-ready\0scaffold-v1";
+
+/// Which claim a caller requires of the shell it launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadySemantics {
+    /// A consent request delivered now reaches a live surface. Production requires this.
+    SurfaceLive,
+    /// The process is up. Test scaffolds only — accepts either marker.
+    ScaffoldEntry,
+}
 
 /// Launch budget: a shell that neither signals nor dies must not wedge the daemon.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,7 +109,9 @@ const DEATH_GRACE: Duration = Duration::from_millis(250);
 /// ```no_run
 /// use delphi_runtime::readiness::{await_shell_ready, DEFAULT_READY_TIMEOUT};
 /// # fn demo(chan: std::os::fd::BorrowedFd, pidfd: std::os::fd::BorrowedFd) {
-/// let up = await_shell_ready(chan, pidfd, DEFAULT_READY_TIMEOUT).is_ok();
+/// # use delphi_runtime::readiness::ReadySemantics;
+/// let up = await_shell_ready(chan, pidfd, DEFAULT_READY_TIMEOUT, ReadySemantics::SurfaceLive)
+///     .is_ok();
 /// # let _ = up;
 /// # }
 /// ```
@@ -83,6 +120,7 @@ pub fn await_shell_ready(
     chan: BorrowedFd<'_>,
     pidfd: BorrowedFd<'_>,
     timeout: Duration,
+    required: ReadySemantics,
 ) -> Result<(), RuntimeError> {
     let deadline = Instant::now() + timeout;
 
@@ -117,7 +155,7 @@ pub fn await_shell_ready(
         let pidfd_revents = fds[1].revents().unwrap_or(PollFlags::empty());
 
         if chan_revents.intersects(PollFlags::POLLIN) {
-            return classify_and_confirm_alive(chan, pidfd);
+            return classify_and_confirm_alive(chan, pidfd, required);
         }
         if pidfd_revents.intersects(PollFlags::POLLIN)
             || chan_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
@@ -298,10 +336,11 @@ fn is_readable(fd: &PollFd<'_>) -> bool {
 fn classify_and_confirm_alive(
     chan: BorrowedFd<'_>,
     pidfd: BorrowedFd<'_>,
+    required: ReadySemantics,
 ) -> Result<(), RuntimeError> {
     // One byte longer than the marker, so an over-long datagram is detected, not truncated
     // into a match (DEFECT_CLASSES 1).
-    let mut buf = [0u8; READY_DATAGRAM.len() + 1];
+    let mut buf = [0u8; MAX_MARKER_LEN + 1];
     // SAFETY: `chan` is valid for the call; the read is bounded by the buffer's own length.
     let n = unsafe {
         nix::libc::read(
@@ -335,7 +374,18 @@ fn classify_and_confirm_alive(
     }
     #[allow(clippy::cast_sign_loss)] // n > 0 established above
     let got = &buf[..n as usize];
-    if got == READY_DATAGRAM {
+    // A1: the weaker marker is REFUSED where the caller requires the surface claim, by name.
+    if got == SCAFFOLD_READY_DATAGRAM && required == ReadySemantics::SurfaceLive {
+        return Err(RuntimeError::Protocol(
+            "the shell signalled the SCAFFOLD readiness marker (process up) where the \
+             SURFACE-LIVE claim is required: a consent request delivered now would reach no \
+             registered surface and be silently dropped. A test fixture in a production \
+             launch, or a shell signalling at process entry instead of at surface \
+             registration — see readiness.rs's contract."
+                .to_owned(),
+        ));
+    }
+    if got == READY_DATAGRAM || got == SCAFFOLD_READY_DATAGRAM {
         return match witness_terminal(chan, pidfd, DEATH_GRACE)? {
             Terminal::None => Ok(()),
             Terminal::Dead => Err(RuntimeError::ShellDiedBeforeReady),
@@ -352,9 +402,11 @@ fn classify_and_confirm_alive(
     }
     // Reports the LENGTH, never the bytes — an untrusted payload must not reach the journal.
     Err(RuntimeError::Protocol(format!(
-        "shell's first datagram was {n} bytes, not the {}-byte readiness marker; the binary \
-         is not speaking the D0 contract — check it is the installed /usr/libexec/delphi-shell",
-        READY_DATAGRAM.len()
+        "shell's first datagram was {n} bytes, not a {}- or {}-byte readiness marker; the \
+         binary is not speaking the D0 contract — check it is the installed \
+         /usr/libexec/delphi-shell",
+        READY_DATAGRAM.len(),
+        SCAFFOLD_READY_DATAGRAM.len()
     )))
 }
 
@@ -377,9 +429,41 @@ fn classify_and_confirm_alive(
 /// # }
 /// ```
 pub fn signal_ready(chan_fd: std::os::fd::RawFd) -> Result<(), RuntimeError> {
+    write_marker(chan_fd, READY_DATAGRAM)
+}
+
+/// Write the WEAKER marker: the process is up, no surface claim.
+///
+/// For fixtures that signal at entry. A caller requiring [`ReadySemantics::SurfaceLive`]
+/// refuses it — which is the point (D0-A A1).
+///
+/// # Errors
+///
+/// [`RuntimeError::Syscall`] if the write fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn demo(chan_fd: std::os::fd::RawFd) -> Result<(), Box<dyn std::error::Error>> {
+/// delphi_runtime::readiness::signal_scaffold_ready(chan_fd)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn signal_scaffold_ready(chan_fd: std::os::fd::RawFd) -> Result<(), RuntimeError> {
+    write_marker(chan_fd, SCAFFOLD_READY_DATAGRAM)
+}
+
+/// The longer of the two markers — the read buffer is sized from this, so neither can be
+/// truncated into a match (DEFECT_CLASSES 1).
+const MAX_MARKER_LEN: usize = if READY_DATAGRAM.len() > SCAFFOLD_READY_DATAGRAM.len() {
+    READY_DATAGRAM.len()
+} else {
+    SCAFFOLD_READY_DATAGRAM.len()
+};
+
+fn write_marker(chan_fd: std::os::fd::RawFd, marker: &[u8]) -> Result<(), RuntimeError> {
     // SAFETY: single bounded write of a const buffer; SEQPACKET sends it as one datagram.
-    let n =
-        unsafe { nix::libc::write(chan_fd, READY_DATAGRAM.as_ptr().cast(), READY_DATAGRAM.len()) };
+    let n = unsafe { nix::libc::write(chan_fd, marker.as_ptr().cast(), marker.len()) };
     if n < 0 {
         return Err(RuntimeError::Syscall {
             op: "write (shell readiness marker)",
@@ -653,7 +737,7 @@ mod tests {
         });
         drop(shell_end);
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a child that closed the channel and then died is dead");
         assert!(
             matches!(err, RuntimeError::ShellDiedBeforeReady),
@@ -686,7 +770,7 @@ mod tests {
                 // exit immediately: no sleep, no barrier — the death races the decision
             });
             drop(shell_end);
-            if await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(2)).is_ok()
+            if await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(2), ReadySemantics::SurfaceLive).is_ok()
             {
                 accepted += 1;
             }
@@ -715,7 +799,7 @@ mod tests {
         });
         drop(shell_end); // the parent drops its copy so only the (dead) child held one
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a dead shell must not be reported ready");
         assert!(
             matches!(err, RuntimeError::ShellDiedBeforeReady),
@@ -737,7 +821,7 @@ mod tests {
         });
         drop(shell_end);
 
-        await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect("a shell that signalled must be reported ready");
     }
 
@@ -754,7 +838,7 @@ mod tests {
         });
         drop(shell_end);
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a non-marker datagram is not readiness");
         assert!(matches!(err, RuntimeError::Protocol(_)), "expected Protocol, got: {err}");
     }
@@ -773,7 +857,7 @@ mod tests {
         });
         drop(shell_end);
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a superset of the marker is not the marker");
         assert!(matches!(err, RuntimeError::Protocol(_)), "expected Protocol, got: {err}");
     }
@@ -790,7 +874,7 @@ mod tests {
         drop(shell_end);
 
         let started = Instant::now();
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_millis(300))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_millis(300), ReadySemantics::SurfaceLive)
             .expect_err("a silent live shell must time out");
         assert!(
             matches!(err, RuntimeError::ShellReadyTimeout { .. }),
@@ -823,7 +907,7 @@ mod tests {
 
         wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a shell that signalled and then DIED is dead, not ready");
         assert!(
             matches!(err, RuntimeError::ShellDiedBeforeReady),
@@ -845,7 +929,7 @@ mod tests {
         });
         drop(shell_end);
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("an empty datagram is not the marker");
         assert!(
             matches!(err, RuntimeError::Protocol(_)),
@@ -876,7 +960,7 @@ mod tests {
 
         wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a shell that closed the consent channel is not ready, alive or not");
         // The PROPERTY (not ready) is unchanged; only the DIAGNOSIS is corrected. This shell
         // is demonstrably running, so reporting `ShellDiedBeforeReady` was the same
@@ -906,7 +990,7 @@ mod tests {
 
         wait_for_hup(daemon_end.as_fd(), Duration::from_secs(5));
 
-        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5))
+        let err = await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), ReadySemantics::SurfaceLive)
             .expect_err("a closed channel is not readiness");
         // The process is ALIVE, so "died before ready" would be a false diagnosis.
         assert!(
@@ -922,5 +1006,89 @@ mod tests {
     fn marker_is_not_digest_sized() {
         assert_ne!(READY_DATAGRAM.len(), 32, "marker must not collide with the digest size");
         assert!(READY_DATAGRAM.contains(&0), "marker carries a NUL so it is not plain text");
+    }
+
+    /// A1: a shell that signals at process ENTRY is REFUSED where the surface claim is
+    /// required — the whole point, since before A1 it satisfied `launch()` identically to a
+    /// surface-registering one and then dropped every approval request.
+    #[test]
+    fn a_scaffold_marker_is_refused_where_the_surface_claim_is_required() {
+        let _guard = fork_guard();
+        let (daemon_end, shell_end) = channel_pair();
+        let shell_raw = shell_end.as_raw_fd();
+        let (_child, pidfd) = fork_child_synced(move |sync| {
+            signal_scaffold_ready(shell_raw).expect("signal_scaffold_ready");
+            setup_done(sync);
+            unsafe { nix::libc::sleep(5) };
+        });
+        drop(shell_end);
+
+        let err = await_shell_ready(
+            daemon_end.as_fd(),
+            pidfd.as_fd(),
+            Duration::from_secs(5),
+            ReadySemantics::SurfaceLive,
+        )
+        .expect_err("the weaker claim must not satisfy the stronger requirement");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SCAFFOLD") && msg.contains("silently dropped"),
+            "the refusal must name WHAT is wrong (the weaker claim) and its CONSEQUENCE (the \
+             request is dropped), so a shell author can act on it. Got: {msg}"
+        );
+    }
+
+    /// The same shell is ACCEPTED by a caller that asked only for the weaker claim — so the
+    /// refusal above is about the REQUIREMENT, not about the scaffold marker being unreadable.
+    /// Without this leg the test above passes for a parsing bug just as happily.
+    #[test]
+    fn the_same_scaffold_marker_satisfies_a_scaffold_requirement() {
+        let _guard = fork_guard();
+        let (daemon_end, shell_end) = channel_pair();
+        let shell_raw = shell_end.as_raw_fd();
+        let (_child, pidfd) = fork_child_synced(move |sync| {
+            signal_scaffold_ready(shell_raw).expect("signal_scaffold_ready");
+            setup_done(sync);
+            unsafe { nix::libc::sleep(5) };
+        });
+        drop(shell_end);
+
+        await_shell_ready(
+            daemon_end.as_fd(),
+            pidfd.as_fd(),
+            Duration::from_secs(5),
+            ReadySemantics::ScaffoldEntry,
+        )
+        .expect("a scaffold marker satisfies a scaffold requirement");
+    }
+
+    /// The surface marker satisfies BOTH requirements — the strong claim is never refused for
+    /// being too strong.
+    #[test]
+    fn the_surface_marker_satisfies_both_requirements() {
+        for required in [ReadySemantics::SurfaceLive, ReadySemantics::ScaffoldEntry] {
+            let _guard = fork_guard();
+            let (daemon_end, shell_end) = channel_pair();
+            let shell_raw = shell_end.as_raw_fd();
+            let (_child, pidfd) = fork_child_synced(move |sync| {
+                signal_ready(shell_raw).expect("signal_ready");
+                setup_done(sync);
+                unsafe { nix::libc::sleep(5) };
+            });
+            drop(shell_end);
+            await_shell_ready(daemon_end.as_fd(), pidfd.as_fd(), Duration::from_secs(5), required)
+                .unwrap_or_else(|e| panic!("surface marker refused under {required:?}: {e}"));
+        }
+    }
+
+    /// The two markers must be DISTINGUISHABLE, not merely different: one must not be a prefix
+    /// of the other, or a truncated read of the longer could match the shorter.
+    #[test]
+    fn neither_marker_is_a_prefix_of_the_other() {
+        assert!(!READY_DATAGRAM.starts_with(SCAFFOLD_READY_DATAGRAM));
+        assert!(!SCAFFOLD_READY_DATAGRAM.starts_with(READY_DATAGRAM));
+        assert_ne!(READY_DATAGRAM, SCAFFOLD_READY_DATAGRAM);
+        assert!(MAX_MARKER_LEN >= READY_DATAGRAM.len());
+        assert!(MAX_MARKER_LEN >= SCAFFOLD_READY_DATAGRAM.len());
     }
 }

@@ -26,7 +26,8 @@ fn main() {
     //    until it does, the shell is indistinguishable from one that exec'd and died. This
     //    minimal shell has nothing to initialise, so "up" is simply "reached main" — the real
     //    WRY host signals later, once its WebView has loaded (see runtime/shell-host).
-    delphi_runtime::readiness::signal_ready(chan).expect("signal readiness");
+    // Signals at ENTRY — no surface exists here, so it writes the weaker marker (D0-A A1).
+    delphi_runtime::readiness::signal_scaffold_ready(chan).expect("signal readiness");
 
     // 1. The approval request: digest + the arbiter's preview of the exact action.
     let (digest, preview) = recv_approval_request(chan).expect("recv approval request");

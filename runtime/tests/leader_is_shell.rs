@@ -463,6 +463,8 @@ fn session_leader_is_the_shell_itself_r3_01c() {
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
 
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid,
@@ -668,6 +670,8 @@ fn shell_inherits_only_the_allowlisted_fds_fd_01() {
     );
 
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid,
@@ -817,6 +821,8 @@ fn shell_child_drops_to_the_session_user_b3() {
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
 
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid,
@@ -928,6 +934,8 @@ fn launch_kills_the_shell_when_a_later_step_fails_d0_r4_02() {
     // fails only after the shell is fully up — the exact window the guard exists to cover.
     let missing_ai = work.join("does-not-exist-ai");
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &missing_ai,
         uid,
@@ -1022,6 +1030,8 @@ fn launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01() {
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
 
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &missing_shell,
         ai_path: &ai_bin,
         uid,

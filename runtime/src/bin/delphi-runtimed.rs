@@ -24,7 +24,7 @@
 //! Usage: `delphi-runtimed --session <username>`
 
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -95,6 +95,8 @@ fn main() -> Result<()> {
         gid: user.gid,
         socket_path: &paths.socket,
         tty: &tty,
+        // Production requires the SURFACE-LIVE claim: a scaffold marker is refused (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::SurfaceLive,
         // The children inherit the daemon's env; no per-child overrides needed.
         shell_env: &[],
         ai_env: &[],
@@ -108,7 +110,7 @@ fn main() -> Result<()> {
         "B1: anchor + launcher up; serving one action"
     );
 
-    let session_source = logind_source(children.shell_pid);
+    let session_source = logind_source(children.shell_pidfd.as_fd());
     // B2A-C-R3-02: surface a false startup verdict LOUDLY — but do NOT abort, because for a
     // valid `ttyN` the only axis that can be false here is ACTIVE, and that one tracks which VT
     // holds the seat's foreground, so it is a race at boot rather than a config error.
@@ -165,10 +167,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Where the shell's logind verdict is read from — **fail-closed**, and re-read at every
-/// gate decision rather than captured once (D0-A A3). (A compile-time test seam, excluded
+/// Where the shell's logind verdict is read from — **fail-closed**, re-read at every gate
+/// decision rather than captured once (A3), and resolved through the **pidfd** rather than a
+/// reusable pid (A2). (A compile-time test seam, excluded
 /// from production, lets the binary-flow test pass on a seatless WSL2.)
-fn logind_source(shell_pid: i32) -> Box<dyn SessionSource> {
+fn logind_source(shell_pidfd: std::os::fd::BorrowedFd<'_>) -> Box<dyn SessionSource + '_> {
     #[cfg(feature = "insecure-test-seams")]
     if std::env::var("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION").is_ok() {
         tracing::error!(
@@ -182,7 +185,7 @@ fn logind_source(shell_pid: i32) -> Box<dyn SessionSource> {
             seated: true,
         });
     }
-    Box::new(LogindSource::for_pid(shell_pid))
+    Box::new(LogindSource::for_pidfd(shell_pidfd))
 }
 
 /// 32 random bytes from `/dev/urandom` (no `rand` dependency).

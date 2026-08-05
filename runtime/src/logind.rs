@@ -40,6 +40,7 @@
 //! logind session *for a daemon-spawned shell* (via `pam_open_session`/`pam_systemd`) is
 //! the B2a lane-dependent half, proven on the real seated lane — not faked here.
 
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ffi::{c_char, c_int, CStr, CString};
 
 // SAFETY: the four stable sd-login ABI symbols, resolved from the system
@@ -227,32 +228,71 @@ impl SessionSource for FixedVerdict {
     }
 }
 
-/// The production source: re-queries logind for `pid`'s session on every call.
-pub struct LogindSource {
-    pid: i32,
+/// The pid a pidfd currently refers to, or `None` once it refers to nothing.
+///
+/// # Why not just keep the pid (D0-A finding A2)
+///
+/// A pid is reusable the moment the process is reaped, so a stored one can come to name a
+/// DIFFERENT process — and `sd_pid_get_session` would then answer about the impostor. The
+/// pidfd is the race-free handle `clone3(CLONE_PIDFD)` exists to provide; reading the pid back
+/// out of it at each use is what makes the answer about the shell rather than about a number.
+///
+/// MEASURED (kernel 7.0.0-28, `/proc/self/fdinfo/<pidfd>`): `Pid:` reports the pid while the
+/// process is **alive**, still reports it while **dead but unreaped**, and reports **`-1`**
+/// once **reaped** — which is exactly when the pid becomes recyclable. So `None` here and
+/// "the pid may now name someone else" are the same instant.
+///
+/// # Examples
+///
+/// ```
+/// use delphi_runtime::logind::pid_from_pidfd;
+/// # use std::os::fd::AsFd;
+/// # fn demo(pidfd: std::os::fd::BorrowedFd) {
+/// let _ = pid_from_pidfd(pidfd); // Some(pid) while it names a process, None once reaped
+/// # }
+/// ```
+#[must_use]
+pub fn pid_from_pidfd(pidfd: BorrowedFd<'_>) -> Option<i32> {
+    let path = format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd());
+    let text = std::fs::read_to_string(path).ok()?;
+    let pid: i32 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Pid:"))
+        .map(str::trim)
+        .and_then(|v| v.parse().ok())?;
+    // -1 = reaped. 0 = a pid outside our namespace. Neither is a process we may ask about.
+    (pid > 0).then_some(pid)
 }
 
-impl LogindSource {
-    /// Query the session of `pid` at each [`SessionSource::current`].
+/// The production source: resolves the shell through its **pidfd** and re-queries logind on
+/// every call.
+pub struct LogindSource<'a> {
+    pidfd: BorrowedFd<'a>,
+}
+
+impl<'a> LogindSource<'a> {
+    /// Read the session of whatever `pidfd` names, at each [`SessionSource::current`].
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use delphi_runtime::logind::{LogindSource, SessionSource};
-    /// let src = LogindSource::for_pid(std::process::id() as i32);
-    /// let _ = src.current(); // resolvable or not, never panics
+    /// # fn demo(pidfd: std::os::fd::BorrowedFd) {
+    /// let src = LogindSource::for_pidfd(pidfd);
+    /// let _ = src.current();
+    /// # }
     /// ```
     #[must_use]
-    pub fn for_pid(pid: i32) -> Self {
-        Self { pid }
+    pub fn for_pidfd(pidfd: BorrowedFd<'a>) -> Self {
+        Self { pidfd }
     }
 }
 
-impl SessionSource for LogindSource {
+impl SessionSource for LogindSource<'_> {
     fn current(&self) -> Box<dyn SessionVerdict> {
-        match LogindVerdict::for_pid(self.pid) {
+        match pid_from_pidfd(self.pidfd).and_then(LogindVerdict::for_pid) {
             Some(v) => Box::new(v),
-            // No resolvable session ⇒ deny. Unknown is never "fine" at a gate.
+            // Reaped, or no resolvable session ⇒ deny. Unknown is never "fine" at a gate.
             None => Box::new(FixedVerdict::DENIED),
         }
     }
@@ -423,9 +463,50 @@ mod tests {
         assert!(crate::service::gate_allows(&s), "after the flip back the gate must ALLOW");
     }
 
+    /// A2: the pidfd names the shell while it lives and NOTHING once it is reaped — which is
+    /// exactly when the pid becomes recyclable. Both legs, because "denies after reaping"
+    /// passes on this box for the wrong reason (no session resolves here at all): the
+    /// DISCRIMINATING claim is about the pid RESOLUTION, not about the verdict.
     #[test]
-    fn an_unresolvable_session_denies() {
-        // LogindSource fail-closes on a pid with no session. pid 1 (init) has none.
-        assert!(!crate::service::gate_allows(&LogindSource::for_pid(1)));
+    fn a_pidfd_resolves_to_its_process_while_alive_and_to_nothing_once_reaped() {
+        use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+        // SAFETY: fork in a test; the child only calls async-signal-safe pause/_exit.
+        let child = unsafe { nix::libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // SAFETY: child arm — pause until killed.
+            unsafe {
+                nix::libc::pause();
+                nix::libc::_exit(0);
+            }
+        }
+        // SAFETY: pidfd_open on our own child; the fd is owned from here.
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, child, 0) };
+        assert!(raw >= 0, "pidfd_open failed");
+        #[allow(clippy::cast_possible_truncation)]
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let fd = unsafe { BorrowedFd::borrow_raw(pidfd.as_raw_fd()) };
+
+        assert_eq!(
+            pid_from_pidfd(fd),
+            Some(child),
+            "while the process lives, the pidfd must resolve to it"
+        );
+
+        // SAFETY: killing and reaping our own child.
+        unsafe {
+            nix::libc::kill(child, nix::libc::SIGKILL);
+            let mut st = 0;
+            nix::libc::waitpid(child, &raw mut st, 0);
+        }
+
+        assert_eq!(
+            pid_from_pidfd(fd),
+            None,
+            "once REAPED the pid is recyclable, so the pidfd must resolve to nothing — a \
+             stored pid would keep naming a number that can now be someone else"
+        );
+        // And the gate fail-closes on it.
+        assert!(!crate::service::gate_allows(&LogindSource::for_pidfd(fd)));
     }
 }

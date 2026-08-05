@@ -295,6 +295,8 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid,
@@ -368,6 +370,8 @@ fn b1_token_expiry_blocks_the_assembled_loop() {
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid,
@@ -760,6 +764,8 @@ fn b1_launcher_keeps_the_channel_out_of_the_ai() {
     // shared rather than written per-file (D0-R1-03).
     let sleeper = shell_fixtures::signalling_sh_sleeper(&base, 2);
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &sleeper,
         ai_path: &sleeper,
         uid,
@@ -839,6 +845,8 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
     let spec = LaunchSpec {
+        // Sleeper/minimal fixtures signal at ENTRY — the weaker claim (D0-A A1).
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
         ai_path: &ai_bin,
         uid,

@@ -1364,11 +1364,23 @@ the stale text survived, and it reached review as R1-06. A later verification pa
 this reliably — it checks what you thought to check, and the whole failure is that you believed
 the edit landed.
 
-**VALIDATED IMMEDIATELY, AND THE CLASS WAS UNDER-WEIGHTED (2026-08-06).** With the rule in force
-for one increment, **three** further silent no-ops were caught before anything was written: an
-over-wide test-module deletion that would have removed the very helper it was rewriting, an
-indentation mismatch, and a doc-header mismatch. R1-06 was not a one-off — three more were
-already queued behind it in the same increment.
+**FIVE IN ONE SESSION — THE RULE SHOULD HAVE EXISTED EARLIER, AND ITS ABSENCE WAS SILENTLY
+COSTING EDITS THE WHOLE TIME (2026-08-06).** R1-06 was not "a defect we found once". It was the
+one that **reached review while four others were caught**, in a single increment, once the rule
+was in force:
+
+1. the stale warning string that shipped and became R1-06;
+2. an over-wide test-module deletion that would have removed the very helper it was rewriting;
+3. an indentation mismatch;
+4. a doc-header mismatch;
+5. **the fix for R1-06 itself**, which failed to match for the same line-continuation reason
+   the original did — the identical no-op, one layer up, while fixing it.
+
+Before the rule, every one of those would have reported success and changed nothing. An entry
+reading "we hit this once" **understates the rate by a factor of five** and would leave the next
+reader treating it as a curiosity rather than as a standing property of scripted editing. The
+correct reading is the reverse: silent-no-op edits were happening continuously and invisibly,
+and the only reason the count is known is that something finally counted.
 
 **"The weaken failed" and "the weaken failed for its stated reason" are different observations,
 and only the second is evidence.** So the obligation is: read the failing assertion's line and

@@ -55,9 +55,6 @@ unsafe extern "C" {
     fn sd_pid_get_session(pid: nix::libc::pid_t, session: *mut *mut c_char) -> c_int;
 }
 
-/// A session's active/remote/seated verdict — the seam between the **decision** (unit-
-/// testable) and its **source** (logind, gated-live; or, in the RED-proof, a same-uid-
-/// assertable signal).
 /// The three axes the gate reads, sampled together.
 ///
 /// # A CONCRETE TRIPLE, NOT A TRAIT — and why that is the mechanism (D0A-R1-04)
@@ -151,18 +148,21 @@ impl SessionSnapshot {
     /// # }
     /// ```
     #[must_use]
-    pub fn for_pidfd(pidfd: BorrowedFd<'_>) -> Option<Self> {
+    pub fn for_pidfd(pidfd: BorrowedFd<'_>) -> SessionResolution {
         let mut session: *mut c_char = std::ptr::null_mut();
         // SAFETY: a valid fd passed by value; libsystemd allocates `session` on success.
         let rc = unsafe { sd_pidfd_get_session(pidfd.as_raw_fd(), &raw mut session) };
-        if rc < 0 || session.is_null() {
-            return None;
+        if rc < 0 {
+            return SessionResolution::from_errno(-rc);
+        }
+        if session.is_null() {
+            return SessionResolution::QueryFailed(0);
         }
         // SAFETY: non-null, NUL-terminated, allocated by libsystemd; freed exactly once below.
         let id = unsafe { CStr::from_ptr(session) }.to_string_lossy().into_owned();
         // SAFETY: free the libsystemd-allocated string exactly once.
         unsafe { nix::libc::free(session.cast()) };
-        Self::query(&id)
+        Self::query(&id).map_or(SessionResolution::SessionUnknown(id), SessionResolution::Resolved)
     }
 }
 
@@ -255,6 +255,73 @@ impl SessionSource for SessionSnapshot {
     }
 }
 
+/// Why a session could not be resolved — every variant DENIES, none is silent (D0A-R1-05).
+///
+/// Fail-closed was already right; losing the diagnosis was not. A single `Option` collapsed a
+/// missing `/proc`, a wrong fd, a reaped shell and a sessionless process into one `None`, so
+/// the operator saw the same denial for a configuration error and for normal operation.
+///
+/// **MEASURED, not assumed** (libsystemd, systemd 259): `sd_pidfd_get_session` returns
+/// `-ENODATA` for a live process in no session, `-ESRCH` once it is reaped, `-EBADF` for a
+/// closed fd and `-ENOTTY` for an fd that is not a pidfd. Binding it in D0A-R1-01 therefore
+/// made MORE causes distinguishable than the `/proc` parse it replaced, not fewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionResolution {
+    /// logind answered; this is the triple.
+    Resolved(SessionSnapshot),
+    /// `-ENODATA` — the process is alive and belongs to no session. NORMAL on a seatless box.
+    NoSession,
+    /// `-ESRCH` — the process is gone. The pidfd outlived what it named.
+    ProcessGone,
+    /// `-EBADF` / `-ENOTTY` — the fd is closed or is not a pidfd. **Our bug, not the user's.**
+    NotAPidfd(i32),
+    /// Any other `-errno` from logind.
+    QueryFailed(i32),
+    /// logind named a session it then could not describe — a logind-side inconsistency.
+    SessionUnknown(String),
+}
+
+impl SessionResolution {
+    fn from_errno(e: i32) -> Self {
+        match e {
+            nix::libc::ENODATA => Self::NoSession,
+            nix::libc::ESRCH => Self::ProcessGone,
+            nix::libc::EBADF | nix::libc::ENOTTY => Self::NotAPidfd(e),
+            other => Self::QueryFailed(other),
+        }
+    }
+
+    /// The triple to gate on. Every non-`Resolved` cause denies — and says which it was.
+    #[must_use]
+    pub fn snapshot_or_denied(&self) -> SessionSnapshot {
+        match self {
+            Self::Resolved(s) => *s,
+            Self::NoSession => {
+                tracing::warn!("consent DENIED: the shell belongs to no logind session");
+                SessionSnapshot::DENIED
+            }
+            Self::ProcessGone => {
+                tracing::warn!("consent DENIED: the pinned shell process is gone");
+                SessionSnapshot::DENIED
+            }
+            Self::NotAPidfd(e) => {
+                tracing::error!(errno = e, "consent DENIED: the pidfd is invalid — a DAEMON \
+                                BUG (closed fd or not a pidfd), not a user misconfiguration");
+                SessionSnapshot::DENIED
+            }
+            Self::QueryFailed(e) => {
+                tracing::warn!(errno = e, "consent DENIED: logind query failed");
+                SessionSnapshot::DENIED
+            }
+            Self::SessionUnknown(id) => {
+                tracing::warn!(session = %id, "consent DENIED: logind named a session it then \
+                               could not describe");
+                SessionSnapshot::DENIED
+            }
+        }
+    }
+}
+
 /// The pid a pidfd currently refers to, or `None` once it refers to nothing.
 ///
 /// # Why not just keep the pid (D0-A finding A2)
@@ -318,8 +385,8 @@ impl<'a> LogindSource<'a> {
 impl SessionSource for LogindSource<'_> {
     fn current(&self) -> SessionSnapshot {
         // D0A-R1-01: resolved from the PIDFD, so no pid number crosses between two operations.
-        // Reaped, or no resolvable session ⇒ deny. Unknown is never "fine" at a gate.
-        SessionSnapshot::for_pidfd(self.pidfd).unwrap_or(SessionSnapshot::DENIED)
+        // D0A-R1-05: every failure denies, and each names its own cause.
+        SessionSnapshot::for_pidfd(self.pidfd).snapshot_or_denied()
     }
 }
 
@@ -404,6 +471,60 @@ mod tests {
         let s = Advancing { reads: std::cell::Cell::new(1) };
         assert!(!crate::service::gate_allows(&s), "first decision: not active → DENY");
         assert!(crate::service::gate_allows(&s), "after the flip back the gate must ALLOW");
+    }
+
+    /// D0A-R1-05 — each cause keeps its own identity instead of collapsing into one denial.
+    ///
+    /// Fail-closed was already right; losing the diagnosis was not. The errnos below are
+    /// MEASURED against libsystemd (systemd 259), not assumed — binding
+    /// `sd_pidfd_get_session` in R1-01 made MORE causes distinguishable, not fewer.
+    #[test]
+    fn each_resolution_failure_keeps_its_own_cause() {
+        use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+
+        // A live process in no session (this box has none) → NoSession, NOT ProcessGone.
+        #[allow(clippy::cast_possible_wrap)]
+        let self_pid = std::process::id() as i32;
+        // SAFETY: pidfd_open on ourselves.
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, self_pid, 0) };
+        assert!(raw >= 0);
+        #[allow(clippy::cast_possible_truncation)]
+        let me = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let live = SessionSnapshot::for_pidfd(me.as_fd());
+        assert!(
+            matches!(live, SessionResolution::NoSession | SessionResolution::Resolved(_)),
+            "a LIVE process must report NoSession (or resolve, on a seated box) — never \
+             ProcessGone, which is the cause that means the pidfd outlived what it named. \
+             Got {live:?}"
+        );
+
+        // Not a pidfd → OUR bug, and it says so distinctly.
+        let pipe = std::io::stdout();
+        assert!(
+            matches!(SessionSnapshot::for_pidfd(pipe.as_fd()), SessionResolution::NotAPidfd(_)),
+            "an fd that is not a pidfd is a DAEMON bug and must not look like a user's \
+             misconfiguration"
+        );
+        // A CLOSED fd number — not `-1`, which `BorrowedFd::borrow_raw` rejects outright
+        // (reserved for niche optimization; it panics `fd != -1`). Measured, not assumed.
+        // SAFETY: a stale fd number; the call only inspects it and returns -EBADF.
+        let bad = unsafe { BorrowedFd::borrow_raw(9999) };
+        assert!(
+            matches!(SessionSnapshot::for_pidfd(bad), SessionResolution::NotAPidfd(_)),
+            "a closed fd is EBADF — also our bug, and reported as such"
+        );
+
+        // EVERY cause denies — the diagnosis is added, the fail-closed posture is unchanged.
+        for r in [
+            SessionResolution::NoSession,
+            SessionResolution::ProcessGone,
+            SessionResolution::NotAPidfd(nix::libc::EBADF),
+            SessionResolution::QueryFailed(nix::libc::EIO),
+            SessionResolution::SessionUnknown("c1".to_owned()),
+        ] {
+            assert_eq!(r.snapshot_or_denied(), SessionSnapshot::DENIED, "{r:?} must DENY");
+            assert!(!session_passes_gate(r.snapshot_or_denied()));
+        }
     }
 
     /// D0A-R1-01 — THE BARRIER. A pid is RECYCLED, and the pidfd must still refuse.
@@ -503,9 +624,11 @@ mod tests {
         );
 
         // THE FIX: resolution through the pidfd carries no number at all, and refuses.
-        assert!(
-            SessionSnapshot::for_pidfd(fd).is_none(),
-            "a reaped process must not resolve, even though its pid is live again"
+        assert_eq!(
+            SessionSnapshot::for_pidfd(fd),
+            SessionResolution::ProcessGone,
+            "a reaped process must resolve to PROCESS GONE — not merely 'no session', which is \
+             what a live process in no session reports (D0A-R1-05 makes the two distinct)"
         );
         // And after the reap the diagnostic reports nothing rather than the recycled number.
         assert_eq!(pid_from_pidfd(fd), None, "post-reap the pidfd yields no number");

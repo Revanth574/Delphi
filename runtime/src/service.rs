@@ -163,6 +163,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     send_approval_request(ctx.channel_fd, &digest, &preview_text)?;
 
     // 3. logind gate (composed), then live PAM over the private channel.
+    // FIRST of two reads: refuse to PROMPT at a surface that is not the seat's foreground.
     if !gate_allows(ctx.session) {
         return deny(ai, &id, "logind: shell session not active+local");
     }
@@ -174,6 +175,17 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     let confirm = recv_mint_confirm(ctx.channel_fd)?;
     if confirm != digest {
         return deny(ai, &id, "shell mint-confirm digest != stored digest");
+    }
+    // SECOND read, ADJACENT TO THE MINT (D0A-R1-02). A3 made the READ fresh and left the
+    // DECISION stale: PAM waits on a human, so unboundedly, and `recv_mint_confirm` blocks
+    // after it. A session going true → false during authentication still minted — the exact
+    // case A3's own docs name as the security property. Class 26 one level above A3.
+    if !gate_allows(ctx.session) {
+        return deny(
+            ai,
+            &id,
+            "logind: the shell session stopped being active+local+seated DURING              authentication — the seat's foreground moved, so this consent would not be              one a human at the seat gave",
+        );
     }
     // Mint at the time of consent (read FRESH — not a frozen snapshot).
     let token = mint(ctx.key, &digest, ctx.clock.now_unix());

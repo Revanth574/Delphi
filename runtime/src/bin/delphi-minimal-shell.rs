@@ -27,6 +27,17 @@ fn main() {
     //    minimal shell has nothing to initialise, so "up" is simply "reached main" — the real
     //    WRY host signals later, once its WebView has loaded (see runtime/shell-host).
     // Signals at ENTRY — no surface exists here, so it writes the weaker marker (D0-A A1).
+    //
+    // D0A-R1-03: under `insecure-test-seams` ONLY, it writes the SURFACE marker instead. The
+    // daemon BINARY requires `SurfaceLive`, so without this the binary-flow test could never
+    // reach the assembled flow once its other prerequisites were met — a latent
+    // never-runs-again, invisible because that test currently skips for want of the feature.
+    // The production requirement does NOT move: this is the same compile-time seam that
+    // already bypasses the logind gate for that one test, and it is absent from every build
+    // that does not enable it.
+    #[cfg(feature = "insecure-test-seams")]
+    delphi_runtime::readiness::signal_ready(chan).expect("signal readiness");
+    #[cfg(not(feature = "insecure-test-seams"))]
     delphi_runtime::readiness::signal_scaffold_ready(chan).expect("signal readiness");
 
     // 1. The approval request: digest + the arbiter's preview of the exact action.

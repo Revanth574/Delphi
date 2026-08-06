@@ -338,6 +338,109 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     assert_eq!(marker, "B1-LIVES", "the STORED canonical action executed end-to-end");
 }
 
+// ── D0A-R1-02: the gate is re-read ADJACENT TO THE MINT ─────────────────────
+
+/// A source that ALLOWS the first read and DENIES every one after — the session going
+/// true → false while PAM waits on a human.
+struct FlipsAfterFirstRead {
+    reads: std::sync::atomic::AtomicUsize,
+}
+impl delphi_runtime::logind::SessionSource for FlipsAfterFirstRead {
+    fn current(&self) -> delphi_runtime::logind::SessionSnapshot {
+        let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            delphi_runtime::logind::SessionSnapshot { active: true, remote: false, seated: true }
+        } else {
+            delphi_runtime::logind::SessionSnapshot::DENIED
+        }
+    }
+}
+
+/// A3 made the READ fresh and left the DECISION stale: the gate passed, then PAM blocked on a
+/// human — unboundedly — and the mint never re-checked. A session that stopped being the
+/// seat's foreground during authentication still minted, which is the case A3's own docs name
+/// as the security property.
+///
+/// This test needs to get PAST PAM to reach the second read, so it is root-gated. A skip
+/// proves nothing.
+#[test]
+fn b1_session_lost_during_pam_blocks_the_mint_d0a_r1_02() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP b1_session_lost_during_pam: requires root (anchor + PAM)");
+        return;
+    }
+    if !bwrap_available() {
+        eprintln!("SKIP b1_session_lost_during_pam: requires bwrap + unprivileged userns");
+        return;
+    }
+    let setup = Setup::new("r102");
+    let (uid, gid) = setup.ids();
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-r102-")
+            .tempdir_in("/run").expect("tempdir"));
+    let base = _base_tmp.path().to_path_buf();
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let result = work.join("result");
+    let exe = write_marker_exe(&work, &result);
+
+    let exe_str = exe.display().to_string();
+    let work_str = work.display().to_string();
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+    let spec = LaunchSpec {
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
+        shell_path: &shell_bin,
+        ai_path: &ai_bin,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        tty: test_vt(),
+        shell_env: &[("DELPHI_TEST_PASSWORD", PASSWORD)],
+        ai_env: &[("DELPHI_TEST_EXE", &exe_str), ("DELPHI_TEST_CWD", &work_str)],
+    };
+    let children = launch(&spec).expect("launch");
+    let mut ai = accept_requester(&listener, uid.as_raw()).expect("accept AI");
+    let mut store = PendingStore::new();
+    let mut ledger = ConsumptionLedger::new();
+    let key = MintingKey::from_bytes(KEY);
+    let flipping = FlipsAfterFirstRead { reads: std::sync::atomic::AtomicUsize::new(0) };
+    let mut ctx = ServiceCtx {
+        channel_fd: children.daemon_channel.as_raw_fd(),
+        session: &flipping,
+        key: &key,
+        pam_service: SERVICE,
+        session_user: &setup.user,
+        store: &mut store,
+        ledger: &mut ledger,
+        clock: &FixedClock(NOW),
+    };
+    let outcome = serve_one_action(&mut ai, &mut ctx).expect("serve one action");
+    let _ = waitpid(nix::unistd::Pid::from_raw(children.shell_pid), None);
+    let _ = waitpid(nix::unistd::Pid::from_raw(children.ai_pid), None);
+    let marker = std::fs::read_to_string(&result).unwrap_or_default();
+
+    // The FIRST read allowed, so PAM ran and the prompt was shown — that is deliberate: the
+    // pre-PAM check exists so we never prompt at a surface that is not the foreground.
+    assert!(
+        flipping.reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the gate must be read AGAIN after PAM — one read means the mint is still \
+         authorized by a verdict taken before an unbounded human wait"
+    );
+    match outcome {
+        Outcome::Denied { reason, .. } => assert!(
+            reason.contains("DURING authentication"),
+            "the denial must name the transition, not look like a first-gate refusal: {reason}"
+        ),
+        other => panic!("a session lost during PAM must NOT mint: {other:?}"),
+    }
+    assert!(marker.is_empty(), "nothing may execute: the action was never granted");
+}
+
 // ── B1-R2-01: token TTL is a REAL control in the assembled loop ──────────────
 
 #[test]

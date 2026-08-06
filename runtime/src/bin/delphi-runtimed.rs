@@ -123,10 +123,10 @@ fn main() -> Result<()> {
         tracing::warn!(
             shell_pid = children.shell_pid,
             vt = %vt,
-            "shell session is NOT active-local-seated at startup — every consent will be DENIED. \
-             Check DELPHI_SHELL_VT names the seat's FOREGROUND VT (§4 R3-02a PRIMARY shape). NOT \
-             aborting, but note this verdict is a STARTUP SNAPSHOT: switching VTs later will not \
-             change it (D0-A finding A3)."
+            "shell session is NOT active-local-seated at startup — consent will be DENIED while \
+             this holds. Check DELPHI_SHELL_VT names the seat's FOREGROUND VT (§4 R3-02a PRIMARY \
+             shape). NOT aborting: the gate re-reads the verdict at EVERY decision (D0-A A3), so \
+             switching to the shell's VT clears this without a restart."
         );
     }
     // Real wall-clock — read fresh at mint and at Present-verify so the token TTL is a

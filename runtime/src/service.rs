@@ -96,14 +96,14 @@ pub struct ServiceCtx<'a> {
 /// # Examples
 ///
 /// ```
-/// use delphi_runtime::logind::FixedVerdict;
+/// use delphi_runtime::logind::SessionSnapshot;
 /// use delphi_runtime::service::gate_allows;
-/// assert!(gate_allows(&FixedVerdict { active: true, remote: false, seated: true }));
-/// assert!(!gate_allows(&FixedVerdict::DENIED));
+/// assert!(gate_allows(&SessionSnapshot { active: true, remote: false, seated: true }));
+/// assert!(!gate_allows(&SessionSnapshot::DENIED));
 /// ```
 #[must_use]
 pub fn gate_allows(source: &dyn SessionSource) -> bool {
-    session_passes_gate(source.current().as_ref())
+    session_passes_gate(source.current())
 }
 
 /// The terminal outcome of one serviced action.

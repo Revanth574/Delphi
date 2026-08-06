@@ -179,7 +179,7 @@ fn logind_source(shell_pidfd: std::os::fd::BorrowedFd<'_>) -> Box<dyn SessionSou
              DELPHI_INSECURE_ASSUME_ACTIVE_SESSION; this MUST NOT appear in production"
         );
         // The seam also asserts `seated` — the B2a gate requires it.
-        return Box::new(delphi_runtime::logind::FixedVerdict {
+        return Box::new(delphi_runtime::logind::SessionSnapshot {
             active: true,
             remote: false,
             seated: true,

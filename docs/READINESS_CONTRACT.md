@@ -143,11 +143,30 @@ and a source of itself, so the tests and the insecure seam need no adapter.
 
 **Why a source rather than a live-querying `SessionVerdict`.** `session_passes_gate` reads the
 three axes as three calls, so an impl that queried per method could **tear**: `active` from one
-instant, `seated` from another, producing a verdict that never described any actual moment. One
-`current()` per decision yields a triple that was simultaneously true, which is what
-"active-local-seated now" means. **This is `DEFECT_CLASSES` 26 one level up** — R2-01/R2-01b/c
-were a captured `revents` reused after a syscall; this is a captured verdict reused across the
-decision it authorizes. Same asymmetry, different altitude.
+instant, `seated` from another, producing a verdict that never described any actual moment.
+**This is `DEFECT_CLASSES` 26 one level up** — R2-01/R2-01b/c were a captured `revents` reused
+after a syscall; this is a captured verdict reused across the decision it authorizes. Same
+asymmetry, different altitude.
+
+**CORRECTION (D0A-R1-04), because A3 shipped with two claims that did not hold.**
+
+1. *"One `current()` per decision yields a triple that was simultaneously true."* **False, and
+   withdrawn.** `SessionSnapshot::query` makes THREE separate libsystemd calls
+   (`sd_session_is_active`, `sd_session_is_remote`, `sd_session_get_seat`) — logind offers no
+   atomic read of the three. The honest guarantee is **three reads in immediate succession**: a
+   VT switch landing between them yields a mixed triple, the window is the span of two library
+   calls, and the next decision re-reads from scratch. Stated rather than claimed away.
+2. *The simultaneity "law" was enforcement.* It was **convention**. `current()` returned
+   `Box<dyn SessionVerdict>`, so a lazily-querying impl was still expressible, and the
+   `#[should_panic]` test policing it exercised a permanently-separate fixture — making the
+   PRODUCTION source lazy would have left the suite green.
+
+Both are closed by `current()` returning a concrete `SessionSnapshot`. The tearing shape is now
+**unrepresentable**, so the type is the law and the fixture and its test are deleted.
+**Codex's settling weaken — make the production `LogindSource` lazy per axis — no longer
+compiles** (`E0053: method 'current' has an incompatible type for trait`). A weaken that fails
+to COMPILE forecloses the class rather than detecting an instance of it, which is the stronger
+outcome and the one to record.
 
 **Proofs** (`runtime/src/logind.rs` tests):
 

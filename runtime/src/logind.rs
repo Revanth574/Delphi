@@ -34,7 +34,7 @@
 //!
 //! The **decision** (`active && !remote && seated`) is unit-testable without a live
 //! session ([`session_passes_gate`]) — including the B2a gate-negative (a seatless
-//! active-local session is denied). The **logind query** ([`LogindVerdict`]) is proven
+//! active-local session is denied). The **logind query** ([`SessionSnapshot::query`]) is proven
 //! live where a real session exists (gated): the seatless-negative bites on WSL2's real
 //! seatless session; the seated-**positive** needs a real seated lane. Provisioning a
 //! logind session *for a daemon-spawned shell* (via `pam_open_session`/`pam_systemd`) is
@@ -55,35 +55,52 @@ unsafe extern "C" {
 /// A session's active/remote/seated verdict — the seam between the **decision** (unit-
 /// testable) and its **source** (logind, gated-live; or, in the RED-proof, a same-uid-
 /// assertable signal).
-pub trait SessionVerdict {
-    /// Whether the session is currently active (the foreground session on its seat).
-    fn is_active(&self) -> bool;
-    /// Whether the session is remote (e.g. SSH) rather than local.
-    fn is_remote(&self) -> bool;
-    /// Whether the session is attached to a physical **seat** (a local console). A
-    /// seatless session (bare `pts`, seatless container) is not a physical-console
-    /// session, so it cannot represent a human present at the seat (B2a R3-02 tightening).
-    fn is_seated(&self) -> bool;
+/// The three axes the gate reads, sampled together.
+///
+/// # A CONCRETE TRIPLE, NOT A TRAIT — and why that is the mechanism (D0A-R1-04)
+///
+/// A3 returned `Box<dyn SessionVerdict>` and asked implementations, in prose, to describe one
+/// instant. That was a **convention**: an impl could still read each axis lazily at call time,
+/// mixing instants, and the `#[should_panic]` law policing it exercised a permanently separate
+/// fixture — so making the *production* source lazy would have left the suite green. A struct
+/// of three `bool`s makes the tearing shape **unrepresentable**, so the type is the law and no
+/// test is needed to enforce it.
+///
+/// # WHAT THIS DOES *NOT* CLAIM — the atomicity correction (D0A-R1-04)
+///
+/// A3's write-up said one query yields "a triple that was simultaneously true". **That was
+/// false and is withdrawn.** [`SessionSnapshot::query`] makes THREE separate libsystemd calls
+/// (`sd_session_is_active`, `sd_session_is_remote`, `sd_session_get_seat`); logind offers no
+/// atomic read of the three. The honest guarantee is **three reads in immediate succession**:
+/// a VT switch landing between them yields a mixed triple, the window is the span of two
+/// library calls, and the next decision re-reads from scratch. Documented rather than claimed
+/// away — a false atomicity claim is worse than a stated sampling window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    /// Foreground on its seat.
+    pub active: bool,
+    /// Remote (SSH) rather than local.
+    pub remote: bool,
+    /// Attached to a physical seat.
+    pub seated: bool,
+}
+
+impl SessionSnapshot {
+    /// The fail-closed triple: fails every axis the gate reads.
+    pub const DENIED: Self = Self { active: false, remote: false, seated: false };
 }
 
 /// THE DECISION: a session passes the gate iff it is **active AND local AND seated**.
-/// Unit-testable without any live session. The seat requirement is the B2a
-/// strengthening (see the module docs) — strictly more restrictive than the pre-B2a
-/// `active && !remote`.
+/// Unit-testable without any live session. The seat requirement is the B2a strengthening
+/// (see the module docs) — strictly more restrictive than the pre-B2a `active && !remote`.
 #[must_use]
-pub fn session_passes_gate(verdict: &(impl SessionVerdict + ?Sized)) -> bool {
-    verdict.is_active() && !verdict.is_remote() && verdict.is_seated()
+pub fn session_passes_gate(s: SessionSnapshot) -> bool {
+    s.active && !s.remote && s.seated
 }
 
-/// The **authoritative** verdict: queried directly from logind. A same-uid process
-/// cannot make logind report a session as active-local-seated when it is not.
-pub struct LogindVerdict {
-    active: bool,
-    remote: bool,
-    seated: bool,
-}
-
-impl LogindVerdict {
+/// The **authoritative** triple: queried directly from logind. A same-uid process cannot make
+/// logind report a session as active-local-seated when it is not.
+impl SessionSnapshot {
     /// Query logind for the named session id. Returns `None` if logind does not know the
     /// session (or on error querying active/remote).
     #[must_use]
@@ -190,41 +207,13 @@ fn session_is_seated(session: &CStr) -> bool {
 /// Implementations MUST return a verdict describing ONE instant. `verdict_triple_is_simultaneous`
 /// in this module's tests is that law, and it is proven discriminating against a tearing impl.
 pub trait SessionSource {
-    /// The session's verdict as of now. Fail-closed: unresolvable ⇒ a denying verdict.
-    fn current(&self) -> Box<dyn SessionVerdict>;
+    /// The session's triple as of now. Fail-closed: unresolvable ⇒ [`SessionSnapshot::DENIED`].
+    fn current(&self) -> SessionSnapshot;
 }
 
-/// A verdict fixed at construction — the fail-closed default, and the test seam.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FixedVerdict {
-    /// Foreground on its seat.
-    pub active: bool,
-    /// Remote (SSH) rather than local.
-    pub remote: bool,
-    /// Attached to a physical seat.
-    pub seated: bool,
-}
-
-impl FixedVerdict {
-    /// The fail-closed verdict: fails every axis the gate reads.
-    pub const DENIED: Self = Self { active: false, remote: false, seated: false };
-}
-
-impl SessionVerdict for FixedVerdict {
-    fn is_active(&self) -> bool {
-        self.active
-    }
-    fn is_remote(&self) -> bool {
-        self.remote
-    }
-    fn is_seated(&self) -> bool {
-        self.seated
-    }
-}
-
-impl SessionSource for FixedVerdict {
-    fn current(&self) -> Box<dyn SessionVerdict> {
-        Box::new(*self)
+impl SessionSource for SessionSnapshot {
+    fn current(&self) -> SessionSnapshot {
+        *self
     }
 }
 
@@ -289,24 +278,11 @@ impl<'a> LogindSource<'a> {
 }
 
 impl SessionSource for LogindSource<'_> {
-    fn current(&self) -> Box<dyn SessionVerdict> {
-        match pid_from_pidfd(self.pidfd).and_then(LogindVerdict::for_pid) {
-            Some(v) => Box::new(v),
-            // Reaped, or no resolvable session ⇒ deny. Unknown is never "fine" at a gate.
-            None => Box::new(FixedVerdict::DENIED),
-        }
-    }
-}
-
-impl SessionVerdict for LogindVerdict {
-    fn is_active(&self) -> bool {
-        self.active
-    }
-    fn is_remote(&self) -> bool {
-        self.remote
-    }
-    fn is_seated(&self) -> bool {
-        self.seated
+    fn current(&self) -> SessionSnapshot {
+        // Reaped, or no resolvable session ⇒ deny. Unknown is never "fine" at a gate.
+        pid_from_pidfd(self.pidfd)
+            .and_then(SessionSnapshot::for_pid)
+            .unwrap_or(SessionSnapshot::DENIED)
     }
 }
 
@@ -314,132 +290,62 @@ impl SessionVerdict for LogindVerdict {
 mod tests {
     use super::*;
 
-    struct Mock {
-        active: bool,
-        remote: bool,
-        seated: bool,
-    }
-    impl SessionVerdict for Mock {
-        fn is_active(&self) -> bool {
-            self.active
-        }
-        fn is_remote(&self) -> bool {
-            self.remote
-        }
-        fn is_seated(&self) -> bool {
-            self.seated
-        }
-    }
-
     /// THE DECISION LOGIC (unit, no live session): passes iff active AND local AND seated.
     #[test]
     fn gate_passes_only_active_local_and_seated() {
         assert!(
-            session_passes_gate(&Mock { active: true, remote: false, seated: true }),
+            session_passes_gate(SessionSnapshot { active: true, remote: false, seated: true }),
             "active local seated → pass"
         );
         // THE B2a GATE-NEGATIVE (the bite): active + local but SEATLESS — this passed the
         // pre-B2a `active && !remote` gate; it must now be DENIED by the seated gate.
         assert!(
-            !session_passes_gate(&Mock { active: true, remote: false, seated: false }),
+            !session_passes_gate(SessionSnapshot { active: true, remote: false, seated: false }),
             "active local but SEATLESS → deny (B2a R3-02 tightening)"
         );
         assert!(
-            !session_passes_gate(&Mock { active: false, remote: false, seated: true }),
+            !session_passes_gate(SessionSnapshot { active: false, remote: false, seated: true }),
             "inactive → deny"
         );
         assert!(
-            !session_passes_gate(&Mock { active: true, remote: true, seated: true }),
+            !session_passes_gate(SessionSnapshot { active: true, remote: true, seated: true }),
             "remote → deny"
         );
     }
 
     /// A source whose state advances on every READ of the underlying cell.
-    ///
-    /// Snapshot impls read the cell ONCE per `current()`, so their triple is one instant.
-    /// A per-method-querying impl reads it three times and mixes instants.
     struct Advancing {
         reads: std::cell::Cell<usize>,
     }
     impl Advancing {
-        const A: FixedVerdict = FixedVerdict { active: true, remote: false, seated: true };
-        const B: FixedVerdict = FixedVerdict { active: false, remote: true, seated: false };
-        fn read(&self) -> FixedVerdict {
+        const A: SessionSnapshot = SessionSnapshot { active: true, remote: false, seated: true };
+        const B: SessionSnapshot = SessionSnapshot { active: false, remote: true, seated: false };
+        fn read(&self) -> SessionSnapshot {
             let n = self.reads.get();
             self.reads.set(n + 1);
             if n.is_multiple_of(2) { Self::A } else { Self::B }
         }
     }
-    /// CORRECT shape: one read per decision.
     impl SessionSource for Advancing {
-        fn current(&self) -> Box<dyn SessionVerdict> {
-            Box::new(self.read())
+        fn current(&self) -> SessionSnapshot {
+            self.read()
         }
     }
 
-    /// The forbidden shape, kept so the law below is PROVEN discriminating rather than
-    /// merely asserted: each axis is read at a different instant.
-    struct Tearing {
-        inner: Advancing,
-    }
-    struct TornVerdict {
-        active: bool,
-        remote: bool,
-        seated: bool,
-    }
-    impl SessionSource for Tearing {
-        fn current(&self) -> Box<dyn SessionVerdict> {
-            Box::new(TornVerdict {
-                active: self.inner.read().active,
-                remote: self.inner.read().remote,
-                seated: self.inner.read().seated,
-            })
-        }
-    }
-    impl SessionVerdict for TornVerdict {
-        fn is_active(&self) -> bool {
-            self.active
-        }
-        fn is_remote(&self) -> bool {
-            self.remote
-        }
-        fn is_seated(&self) -> bool {
-            self.seated
-        }
-    }
+    // D0A-R1-04: the `Tearing` fixture and the `#[should_panic]` law that policed it are GONE.
+    // `current()` returns a concrete `SessionSnapshot`, so an implementation CANNOT read one
+    // axis at a time — the settling weaken (make the production source lazy per axis) no longer
+    // COMPILES. Foreclosed rather than detected, which is why no test replaces them.
 
-    /// THE LAW every `SessionSource` owes: the triple describes ONE instant.
-    ///
-    /// Against a source whose state advances per read, a conforming `current()` returns
-    /// exactly `A` or exactly `B` — never a mixture. A verdict assembled from three instants
-    /// never described any actual moment, which is not a thing the gate can act on.
-    fn assert_triple_is_simultaneous(src: &dyn SessionSource) {
+    /// The fixture yields one state or the other, never a blend — a sanity check on the test
+    /// double itself, since the TYPE now guarantees this for every real source.
+    #[test]
+    fn the_advancing_fixture_yields_one_state_at_a_time() {
+        let src = Advancing { reads: std::cell::Cell::new(0) };
         for _ in 0..8 {
-            let v = src.current();
-            let got = FixedVerdict {
-                active: v.is_active(),
-                remote: v.is_remote(),
-                seated: v.is_seated(),
-            };
-            assert!(
-                got == Advancing::A || got == Advancing::B,
-                "TORN verdict {got:?} — assembled from more than one instant, so it describes \
-                 no actual moment (D0-A A3; DEFECT_CLASSES 26 one level up)"
-            );
+            let got = src.current();
+            assert!(got == Advancing::A || got == Advancing::B, "blended triple {got:?}");
         }
-    }
-
-    #[test]
-    fn a_snapshotting_source_yields_a_simultaneous_triple() {
-        assert_triple_is_simultaneous(&Advancing { reads: std::cell::Cell::new(0) });
-    }
-
-    /// The law's discrimination, PROVEN — not a weaken run once and reported, but a case that
-    /// fails forever if `current()` is ever refactored into per-method queries.
-    #[test]
-    #[should_panic(expected = "TORN verdict")]
-    fn the_law_rejects_a_source_that_reads_each_axis_at_a_different_instant() {
-        assert_triple_is_simultaneous(&Tearing { inner: Advancing { reads: std::cell::Cell::new(0) } });
     }
 
     /// A source read at the decision follows a flip. Both directions, because only one of

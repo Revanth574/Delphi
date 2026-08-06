@@ -19,23 +19,17 @@
 use std::fs;
 use std::path::PathBuf;
 
-use delphi_runtime::logind::{session_passes_gate, LogindVerdict, SessionVerdict};
+use delphi_runtime::logind::{session_passes_gate, SessionSnapshot};
 
-/// A verdict sourced from a same-uid-writable FILE — the deliberately-weakened,
-/// forgeable trust source for the RED-proof.
-struct FileAssertedVerdict {
-    path: PathBuf,
-}
-
-impl SessionVerdict for FileAssertedVerdict {
-    fn is_active(&self) -> bool {
-        fs::read_to_string(&self.path).is_ok_and(|s| s.contains("active"))
-    }
-    fn is_remote(&self) -> bool {
-        fs::read_to_string(&self.path).is_ok_and(|s| s.contains("remote"))
-    }
-    fn is_seated(&self) -> bool {
-        fs::read_to_string(&self.path).is_ok_and(|s| s.contains("seated"))
+/// A triple sourced from a same-uid-writable FILE — the deliberately-weakened, forgeable
+/// trust source for the RED-proof. ONE read, three fields: under D0A-R1-04 a source yields a
+/// triple, so this fixture no longer re-reads the file per axis either.
+fn file_asserted(path: &PathBuf) -> SessionSnapshot {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    SessionSnapshot {
+        active: text.contains("active"),
+        remote: text.contains("remote"),
+        seated: text.contains("seated"),
     }
 }
 
@@ -45,7 +39,7 @@ impl SessionVerdict for FileAssertedVerdict {
 #[test]
 fn logind_trust_denies_same_uid_forge() {
     let fake = format!("delphi-no-such-session-{}", std::process::id());
-    let passed = LogindVerdict::query(&fake).is_some_and(|v| session_passes_gate(&v));
+    let passed = SessionSnapshot::query(&fake).is_some_and(session_passes_gate);
     assert!(
         !passed,
         "logind-trust: a session logind does not know cannot pass the gate — a same-uid \
@@ -69,7 +63,7 @@ fn red_proof_same_uid_signal_trust_lets_forge_succeed() {
     // the signal it can reach — the B2a seat axis is forgeable too when the source is a
     // same-uid file, which is precisely why the source must be logind.
     fs::write(&path, "active seated").expect("same-uid write to the forgeable signal");
-    let passed = session_passes_gate(&FileAssertedVerdict { path: path.clone() });
+    let passed = session_passes_gate(file_asserted(&path));
     assert!(
         passed,
         "RED-proof: trusting a same-uid-writable signal lets the attacker forge \
@@ -95,14 +89,14 @@ fn seatless_active_session_fails_the_seated_gate_live() {
         return;
     };
     // Precondition: this real session passes the PRE-B2a gate (active && !remote)…
-    let old_gate = v.is_active() && !v.is_remote();
-    let new_gate = session_passes_gate(&v);
+    let old_gate = v.active && !v.remote;
+    let new_gate = session_passes_gate(v);
     eprintln!(
         "gate-negative-live BIT: real logind session {id:?} — active={} remote={} seated={} \
          → OLD gate (active&&!remote)={old_gate}, tightened seated gate={new_gate}",
-        v.is_active(),
-        v.is_remote(),
-        v.is_seated(),
+        v.active,
+        v.remote,
+        v.seated,
     );
     assert!(old_gate, "precondition: a real active+local session passes the OLD gate");
     // …and MUST fail the tightened seated gate — the bite.
@@ -116,17 +110,17 @@ fn seatless_active_session_fails_the_seated_gate_live() {
 /// Scan logind's session registry (`/run/systemd/sessions/<id>`) for an active, local,
 /// **seatless** session, confirmed via the authoritative `sd_session_*` query. The `.ref`
 /// lock files and non-session entries are skipped.
-fn active_local_seatless_session() -> Option<(String, LogindVerdict)> {
+fn active_local_seatless_session() -> Option<(String, SessionSnapshot)> {
     for entry in fs::read_dir("/run/systemd/sessions").ok()?.flatten() {
         let name = entry.file_name();
         let id = name.to_string_lossy().into_owned();
         if id.ends_with(".ref") || !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
-        if let Some(v) = LogindVerdict::query(&id)
-            && v.is_active()
-            && !v.is_remote()
-            && !v.is_seated()
+        if let Some(v) = SessionSnapshot::query(&id)
+            && v.active
+            && !v.remote
+            && !v.seated
         {
             return Some((id, v));
         }
@@ -139,13 +133,13 @@ fn active_local_seatless_session() -> Option<(String, LogindVerdict)> {
 #[test]
 fn live_logind_query_path_works_or_documents_deferral() {
     let pid = i32::try_from(std::process::id()).expect("pid fits i32");
-    match LogindVerdict::for_pid(pid) {
+    match SessionSnapshot::for_pid(pid) {
         Some(v) => {
             // A real session: the LIVE sd_session_* query succeeded and yields a
             // usable verdict; the gate decision then composes deterministically.
             // (Active/local state here is environmental, so it is not asserted —
             // the point proven is that the live query path works.)
-            let _ = session_passes_gate(&v);
+            let _ = session_passes_gate(v);
         }
         None => {
             eprintln!(

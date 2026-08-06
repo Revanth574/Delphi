@@ -72,9 +72,9 @@ const NOW: u64 = 1_000;
 const KEY: [u8; 32] = [0x5B; 32];
 
 /// The verdict the gate reads, injected as a SOURCE (WSL2 sessions are ephemeral, so a real
-/// `for_pid` query is unreliable — the `logind_gate` test proves the real `LogindVerdict`).
-/// `FixedVerdict` is both the verdict and a source of it, so these sites need no adapter.
-type Verdict = delphi_runtime::logind::FixedVerdict;
+/// `for_pid` query is unreliable — the `logind_gate` test proves the real logind query).
+/// `SessionSnapshot` is both the triple and a source of it, so these sites need no adapter.
+type Verdict = delphi_runtime::logind::SessionSnapshot;
 
 const PASS: Verdict = Verdict { active: true, remote: false, seated: true };
 

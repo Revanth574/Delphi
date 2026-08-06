@@ -49,6 +49,9 @@ unsafe extern "C" {
     fn sd_session_is_active(session: *const c_char) -> c_int;
     fn sd_session_is_remote(session: *const c_char) -> c_int;
     fn sd_session_get_seat(session: *const c_char, seat: *mut *mut c_char) -> c_int;
+    /// systemd >= 253. Resolves a **pidfd** to its session, re-verifying the pidfd after the
+    /// lookup — the step a hand-rolled pidfd→pid→lookup cannot perform (D0A-R1-01).
+    fn sd_pidfd_get_session(pidfd: c_int, session: *mut *mut c_char) -> c_int;
     fn sd_pid_get_session(pid: nix::libc::pid_t, session: *mut *mut c_char) -> c_int;
 }
 
@@ -125,6 +128,41 @@ impl SessionSnapshot {
     #[must_use]
     pub fn for_pid(pid: i32) -> Option<Self> {
         Self::query(&session_id_for_pid(pid)?)
+    }
+
+    /// Resolve the session of a **pidfd**, then query it — the race-free path.
+    ///
+    /// # Why not pidfd → pid → [`Self::for_pid`] (D0A-R1-01)
+    ///
+    /// That is two operations with an interval between them: the process can exit, be reaped,
+    /// and its pid REUSED after the number is read and before it is looked up, so the answer
+    /// describes an impostor. A2 shipped exactly that shape, and its test never exercised the
+    /// interval — it sampled wholly before and wholly after the reap, never across.
+    /// `sd_pidfd_get_session` closes the interval inside libsystemd by re-verifying the pidfd
+    /// after the lookup. Bound rather than hand-rolled — and measured rather than taken on
+    /// trust: `pidfd_refuses_a_recycled_pid_barrier` recycles the pid and checks the refusal.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use delphi_runtime::logind::SessionSnapshot;
+    /// # fn demo(pidfd: std::os::fd::BorrowedFd) {
+    /// let _ = SessionSnapshot::for_pidfd(pidfd);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn for_pidfd(pidfd: BorrowedFd<'_>) -> Option<Self> {
+        let mut session: *mut c_char = std::ptr::null_mut();
+        // SAFETY: a valid fd passed by value; libsystemd allocates `session` on success.
+        let rc = unsafe { sd_pidfd_get_session(pidfd.as_raw_fd(), &raw mut session) };
+        if rc < 0 || session.is_null() {
+            return None;
+        }
+        // SAFETY: non-null, NUL-terminated, allocated by libsystemd; freed exactly once below.
+        let id = unsafe { CStr::from_ptr(session) }.to_string_lossy().into_owned();
+        // SAFETY: free the libsystemd-allocated string exactly once.
+        unsafe { nix::libc::free(session.cast()) };
+        Self::query(&id)
     }
 }
 
@@ -279,10 +317,9 @@ impl<'a> LogindSource<'a> {
 
 impl SessionSource for LogindSource<'_> {
     fn current(&self) -> SessionSnapshot {
+        // D0A-R1-01: resolved from the PIDFD, so no pid number crosses between two operations.
         // Reaped, or no resolvable session ⇒ deny. Unknown is never "fine" at a gate.
-        pid_from_pidfd(self.pidfd)
-            .and_then(SessionSnapshot::for_pid)
-            .unwrap_or(SessionSnapshot::DENIED)
+        SessionSnapshot::for_pidfd(self.pidfd).unwrap_or(SessionSnapshot::DENIED)
     }
 }
 
@@ -367,6 +404,125 @@ mod tests {
         let s = Advancing { reads: std::cell::Cell::new(1) };
         assert!(!crate::service::gate_allows(&s), "first decision: not active → DENY");
         assert!(crate::service::gate_allows(&s), "after the flip back the gate must ALLOW");
+    }
+
+    /// D0A-R1-01 — THE BARRIER. A pid is RECYCLED, and the pidfd must still refuse.
+    ///
+    /// A2's original proof sampled wholly before and wholly after the reap, so it never
+    /// exercised the interval that makes a pid unsafe: read the number, the process is reaped,
+    /// the number is REUSED by someone else, and the lookup answers about the impostor. Here
+    /// the impostor is made real — same pid, live, different process — and the assertion is
+    /// that resolution through the pidfd is unmoved by it.
+    ///
+    /// Runs itself under `unshare -Ur -p --fork --mount-proc`, where pids restart low and
+    /// `/proc/sys/kernel/ns_last_pid` is writable without root, so recycling is deterministic
+    /// rather than a 4-million-fork spin.
+    #[test]
+    fn pidfd_refuses_a_recycled_pid_barrier() {
+        use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+        if std::env::var_os("DELPHI_BARRIER_CHILD").is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let out = std::process::Command::new("unshare")
+                .args(["-Ur", "-p", "--fork", "--mount-proc"])
+                .arg(&exe)
+                .args(["--exact", "--nocapture", "--test-threads=1",
+                       "logind::tests::pidfd_refuses_a_recycled_pid_barrier"])
+                .env("DELPHI_BARRIER_CHILD", "1")
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    // A skip proves nothing, so say exactly what could not be set up.
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    assert!(
+                        err.contains("unshare") || err.contains("Operation not permitted"),
+                        "the barrier ran and FAILED (not a setup problem):\n{}\n{err}",
+                        String::from_utf8_lossy(&o.stdout)
+                    );
+                    eprintln!("SKIP pidfd_refuses_a_recycled_pid_barrier: user namespaces \
+                               unavailable here, so a pid cannot be recycled deterministically");
+                }
+                Err(e) => eprintln!("SKIP pidfd_refuses_a_recycled_pid_barrier: no `unshare`: {e}"),
+            }
+            return;
+        }
+
+        // ── inside the pid namespace ──────────────────────────────────────────────────
+        // SAFETY: fork in a single-purpose child; the forked side only pauses or _exits.
+        let spawn = || unsafe {
+            let p = nix::libc::fork();
+            assert!(p >= 0, "fork failed");
+            if p == 0 {
+                nix::libc::pause();
+                nix::libc::_exit(0);
+            }
+            p
+        };
+        let victim = spawn();
+        // SAFETY: pidfd_open on our own child.
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, victim, 0) };
+        assert!(raw >= 0, "pidfd_open failed");
+        #[allow(clippy::cast_possible_truncation)]
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let fd = unsafe { BorrowedFd::borrow_raw(pidfd.as_raw_fd()) };
+
+        // STEP 1 of the two-step, taken while the victim is ALIVE — this is the number a
+        // pidfd->pid->lookup would carry into its second operation.
+        let number_read_while_alive =
+            pid_from_pidfd(fd).expect("the victim is alive, so its pid resolves");
+        assert_eq!(number_read_while_alive, victim);
+
+        // SAFETY: kill and reap our own child — after this the pid is recyclable.
+        unsafe {
+            nix::libc::kill(victim, nix::libc::SIGKILL);
+            let mut st = 0;
+            nix::libc::waitpid(victim, &raw mut st, 0);
+        }
+
+        // Force the NEXT pid to be the victim's, making a live impostor at that number.
+        std::fs::write("/proc/sys/kernel/ns_last_pid", (victim - 1).to_string())
+            .expect("ns_last_pid is writable inside the userns");
+        let impostor = spawn();
+        assert_eq!(
+            impostor, victim,
+            "setup: the impostor must occupy the victim's pid, or there is no barrier to test"
+        );
+        // SAFETY: signal 0 probes liveness without delivering anything.
+        assert_eq!(
+            unsafe { nix::libc::kill(impostor, 0) },
+            0,
+            "setup: the impostor must be ALIVE at the recycled pid"
+        );
+
+        // THE VULNERABILITY, made concrete: the number taken in step 1 now names a DIFFERENT,
+        // LIVE process. A second operation keyed on it answers about the impostor. This is the
+        // interval A2's proof never crossed — it reaped before reading, so it saw only `-1`.
+        assert_eq!(
+            number_read_while_alive, impostor,
+            "the number carried from step 1 now addresses the impostor — that is the race"
+        );
+
+        // THE FIX: resolution through the pidfd carries no number at all, and refuses.
+        assert!(
+            SessionSnapshot::for_pidfd(fd).is_none(),
+            "a reaped process must not resolve, even though its pid is live again"
+        );
+        // And after the reap the diagnostic reports nothing rather than the recycled number.
+        assert_eq!(pid_from_pidfd(fd), None, "post-reap the pidfd yields no number");
+
+        // ── WHAT THIS TEST CANNOT SHOW HERE, STATED RATHER THAN IMPLIED ──────────────────
+        // The DISCRIMINATING leg — the impostor's session resolving where the victim's would
+        // not — needs the impostor to HAVE a logind session. Inside this namespace (and on any
+        // seatless dev box) every lookup returns None, so `for_pid(stale)` and `for_pidfd`
+        // agree by accident. The staleness above is proven; that the FIX changes the ANSWER is
+        // not, and is owed to the seated lane. See PROGRESS.md.
+
+        // SAFETY: clean up the impostor.
+        unsafe {
+            nix::libc::kill(impostor, nix::libc::SIGKILL);
+            let mut st = 0;
+            nix::libc::waitpid(impostor, &raw mut st, 0);
+        }
     }
 
     /// A2: the pidfd names the shell while it lives and NOTHING once it is reaped — which is

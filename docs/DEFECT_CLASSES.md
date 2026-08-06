@@ -1333,6 +1333,21 @@ sampled bound. A fix with only (a) is proven to address its instance, not its cl
 
 ---
 
+**FOR A STALENESS FIX, ASK WHERE THE TEST OBSERVES: ACROSS THE INTERVAL, OR ONLY BEFORE AND
+AFTER IT? (D0A-R1-01 — third instance.)** A staleness defect lives in the gap between reading a
+value and using it. A test that samples wholly before and wholly after that gap sees two
+consistent worlds and reports success, because the inconsistent world exists only *inside* it.
+Three instances now, each while fixing the one below:
+
+1. **A2** resolved pidfd → pid → lookup: two operations with a gap.
+2. **A2's own test** reaped, then read — before and after, never across. It passed.
+3. **A2's BARRIER test**, written specifically to close that gap, reaped before reading the pid
+   too. Under the weaken to the old two-step it still PASSED. Both prior tests *looked like
+   proofs*; the weaken is the only thing that said otherwise.
+
+The check is mechanical and belongs in the design step, not the review: name the interval, then
+point at the line where the test observes and ask whether that line is inside it.
+
 **VERIFY-IT-APPLIED IS NOT ENOUGH — VERIFY WHERE IT FAILED (D0-A A3).** The existing rule catches
 a weaken whose substitution matched nothing. It does not catch a weaken that *did* apply and then
 failed **for an adjacent reason**. A3's weaken (a) froze the gate verdict behind a
@@ -1340,6 +1355,20 @@ process-global `OnceLock`; the flip test duly failed — at its FIRST assertion,
 test in the same binary had already seeded the memo. The weaken was real, the failure was real,
 and the failure was **not** the one the test names. Re-run with `--exact`, it failed at the
 true→false leg quoting the intended message.
+
+**AN EDIT THAT CAN SILENTLY MATCH NOTHING MUST ASSERT IT MATCHED, AND THE ASSERTION BELONGS IN
+THE EDIT — NOT IN A LATER VERIFICATION PASS (D0A-R1-06).** A scripted string replacement that
+matches nothing is a no-op that raises no error, so the edit reports success and the file is
+unchanged. D0-A A3 "corrected" a stale warning string this way; the replacement matched nothing,
+the stale text survived, and it reached review as R1-06. A later verification pass cannot save
+this reliably — it checks what you thought to check, and the whole failure is that you believed
+the edit landed.
+
+**VALIDATED IMMEDIATELY, AND THE CLASS WAS UNDER-WEIGHTED (2026-08-06).** With the rule in force
+for one increment, **three** further silent no-ops were caught before anything was written: an
+over-wide test-module deletion that would have removed the very helper it was rewriting, an
+indentation mismatch, and a doc-header mismatch. R1-06 was not a one-off — three more were
+already queued behind it in the same increment.
 
 **"The weaken failed" and "the weaken failed for its stated reason" are different observations,
 and only the second is evidence.** So the obligation is: read the failing assertion's line and

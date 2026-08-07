@@ -1979,6 +1979,71 @@ assert both operands appear.
 
 ---
 
+## 34. A deferral is an untested claim  *(new — D0-A, three instances in one increment)*
+
+**The pattern: "needs the lane" was written from the author's model of why a test skipped, not
+from measuring what it actually lacked.** Examined three times on this branch, it was wrong
+three times — and always in the same direction, which is what makes it a bias rather than three
+unlucky entries.
+
+| entry | recorded as | what it actually was |
+|---|---|---|
+| D0A-R1-02 orchestration test | "compile-verified, needs the lane" | **unprovable as written** — it passed env names that exist nowhere, so it could not have run on ANY machine, lane included |
+| D0A-R1-01 answer-discrimination | "needs a real session ⇒ lane-only" | **root-gated** — any box with a resolvable logind session; settled by `sudo` on the dev box |
+| D0A-R1-02, after R2-01 | "needs the lane" (again) | **root-gated** — the PAM stack, not a seat |
+
+**THE MECHANISM, and it is precise: the SKIP CONDITION and the LEDGER'S DEFERRAL CATEGORY are
+different claims, and only the first is ever checked.** `if geteuid() != 0 { eprintln!("SKIP:
+requires root") }` is accurate and testable. The ledger entry that grows from it — "owed to the
+lane" — is a *larger* claim about what environment is required, written by hand, never verified,
+and load-bearing for scheduling. Nothing in the toolchain compares the two.
+
+**Why the bias runs one way.** An expensive deferral is never falsified by the work stopping:
+the task simply waits, the entry looks prudent, and no one pays to discover it was cheaper. A
+*cheap* mis-categorisation would be caught within minutes by someone trying it. So the error is
+selected for.
+
+**The check, and it is one command.** Before writing a deferral, run the thing and read what it
+actually says it lacks. `geteuid`, a missing binary, a missing PAM stack and a missing seat are
+four different constraints; only one of them is a lane. If the answer is "I have not run it",
+the honest entry names *that*, not an environment.
+
+**Foreclosing discipline:** a deferral entry must quote the **measured** blocker — the skip line,
+the error, the missing file — not a category. "SKIPS: `requires root (anchor + PAM)`" is a fact.
+"Needs the lane" is a forecast.
+
+---
+
+## 35. Use a cited boundary to design the falsifier for the citation  *(new — D0A-R3-01; a technique, not a defect)*
+
+Recorded because it converted the arc's largest outstanding delegation from a citation into a
+measurement, and the move is reusable.
+
+**The situation.** A fix rests on behaviour inside a dependency (`sd_pidfd_get_session`
+re-verifies the pidfd after resolving). The claim came from a reviewer reading systemd's source.
+**A citation is not a measurement**, but the step is internal and cannot be observed directly.
+
+**The move.** Ask the citation for its own boundary, then build the configuration that lands
+*inside* it. Here: *verification runs only on SUCCESSFUL session-returning paths, and is skipped
+on error paths such as `ENODATA`.* That boundary dictates the experiment — put the **impostor**
+in the session, not the victim, because only a successful lookup reaches the step under test.
+The naive arrangement (victim in the session) returns `ENODATA` and proves nothing, which is why
+the first two attempts read as "no discrimination available off-lane".
+
+**The result, on this machine:**
+
+| run | configuration | result |
+|---|---|---|
+| control | victim in a real session, barrier inert | `rc=0 session=2` |
+| barrier | impostor in the session, victim reaped and its pid recycled mid-call | `rc=-3` (ESRCH) |
+
+**The control is not optional.** `rc != 0` is satisfied by any box where nothing resolves — the
+exact way the previous harness fooled itself. Proving the environment CAN produce a positive is
+what converts a negative from ambiguous to real. Pair every falsifier with a positive control
+that would fail if the environment were incapable.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2017,4 +2082,6 @@ assert both operands appear.
 | 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |
 | 29a. Holder-check names the wrong resource | one shared checker matching the SUBJECT's resource on ANY location (`scripts/check-stale-test-sessions.sh`), used by every caller | **Extracted** |
 | 31. Teardown failure unobservable | a teardown that CAN fail must REPORT its failure; if it cannot report, it must ASSERT. Capture the reason (`.output()`), never `let _ = …status()` | Discipline |
+| 34. A deferral is an untested claim | quote the MEASURED blocker (skip line, error, missing file) in the ledger entry — never an environment category | Discipline |
+| 35. Cited boundary → falsifier design | ask a citation for its own boundary, build the configuration inside it, and PAIR it with a positive control | Technique |
 | 32. Mechanical substitution, undocumented property | ask at substitution: **what unstated property is the caller relying on?**; make it explicit in the replacement rather than trusting the new default | Discipline |

@@ -105,7 +105,19 @@ impl SessionSnapshot {
     /// session (or on error querying active/remote).
     #[must_use]
     pub fn query(session: &str) -> Option<Self> {
-        let c = CString::new(session).ok()?;
+        Self::query_detailed(session).ok()
+    }
+
+    /// As [`Self::query`], but reporting WHICH axis failed (D0A-R2-04).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionResolution::AxisQueryFailed`] naming the libsystemd call and its errno.
+    pub fn query_detailed(session: &str) -> Result<Self, SessionResolution> {
+        let c = CString::new(session).map_err(|_| SessionResolution::AxisQueryFailed {
+            axis: "session id contains NUL",
+            errno: nix::libc::EINVAL,
+        })?;
         // SAFETY: `c` is a valid NUL-terminated string; the calls only read it and
         // return an int (>0 yes, 0 no, <0 error).
         let (a, r) = unsafe {
@@ -114,10 +126,25 @@ impl SessionSnapshot {
                 sd_session_is_remote(c.as_ptr()),
             )
         };
-        if a < 0 || r < 0 {
-            return None;
+        if a < 0 {
+            return Err(SessionResolution::AxisQueryFailed {
+                axis: "sd_session_is_active",
+                errno: -a,
+            });
         }
-        Some(Self { active: a > 0, remote: r > 0, seated: session_is_seated(&c) })
+        if r < 0 {
+            return Err(SessionResolution::AxisQueryFailed {
+                axis: "sd_session_is_remote",
+                errno: -r,
+            });
+        }
+        // A seat query FAILING is not the same fact as "no seat", so it is not folded into a
+        // bool here (D0A-R2-04).
+        let seated = session_is_seated(&c).map_err(|errno| SessionResolution::AxisQueryFailed {
+            axis: "sd_session_get_seat",
+            errno,
+        })?;
+        Ok(Self { active: a > 0, remote: r > 0, seated })
     }
 
     /// Resolve the session owning `pid` (the daemon's pidfd-pinned shell), then query
@@ -162,7 +189,10 @@ impl SessionSnapshot {
         let id = unsafe { CStr::from_ptr(session) }.to_string_lossy().into_owned();
         // SAFETY: free the libsystemd-allocated string exactly once.
         unsafe { nix::libc::free(session.cast()) };
-        Self::query(&id).map_or(SessionResolution::SessionUnknown(id), SessionResolution::Resolved)
+        match Self::query_detailed(&id) {
+            Ok(snap) => SessionResolution::Resolved(snap),
+            Err(cause) => cause,
+        }
     }
 }
 
@@ -212,17 +242,25 @@ pub fn session_id_for_pid(pid: i32) -> Option<String> {
 /// Whether `session` is attached to a seat. `sd_session_get_seat` returns a non-negative
 /// value and a malloc'd seat name when seated, and **`-ENODATA`** for a seatless session
 /// (per sd-login) — so a negative return, or a null out-pointer, means "no seat".
-fn session_is_seated(session: &CStr) -> bool {
+fn session_is_seated(session: &CStr) -> Result<bool, i32> {
     let mut seat: *mut c_char = std::ptr::null_mut();
     // SAFETY: `session` is a valid NUL-terminated string; `seat` receives a malloc'd C
     // string on success (rc >= 0), untouched on failure (rc < 0, e.g. -ENODATA seatless).
     let rc = unsafe { sd_session_get_seat(session.as_ptr(), &mut seat) };
-    if rc < 0 || seat.is_null() {
-        return false;
+    // -ENODATA is the genuine "this session has no seat"; any OTHER error is a failed QUERY
+    // and must not be reported as seatless (D0A-R2-04).
+    if rc == -nix::libc::ENODATA {
+        return Ok(false);
+    }
+    if rc < 0 {
+        return Err(-rc);
+    }
+    if seat.is_null() {
+        return Ok(false);
     }
     // SAFETY: free the libsystemd-allocated seat string exactly once.
     unsafe { nix::libc::free(seat.cast()) };
-    true
+    Ok(true)
 }
 
 /// A source of the shell session's verdict, queried **at** the decision it authorizes.
@@ -269,22 +307,77 @@ impl SessionSource for SessionSnapshot {
 pub enum SessionResolution {
     /// logind answered; this is the triple.
     Resolved(SessionSnapshot),
-    /// `-ENODATA` — the process is alive and belongs to no session. NORMAL on a seatless box.
-    NoSession,
+    /// `-ENODATA` from the lookup. **An observation, not a liveness claim (D0A-R2-03).**
+    ///
+    /// The previous name, `NoSession`, asserted the process was alive and merely unattached.
+    /// It cannot: the verifier is **error-gated** — on this path libsystemd returns before
+    /// proving liveness, so a victim that vanished between the first read and the lookup, with
+    /// an impostor at its pid, also lands here. All that is known is *the lookup returned no
+    /// data*. Normal on a seatless box; NOT evidence about the process.
+    LookupNoData,
     /// `-ESRCH` — the process is gone. The pidfd outlived what it named.
     ProcessGone,
     /// `-EBADF` / `-ENOTTY` — the fd is closed or is not a pidfd. **Our bug, not the user's.**
+    ///
+    /// `ENOTTY` for a non-pidfd is **observed on systemd 259, not an API promise** — measured,
+    /// and named here as observation so a later kernel or libsystemd reporting `EINVAL` shows
+    /// up as `QueryFailed` rather than being silently misfiled.
     NotAPidfd(i32),
-    /// Any other `-errno` from logind.
+    /// Any other `-errno` from the session lookup.
     QueryFailed(i32),
-    /// logind named a session it then could not describe — a logind-side inconsistency.
-    SessionUnknown(String),
+    /// The session id resolved, but an **axis query** failed (D0A-R2-04).
+    ///
+    /// `sd_session_is_active` / `is_remote` / `get_seat` each return a negative errno of their
+    /// own. Collapsing those into "not seated" made a query failure look like a real seatless
+    /// session — a *different fact*, and the one that reads as routine.
+    AxisQueryFailed {
+        /// Which axis failed, by its libsystemd call.
+        axis: &'static str,
+        /// The errno it returned.
+        errno: i32,
+    },
+}
+
+impl SessionResolution {
+    /// Why this denied, phrased for the operator — **derived from the cause** (D0A-R2-04).
+    ///
+    /// A fixed string claiming "the seat's foreground moved" is false when the shell is gone or
+    /// the pidfd is invalid. `during_auth` selects the phase wording, but only where the
+    /// session genuinely resolved and then failed the gate; every other cause names itself.
+    #[must_use]
+    pub fn denial(&self, during_auth: bool) -> String {
+        match self {
+            Self::Resolved(_) if during_auth => {
+                crate::service::REASON_SESSION_LOST_DURING_AUTH.to_owned()
+            }
+            Self::Resolved(_) => "logind: shell session not active+local+seated".to_owned(),
+            Self::LookupNoData => {
+                "logind: no session data for the shell (it is in no session, or it vanished \
+                 before the lookup could say)"
+                    .to_owned()
+            }
+            Self::ProcessGone => {
+                "logind: the pinned shell process is GONE - there is no session to consent \
+                 from, whatever stage this reached"
+                    .to_owned()
+            }
+            Self::NotAPidfd(e) => format!(
+                "logind: the pinned handle is not a usable pidfd (errno {e}) - a DAEMON BUG, \
+                 not a seat or configuration problem"
+            ),
+            Self::QueryFailed(e) => format!("logind: session lookup failed (errno {e})"),
+            Self::AxisQueryFailed { axis, errno } => format!(
+                "logind: session resolved but `{axis}` failed (errno {errno}) - the verdict is \
+                 UNKNOWN, which is not the same as seatless"
+            ),
+        }
+    }
 }
 
 impl SessionResolution {
     fn from_errno(e: i32) -> Self {
         match e {
-            nix::libc::ENODATA => Self::NoSession,
+            nix::libc::ENODATA => Self::LookupNoData,
             nix::libc::ESRCH => Self::ProcessGone,
             nix::libc::EBADF | nix::libc::ENOTTY => Self::NotAPidfd(e),
             other => Self::QueryFailed(other),
@@ -296,8 +389,13 @@ impl SessionResolution {
     pub fn snapshot_or_denied(&self) -> SessionSnapshot {
         match self {
             Self::Resolved(s) => *s,
-            Self::NoSession => {
-                tracing::warn!("consent DENIED: the shell belongs to no logind session");
+            Self::LookupNoData => {
+                tracing::warn!("consent DENIED: no session data for the shell");
+                SessionSnapshot::DENIED
+            }
+            Self::AxisQueryFailed { axis, errno } => {
+                tracing::warn!(axis, errno, "consent DENIED: a session axis query failed - the \
+                               verdict is UNKNOWN, not seatless");
                 SessionSnapshot::DENIED
             }
             Self::ProcessGone => {
@@ -311,11 +409,6 @@ impl SessionResolution {
             }
             Self::QueryFailed(e) => {
                 tracing::warn!(errno = e, "consent DENIED: logind query failed");
-                SessionSnapshot::DENIED
-            }
-            Self::SessionUnknown(id) => {
-                tracing::warn!(session = %id, "consent DENIED: logind named a session it then \
-                               could not describe");
                 SessionSnapshot::DENIED
             }
         }
@@ -492,8 +585,8 @@ mod tests {
         let me = unsafe { OwnedFd::from_raw_fd(raw as i32) };
         let live = SessionSnapshot::for_pidfd(me.as_fd());
         assert!(
-            matches!(live, SessionResolution::NoSession | SessionResolution::Resolved(_)),
-            "a LIVE process must report NoSession (or resolve, on a seated box) — never \
+            matches!(live, SessionResolution::LookupNoData | SessionResolution::Resolved(_)),
+            "a LIVE process must report LookupNoData (or resolve, on a seated box) — never \
              ProcessGone, which is the cause that means the pidfd outlived what it named. \
              Got {live:?}"
         );
@@ -515,16 +608,99 @@ mod tests {
         );
 
         // EVERY cause denies — the diagnosis is added, the fail-closed posture is unchanged.
-        for r in [
-            SessionResolution::NoSession,
-            SessionResolution::ProcessGone,
-            SessionResolution::NotAPidfd(nix::libc::EBADF),
-            SessionResolution::QueryFailed(nix::libc::EIO),
-            SessionResolution::SessionUnknown("c1".to_owned()),
+        // AND each must actually EMIT its diagnosis: asserting enum identities alone would
+        // stay green with every log line deleted, which is Class 22's question turned on this
+        // test rather than on the code (D0A-R2-04).
+        for (r, must_say) in [
+            (SessionResolution::LookupNoData, "no session data"),
+            (SessionResolution::ProcessGone, "shell process is gone"),
+            (SessionResolution::NotAPidfd(nix::libc::EBADF), "pidfd is invalid"),
+            (SessionResolution::QueryFailed(nix::libc::EIO), "logind query failed"),
+            (
+                SessionResolution::AxisQueryFailed {
+                    axis: "sd_session_is_active",
+                    errno: nix::libc::EIO,
+                },
+                "axis query failed",
+            ),
         ] {
-            assert_eq!(r.snapshot_or_denied(), SessionSnapshot::DENIED, "{r:?} must DENY");
+            let logged = capture_logs(|| {
+                assert_eq!(r.snapshot_or_denied(), SessionSnapshot::DENIED, "{r:?} must DENY");
+            });
             assert!(!session_passes_gate(r.snapshot_or_denied()));
+            assert!(
+                logged.to_lowercase().contains(must_say),
+                "{r:?} denied silently — it must SAY {must_say:?}, or the operator sees the \
+                 same denial for a daemon bug and for normal operation. Captured: {logged:?}"
+            );
+            // And the operator-facing reason must name THIS cause, not a generic one.
+            let reason = r.denial(true);
+            assert!(
+                !matches!(r, SessionResolution::Resolved(_))
+                    && reason != crate::service::REASON_SESSION_LOST_DURING_AUTH,
+                "{r:?} must not be reported as 'the foreground moved during authentication' — \
+                 that claim is false for a gone process or a bad pidfd (D0A-R2-04)"
+            );
         }
+    }
+
+    /// D0A-R2-04, the CONSTRUCTION half: an axis query that fails must PRODUCE
+    /// `AxisQueryFailed`, not collapse into a triple that reads as a real seatless session.
+    ///
+    /// Measured: every `sd_session_*` axis returns `-EINVAL` for an unusable session id
+    /// (systemd 259), so this path is reachable without a live session.
+    ///
+    /// **WHAT THIS LEG DOES NOT COVER, stated rather than left implied:** it exercises the
+    /// FIRST axis. Making `sd_session_get_seat` fail with something other than `-ENODATA`
+    /// while the other two succeed needs a real session whose seat query errors, which is not
+    /// constructible off-lane — so the seat-axis collapse specifically is unbitten here.
+    #[test]
+    fn an_axis_query_failure_is_produced_not_collapsed() {
+        let bogus = format!("delphi-no-such-session-{}", std::process::id());
+        match SessionSnapshot::query_detailed(&bogus) {
+            Err(SessionResolution::AxisQueryFailed { axis, errno }) => {
+                assert_eq!(axis, "sd_session_is_active");
+                assert_ne!(errno, 0, "the errno must be retained, not zeroed");
+            }
+            other => panic!(
+                "a failing axis query must name itself; collapsing it makes a FAILED QUERY \
+                 look like a real seatless session, which is a different fact and the one \
+                 that reads as routine. Got {other:?}"
+            ),
+        }
+        // And it denies, like every other cause.
+        let r = SessionSnapshot::query_detailed(&bogus).unwrap_err();
+        assert_eq!(r.snapshot_or_denied(), SessionSnapshot::DENIED);
+    }
+
+    /// Run `f` with a subscriber capturing everything it logs.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buf {
+            type Writer = Self;
+            fn make_writer(&self) -> Self {
+                self.clone()
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let out = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     /// D0A-R1-01 — THE BARRIER. A pid is RECYCLED, and the pidfd must still refuse.

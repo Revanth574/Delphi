@@ -24,6 +24,7 @@
 
 use std::os::fd::RawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Duration;
 
 use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::socket::getsockopt;
@@ -86,6 +87,74 @@ pub struct ServiceCtx<'a> {
     /// The clock — read FRESH at mint and at Present-verify so the token TTL is a real
     /// control (B1-R2-01), not a frozen-`now` no-op.
     pub clock: &'a dyn Clock,
+}
+
+/// Denial when the session stopped qualifying between the PAM prompt and the mint.
+///
+/// A `const` shared with the test that asserts it (D0A-R2-05): the test required
+/// `"DURING authentication"` contiguous while the literal had fourteen spaces baked into it,
+/// so the assertion could never match and the production message was malformed. One
+/// construction site removes the possibility of the two drifting.
+///
+/// The padding came from writing a Rust `\`-continuation through a Python heredoc: Rust strips
+/// the next line's leading whitespace, Python does not. It compiled, so nothing objected.
+pub const REASON_SESSION_LOST_DURING_AUTH: &str =
+    "logind: the shell session stopped being active+local+seated DURING authentication - the \
+     seat's foreground moved, so this consent is not one a human at the seat gave";
+
+/// Accept the requester, or give up at `deadline`.
+///
+/// # Why a deadline exists at all (D0A-R2-01)
+///
+/// A fixture that mis-names an environment variable makes the AI panic *before* it connects,
+/// and the plain accept then blocks forever. The run hangs with no output and no cause — the
+/// worst failure shape available, because it looks like a slow test rather than a broken one.
+/// Foreclosure handles the mis-naming ([`crate::scaffold_env`]); this handles the residual:
+/// whatever else stops the AI connecting, the wait ends and says so.
+///
+/// Production keeps the blocking [`accept_requester`] deliberately — an unbounded wait for the
+/// AI is B1's documented shape, and changing it is not this finding's business.
+///
+/// # Errors
+///
+/// [`RuntimeError::Protocol`] if nothing connects before `deadline`; otherwise as
+/// [`accept_requester`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::os::unix::net::UnixListener;
+/// # use std::time::Duration;
+/// # fn demo(l: &UnixListener) -> Result<(), Box<dyn std::error::Error>> {
+/// let ai = delphi_runtime::service::accept_requester_within(l, 1000, Duration::from_secs(20))?;
+/// # let _ = ai;
+/// # Ok(())
+/// # }
+/// ```
+pub fn accept_requester_within(
+    listener: &UnixListener,
+    expected_uid: u32,
+    deadline: Duration,
+) -> Result<UnixStream, RuntimeError> {
+    use nix::poll::{PollFd, PollFlags};
+    use std::os::fd::AsFd;
+
+    let mut fds = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+    // The same conversion the readiness wait uses — one site, so D0-R5-02's i32 reasoning
+    // is not re-derived here with a different cap.
+    let n = nix::poll::poll(&mut fds, crate::readiness::poll_timeout(deadline)).map_err(|source| RuntimeError::Syscall {
+        op: "poll (accept requester)",
+        source,
+    })?;
+    if n == 0 {
+        return Err(RuntimeError::Protocol(format!(
+            "no requester connected to the approval socket within {}s. The AI side never \
+             reached connect() - check it started and is reading the same environment names \
+             the launcher sets (see scaffold_env). This is a SETUP failure, not a protocol one.",
+            deadline.as_secs()
+        )));
+    }
+    accept_requester(listener, expected_uid)
 }
 
 /// Evaluate the gate against a verdict read **now**.
@@ -181,11 +250,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     // after it. A session going true → false during authentication still minted — the exact
     // case A3's own docs name as the security property. Class 26 one level above A3.
     if !gate_allows(ctx.session) {
-        return deny(
-            ai,
-            &id,
-            "logind: the shell session stopped being active+local+seated DURING              authentication — the seat's foreground moved, so this consent would not be              one a human at the seat gave",
-        );
+        return deny(ai, &id, REASON_SESSION_LOST_DURING_AUTH);
     }
     // Mint at the time of consent (read FRESH — not a frozen snapshot).
     let token = mint(ctx.key, &digest, ctx.clock.now_unix());
@@ -385,4 +450,32 @@ pub fn present_msg(pending_id: &str, token: &str) -> pb::AiToDaemon {
 pub fn ai_round_trip(stream: &mut UnixStream, msg: &pb::AiToDaemon) -> Result<pb::DaemonToAi, RuntimeError> {
     write_frame(stream, msg)?;
     read_frame(stream)
+}
+
+#[cfg(test)]
+mod accept_deadline_tests {
+    use super::*;
+
+    /// D0A-R2-01: a fixture that never connects must END the wait and NAME the cause. The
+    /// defect this replaces was a hang with no output — the worst shape available, because it
+    /// reads as a slow test rather than a broken one.
+    #[test]
+    fn a_requester_that_never_connects_fails_fast_and_names_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("approve.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let started = std::time::Instant::now();
+        let err = accept_requester_within(&listener, 0, Duration::from_millis(300))
+            .expect_err("nothing connected, so the wait must not succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it must give up at the deadline, not block: took {:?}",
+            started.elapsed()
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("never reached connect()") && msg.contains("SETUP failure"),
+            "the error must name the AI and say this is setup, not protocol: {msg}"
+        );
+    }
 }

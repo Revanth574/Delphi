@@ -25,10 +25,12 @@ fn rw(p: &str) -> pb::Bind {
 }
 
 fn main() {
-    let sock = std::env::var("DELPHI_APPROVE_SOCK").expect("DELPHI_APPROVE_SOCK");
-    let exe = std::env::var("DELPHI_AI_EXE").expect("DELPHI_AI_EXE");
-    let arg = std::env::var("DELPHI_AI_ARG").unwrap_or_default();
-    let bind_rw = std::env::var("DELPHI_AI_BIND_RW").unwrap_or_else(|_| "/tmp".into());
+    let sock = std::env::var(delphi_runtime::scaffold_env::APPROVE_SOCK)
+        .expect(delphi_runtime::scaffold_env::APPROVE_SOCK);
+    let exe = std::env::var(delphi_runtime::scaffold_env::AI_EXE)
+        .expect(delphi_runtime::scaffold_env::AI_EXE);
+    let arg = std::env::var(delphi_runtime::scaffold_env::AI_ARG).unwrap_or_default();
+    let bind_rw = std::env::var(delphi_runtime::scaffold_env::AI_BIND_RW).unwrap_or_else(|_| "/tmp".into());
 
     let mut stream = UnixStream::connect(&sock).expect("connect approve.sock");
 

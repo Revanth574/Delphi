@@ -58,6 +58,7 @@ pub mod pidfd;
 pub mod privdrop;
 pub mod readiness;
 pub mod sandbox;
+pub mod scaffold_env;
 pub mod service;
 pub mod store;
 #[cfg(any(test, feature = "test-fixtures"))]

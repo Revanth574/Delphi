@@ -1073,7 +1073,7 @@ fn fork_ai(spec: &LaunchSpec) -> Result<i32, RuntimeError> {
     let (uid, gid) = (spec.uid, spec.gid);
 
     let mut cmd = Command::new(spec.ai_path);
-    cmd.env("DELPHI_APPROVE_SOCK", spec.socket_path);
+    cmd.env(crate::scaffold_env::APPROVE_SOCK, spec.socket_path);
     for (k, v) in spec.ai_env {
         cmd.env(k, v);
     }

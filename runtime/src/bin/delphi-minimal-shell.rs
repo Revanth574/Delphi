@@ -16,11 +16,11 @@ use std::os::fd::RawFd;
 use delphi_runtime::service::{recv_approval_request, send_mint_confirm};
 
 fn main() {
-    let chan: RawFd = std::env::var("DELPHI_CHANNEL_FD")
+    let chan: RawFd = std::env::var(delphi_runtime::scaffold_env::CHANNEL_FD)
         .expect("DELPHI_CHANNEL_FD")
         .parse()
         .expect("DELPHI_CHANNEL_FD is a fd number");
-    let password = std::env::var("DELPHI_PASSWORD").unwrap_or_default();
+    let password = std::env::var(delphi_runtime::scaffold_env::PASSWORD).unwrap_or_default();
 
     // 0. READINESS (D0). The daemon's `launch()` blocks here until this datagram arrives:
     //    until it does, the shell is indistinguishable from one that exec'd and died. This

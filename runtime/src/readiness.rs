@@ -306,7 +306,7 @@ fn witness_terminal(
 /// `PollTimeout::try_from(Duration)` truncates: 249.9ms becomes a 249ms poll, which returns
 /// `Ok(0)` while ~0.9ms of grace remains. Treating that as the grace elapsing let a death
 /// arriving in the truncated window be classified as liveness.
-fn poll_timeout(remaining: Duration) -> PollTimeout {
+pub(crate) fn poll_timeout(remaining: Duration) -> PollTimeout {
     let ms = remaining.as_nanos().div_ceil(1_000_000);
     // i32, not u16 (D0-R5-02): a u16 cap is ~65.5s, and a grace longer than that produced a
     // short poll whose `Ok(0)` was read as the grace elapsing. The cap is now beyond any

@@ -303,11 +303,11 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
         gid,
         socket_path: &paths.socket,
         tty: test_vt(),
-        shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
+        shell_env: &[(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)],
         ai_env: &[
-            ("DELPHI_AI_EXE", &exe_str),
-            ("DELPHI_AI_ARG", "B1-LIVES"),
-            ("DELPHI_AI_BIND_RW", &work_str),
+            (delphi_runtime::scaffold_env::AI_EXE, &exe_str),
+            (delphi_runtime::scaffold_env::AI_ARG, "B1-LIVES"),
+            (delphi_runtime::scaffold_env::AI_BIND_RW, &work_str),
         ],
     };
     let children = launch(&spec).expect("launch shell + AI");
@@ -400,11 +400,20 @@ fn b1_session_lost_during_pam_blocks_the_mint_d0a_r1_02() {
         gid,
         socket_path: &paths.socket,
         tty: test_vt(),
-        shell_env: &[("DELPHI_TEST_PASSWORD", PASSWORD)],
-        ai_env: &[("DELPHI_TEST_EXE", &exe_str), ("DELPHI_TEST_CWD", &work_str)],
+        shell_env: &[(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)],
+        ai_env: &[(delphi_runtime::scaffold_env::AI_EXE, &exe_str),
+            (delphi_runtime::scaffold_env::AI_ARG, "B1-LIVES"),
+            (delphi_runtime::scaffold_env::AI_BIND_RW, &work_str),],
     };
     let children = launch(&spec).expect("launch");
-    let mut ai = accept_requester(&listener, uid.as_raw()).expect("accept AI");
+    // D0A-R2-01: a deadline, so a broken fixture FAILS FAST and names the AI rather than
+    // hanging the run with no output.
+    let mut ai = delphi_runtime::service::accept_requester_within(
+        &listener,
+        uid.as_raw(),
+        std::time::Duration::from_secs(20),
+    )
+    .expect("the AI must connect");
     let mut store = PendingStore::new();
     let mut ledger = ConsumptionLedger::new();
     let key = MintingKey::from_bytes(KEY);
@@ -432,9 +441,9 @@ fn b1_session_lost_during_pam_blocks_the_mint_d0a_r1_02() {
          authorized by a verdict taken before an unbounded human wait"
     );
     match outcome {
-        Outcome::Denied { reason, .. } => assert!(
-            reason.contains("DURING authentication"),
-            "the denial must name the transition, not look like a first-gate refusal: {reason}"
+        Outcome::Denied { reason, .. } => assert_eq!(
+            reason, delphi_runtime::service::REASON_SESSION_LOST_DURING_AUTH,
+            "the denial must be the DURING-authentication one, not a first-gate refusal"
         ),
         other => panic!("a session lost during PAM must NOT mint: {other:?}"),
     }
@@ -481,11 +490,11 @@ fn b1_token_expiry_blocks_the_assembled_loop() {
         gid,
         socket_path: &paths.socket,
         tty: test_vt(),
-        shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
+        shell_env: &[(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)],
         ai_env: &[
-            ("DELPHI_AI_EXE", &exe_str),
-            ("DELPHI_AI_ARG", "SHOULD-NOT-RUN"),
-            ("DELPHI_AI_BIND_RW", &work_str),
+            (delphi_runtime::scaffold_env::AI_EXE, &exe_str),
+            (delphi_runtime::scaffold_env::AI_ARG, "SHOULD-NOT-RUN"),
+            (delphi_runtime::scaffold_env::AI_BIND_RW, &work_str),
         ],
     };
     let children = launch(&spec).expect("launch");
@@ -815,10 +824,10 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
         .args(["--session", &setup.user])
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
-        .env("DELPHI_PASSWORD", PASSWORD)
-        .env("DELPHI_AI_EXE", &exe)
-        .env("DELPHI_AI_ARG", "BINARY-FLOW")
-        .env("DELPHI_AI_BIND_RW", &stage)
+        .env(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)
+        .env(delphi_runtime::scaffold_env::AI_EXE, &exe)
+        .env(delphi_runtime::scaffold_env::AI_ARG, "BINARY-FLOW")
+        .env(delphi_runtime::scaffold_env::AI_BIND_RW, &stage)
         // `DELPHI_SHELL_VT` has no default (§4 R3-02a — guessing a VT is either a collision
         // or a silently SEATLESS session), so the daemon requires it.
         .env("DELPHI_SHELL_VT", "tty1")
@@ -956,11 +965,11 @@ fn b1_logind_deny_blocks_the_assembled_loop() {
         gid,
         socket_path: &paths.socket,
         tty: test_vt(),
-        shell_env: &[("DELPHI_PASSWORD", PASSWORD)],
+        shell_env: &[(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)],
         ai_env: &[
-            ("DELPHI_AI_EXE", &exe_str),
-            ("DELPHI_AI_ARG", "SHOULD-NOT-RUN"),
-            ("DELPHI_AI_BIND_RW", &work_str),
+            (delphi_runtime::scaffold_env::AI_EXE, &exe_str),
+            (delphi_runtime::scaffold_env::AI_ARG, "SHOULD-NOT-RUN"),
+            (delphi_runtime::scaffold_env::AI_BIND_RW, &work_str),
         ],
     };
     let children = launch(&spec).expect("launch");

@@ -288,13 +288,18 @@ fn session_is_seated(session: &CStr) -> Result<bool, i32> {
 /// captured `revents` reused after a syscall; here, a captured verdict reused across the
 /// decision it authorizes.
 pub trait SessionSource {
-    /// The session's triple as of now. Fail-closed: unresolvable ⇒ [`SessionSnapshot::DENIED`].
-    fn current(&self) -> SessionSnapshot;
+    /// The session as of now, **with the cause when it did not resolve** (D0A-R3-02).
+    ///
+    /// Returning a bare triple discarded the distinctions R1-05 measured before they could
+    /// reach the operator. `Resolved` still carries a CONCRETE `SessionSnapshot`, so the
+    /// consumer-side foreclosure of D0A-R1-04 is unchanged — an implementation still cannot
+    /// hand back something that re-reads an axis later.
+    fn current(&self) -> SessionResolution;
 }
 
 impl SessionSource for SessionSnapshot {
-    fn current(&self) -> SessionSnapshot {
-        *self
+    fn current(&self) -> SessionResolution {
+        SessionResolution::Resolved(*self)
     }
 }
 
@@ -481,10 +486,10 @@ impl<'a> LogindSource<'a> {
 }
 
 impl SessionSource for LogindSource<'_> {
-    fn current(&self) -> SessionSnapshot {
+    fn current(&self) -> SessionResolution {
         // D0A-R1-01: resolved from the PIDFD, so no pid number crosses between two operations.
-        // D0A-R1-05: every failure denies, and each names its own cause.
-        SessionSnapshot::for_pidfd(self.pidfd).snapshot_or_denied()
+        // D0A-R1-05/R3-02: every failure denies, and the cause travels with it.
+        SessionSnapshot::for_pidfd(self.pidfd)
     }
 }
 
@@ -529,8 +534,8 @@ mod tests {
         }
     }
     impl SessionSource for Advancing {
-        fn current(&self) -> SessionSnapshot {
-            self.read()
+        fn current(&self) -> SessionResolution {
+            SessionResolution::Resolved(self.read())
         }
     }
 
@@ -545,7 +550,7 @@ mod tests {
     fn the_advancing_fixture_yields_one_state_at_a_time() {
         let src = Advancing { reads: std::cell::Cell::new(0) };
         for _ in 0..8 {
-            let got = src.current();
+            let got = src.current().snapshot_or_denied();
             assert!(got == Advancing::A || got == Advancing::B, "blended triple {got:?}");
         }
     }

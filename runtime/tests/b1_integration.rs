@@ -346,12 +346,17 @@ struct FlipsAfterFirstRead {
     reads: std::sync::atomic::AtomicUsize,
 }
 impl delphi_runtime::logind::SessionSource for FlipsAfterFirstRead {
-    fn current(&self) -> delphi_runtime::logind::SessionSnapshot {
+    fn current(&self) -> delphi_runtime::logind::SessionResolution {
+        use delphi_runtime::logind::{SessionResolution, SessionSnapshot};
         let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
-            delphi_runtime::logind::SessionSnapshot { active: true, remote: false, seated: true }
+            SessionResolution::Resolved(SessionSnapshot {
+                active: true,
+                remote: false,
+                seated: true,
+            })
         } else {
-            delphi_runtime::logind::SessionSnapshot::DENIED
+            SessionResolution::Resolved(SessionSnapshot::DENIED)
         }
     }
 }
@@ -441,10 +446,30 @@ fn b1_session_lost_during_pam_blocks_the_mint_d0a_r1_02() {
          authorized by a verdict taken before an unbounded human wait"
     );
     match outcome {
-        Outcome::Denied { reason, .. } => assert_eq!(
-            reason, delphi_runtime::service::REASON_SESSION_LOST_DURING_AUTH,
-            "the denial must be the DURING-authentication one, not a first-gate refusal"
-        ),
+        Outcome::Denied { reason, .. } => {
+            // D0A-R3-03: the expected wording is named HERE, independently. Comparing the
+            // message to the constant it came from forecloses DRIFT between two sites but
+            // cannot verify EITHER is correct — which is exactly how R2-05's garbled
+            // `DURING<14 spaces>authentication` passed: the message was malformed, the test
+            // compared it to itself, and neither noticed.
+            for expected in [
+                "stopped being active+local+seated",
+                "DURING authentication",
+                "not one a human at the seat gave",
+            ] {
+                assert!(
+                    reason.contains(expected),
+                    "the denial must read as prose an operator can act on; missing {expected:?} \
+                     in {reason:?}"
+                );
+            }
+            assert!(
+                !reason.contains("  "),
+                "no doubled spaces — a malformed literal is how R2-05 shipped: {reason:?}"
+            );
+            // AND it must still be the shared constant, so the two sites cannot drift apart.
+            assert_eq!(reason, delphi_runtime::service::REASON_SESSION_LOST_DURING_AUTH);
+        }
         other => panic!("a session lost during PAM must NOT mint: {other:?}"),
     }
     assert!(marker.is_empty(), "nothing may execute: the action was never granted");

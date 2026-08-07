@@ -78,6 +78,27 @@ static void reap_and_recycle(pid_t victim) {
         pause();
         _exit(0);
     }
+
+    // D0A-R3-01: put the IMPOSTOR into a real logind session, so the lookup that follows
+    // takes the SUCCESSFUL session-returning path — the only path on which the delegated
+    // verification is claimed to run. The victim stays sessionless, so a call that answers
+    // with this session has answered about the impostor.
+    const char *join = getenv("DELPHI_BARRIER_JOIN_CGROUP");
+    if (join) {
+        int cg = open(join, O_WRONLY);
+        if (cg < 0) {
+            log_line("BARRIER ERROR: cannot open %s (need real root)\n", join);
+        } else {
+            char pbuf[32];
+            int pn = snprintf(pbuf, sizeof pbuf, "%d", (int)impostor);
+            if (write(cg, pbuf, (size_t)pn) != pn) {
+                log_line("BARRIER ERROR: could not place impostor in %s\n", join);
+            } else {
+                log_line("BARRIER PLACED impostor=%d in %s\n", (int)impostor, join);
+            }
+            close(cg);
+        }
+    }
     // Both pids, so "it recycled" is checkable by the harness rather than claimed here.
     log_line("BARRIER FIRED victim=%d impostor=%d\n", (int)victim, (int)impostor);
 }
@@ -91,6 +112,12 @@ FILE *fopen64(const char *path, const char *mode) {
     }
 
     const char *victim_s = getenv("DELPHI_BARRIER_VICTIM");
+    // Logged whether or not this is the call we act on, so a control run and a barrier run can
+    // be SHOWN to take the same route rather than assumed to (D0A-R3-01). A control that
+    // resolves through a different path would prove less than it appears to.
+    if (path && strncmp(path, "/proc/", 6) == 0 && strstr(path, "/cgroup")) {
+        log_line("OBSERVED %s\n", path);
+    }
     if (!fired && victim_s && path) {
         // Overridable ONLY so the harness can aim the barrier at a path this call never opens
         // and confirm the suite then FAILS — otherwise the passing legs prove nothing.

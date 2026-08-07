@@ -39,6 +39,8 @@ gcc -shared -fPIC -O0 -o "$SP/preload.so" runtime/tests/barrier/preload.c -ldl \
   || { echo "REFUSING: shim did not build"; exit 2; }
 gcc -O0 -o "$SP/driver" runtime/tests/barrier/driver.c -lsystemd \
   || { echo "REFUSING: driver did not build (libsystemd-dev absent?)"; exit 2; }
+gcc -O0 -o "$SP/resolve" runtime/tests/barrier/resolve.c -lsystemd \
+  || { echo "REFUSING: resolve helper did not build"; exit 2; }
 
 run_barrier() {  # run_barrier [suffix-override] -> transcript on stdout
     if [ $# -gt 0 ]; then
@@ -104,6 +106,85 @@ if printf '%s' "$WOUT" | grep -q '^BARRIER MATCHED'; then
     bad "weaken: no MATCHED line either" "it matched a path the call never opens"
 else
     ok "weaken: no MATCHED line either, so leg 1 measures the path and not the preload"
+fi
+
+# ── ROOT SECTION: the ANSWER, not just the interval (D0A-R3-01) ──────────────────────────
+#
+# ROOT-GATED IS NOT LANE-ONLY, and the distinction is the point of this section. "Skips without
+# sudo" and "needs a physical seated machine with a free VT" are different constraints; the
+# ledger carried the second while the first was true. Codex settled it: a remote or seatless
+# logind session suffices, and this box has one.
+echo
+echo "--- answer-discrimination (requires real root + a resolvable logind session) ---"
+if [ "$(id -u)" != 0 ]; then
+    echo "  SKIP: not root. This leg places processes into a session cgroup and writes the"
+    echo "        global ns_last_pid; both need real uid 0 (a userns-mapped root cannot)."
+    echo "        Re-run: sudo runtime/tests/pidfd-barrier.test.sh"
+else
+    # Find a session scope whose members actually resolve. Not "a scope exists" — a scope that
+    # sd_pid_get_session answers for, since that is what the lookup will consult.
+    SCOPE=""
+    for d in /sys/fs/cgroup/user.slice/*/session-*.scope; do
+        [ -r "$d/cgroup.procs" ] || continue
+        m=$(head -1 "$d/cgroup.procs" 2>/dev/null)
+        [ -n "$m" ] || continue
+        got=$("$SP/resolve" "$m" 2>/dev/null)
+        [ -n "$got" ] && { SCOPE="$d"; SESSION="$got"; break; }
+    done
+    if [ -z "$SCOPE" ]; then
+        bad "a resolvable logind session exists" "none found — cannot discriminate the answer"
+    else
+        echo "  using $SCOPE (session $SESSION)"
+
+        # (a) POSITIVE CONTROL: victim IN the session, NO barrier. The call must resolve it.
+        #     Without this, "the barrier run returned no session" cannot be told apart from
+        #     "nothing on this box ever resolves".
+        COUT=$(DELPHI_VICTIM_JOIN_CGROUP="$SCOPE/cgroup.procs" \
+               LD_PRELOAD="$SP/preload.so" "$SP/driver" 2>&1)
+        printf '%s\n' "$COUT" | sed 's/^/    /'
+        if printf '%s' "$COUT" | grep -q "^CALL RETURNED rc=0 session=$SESSION$"; then
+            ok "control: a victim in the session RESOLVES (rc=0 session=$SESSION)"
+        else
+            bad "control: a victim in the session resolves" "it did not — the negative below would be meaningless"
+        fi
+
+        # (b) THE BARRIER RUN: victim sessionless; the IMPOSTOR is placed in the session, so
+        #     the lookup takes the SUCCESSFUL path — the only one on which the delegated
+        #     verification is claimed to run.
+        BOUT=$(DELPHI_BARRIER_JOIN_CGROUP="$SCOPE/cgroup.procs" \
+               LD_PRELOAD="$SP/preload.so" "$SP/driver" 2>&1)
+        printf '%s\n' "$BOUT" | sed 's/^/    /'
+        if printf '%s' "$BOUT" | grep -q '^BARRIER PLACED'; then
+            ok "barrier: the impostor was placed in the session"
+        else
+            bad "barrier: the impostor was placed in the session" "placement failed — the successful path is not exercised"
+        fi
+        if printf '%s' "$BOUT" | grep -q "^CALL RETURNED rc=0 session=$SESSION$"; then
+            bad "THE DELEGATION IS FALSIFIED" \
+                "the call answered session=$SESSION for a pidfd whose process was reaped — that is the IMPOSTOR's session attributed to the victim's pidfd"
+        else
+            ok "barrier: the call did NOT answer with the impostor's session"
+        fi
+
+        # (c) SAME ROUTE: both runs must reach the lookup the same way, or the control proves
+        #     less than it appears to. The OBSERVED line is logged regardless of matching.
+        CR=$(printf '%s' "$COUT" | grep -c '^OBSERVED /proc/[0-9]*/cgroup$')
+        BR=$(printf '%s' "$BOUT" | grep -c '^OBSERVED /proc/[0-9]*/cgroup$')
+        if [ "$CR" -ge 1 ] && [ "$BR" -ge 1 ]; then
+            ok "both runs reached the same lookup route (OBSERVED in each)"
+        else
+            bad "both runs reached the same lookup route" "control=$CR barrier=$BR observed lookups"
+        fi
+
+        # (d) WEAKEN: drop the impostor's placement. The lookup then returns ENODATA and (b)
+        #     passes VACUOUSLY — so the control is what has to catch it.
+        WB=$(LD_PRELOAD="$SP/preload.so" "$SP/driver" 2>&1)
+        if printf '%s' "$WB" | grep -q '^BARRIER PLACED'; then
+            bad "weaken: no placement means no PLACED line" "it placed anyway"
+        else
+            ok "weaken: without placement the run is vacuous — which is why (a) exists"
+        fi
+    fi
 fi
 
 echo

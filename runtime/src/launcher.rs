@@ -979,7 +979,7 @@ fn shell_argv_envp(spec: &LaunchSpec) -> Result<(CString, Vec<CString>), ()> {
     let path = CString::new(spec.shell_path.as_os_str().as_bytes()).map_err(|_| ())?;
 
     let overrides: Vec<(&str, String)> = std::iter::once((
-        "DELPHI_CHANNEL_FD",
+        crate::scaffold_env::CHANNEL_FD,
         SHELL_CHANNEL_FD.to_string(),
     ))
     .chain(spec.shell_env.iter().map(|(k, v)| (*k, (*v).to_owned())))

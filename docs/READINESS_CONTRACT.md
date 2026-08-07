@@ -99,9 +99,16 @@ calls, so the pid cannot be recycled. **P4 (the long-lived service loop) is the 
 removes that accident** — a loop that reaps and relaunches makes the pid recyclable between
 resolution and use.
 
-**RESOLVED.** `LogindSource` holds the **pidfd** and resolves the pid through
-`/proc/self/fdinfo/<fd>` at each `current()`; `Pid: -1` (reaped) or a non-positive value denies.
-A3's shape is what made this a change *inside* the source rather than a rewiring of `launch()`.
+**RESOLVED — but NOT by what this paragraph first said.** The original fix resolved the pid
+through `/proc/self/fdinfo/<fd>` at each `current()` and denied on `Pid: -1`. **Codex D0A-R1-01
+found that still race-prone**: reading a number and then looking it up are two operations, and
+the pid can be reaped and reused between them. `LogindSource` now binds
+`sd_pidfd_get_session`, so **no pid number crosses between operations at all**;
+`pid_from_pidfd` survives only as a diagnostic no decision consumes. A3's shape is what made
+both versions a change *inside* the source rather than a rewiring of `launch()`.
+
+The `fdinfo` measurement below is kept because it is still true and still the reason the
+diagnostic is trustworthy — but it is no longer the resolution path.
 
 **MEASURED, not assumed** (kernel 7.0.0-28): `Pid:` reports the pid while the process is alive,
 **still reports it while dead-but-unreaped**, and reports **`-1` once reaped** — which is
@@ -189,6 +196,12 @@ flip test fails at the true→false leg, naming it: *"a stored verdict is what m
 minting consent while the seat points elsewhere."* Weaken (b) — weaken the law's assertion to a
 tautology → the tearing case stops panicking and the `should_panic` test fails, proving the law
 is what catches tearing rather than the harness.
+
+**SUPERSEDED (D0A-R2-06 / R3-05).** Both weakens above describe a `#[should_panic]` law that
+**no longer exists**: D0A-R1-04 replaced it with the type, and the settling weaken now fails to
+COMPILE rather than to run. The paragraph is kept because it records what was measured at the
+time — but as history, not as a live proof. Nothing in the tree today can produce those two
+results.
 
 **A decision whose premise was false is now a decision whose premise is true.** When review
 asked for an abort on a false startup verdict, the accepted counter-argument was *"the `active`

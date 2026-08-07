@@ -172,7 +172,35 @@ pub fn accept_requester_within(
 /// ```
 #[must_use]
 pub fn gate_allows(source: &dyn SessionSource) -> bool {
-    session_passes_gate(source.current())
+    gate_check(source).is_ok()
+}
+
+/// As [`gate_allows`], but handing back **why** it denied (D0A-R3-02).
+///
+/// The cause was measured in R1-05 and phrased for the operator in R2-04, then collapsed to a
+/// `bool` before the service could use it — so a gone process, an invalid pidfd and a genuine
+/// seat change all reached the requester as the same sentence. This is the seam that carries
+/// the distinction the rest of the way.
+///
+/// # Errors
+///
+/// The [`SessionResolution`] that denied, ready for [`SessionResolution::denial`].
+///
+/// # Examples
+///
+/// ```
+/// use delphi_runtime::logind::SessionSnapshot;
+/// use delphi_runtime::service::gate_check;
+/// assert!(gate_check(&SessionSnapshot { active: true, remote: false, seated: true }).is_ok());
+/// assert!(gate_check(&SessionSnapshot::DENIED).is_err());
+/// ```
+pub fn gate_check(source: &dyn SessionSource) -> Result<(), crate::logind::SessionResolution> {
+    let resolution = source.current();
+    if session_passes_gate(resolution.snapshot_or_denied()) {
+        Ok(())
+    } else {
+        Err(resolution)
+    }
 }
 
 /// The terminal outcome of one serviced action.
@@ -233,8 +261,8 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
 
     // 3. logind gate (composed), then live PAM over the private channel.
     // FIRST of two reads: refuse to PROMPT at a surface that is not the seat's foreground.
-    if !gate_allows(ctx.session) {
-        return deny(ai, &id, "logind: shell session not active+local");
+    if let Err(cause) = gate_check(ctx.session) {
+        return deny(ai, &id, &cause.denial(false));
     }
     if authenticate_over_channel(ctx.pam_service, ctx.session_user, ctx.channel_fd).is_err() {
         return deny(ai, &id, "PAM authentication failed");
@@ -249,8 +277,8 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     // DECISION stale: PAM waits on a human, so unboundedly, and `recv_mint_confirm` blocks
     // after it. A session going true → false during authentication still minted — the exact
     // case A3's own docs name as the security property. Class 26 one level above A3.
-    if !gate_allows(ctx.session) {
-        return deny(ai, &id, REASON_SESSION_LOST_DURING_AUTH);
+    if let Err(cause) = gate_check(ctx.session) {
+        return deny(ai, &id, &cause.denial(true));
     }
     // Mint at the time of consent (read FRESH — not a frozen snapshot).
     let token = mint(ctx.key, &digest, ctx.clock.now_unix());

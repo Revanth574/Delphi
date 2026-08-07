@@ -44,6 +44,25 @@ int main(void) {
     snprintf(buf, sizeof buf, "%d", (int)victim);
     setenv("DELPHI_BARRIER_VICTIM", buf, 1);
 
+    // Positive control (D0A-R3-01): place the VICTIM in a real session, run WITHOUT a barrier,
+    // and the call must resolve it. Without this leg, "the barrier run returned no session"
+    // is indistinguishable from "nothing on this box ever resolves" — which is exactly how the
+    // previous version of this harness fooled itself.
+    const char *vjoin = getenv("DELPHI_VICTIM_JOIN_CGROUP");
+    if (vjoin) {
+        FILE *cg = fopen(vjoin, "w");
+        if (!cg) {
+            fprintf(stderr, "DRIVER ERROR: cannot open %s (need real root)\n", vjoin);
+            return 2;
+        }
+        fprintf(cg, "%d", (int)victim);
+        if (fclose(cg) != 0) {
+            fprintf(stderr, "DRIVER ERROR: could not place victim in %s\n", vjoin);
+            return 2;
+        }
+        printf("VICTIM PLACED in %s\n", vjoin);
+    }
+
     printf("CALL BEGIN\n");
     char *session = NULL;
     int rc = sd_pidfd_get_session(pidfd, &session);

@@ -111,7 +111,11 @@ FILE *fopen64(const char *path, const char *mode) {
         }
     }
 
-    const char *victim_s = getenv("DELPHI_BARRIER_VICTIM");
+    // The control run needs the shim LOADED (for OBSERVED, which proves both runs take the
+    // same route) but INERT. Without this the control fired the barrier and destroyed the very
+    // victim it was controlling for — caught by the control failing, which is what it is for.
+    const char *disabled = getenv("DELPHI_BARRIER_DISABLE");
+    const char *victim_s = disabled ? NULL : getenv("DELPHI_BARRIER_VICTIM");
     // Logged whether or not this is the call we act on, so a control run and a barrier run can
     // be SHOWN to take the same route rather than assumed to (D0A-R3-01). A control that
     // resolves through a different path would prove less than it appears to.

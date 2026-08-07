@@ -9,12 +9,17 @@
 # the interval instead of across it (DEFECT_CLASSES 22), so "we crossed it" is the thing that
 # has to be demonstrated before any answer read out of the call means anything.
 #
-# WHAT THIS CANNOT SETTLE HERE, and it is designed for rather than discovered:
+# TWO SECTIONS, TWO CLAIMS:
+#   1. UNPRIVILEGED — the barrier crosses the interval. Runs anywhere with unshare + gcc.
+#   2. ROOT — the ANSWER discriminates (D0A-R3-01). Needs real uid 0 and a resolvable logind
+#      session; NOT a seated lane. Codex settled the schedule question: a remote or seatless
+#      session suffices.
+#
 # Codex bounded its own citation — the pidfd re-verification runs on every SUCCESSFUL
-# session-returning path and is SKIPPED on error paths such as ENODATA. On a box where the
-# victim is in no session, the lookup returns ENODATA before any verification, so the answer
-# is identical whether the delegation holds or not. **The answer-discrimination is lane-only.**
-# This harness is what makes that lane run mean something when it happens.
+# session-returning path and is SKIPPED on error paths such as ENODATA. That is why section 2
+# puts the IMPOSTOR (not the victim) into the session: only then does the lookup succeed, and
+# only a successful lookup reaches the step being tested. Section 1's ENODATA is expected and
+# proves nothing about the answer — which is the whole reason section 2 exists.
 #
 # Fails closed: an unbuildable shim, a missing namespace, or a barrier that never fires is a
 # FAILURE, never a quiet pass.
@@ -139,9 +144,14 @@ else
         # (a) POSITIVE CONTROL: victim IN the session, NO barrier. The call must resolve it.
         #     Without this, "the barrier run returned no session" cannot be told apart from
         #     "nothing on this box ever resolves".
-        COUT=$(DELPHI_VICTIM_JOIN_CGROUP="$SCOPE/cgroup.procs" \
+        COUT=$(DELPHI_VICTIM_JOIN_CGROUP="$SCOPE/cgroup.procs" DELPHI_BARRIER_DISABLE=1 \
                LD_PRELOAD="$SP/preload.so" "$SP/driver" 2>&1)
         printf '%s\n' "$COUT" | sed 's/^/    /'
+        if printf '%s' "$COUT" | grep -q '^BARRIER FIRED'; then
+            bad "control: the barrier must be INERT" "it fired and destroyed the victim it controls for"
+        else
+            ok "control: the barrier was inert (no FIRED line)"
+        fi
         if printf '%s' "$COUT" | grep -q "^CALL RETURNED rc=0 session=$SESSION$"; then
             ok "control: a victim in the session RESOLVES (rc=0 session=$SESSION)"
         else
@@ -159,11 +169,22 @@ else
         else
             bad "barrier: the impostor was placed in the session" "placement failed — the successful path is not exercised"
         fi
+        BRC=$(printf '%s' "$BOUT" | sed -n 's/^CALL RETURNED rc=\(-\?[0-9]*\).*/\1/p')
         if printf '%s' "$BOUT" | grep -q "^CALL RETURNED rc=0 session=$SESSION$"; then
             bad "THE DELEGATION IS FALSIFIED" \
                 "the call answered session=$SESSION for a pidfd whose process was reaped — that is the IMPOSTOR's session attributed to the victim's pidfd"
         else
-            ok "barrier: the call did NOT answer with the impostor's session"
+            ok "barrier: the call did NOT answer with the impostor's session (rc=$BRC)"
+        fi
+        # ESRCH vs ENODATA is the DISCRIMINATING difference, not a detail. With the impostor
+        # in the session the LOOKUP SUCCEEDS, so the call reaches the session-returning path —
+        # the only one on which verification is claimed to run. -ESRCH there means something
+        # then refused because the pidfd no longer names that process. -ENODATA would mean the
+        # lookup never saw the impostor at all, i.e. the configuration did not bite.
+        if [ "$BRC" = "-3" ]; then
+            ok "barrier: refused with ESRCH — the VERIFICATION step is observable"
+        else
+            bad "barrier: refused with ESRCH" "got rc=$BRC; -61 would mean the lookup never saw the impostor, so the successful path was not exercised"
         fi
 
         # (c) SAME ROUTE: both runs must reach the lookup the same way, or the control proves

@@ -110,6 +110,20 @@ both versions a change *inside* the source rather than a rewiring of `launch()`.
 The `fdinfo` measurement below is kept because it is still true and still the reason the
 diagnostic is trustworthy — but it is no longer the resolution path.
 
+**AND THE DELEGATION IS NOW MEASURED, NOT CITED (D0A-R3-01).** Binding
+`sd_pidfd_get_session` moved the race-closing step inside libsystemd, so the fix rested on
+Codex's reading of systemd's source. `runtime/tests/pidfd-barrier.test.sh` settles it by
+experiment — 12/12, root-gated, **no seated lane required**:
+
+| run | configuration | result |
+|---|---|---|
+| control | victim IN a real session, barrier inert | `rc=0 session=2` |
+| barrier | victim sessionless, **impostor** in the session, victim reaped and pid recycled mid-call | `rc=-3` (ESRCH) |
+
+`ENODATA` would mean the lookup returned before verification and told us nothing. `ESRCH` on a
+**successful** lookup means the verification step ran and refused. The control is what makes
+that negative meaningful: without it, `rc != 0` passes on any box where nothing resolves.
+
 **MEASURED, not assumed** (kernel 7.0.0-28): `Pid:` reports the pid while the process is alive,
 **still reports it while dead-but-unreaped**, and reports **`-1` once reaped** — which is
 precisely when the pid becomes recyclable. `None` here and "this number may now name someone

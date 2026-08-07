@@ -271,17 +271,22 @@ fn session_is_seated(session: &CStr) -> Result<bool, i32> {
 /// at daemon start answers about daemon-start time forever, so the axis the gate exists to
 /// enforce stops tracking anything. `docs/READINESS_CONTRACT.md` A3.
 ///
-/// # Why the source returns a verdict rather than the trait querying per method
+/// # What returning a concrete triple buys — and what it does NOT (D0A-R2-06)
 ///
-/// [`session_passes_gate`] reads `is_active`, `is_remote`, `is_seated` as three calls. An impl
-/// that queried logind per method could TEAR — `active` from one instant, `seated` from
-/// another — producing a verdict that never described any actual moment. One `current()` per
-/// decision yields a triple that was simultaneously true, which is what "active-local-seated
-/// now" means. `DEFECT_CLASSES` 26 one level up: there, a captured `revents` reused after a
-/// syscall; here, a captured verdict reused across the decision it authorizes.
+/// It forecloses **consumer-side** laziness: a caller receives three `bool`s already decided,
+/// so it cannot re-read one axis at a time between the gate and the mint. That is the property
+/// A3 needed and the one the type now guarantees — the settling weaken (make the production
+/// source lazy per axis) does not compile.
 ///
-/// Implementations MUST return a verdict describing ONE instant. `verdict_triple_is_simultaneous`
-/// in this module's tests is that law, and it is proven discriminating against a tearing impl.
+/// **It does not foreclose producer-side tearing, and it is not claimed to.**
+/// [`SessionSnapshot::query_detailed`] still makes three separate libsystemd calls, because
+/// logind exposes no atomic read of the three; a VT switch landing between them yields a mixed
+/// triple. The window is the span of two library calls and the next decision re-reads from
+/// scratch. **Narrower than the original claim, and stated instead of assumed away.**
+///
+/// `DEFECT_CLASSES` 26 is the reason the read is taken at the decision at all: there, a
+/// captured `revents` reused after a syscall; here, a captured verdict reused across the
+/// decision it authorizes.
 pub trait SessionSource {
     /// The session's triple as of now. Fail-closed: unresolvable ⇒ [`SessionSnapshot::DENIED`].
     fn current(&self) -> SessionSnapshot;

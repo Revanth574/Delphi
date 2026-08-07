@@ -175,11 +175,14 @@ outcome and the one to record.
   one no human at the seat authorized, which is exactly what R3-02's `active` axis exists to
   prevent. false → true is a false DENY: annoying, never dangerous, and it is what lets a
   `chvt` to the shell's VT take effect without a daemon restart.
-- *the simultaneity law* — against a source whose state advances per read, a conforming
-  `current()` returns exactly one of the two states, never a mixture.
-- **The tearing case is a permanent `#[should_panic]` test, not a weaken run once.** A future
-  refactor to per-method queries fails it forever. That is stronger than a weaken, and it is why
-  the design's central argument is not left as prose.
+- *the guarantee, at its real width* (**corrected, D0A-R2-06** — this bullet previously
+  described a "simultaneity law" enforced by a `#[should_panic]` test, and both are gone). The
+  concrete `SessionSnapshot` forecloses **consumer-side** laziness: a caller gets three `bool`s
+  already decided and cannot re-read one axis between the gate and the mint. It does **not**
+  foreclose **producer-side** tearing — `query_detailed` still makes three separate libsystemd
+  calls, since logind offers no atomic read — so a VT switch between them yields a mixed triple.
+  The window is two library calls wide and the next decision re-reads. The `#[should_panic]`
+  law was deleted because the type replaced it: the settling weaken no longer compiles.
 
 **Measured.** Weaken (a) — freeze the verdict (`OnceLock` memo, the pre-A3 semantics) → the
 flip test fails at the true→false leg, naming it: *"a stored verdict is what makes this ALLOW,

@@ -338,42 +338,79 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     assert_eq!(marker, "B1-LIVES", "the STORED canonical action executed end-to-end");
 }
 
-/// Wait for a spawned `delphi-runtimed`, or KILL it and say so (D0A-R4-07).
+/// A spawned `delphi-runtimed` that CANNOT outlive the test, on any exit path.
 ///
-/// `.output()` waits forever. When the daemon's AI child dies before connecting, the daemon
-/// blocks in accept, the test hangs, and an interrupted run leaves it ORPHANED AS ROOT holding
-/// a VT — four accumulated that way, one per attempt. ONE helper, because the leak fix's own
-/// first pass repaired the spawn site it had just written and left the pre-existing one.
-fn wait_or_kill_daemon(
-    mut child: std::process::Child,
-    session_user: &str,
-) -> std::process::Output {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    let mut killed = false;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if std::time::Instant::now() >= deadline => {
-                // SAFETY: signalling a process this test spawned.
-                unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
-                killed = true;
-                break;
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
+/// # Why RAII and not straight-line teardown (D0A-R4-07, second attempt)
+///
+/// The first fix waited-and-killed with ordinary statements after `spawn()`. That reaps on the
+/// happy path and on a deadline — and **skips entirely on a panic**, which is the path these
+/// tests actually take: an assertion fails, the stack unwinds past the teardown, and the daemon
+/// is orphaned AS ROOT holding a VT. `Setup` was already RAII; the daemon was not, so a failing
+/// test leaked a privileged process while a passing one did not.
+///
+/// It is the same argument made for `ReportingTempDir` in D0-R7-07 — explicit cleanup runs only
+/// where it is called, a `Drop` runs everywhere — applied here only after it cost four orphans.
+struct DaemonGuard {
+    child: Option<std::process::Child>,
+    session_user: String,
+}
+
+impl DaemonGuard {
+    fn spawn(mut cmd: Command, session_user: &str) -> Self {
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the daemon binary");
+        Self { child: Some(child), session_user: session_user.to_owned() }
     }
-    let out = child.wait_with_output().expect("collect daemon output");
-    // Scoped to THIS test's user, on every path including the happy one.
-    let _ = Command::new("pkill")
-        .args(["-9", "-f", &format!("delphi-runtimed --session {session_user}")])
-        .status();
-    assert!(
-        !killed,
-        "the daemon had to be KILLED at the deadline — that is the orphan condition \
-         (D0A-R4-07), not a slow machine. stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out
+
+    /// Wait to a deadline, then take the output. A kill is reported by the caller's assertion;
+    /// the REAPING has already happened either way.
+    fn wait(mut self) -> (std::process::Output, bool) {
+        let mut child = self.child.take().expect("child present");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let mut killed = false;
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    // SAFETY: signalling a process this test spawned.
+                    unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
+                    killed = true;
+                    break;
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+        let out = child.wait_with_output().expect("collect daemon output");
+        Self::sweep(&self.session_user);
+        (out, killed)
+    }
+
+    /// Kill anything still running under this test's own session user. Scoped by user, so it
+    /// can never touch a daemon another test owns.
+    fn sweep(session_user: &str) {
+        let _ = Command::new("pkill")
+            .args(["-9", "-f", &format!("delphi-runtimed --session {session_user}")])
+            .status();
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Reached only when the test panicked before `wait()` — the path that leaked.
+            // SAFETY: signalling a process this test spawned.
+            unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
+            let _ = child.wait();
+            eprintln!(
+                "DaemonGuard: the test unwound before wait(); killed the daemon for {}",
+                self.session_user
+            );
+        }
+        Self::sweep(&self.session_user);
+    }
 }
 
 // ── D0A-R4-03: the PRODUCTION wiring, which had never executed ──────────────
@@ -500,7 +537,8 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     // and when the operator interrupted the hang the daemon ORPHANED AS ROOT holding its VT —
     // four times, each run making the next one's precondition fail. A test that leaks a
     // privileged process is worse than a test that fails.
-    let child = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"));
+    cmd
         .args(["--session", &setup.user])
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
@@ -513,11 +551,9 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         // assumption against the source rather than by a reviewer.
         // DELPHI_INSECURE_ASSUME_ACTIVE_SESSION is DELIBERATELY UNSET: the real gate runs.
         .env_remove("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the daemon binary");
-    let out = wait_or_kill_daemon(child, &setup.user);
+    ;
+    let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
+    assert!(!killed, "the daemon had to be KILLED at the deadline — the orphan condition");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
     // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
@@ -1045,7 +1081,8 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
     // fixed — Class 17 inside the leak fix itself: I repaired the spawn site I had just
     // written and left the pre-existing one, which is the same unbounded wait that orphaned
     // four root daemons. Whether or not it produced THIS leak, it can produce the next one.
-    let child = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"));
+    cmd
         .args(["--session", &setup.user])
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
@@ -1059,11 +1096,9 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
         // The compile-time test seam (the binary is built with --features
         // insecure-test-seams in the lane); WSL has no real logind session.
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the daemon binary");
-    let out = wait_or_kill_daemon(child, &setup.user);
+    ;
+    let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
+    assert!(!killed, "the daemon had to be KILLED at the deadline — the orphan condition");
 
     let marker = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

@@ -99,6 +99,12 @@ static void reap_and_recycle(pid_t victim) {
             close(cg);
         }
     }
+    // D0A-R4-02: publish the impostor IN-PROCESS. The driver must clean up the process it
+    // actually created, not whatever now holds the victim's number — killing by the raw pid is
+    // the very recycling hazard this harness exists to demonstrate, and it was live here.
+    char ibuf[32];
+    snprintf(ibuf, sizeof ibuf, "%d", (int)impostor);
+    setenv("DELPHI_BARRIER_IMPOSTOR", ibuf, 1);
     // Both pids, so "it recycled" is checkable by the harness rather than claimed here.
     log_line("BARRIER FIRED victim=%d impostor=%d\n", (int)victim, (int)impostor);
 }

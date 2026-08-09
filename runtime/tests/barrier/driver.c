@@ -74,8 +74,28 @@ int main(void) {
     int occupied = (kill(victim, 0) == 0);
     printf("PID %d OCCUPIED AFTER CALL: %s\n", (int)victim, occupied ? "yes" : "no");
 
-    kill(victim, SIGKILL);
-    int st = 0;
-    waitpid(victim, &st, 0);
-    return 0;
+    // D0A-R4-02. Two defects lived in the old two lines here:
+    //   1. `kill(victim, ...)` killed whatever holds that NUMBER now. If a concurrent fork won
+    //      the race, that is an unrelated process — and the real impostor leaks.
+    //   2. Nothing asserted the recycle actually landed on the victim's pid, so a race left
+    //      ESRCH looking correct for the wrong reason: the pidfd's process was gone either way.
+    const char *imp_s = getenv("DELPHI_BARRIER_IMPOSTOR");
+    int recycled_ok = 1;
+    if (imp_s) {
+        pid_t impostor = (pid_t)atoi(imp_s);
+        if (impostor != victim) {
+            // Loud, and fatal to the run: the experiment did not happen.
+            printf("RECYCLE MISSED victim=%d impostor=%d\n", (int)victim, (int)impostor);
+            recycled_ok = 0;
+        }
+        kill(impostor, SIGKILL);
+        int st = 0;
+        waitpid(impostor, &st, 0);
+    } else {
+        // No barrier ran; the victim is still ours and still the same process.
+        kill(victim, SIGKILL);
+        int st = 0;
+        waitpid(victim, &st, 0);
+    }
+    return recycled_ok ? 0 : 3;
 }

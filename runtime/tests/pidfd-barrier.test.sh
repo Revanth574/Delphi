@@ -27,9 +27,21 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-SP="${TMPDIR:-/tmp}/delphi-barrier-$$"
-mkdir -p "$SP"
+# D0A-R4-01. This was `${TMPDIR:-/tmp}/delphi-barrier-$$` + `mkdir -p`, which SUCCEEDS on an
+# existing directory or a symlink — and the documented invocation is `sudo`, so another local
+# user who pre-creates or races that path gets driver/resolve/preload.so compiled and executed
+# AS ROOT. The harness written to prove a security property introduced one.
+#
+# `mktemp -d` creates atomically with an unpredictable name at mode 0700 and FAILS if the name
+# exists, which closes the pre-create and the race. The checks after it are not redundant: they
+# refuse a parent whose semantics we did not expect (a symlinked TMPDIR, an inherited mode).
+SP=$(mktemp -d "${TMPDIR:-/tmp}/delphi-barrier-XXXXXXXXXX") || {
+    echo "REFUSING: mktemp -d failed"; exit 2; }
 trap 'rm -rf "$SP"' EXIT
+[ -d "$SP" ] && [ ! -L "$SP" ] || { echo "REFUSING: $SP is not a real directory"; exit 2; }
+SP_OWNER=$(stat -c %u "$SP") ; SP_MODE=$(stat -c %a "$SP")
+[ "$SP_OWNER" = "$(id -u)" ] || { echo "REFUSING: $SP owned by uid $SP_OWNER, not $(id -u)"; exit 2; }
+[ "$SP_MODE" = 700 ] || { echo "REFUSING: $SP has mode $SP_MODE, expected 700"; exit 2; }
 
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf '  %-56s PASS\n' "$1"; }
@@ -168,6 +180,22 @@ else
             ok "barrier: the impostor was placed in the session"
         else
             bad "barrier: the impostor was placed in the session" "placement failed — the successful path is not exercised"
+        fi
+        # D0A-R4-02: THE RECYCLE MUST HAVE LANDED ON THE VICTIM'S PID. This leg was present in
+        # the unprivileged section and MISSING here — so in the host pid namespace a concurrent
+        # fork could take the number, the pidfd's process would still be gone, and ESRCH would
+        # appear for a reason that has nothing to do with the impostor. A correct-looking result
+        # from an experiment that did not happen.
+        BV=$(printf '%s' "$BOUT" | sed -n 's/^VICTIM \([0-9]*\)$/\1/p')
+        BI=$(printf '%s' "$BOUT" | sed -n 's/^BARRIER FIRED victim=[0-9]* impostor=\([0-9]*\)$/\1/p')
+        if [ -n "$BV" ] && [ "$BV" = "$BI" ]; then
+            ok "barrier: the recycle landed on the victim's pid ($BV)"
+        else
+            bad "barrier: the recycle landed on the victim's pid" \
+                "victim=${BV:-?} impostor=${BI:-none} — a concurrent fork won the race, so the rc below is about the wrong process"
+        fi
+        if printf '%s' "$BOUT" | grep -q '^RECYCLE MISSED'; then
+            bad "barrier: driver reports the recycle landed" "$(printf '%s' "$BOUT" | grep '^RECYCLE MISSED')"
         fi
         BRC=$(printf '%s' "$BOUT" | sed -n 's/^CALL RETURNED rc=\(-\?[0-9]*\).*/\1/p')
         if printf '%s' "$BOUT" | grep -q "^CALL RETURNED rc=0 session=$SESSION$"; then

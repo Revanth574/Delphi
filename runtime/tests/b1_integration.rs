@@ -338,6 +338,156 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     assert_eq!(marker, "B1-LIVES", "the STORED canonical action executed end-to-end");
 }
 
+// ── D0A-R4-03: the PRODUCTION wiring, which had never executed ──────────────
+
+/// `LogindSource` + a real `shell_pidfd` + a real logind session, together.
+///
+/// # Why this test exists (D0A-R4-03, merge-blocking)
+///
+/// `LogindSource::for_pidfd` is constructed at exactly ONE site — `delphi-runtimed.rs:188` —
+/// and the only test that ran the daemon binary enabled `insecure-test-seams`, whose seam
+/// returns a `SessionSnapshot` and **never reaches `LogindSource` at all**. Every other test
+/// injects a source. So each piece was proven and the ASSEMBLY was not. That is the same shape
+/// as D0-A's own three findings, and it survived three review rounds for the same reason.
+///
+/// # Why the assertion is on the CAUSE and not on "it denied"
+///
+/// A denial is worthless as evidence here: a **broken** assembly denies too, fail-closed, and
+/// looks identical. The discriminating claim is `Resolved` — the session was reached THROUGH
+/// the real pidfd and described — with `active == false` as the axis that refused it.
+/// `LookupNoData` would mean the wiring never got to logind, which is exactly what a
+/// denial-only assertion hides. Same discrimination problem as the barrier's `rc != 0`, one
+/// layer up.
+#[test]
+fn the_real_logind_source_resolves_the_shells_session_d0a_r4_03() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP r4_03_real_wiring: requires root (PAM session for the spawned shell)");
+        return;
+    }
+    let setup = Setup::new("r403");
+    let (uid, gid) = setup.ids();
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-r403-").tempdir_in("/run").expect("tempdir"),
+    );
+    let base = _base_tmp.path().to_path_buf();
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+
+    // A VT that is NOT the seat's foreground, so a RESOLVED session is denied on `active`
+    // specifically — the one axis whose falsity proves the query reached logind and got an
+    // answer, rather than failing closed on the way.
+    let vt = VtName::new("tty3").expect("tty3");
+    let spec = LaunchSpec {
+        ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
+        shell_path: &shell_bin,
+        ai_path: &ai_bin,
+        uid,
+        gid,
+        socket_path: &paths.socket,
+        tty: &vt,
+        shell_env: &[(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)],
+        ai_env: &[],
+    };
+    let children = launch(&spec).expect("launch");
+
+    // THE PRODUCTION CONSTRUCTION, verbatim from delphi-runtimed.rs:188.
+    use delphi_runtime::logind::SessionSource as _;
+    use std::os::fd::AsFd as _;
+    let source = delphi_runtime::logind::LogindSource::for_pidfd(children.shell_pidfd.as_fd());
+    let cause = source.current();
+
+    let _ = waitpid(nix::unistd::Pid::from_raw(children.shell_pid), None);
+    let _ = waitpid(nix::unistd::Pid::from_raw(children.ai_pid), None);
+
+    match cause {
+        delphi_runtime::logind::SessionResolution::Resolved(snap) => {
+            assert!(
+                !snap.active,
+                "a session on a NON-foreground VT must not be active; got {snap:?}"
+            );
+            assert!(
+                snap.seated,
+                "the shell's session was opened with PAM_TTY on a seat, so it must be seated; \
+                 got {snap:?} — if this is false the launcher's seat provisioning changed"
+            );
+            assert!(!snap.remote, "a VT session is local; got {snap:?}");
+        }
+        other => panic!(
+            "THE ASSEMBLY DID NOT RESOLVE. LogindSource + the real shell_pidfd + a real PAM \
+             session must reach logind and be DESCRIBED; {other:?} means the wiring never got \
+             an answer. A denial-only assertion would have passed here, which is why this test \
+             asserts the cause."
+        ),
+    }
+    // And the composed gate refuses it — the same call the service makes.
+    assert!(
+        !delphi_runtime::service::gate_allows(&source),
+        "a resolved-but-inactive session must not pass the gate"
+    );
+}
+
+/// The daemon BINARY runs its real gate — the seam absent, not merely unlogged.
+///
+/// D0A-R4-03: asserting "no seam line appeared" is satisfied by a run that logged NOTHING —
+/// a crash, a wrong binary, an unbuilt feature. So this asserts the run produced its EXPECTED
+/// startup output and that the seam line is not among it. Absence is only evidence once
+/// presence is established.
+#[test]
+fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP r4_03_daemon_real_gate: requires root");
+        return;
+    }
+    let setup = Setup::new("r403d");
+    let (_uid, gid) = setup.ids();
+    let _base_tmp = delphi_runtime::test_child_guard::ReportingTempDir::new(
+        tempfile::Builder::new().prefix("delphi-r403d-").tempdir_in("/run").expect("tempdir"),
+    );
+    let base = _base_tmp.path().to_path_buf();
+    let dir = ensure_runtime_dir(&base, &setup.user).expect("anchor dir");
+    let (_paths, _listener) = bind_approval_socket(&dir, gid.as_raw()).expect("anchor socket");
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+        .args(["--session", &setup.user])
+        .env("DELPHI_SHELL_BIN", &shell_bin)
+        .env("DELPHI_AI_BIN", &ai_bin)
+        .env(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)
+        .env("DELPHI_SHELL_VT", "tty3")
+        // NOTE: the daemon anchors at the hardcoded DEFAULT_RUNTIME_BASE — it takes no base
+        // override. An earlier draft of this test passed `DELPHI_RUNTIME_BASE`, a name that
+        // exists NOWHERE in the binary; it was a silent no-op, which is D0A-R2-01's class
+        // reappearing in the very test written to close a wiring gap. Caught by checking the
+        // assumption against the source rather than by a reviewer.
+        // DELPHI_INSECURE_ASSUME_ACTIVE_SESSION is DELIBERATELY UNSET: the real gate runs.
+        .env_remove("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION")
+        .output()
+        .expect("run the daemon binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
+    assert!(
+        stderr.contains("anchor + launcher up") || stderr.contains("shell session is NOT"),
+        "the daemon must have produced its startup output; without that, the seam's absence \
+         says the process did not run, not that it ran without the bypass. stderr:\n{stderr}"
+    );
+    // THEN absence, by name.
+    assert!(
+        !stderr.contains("INSECURE TEST SEAM ACTIVE"),
+        "the gate-bypass seam must NOT have engaged in this run. stderr:\n{stderr}"
+    );
+}
+
 // ── D0A-R1-02: the gate is re-read ADJACENT TO THE MINT ─────────────────────
 
 /// A source that ALLOWS the first read and DENIES every one after — the session going

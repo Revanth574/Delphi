@@ -26,6 +26,7 @@
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use nix::sys::wait::waitpid;
@@ -35,7 +36,7 @@ use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
 use delphi_runtime::execute::ConsumptionLedger;
 use delphi_runtime::launcher::{launch, LaunchSpec, VtName};
 use delphi_runtime::logind::{LogindSource, SessionSource};
-use delphi_runtime::service::{accept_requester, serve_one_action, ServiceCtx, SystemClock};
+use delphi_runtime::service::{accept_requester_within, serve_one_action, ServiceCtx, SystemClock};
 use delphi_runtime::store::PendingStore;
 use delphi_runtime::token::MintingKey;
 use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
@@ -134,7 +135,13 @@ fn main() -> Result<()> {
     let clock = SystemClock;
 
     // B1: service exactly one action, then exit (B2 loops).
-    let mut ai = accept_requester(&listener, user.uid.as_raw()).context("accepting the requester")?;
+    // D0A-R4-07: BOUNDED. An unbounded accept orphaned FOUR root daemons on the operator's
+    // machine — the AI child died before connect (a bad DELPHI_AI_BIN), the daemon blocked
+    // here forever, each holding its VT and a pam_systemd user manager. R2-01 built this
+    // deadline for the test path and left the daemon on the blocking call; the leak is what
+    // that gap cost. 120 s is generous for a real AI start and finite for a dead one.
+    let mut ai = accept_requester_within(&listener, user.uid.as_raw(), Duration::from_secs(120))
+        .context("accepting the requester")?;
     let mut ctx = ServiceCtx {
         channel_fd: children.daemon_channel.as_raw_fd(),
         session: session_source.as_ref(),

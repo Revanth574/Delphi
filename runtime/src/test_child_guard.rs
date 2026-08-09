@@ -97,8 +97,11 @@ pub fn assert_no_stale_session_on(vt: &str) {
     };
     assert!(
         out.status.success(),
-        "PRECONDITION FAILED before this test ran — a previous test leaked a session on {vt}. \
-         This test has not started; the fault is upstream.\n{}{}",
+        "PRECONDITION FAILED before this test ran — a session is live on {vt}. \
+         DO NOT assume a PREVIOUS test left it (D0A-R4-07): a daemon spawned by THIS run \
+         can create one and outlive the test that spawned it. Check `ps -ef | grep \
+         delphi-runtimed` for a live ROOT daemon before blaming an earlier test — four \
+         orphaned root daemons once presented exactly this way, one per attempt.\n{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

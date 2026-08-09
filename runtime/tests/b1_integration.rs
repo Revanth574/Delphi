@@ -458,7 +458,11 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+    // D0A-R4-07: SPAWN + BOUNDED WAIT + KILL, never `.output()`. `.output()` waits forever,
+    // and when the operator interrupted the hang the daemon ORPHANED AS ROOT holding its VT —
+    // four times, each run making the next one's precondition fail. A test that leaks a
+    // privileged process is worse than a test that fails.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
         .args(["--session", &setup.user])
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
@@ -471,9 +475,35 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         // assumption against the source rather than by a reviewer.
         // DELPHI_INSECURE_ASSUME_ACTIVE_SESSION is DELIBERATELY UNSET: the real gate runs.
         .env_remove("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION")
-        .output()
-        .expect("run the daemon binary");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the daemon binary");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let killed = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(_) => break false,
+            None if std::time::Instant::now() >= deadline => {
+                // SAFETY: signalling a process this test spawned.
+                unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
+                let _ = child.wait();
+                break true;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    let out = child.wait_with_output().expect("collect daemon output");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Belt and braces: nothing named for THIS test's user may survive, whatever happened.
+    let _ = Command::new("pkill")
+        .args(["-9", "-f", &format!("delphi-runtimed --session {}", setup.user)])
+        .status();
+    assert!(
+        !killed,
+        "the daemon had to be KILLED at the deadline — it did not exit on its own. That is \
+         the orphan condition (D0A-R4-07), not a slow machine. stderr:\n{stderr}"
+    );
 
     // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
     assert!(

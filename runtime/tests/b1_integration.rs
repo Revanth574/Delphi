@@ -338,6 +338,44 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
     assert_eq!(marker, "B1-LIVES", "the STORED canonical action executed end-to-end");
 }
 
+/// Wait for a spawned `delphi-runtimed`, or KILL it and say so (D0A-R4-07).
+///
+/// `.output()` waits forever. When the daemon's AI child dies before connecting, the daemon
+/// blocks in accept, the test hangs, and an interrupted run leaves it ORPHANED AS ROOT holding
+/// a VT — four accumulated that way, one per attempt. ONE helper, because the leak fix's own
+/// first pass repaired the spawn site it had just written and left the pre-existing one.
+fn wait_or_kill_daemon(
+    mut child: std::process::Child,
+    session_user: &str,
+) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut killed = false;
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                // SAFETY: signalling a process this test spawned.
+                unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
+                killed = true;
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    let out = child.wait_with_output().expect("collect daemon output");
+    // Scoped to THIS test's user, on every path including the happy one.
+    let _ = Command::new("pkill")
+        .args(["-9", "-f", &format!("delphi-runtimed --session {session_user}")])
+        .status();
+    assert!(
+        !killed,
+        "the daemon had to be KILLED at the deadline — that is the orphan condition \
+         (D0A-R4-07), not a slow machine. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
 // ── D0A-R4-03: the PRODUCTION wiring, which had never executed ──────────────
 
 /// `LogindSource` + a real `shell_pidfd` + a real logind session, together.
@@ -462,7 +500,7 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     // and when the operator interrupted the hang the daemon ORPHANED AS ROOT holding its VT —
     // four times, each run making the next one's precondition fail. A test that leaks a
     // privileged process is worse than a test that fails.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+    let child = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
         .args(["--session", &setup.user])
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
@@ -479,31 +517,8 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn the daemon binary");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    let killed = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break false,
-            None if std::time::Instant::now() >= deadline => {
-                // SAFETY: signalling a process this test spawned.
-                unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
-                let _ = child.wait();
-                break true;
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
-    let out = child.wait_with_output().expect("collect daemon output");
+    let out = wait_or_kill_daemon(child, &setup.user);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    // Belt and braces: nothing named for THIS test's user may survive, whatever happened.
-    let _ = Command::new("pkill")
-        .args(["-9", "-f", &format!("delphi-runtimed --session {}", setup.user)])
-        .status();
-    assert!(
-        !killed,
-        "the daemon had to be KILLED at the deadline — it did not exit on its own. That is \
-         the orphan condition (D0A-R4-07), not a slow machine. stderr:\n{stderr}"
-    );
 
     // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
     assert!(
@@ -1025,7 +1040,12 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
     let exe = write_marker_exe(&stage, &result);
 
     // Run the actual delphi-runtimed BINARY — it does anchor + launch + serve itself.
-    let out = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
+    //
+    // D0A-R4-07, SECOND INSTANCE. This site kept `.output()` while the sibling at :465 was
+    // fixed — Class 17 inside the leak fix itself: I repaired the spawn site I had just
+    // written and left the pre-existing one, which is the same unbounded wait that orphaned
+    // four root daemons. Whether or not it produced THIS leak, it can produce the next one.
+    let child = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"))
         .args(["--session", &setup.user])
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
@@ -1039,8 +1059,11 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
         // The compile-time test seam (the binary is built with --features
         // insecure-test-seams in the lane); WSL has no real logind session.
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1")
-        .output()
-        .expect("run delphi-runtimed");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the daemon binary");
+    let out = wait_or_kill_daemon(child, &setup.user);
 
     let marker = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

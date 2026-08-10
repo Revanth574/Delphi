@@ -2071,6 +2071,45 @@ agrees with it.
 
 ---
 
+## 37. Remediation is where a class reappears  *(unifies 22 and 36's recurrence — D0A-R5)*
+
+**The cause behind both: whoever writes the fix is reasoning in the frame that produced the
+defect, so the frame's blind spot survives the repair.**
+
+This is not a description after the fact — it **predicts where to look**:
+
+> **The highest-yield place to look for instance N+1 of any class is the diff that fixed
+> instance N.**
+
+Five instances, across DIFFERENT classes, all at remediation:
+
+| instance | appeared inside the fix for |
+|---|---|
+| R2-01c | R2-01b |
+| the barrier test sampling around the interval | a fix for sampling around the interval |
+| R5-04 (pipe retention) | R5-01's guard, within a minute |
+| R5-06 (untested mapping) | R4-05's classifier extraction |
+| R5-02 (trusted parent) | R4-01's unpredictable name |
+
+**THE CAVEAT THAT KEEPS THIS USEFUL — the distinct foreclosures are NOT merged.** Unifying the
+*cause* must not average the *remedies*, or the entry becomes "be careful at remediation",
+which is weaker than either parent:
+
+- **Class 22's foreclosure stands unchanged:** weaken (a) and weaken (b); verify the weaken
+  APPLIED *and* that it failed for its **stated reason**.
+- **Class 36's foreclosure stands unchanged:** assert PROPERTIES, never literals; and check the
+  fixture models something that **can happen**.
+- **This entry adds only the search rule**, which neither parent states: when a fix lands, read
+  it as the most likely home of the next instance of the same class — and of a different one.
+
+**Class 17 is adjacent but distinct**, and the record supports keeping them apart: Class 17 is
+*the reported instance was one of several* (four instances this arc — R2-01's env names,
+R4-07's second spawn site, `reap_and_recycle`'s `atoi`, R5-02's parent). Class 17 is about
+**breadth at the time of the fix**; this entry is about **recurrence in the fix itself**. A
+sweep answers the first and does nothing for the second.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2109,6 +2148,7 @@ agrees with it.
 | 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |
 | 29a. Holder-check names the wrong resource | one shared checker matching the SUBJECT's resource on ANY location (`scripts/check-stale-test-sessions.sh`), used by every caller | **Extracted** |
 | 31. Teardown failure unobservable | a teardown that CAN fail must REPORT its failure; if it cannot report, it must ASSERT. Capture the reason (`.output()`), never `let _ = …status()` | Discipline |
+| 37. Remediation is where a class reappears | read the fix for instance N as the likeliest home of instance N+1; keep 22's and 36's foreclosures intact rather than averaging them | Search rule |
 | 34. A deferral is an untested claim | quote the MEASURED blocker (skip line, error, missing file) in the ledger entry — never an environment category | Discipline |
 | 35. Cited boundary → falsifier design | ask a citation for its own boundary, build the configuration inside it, and PAIR it with a positive control | Technique |
 | 32. Mechanical substitution, undocumented property | ask at substitution: **what unstated property is the caller relying on?**; make it explicit in the replacement rather than trusting the new default | Discipline |

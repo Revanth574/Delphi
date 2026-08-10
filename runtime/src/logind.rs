@@ -262,6 +262,24 @@ pub(crate) enum SeatRc {
     QueryFailed(i32),
 }
 
+/// The rc → outcome mapping `session_is_seated` uses (D0A-R5-06).
+///
+/// D0A-R4-05 extracted the CLASSIFIER and tested it, and left the MAPPING from `SeatRc` to
+/// `Result` inline and untested — so swapping the `NoSeat` and `QueryFailed` arms kept the
+/// suite green. The classifier test and the production mapping agreed only by inspection,
+/// which is Class 36's mutual stabilisation appearing inside the fix that closed R4-05.
+///
+/// # Errors
+///
+/// The errno, when the query failed rather than answering "no seat".
+pub(crate) fn seat_outcome(rc: c_int) -> Result<bool, i32> {
+    match classify_seat_rc(rc) {
+        SeatRc::HasSeat => Ok(true),
+        SeatRc::NoSeat => Ok(false),
+        SeatRc::QueryFailed(e) => Err(e),
+    }
+}
+
 pub(crate) fn classify_seat_rc(rc: c_int) -> SeatRc {
     if rc >= 0 {
         SeatRc::HasSeat
@@ -277,10 +295,8 @@ fn session_is_seated(session: &CStr) -> Result<bool, i32> {
     // SAFETY: `session` is a valid NUL-terminated string; `seat` receives a malloc'd C
     // string on success (rc >= 0), untouched on failure (rc < 0, e.g. -ENODATA seatless).
     let rc = unsafe { sd_session_get_seat(session.as_ptr(), &mut seat) };
-    match classify_seat_rc(rc) {
-        SeatRc::NoSeat => return Ok(false),
-        SeatRc::QueryFailed(e) => return Err(e),
-        SeatRc::HasSeat => {}
+    if !seat_outcome(rc)? {
+        return Ok(false);
     }
     if seat.is_null() {
         return Ok(false);
@@ -734,6 +750,16 @@ mod tests {
     /// the one that reads as routine.
     #[test]
     fn a_failed_seat_query_is_not_the_same_as_no_seat() {
+        // D0A-R5-06: the MAPPING, not just the classifier. Swapping the NoSeat and
+        // QueryFailed arms left the suite green because nothing tested this step.
+        assert_eq!(seat_outcome(0), Ok(true), "rc>=0 means the session HAS a seat");
+        assert_eq!(seat_outcome(-nix::libc::ENODATA), Ok(false), "ENODATA is a real 'no seat'");
+        assert_eq!(
+            seat_outcome(-nix::libc::EIO),
+            Err(nix::libc::EIO),
+            "any other errno is a FAILED QUERY — it must not map to 'no seat', which is what \
+             a swapped arm would do and what nothing was checking"
+        );
         assert_eq!(classify_seat_rc(0), SeatRc::HasSeat);
         assert_eq!(classify_seat_rc(1), SeatRc::HasSeat);
         assert_eq!(classify_seat_rc(-nix::libc::ENODATA), SeatRc::NoSeat);

@@ -30,6 +30,13 @@ path = "src/bin/delphi-minimal-shell.rs"
 name = "delphi-minimal-ai"
 path = "src/bin/delphi-minimal-ai.rs"
 
+# D0A-R5-10: a DISTINCT path, so a non-feature build cannot clobber it. `required-features`
+# keeps it out of any production build entirely.
+[[bin]]
+name = "delphi-surface-shell"
+path = "src/bin/delphi-surface-shell.rs"
+required-features = ["insecure-test-seams"]
+
 [dev-dependencies]
 # Self-dependency so the integration tests get the fixture feature without it ever being
 # a default of the shipped library.

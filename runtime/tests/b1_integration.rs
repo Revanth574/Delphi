@@ -650,7 +650,11 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
+    // D0A-R5-10: the SURFACE-marker shell, a distinct binary. The daemon requires
+    // SurfaceLive, so a scaffold-marker shell makes `launch()` refuse BEFORE the gate is ever
+    // consulted — which is what leg 1 was doing for two rounds while its old assertion
+    // accepted the pre-gate startup line.
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-surface-shell"), &work, "sshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
     let result = work.join("result");
     let exe_str = write_marker_exe(&work, &result).display().to_string();

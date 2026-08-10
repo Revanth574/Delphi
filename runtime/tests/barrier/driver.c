@@ -83,6 +83,23 @@ int main(void) {
     int recycled_ok = 1;
     if (imp_s) {
         pid_t impostor = (pid_t)atoi(imp_s);
+        // D0A-R5-01: NEVER signal a non-positive pid. kill(-1) signals every process the
+        // caller may signal; kill(0) signals the whole process group. As root either is
+        // catastrophic and neither is ever the intent here. Guarded at the SINK as well as at
+        // the source, because `atoi` also yields 0 for unparseable input — two independent
+        // ways to reach the same syscall.
+        if (impostor <= 0) {
+            printf("REFUSING to signal non-positive pid %d (kill(-1)/kill(0) would signal \
+far more than this test created)\n", (int)impostor);
+            // D0A-R5-01/R5-04: the victim is OURS and positive by construction, so reap it
+            // before leaving. An early return that left it alive kept the stdout pipe open and
+            // hung the reader forever — which is R5-04's mechanism, reproduced by this very
+            // guard the moment it was written.
+            kill(victim, SIGKILL);
+            int vst = 0;
+            waitpid(victim, &vst, 0);
+            return 3;
+        }
         if (impostor != victim) {
             // Loud, and fatal to the run: the experiment did not happen.
             printf("RECYCLE MISSED victim=%d impostor=%d\n", (int)victim, (int)impostor);

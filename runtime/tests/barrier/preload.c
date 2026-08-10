@@ -52,6 +52,14 @@ static void log_line(const char *fmt, ...) {
 
 // Kill, reap, force the next pid, and start an impostor there.
 static void reap_and_recycle(pid_t victim) {
+    // D0A-R5-01, SIBLING SITE. `victim` comes from `atoi(getenv(...))`, which yields 0 for
+    // unparseable input — and kill(0, SIGKILL) signals THE WHOLE PROCESS GROUP. Same class as
+    // the impostor path, a different source, and fixing only the reported one is the Class 17
+    // mistake this arc has already made twice.
+    if (victim <= 0) {
+        log_line("BARRIER ERROR: refusing to signal non-positive victim %d\n", (int)victim);
+        return;
+    }
     kill(victim, SIGKILL);
     int st = 0;
     if (waitpid(victim, &st, 0) != victim) {
@@ -74,6 +82,14 @@ static void reap_and_recycle(pid_t victim) {
     }
 
     pid_t impostor = fork();
+    if (impostor < 0) {
+        // D0A-R5-01: an UNCHECKED fork failure published `impostor=-1`, which the driver then
+        // passed to kill(-1, SIGKILL) — AS ROOT, i.e. every process the caller can reach.
+        // This harness had already leaked four root daemons; killing the operator's session is
+        // a different order of consequence. Refuse instead: no impostor, no publication.
+        log_line("BARRIER ERROR: fork failed; NOT publishing an impostor pid\n");
+        return;
+    }
     if (impostor == 0) {
         pause();
         _exit(0);

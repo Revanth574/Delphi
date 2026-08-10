@@ -43,6 +43,38 @@ use delphi_runtime::{bind_approval_socket, ensure_runtime_dir};
 
 const PAM_SERVICE: &str = "delphi-runtime";
 
+/// Kills the launched children if the daemon leaves by an error path (D0A-R5-03).
+///
+/// Disarmed on the success path, where the terminal contract lets the shell exit on its own.
+struct ChildReaper {
+    shell: i32,
+    ai: i32,
+    armed: bool,
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for pid in [self.shell, self.ai] {
+            // D0A-R5-01's lesson: never signal a non-positive pid — kill(-1) reaches every
+            // process this root daemon may signal, kill(0) takes the process group.
+            if pid > 0 {
+                // SAFETY: signalling children this process created.
+                unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
+                let _ = waitpid(Pid::from_raw(pid), None);
+            }
+        }
+        tracing::error!(
+            shell = self.shell,
+            ai = self.ai,
+            "daemon leaving by an ERROR path — shell and AI killed so they cannot outlive it, \
+             and the shell's logind session with them (D0A-R5-03)"
+        );
+    }
+}
+
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -111,6 +143,17 @@ fn main() -> Result<()> {
         "B1: anchor + launcher up; serving one action"
     );
 
+    // D0A-R5-03: PRODUCTION orphan path. Every `?` between here and the terminal contract
+    // below exits main and leaves the shell and AI ALIVE — and the shell holds a logind
+    // session on a VT, so the next start fails and a privileged process survives the daemon
+    // that owns it. The requester timeout is the likeliest such exit, but it is not the only
+    // one; the guard covers the class rather than that instance.
+    //
+    // RAII, not statements: an error path unwinds past any cleanup written after it. That is
+    // exactly how the test harness leaked four root daemons (D0A-R4-07), and the daemon had
+    // the same shape.
+    let mut reaper = ChildReaper { shell: children.shell_pid, ai: children.ai_pid, armed: true };
+
     let session_source = logind_source(children.shell_pidfd.as_fd());
     // B2A-C-R3-02: surface a false startup verdict LOUDLY — but do NOT abort, because for a
     // valid `ttyN` the only axis that can be false here is ACTIVE, and that one tracks which VT
@@ -163,6 +206,9 @@ fn main() -> Result<()> {
     // reached the PAM prompt) dismisses on; without it the shell would WEDGE waiting for a
     // prompt + an EOF that never come. (ctx borrows only the local store/ledger, not the
     // channel, so releasing the channel here is sound.)
+    // The success path owns the children from here: the terminal contract below deliberately
+    // lets the shell run to its own exit, so the guard must not pre-empt it.
+    reaper.armed = false;
     drop(children.daemon_channel);
 
     // NOTE (lifecycle, lane-dependent): blocking on the shell fits the ONE-SHOT minimal

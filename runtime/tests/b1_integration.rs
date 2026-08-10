@@ -567,9 +567,18 @@ fn the_real_logind_source_resolves_the_shells_session_d0a_r4_03() {
         ),
     }
     // And the composed gate refuses it — the same call the service makes.
+    // D0A-R5-08: evaluate the gate on the CAPTURED snapshot, not with a fresh query. This
+    // assertion used to call `gate_allows(&source)` AFTER the kill+reap above — a new query on
+    // a reaped pidfd, which returns ESRCH -> ProcessGone -> denied. It therefore passed
+    // because the process was GONE, not because the session failed the gate, and would have
+    // passed with `session_passes_gate` inverted.
+    //
+    // The `Resolved` assertion above is unaffected: `current()` runs BEFORE teardown, so it
+    // asserts a value captured while the shell was alive.
+    let snapshot = cause.snapshot_or_denied();
     assert!(
-        !delphi_runtime::service::gate_allows(&source),
-        "a resolved-but-inactive session must not pass the gate"
+        !delphi_runtime::logind::session_passes_gate(snapshot),
+        "the resolved-but-inactive session must fail the gate ON ITS OWN AXES: {snapshot:?}"
     );
 }
 

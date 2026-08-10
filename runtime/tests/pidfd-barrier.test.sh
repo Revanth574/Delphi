@@ -41,11 +41,13 @@ if [ "$(id -u)" = 0 ]; then
     PARENT=/run
     P_OWNER=$(stat -c %u "$PARENT")
     [ "$P_OWNER" = 0 ] || { echo "REFUSING: $PARENT is owned by uid $P_OWNER, not root"; exit 2; }
-    # World-writable is only acceptable with the sticky bit; /run should be neither.
+    # D0A-R6-04: this examined only the LAST octal digit, so 0775 — GROUP-writable, where any
+    # group member can rename or replace the directory this script compiles and runs as root —
+    # sailed through. Test both write bits arithmetically instead of pattern-matching a digit.
     P_MODE=$(stat -c %a "$PARENT")
-    case "$P_MODE" in
-        *[2367]) echo "REFUSING: $PARENT is world-writable (mode $P_MODE)"; exit 2 ;;
-    esac
+    if [ $(( 8#$P_MODE & 8#022 )) -ne 0 ]; then
+        echo "REFUSING: $PARENT is group- or world-writable (mode $P_MODE)"; exit 2
+    fi
 else
     PARENT="${TMPDIR:-/tmp}"
 fi

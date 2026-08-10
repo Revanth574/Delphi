@@ -108,8 +108,14 @@ far more than this test created)\n", (int)impostor);
         kill(impostor, SIGKILL);
         int st = 0;
         waitpid(impostor, &st, 0);
+    } else if (getenv("DELPHI_BARRIER_VICTIM_REAPED")) {
+        // D0A-R6-02: the barrier reaped the victim and then bailed (fork failed, ns_last_pid
+        // unwritable, short write). Its pid is RECYCLABLE and is not ours to signal — killing
+        // it here is the exact hazard this harness exists to demonstrate, aimed at a stranger.
+        printf("VICTIM ALREADY REAPED by the barrier; NOT signalling %d\n", (int)victim);
+        recycled_ok = 0;
     } else {
-        // No barrier ran; the victim is still ours and still the same process.
+        // No barrier ran at all; the victim is still ours and still the same process.
         kill(victim, SIGKILL);
         int st = 0;
         waitpid(victim, &st, 0);

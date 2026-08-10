@@ -62,6 +62,12 @@ static void reap_and_recycle(pid_t victim) {
     }
     kill(victim, SIGKILL);
     int st = 0;
+    // D0A-R6-02: from HERE the victim is reaped and its pid is RECYCLABLE. Every early return
+    // below used to leave `DELPHI_BARRIER_IMPOSTOR` unset, and the driver reads "unset" as
+    // "the victim is still ours and still the same process" — then SIGKILLs that number AS
+    // ROOT. My own R5-01 fork guard introduced two of these paths. Ownership must never be
+    // inferred from the ABSENCE of a variable, so the reap is published explicitly.
+    setenv("DELPHI_BARRIER_VICTIM_REAPED", "1", 1);
     if (waitpid(victim, &st, 0) != victim) {
         log_line("BARRIER ERROR: could not reap victim %d\n", (int)victim);
         return;

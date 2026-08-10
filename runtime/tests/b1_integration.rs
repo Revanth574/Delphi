@@ -646,7 +646,15 @@ impl delphi_runtime::logind::SessionSource for FlipsAfterFirstRead {
                 seated: true,
             })
         } else {
-            SessionResolution::Resolved(SessionSnapshot::DENIED)
+            // D0A-R4-12: the REAL transition, not `DENIED`. A session that stops being the
+            // seat's foreground KEEPS ITS SEAT — all-false modelled a session that
+            // simultaneously lost its seat, which is a different event and took a different
+            // wording branch. This is the shape R1-02 exists to prove.
+            SessionResolution::Resolved(SessionSnapshot {
+                active: false,
+                remote: false,
+                seated: true,
+            })
         }
     }
 }
@@ -742,17 +750,28 @@ fn b1_session_lost_during_pam_blocks_the_mint_d0a_r1_02() {
             // cannot verify EITHER is correct — which is exactly how R2-05's garbled
             // `DURING<14 spaces>authentication` passed: the message was malformed, the test
             // compared it to itself, and neither noticed.
-            for expected in [
-                "stopped being active+local+seated",
-                "DURING authentication",
-                "not one a human at the seat gave",
-            ] {
-                assert!(
-                    reason.contains(expected),
-                    "the denial must read as prose an operator can act on; missing {expected:?} \
-                     in {reason:?}"
-                );
-            }
+            // D0A-R4-12: assert the PROPERTIES the message must carry, not a literal. R4-04
+            // rewrote the wording to derive from the failing axes and this assertion — pinned
+            // to the old sentence — broke, which is Class 27: a fix invalidating an earlier
+            // round's proof. Swapping in the new literal would reproduce the fragility one
+            // round later, so the check is on what the message must SAY:
+            //   * it names the axis that failed (the foreground), and
+            //   * it places the change DURING authentication, which is what distinguishes this
+            //     denial from a first-gate refusal.
+            assert!(
+                reason.contains("foreground"),
+                "the denial must name the failing axis; got {reason:?}"
+            );
+            assert!(
+                reason.to_lowercase().contains("during authentication"),
+                "the denial must say the change happened DURING authentication — that is what \
+                 distinguishes it from a first-gate refusal; got {reason:?}"
+            );
+            assert!(
+                !reason.contains("NO seat") && !reason.contains("REMOTE"),
+                "the session kept its seat and stayed local, so the message must not claim \
+                 otherwise; got {reason:?}"
+            );
             assert!(
                 !reason.contains("  "),
                 "no doubled spaces — a malformed literal is how R2-05 shipped: {reason:?}"

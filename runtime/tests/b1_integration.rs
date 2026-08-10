@@ -509,8 +509,16 @@ fn the_real_logind_source_resolves_the_shells_session_d0a_r4_03() {
     let source = delphi_runtime::logind::LogindSource::for_pidfd(children.shell_pidfd.as_fd());
     let cause = source.current();
 
-    let _ = waitpid(nix::unistd::Pid::from_raw(children.shell_pid), None);
-    let _ = waitpid(nix::unistd::Pid::from_raw(children.ai_pid), None);
+    // D0A-R4-10: KILL BEFORE REAP. `waitpid(shell_pid, None)` is UNBOUNDED, and the minimal
+    // shell blocks in `recv_approval_request` forever because this test deliberately never
+    // drives the flow — it only wants the gate verdict. So the reap waited on a process that
+    // had no reason to exit: seven attempts, zero output, no deadline anywhere on the path.
+    // The 45 s bound lives in `DaemonGuard`, which this leg does not use.
+    for pid in [children.shell_pid, children.ai_pid] {
+        // SAFETY: signalling children this test created.
+        unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
+        let _ = waitpid(nix::unistd::Pid::from_raw(pid), None);
+    }
 
     match cause {
         delphi_runtime::logind::SessionResolution::Resolved(snap) => {
@@ -592,7 +600,15 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     ;
     let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
     assert!(!killed, "the daemon had to be KILLED at the deadline — the orphan condition");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // D0A-R4-10: BOTH STREAMS. `tracing_subscriber::fmt()` writes to STDOUT by default, so the
+    // daemon's own startup line never appeared in the stderr this assertion was reading — the
+    // "presence" leg failed while the evidence sat in the stream next to it. The AI's and the
+    // shell's output WAS in stderr, which is why the capture looked populated.
+    let stderr = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
     assert!(

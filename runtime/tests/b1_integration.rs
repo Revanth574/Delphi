@@ -156,10 +156,33 @@ impl Drop for Setup {
         // NAIVE version — no session teardown, no wait, and a DISCARDED status, so a failure
         // here was invisible. It leaks the same way for the same reason.
         let _ = Command::new("loginctl").args(["terminate-user", &self.user]).status();
+        // D0A-R4-08: `terminate-user` alone does not take the USER MANAGER down promptly.
+        // `pam_systemd` starts a `systemd --user` (plus dbus, pipewire, portals) that OUTLIVES
+        // the daemon and HOLDS THE SESSION until it times out — measured at roughly a minute.
+        // The session-scoped and `delphi-runtimed`-scoped kills cannot reach it: its cmdline is
+        // `/lib/systemd/systemd --user`. So the manager is stopped explicitly, by unit.
+        //
+        // This is what blocked FIVE root attempts: the guard is SERVICE-keyed (D0-R6-01, and
+        // rightly so — it must catch a leak on any VT), so one lingering `delphi-runtime`
+        // session anywhere fails the next test's precondition, and `--vt` only ADDS a match
+        // rather than narrowing it. Test 1 left a closing session; test 2 never started.
+        if let Ok(out) = Command::new("id").args(["-u", &self.user]).output()
+            && let Ok(uid) = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>()
+        {
+            let _ = Command::new("systemctl")
+                .args(["stop", &format!("user@{uid}.service")])
+                .status();
+            let _ = Command::new("systemctl")
+                .args(["stop", &format!("user-runtime-dir@{uid}.service")])
+                .status();
+        }
         // D0-R6-04: `terminate-user` RETURNS BEFORE the sessions are gone. Deleting straight
         // after it meant `userdel` raced the teardown and the `-f` escalation covered for it —
         // which is an escalation masking a problem it should have reported.
-        for _ in 0..40 {
+        // 40x50ms = 2s was tuned for a session close; the MANAGER takes far longer, so the
+        // budget now covers it (600x50ms = 30s) rather than timing out and reporting a leak
+        // that would have cleared on its own.
+        for _ in 0..600 {
             // D0-R7-04: `.unwrap_or(false)` mapped a FAILED loginctl to "no session", so a
             // spawn failure or a dead bus read as clean and userdel proceeded immediately.
             // An unknown answer is treated as BUSY — the poll then times out and the

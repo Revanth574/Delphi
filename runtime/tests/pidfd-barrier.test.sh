@@ -27,16 +27,30 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-# D0A-R4-01. This was `${TMPDIR:-/tmp}/delphi-barrier-$$` + `mkdir -p`, which SUCCEEDS on an
-# existing directory or a symlink — and the documented invocation is `sudo`, so another local
-# user who pre-creates or races that path gets driver/resolve/preload.so compiled and executed
-# AS ROOT. The harness written to prove a security property introduced one.
+# D0A-R4-01 / R5-02. R4-01 replaced a PREDICTABLE NAME (`…/delphi-barrier-$$` + `mkdir -p`,
+# which succeeds on a pre-created dir or symlink) with `mktemp -d`. That closed the name and
+# LEFT THE PARENT TRUSTED — an unpredictable name inside a directory someone else controls is
+# still a directory someone else controls, and this script compiles and runs its output AS ROOT.
+# Fourth Class 17 instance this arc: the reported instance was one of two again.
 #
-# `mktemp -d` creates atomically with an unpredictable name at mode 0700 and FAILS if the name
-# exists, which closes the pre-create and the race. The checks after it are not redundant: they
-# refuse a parent whose semantics we did not expect (a symlinked TMPDIR, an inherited mode).
-SP=$(mktemp -d "${TMPDIR:-/tmp}/delphi-barrier-XXXXXXXXXX") || {
-    echo "REFUSING: mktemp -d failed"; exit 2; }
+# As root, `TMPDIR` is not trusted at all: it is attacker-influenced input to a privileged
+# process. The parent becomes `/run`, which is root-owned 0755 — no unprivileged user can
+# create, replace or pre-seed an entry there. Unprivileged runs keep `TMPDIR`, where the only
+# thing at risk is the invoking user's own files.
+if [ "$(id -u)" = 0 ]; then
+    PARENT=/run
+    P_OWNER=$(stat -c %u "$PARENT")
+    [ "$P_OWNER" = 0 ] || { echo "REFUSING: $PARENT is owned by uid $P_OWNER, not root"; exit 2; }
+    # World-writable is only acceptable with the sticky bit; /run should be neither.
+    P_MODE=$(stat -c %a "$PARENT")
+    case "$P_MODE" in
+        *[2367]) echo "REFUSING: $PARENT is world-writable (mode $P_MODE)"; exit 2 ;;
+    esac
+else
+    PARENT="${TMPDIR:-/tmp}"
+fi
+SP=$(mktemp -d "$PARENT/delphi-barrier-XXXXXXXXXX") || {
+    echo "REFUSING: mktemp -d failed under $PARENT"; exit 2; }
 trap 'rm -rf "$SP"' EXIT
 [ -d "$SP" ] && [ ! -L "$SP" ] || { echo "REFUSING: $SP is not a real directory"; exit 2; }
 SP_OWNER=$(stat -c %u "$SP") ; SP_MODE=$(stat -c %a "$SP")

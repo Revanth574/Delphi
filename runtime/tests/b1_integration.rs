@@ -476,6 +476,11 @@ fn the_real_logind_source_resolves_the_shells_session_d0a_r4_03() {
     std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+    // D0A-R4-09: the AI child `expect()`s these three. Omitting them made it panic BEFORE
+    // connect, which is the hang both R4-03 legs were dying of — one defect, two symptoms.
+    let result = work.join("result");
+    let exe_str = write_marker_exe(&work, &result).display().to_string();
+    let work_str = work.display().to_string();
 
     // A VT that is NOT the seat's foreground, so a RESOLVED session is denied on `active`
     // specifically — the one axis whose falsity proves the query reached logind and got an
@@ -490,7 +495,11 @@ fn the_real_logind_source_resolves_the_shells_session_d0a_r4_03() {
         socket_path: &paths.socket,
         tty: &vt,
         shell_env: &[(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)],
-        ai_env: &[],
+        ai_env: &[
+            (delphi_runtime::scaffold_env::AI_EXE, &exe_str),
+            (delphi_runtime::scaffold_env::AI_ARG, "R4-03"),
+            (delphi_runtime::scaffold_env::AI_BIND_RW, &work_str),
+        ],
     };
     let children = launch(&spec).expect("launch");
 
@@ -555,6 +564,9 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &work, "mshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
+    let result = work.join("result");
+    let exe_str = write_marker_exe(&work, &result).display().to_string();
+    let work_str = work.display().to_string();
 
     // D0A-R4-07: SPAWN + BOUNDED WAIT + KILL, never `.output()`. `.output()` waits forever,
     // and when the operator interrupted the hang the daemon ORPHANED AS ROOT holding its VT —
@@ -566,6 +578,9 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         .env("DELPHI_SHELL_BIN", &shell_bin)
         .env("DELPHI_AI_BIN", &ai_bin)
         .env(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)
+        .env(delphi_runtime::scaffold_env::AI_EXE, &exe_str)
+        .env(delphi_runtime::scaffold_env::AI_ARG, "R4-03D")
+        .env(delphi_runtime::scaffold_env::AI_BIND_RW, &work_str)
         .env("DELPHI_SHELL_VT", "tty3")
         // NOTE: the daemon anchors at the hardcoded DEFAULT_RUNTIME_BASE — it takes no base
         // override. An earlier draft of this test passed `DELPHI_RUNTIME_BASE`, a name that

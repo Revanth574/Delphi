@@ -380,9 +380,15 @@ struct DaemonGuard {
 
 impl DaemonGuard {
     fn spawn(mut cmd: Command, session_user: &str) -> Self {
+        use std::os::unix::process::CommandExt as _;
         let child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // D0A-R5-04: its OWN process group, so teardown can reach the DESCENDANTS. The
+            // daemon forks a shell and an AI which INHERIT the pipes; killing only the daemon
+            // leaves them holding the write ends, so `wait_with_output()` waits for an EOF
+            // that never comes. That is the mechanism under four runs of hang-chasing.
+            .process_group(0)
             .spawn()
             .expect("spawn the daemon binary");
         Self { child: Some(child), session_user: session_user.to_owned() }
@@ -403,14 +409,17 @@ impl DaemonGuard {
             match child.try_wait().expect("try_wait") {
                 Some(_) => break,
                 None if std::time::Instant::now() >= deadline => {
-                    // SAFETY: signalling a process this test spawned.
-                    unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
+                    Self::kill_group(child.id());
                     killed = true;
                     break;
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(100)),
             }
         }
+        // D0A-R5-04: the daemon has exited, but its shell and AI may not have — and they hold
+        // the pipe write ends. Kill the GROUP before reading, or `wait_with_output()` blocks
+        // for an EOF no living descendant will send.
+        Self::kill_group(child.id());
         let out = child.wait_with_output().expect("collect daemon output");
         Self::sweep(&self.session_user);
         (out, killed)
@@ -423,14 +432,26 @@ impl DaemonGuard {
             .args(["-9", "-f", &format!("delphi-runtimed --session {session_user}")])
             .status();
     }
+
+    /// Kill the whole process GROUP, so no descendant is left holding the pipes (D0A-R5-04).
+    fn kill_group(pid: u32) {
+        #[allow(clippy::cast_possible_wrap)]
+        let pgid = pid as i32;
+        // A NEGATIVE pid signals the group — legitimate here and the whole point, but only
+        // ever computed from a positive child pid. D0A-R5-01's guard, restated where the sign
+        // is deliberate rather than accidental.
+        if pgid > 0 {
+            // SAFETY: signalling the group led by a child this test spawned.
+            unsafe { nix::libc::kill(-pgid, nix::libc::SIGKILL) };
+        }
+    }
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             // Reached only when the test panicked before `wait()` — the path that leaked.
-            // SAFETY: signalling a process this test spawned.
-            unsafe { nix::libc::kill(child.id().cast_signed(), nix::libc::SIGKILL) };
+            Self::kill_group(child.id());
             let _ = child.wait();
             eprintln!(
                 "DaemonGuard: the test unwound before wait(); killed the daemon for {}",
@@ -616,10 +637,16 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     );
 
     // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
+    // D0A-R5-05: "anchor + launcher up" is logged BEFORE the gate runs, so accepting it made
+    // this leg satisfiable by output that proves only that the daemon started — which is
+    // exactly what the eight attempts were spent NOT settling. The evidence must come from
+    // AFTER the gate: on a non-foreground VT the startup check logs this line, and it is
+    // emitted only once `gate_allows` has evaluated a real verdict.
     assert!(
-        stderr.contains("anchor + launcher up") || stderr.contains("shell session is NOT"),
-        "the daemon must have produced its startup output; without that, the seam's absence \
-         says the process did not run, not that it ran without the bypass. stderr:\n{stderr}"
+        stderr.contains("shell session is NOT active-local-seated"),
+        "the daemon must have REACHED AND EVALUATED the real gate — a startup line proves only \
+         that it launched. Without gate-side evidence the seam's absence below says nothing \
+         about whether the bypass was used. stderr:\n{stderr}"
     );
     // THEN absence, by name.
     assert!(

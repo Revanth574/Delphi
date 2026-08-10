@@ -36,7 +36,10 @@
 //! session ([`session_passes_gate`]) — including the B2a gate-negative (a seatless
 //! active-local session is denied). The **logind query** ([`SessionSnapshot::query`]) is proven
 //! live where a real session exists (gated): the seatless-negative bites on WSL2's real
-//! seatless session; the seated-**positive** needs a real seated lane. Provisioning a
+//! seatless session; the seated-**positive** is proven ROOT-GATED, not lane-gated —
+//! D0A-R3-01 settled it on this dev box with a real session (control `rc=0 session=2`,
+//! barrier `rc=-3`). SUPERSEDED CLAIM, kept visible: this paragraph said "needs a real
+//! seated lane" for three rounds while the requirement was `sudo`. Provisioning a
 //! logind session *for a daemon-spawned shell* (via `pam_open_session`/`pam_systemd`) is
 //! the B2a lane-dependent half, proven on the real seated lane — not faked here.
 
@@ -885,7 +888,9 @@ mod tests {
         // not — needs the impostor to HAVE a logind session. Inside this namespace (and on any
         // seatless dev box) every lookup returns None, so `for_pid(stale)` and `for_pidfd`
         // agree by accident. The staleness above is proven; that the FIX changes the ANSWER is
-        // not, and is owed to the seated lane. See PROGRESS.md.
+        // not. SUPERSEDED (D0A-R4-06): this said "owed to the seated lane". It was owed to
+        // ROOT, and `runtime/tests/pidfd-barrier.test.sh`'s root section discharged it —
+        // 12 assertions, then 60 runs with zero misses. See PROGRESS.md.
 
         // SAFETY: clean up the impostor.
         unsafe {

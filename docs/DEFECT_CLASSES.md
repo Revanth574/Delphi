@@ -2044,6 +2044,33 @@ that would fail if the environment were incapable.
 
 ---
 
+## 36. A stale assertion masks an unfaithful fixture  *(new — D0A-R4-12)*
+
+**Repairing the assertion alone PRESERVES the mask.**
+
+R1-02's fixture returned `SessionSnapshot::DENIED` — all three axes false — to model "the
+session stopped qualifying during authentication". That is an **impossible session**: a session
+that loses the seat's foreground *keeps its seat*. So the test was proving a transition that
+cannot occur.
+
+Nothing surfaced it, because the assertion was pinned to a literal sentence that the
+all-false shape happened to produce. The two errors agreed with each other. When D0A-R4-04
+rewrote the denial wording to derive from the failing axes, the assertion broke — and the
+obvious repair (swap in the new literal) would have restored the agreement and left the
+fixture still modelling an impossible event.
+
+**The check:** when an assertion breaks because the code under it changed, ask whether the
+FIXTURE still models something that can happen — not just whether the new expectation matches.
+A literal assertion and a wrong fixture are mutually stabilising: each makes the other look
+correct, and only an external change disturbs the pair.
+
+**Foreclosing discipline:** assert the PROPERTIES a result must carry (it names the failing
+axis; it says the change happened during authentication; it does *not* claim axes that did not
+fail), never the sentence. A property assertion fails against a wrong fixture; a literal one
+agrees with it.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

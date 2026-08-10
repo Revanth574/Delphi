@@ -242,18 +242,42 @@ pub fn session_id_for_pid(pid: i32) -> Option<String> {
 /// Whether `session` is attached to a seat. `sd_session_get_seat` returns a non-negative
 /// value and a malloc'd seat name when seated, and **`-ENODATA`** for a seatless session
 /// (per sd-login) — so a negative return, or a null out-pointer, means "no seat".
+/// What `sd_session_get_seat`'s return code means (D0A-R4-05).
+///
+/// Split out because the distinction it encodes — `-ENODATA` is a real "no seat", any other
+/// negative is a FAILED QUERY and must never be reported as seatless — was previously
+/// untestable: making the call fail with something other than `-ENODATA` needs a live session
+/// whose seat query errors, which is not constructible. As a pure function of the rc it is
+/// directly testable, which is what D0A-R2-04's unbitten weaken was missing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SeatRc {
+    /// rc >= 0 — the session has a seat.
+    HasSeat,
+    /// `-ENODATA` — genuinely no seat.
+    NoSeat,
+    /// Any other negative — the QUERY failed; the seat state is UNKNOWN, not absent.
+    QueryFailed(i32),
+}
+
+pub(crate) fn classify_seat_rc(rc: c_int) -> SeatRc {
+    if rc >= 0 {
+        SeatRc::HasSeat
+    } else if rc == -nix::libc::ENODATA {
+        SeatRc::NoSeat
+    } else {
+        SeatRc::QueryFailed(-rc)
+    }
+}
+
 fn session_is_seated(session: &CStr) -> Result<bool, i32> {
     let mut seat: *mut c_char = std::ptr::null_mut();
     // SAFETY: `session` is a valid NUL-terminated string; `seat` receives a malloc'd C
     // string on success (rc >= 0), untouched on failure (rc < 0, e.g. -ENODATA seatless).
     let rc = unsafe { sd_session_get_seat(session.as_ptr(), &mut seat) };
-    // -ENODATA is the genuine "this session has no seat"; any OTHER error is a failed QUERY
-    // and must not be reported as seatless (D0A-R2-04).
-    if rc == -nix::libc::ENODATA {
-        return Ok(false);
-    }
-    if rc < 0 {
-        return Err(-rc);
+    match classify_seat_rc(rc) {
+        SeatRc::NoSeat => return Ok(false),
+        SeatRc::QueryFailed(e) => return Err(e),
+        SeatRc::HasSeat => {}
     }
     if seat.is_null() {
         return Ok(false);
@@ -357,10 +381,28 @@ impl SessionResolution {
     #[must_use]
     pub fn denial(&self, during_auth: bool) -> String {
         match self {
-            Self::Resolved(_) if during_auth => {
-                crate::service::REASON_SESSION_LOST_DURING_AUTH.to_owned()
+            // D0A-R4-04: derived from WHICH axes failed. These arms ignored the snapshot and
+            // claimed the seat's foreground had moved for EVERY resolved denial — unsupported
+            // when the session is remote or seatless, which systemd defines as distinct facts.
+            Self::Resolved(s) => {
+                let foreground_only = !s.active && !s.remote && s.seated;
+                if during_auth && foreground_only {
+                    crate::service::REASON_SESSION_LOST_DURING_AUTH.to_owned()
+                } else {
+                    let mut failed = Vec::new();
+                    if !s.active {
+                        failed.push("not the seat's foreground");
+                    }
+                    if s.remote {
+                        failed.push("REMOTE rather than on a local seat");
+                    }
+                    if !s.seated {
+                        failed.push("attached to NO seat");
+                    }
+                    let when = if during_auth { " — it changed during authentication" } else { "" };
+                    format!("logind: the shell's session is {}{when}", failed.join(", "))
+                }
             }
-            Self::Resolved(_) => "logind: shell session not active+local+seated".to_owned(),
             Self::LookupNoData => {
                 "logind: no session data for the shell (it is in no session, or it vanished \
                  before the lookup could say)"
@@ -681,6 +723,25 @@ mod tests {
         // And it denies, like every other cause.
         let r = SessionSnapshot::query_detailed(&bogus).unwrap_err();
         assert_eq!(r.snapshot_or_denied(), SessionSnapshot::DENIED);
+    }
+
+    /// D0A-R4-05: the seat rc classification, directly testable now that it is a pure
+    /// function. `-ENODATA` is the only negative that means "no seat"; every other negative is
+    /// a failed QUERY whose result must not be reported as seatless — a different fact, and
+    /// the one that reads as routine.
+    #[test]
+    fn a_failed_seat_query_is_not_the_same_as_no_seat() {
+        assert_eq!(classify_seat_rc(0), SeatRc::HasSeat);
+        assert_eq!(classify_seat_rc(1), SeatRc::HasSeat);
+        assert_eq!(classify_seat_rc(-nix::libc::ENODATA), SeatRc::NoSeat);
+        for e in [nix::libc::EIO, nix::libc::EPERM, nix::libc::EINVAL, nix::libc::ENOENT] {
+            assert_eq!(
+                classify_seat_rc(-e),
+                SeatRc::QueryFailed(e),
+                "errno {e} is a FAILED QUERY — reporting it as seatless would turn an unknown \
+                 into a routine-looking denial"
+            );
+        }
     }
 
     /// Run `f` with a subscriber capturing everything it logs.

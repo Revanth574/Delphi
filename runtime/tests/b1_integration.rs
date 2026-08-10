@@ -392,7 +392,12 @@ impl DaemonGuard {
     /// the REAPING has already happened either way.
     fn wait(mut self) -> (std::process::Output, bool) {
         let mut child = self.child.take().expect("child present");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        // D0A-R4-11: LONGER than the daemon's own 120 s accept bound, deliberately. At 45 s the
+        // test always killed first, so the daemon's bounded exit was NEVER the thing observed —
+        // one of the two deadlines was entirely unexercised, and a kill was reported where the
+        // daemon's own error would have been more informative. Now the daemon gets to fail its
+        // own way first, and this bound is the backstop for a hang it does not cover.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
         let mut killed = false;
         loop {
             match child.try_wait().expect("try_wait") {

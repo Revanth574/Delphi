@@ -462,6 +462,50 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// A VT that is VERIFIED free and non-foreground, or a named skip (D0A-R5-07).
+///
+/// Both R4-03 legs hardcoded `tty3` and ASSUMED it was free and not the seat's foreground. On
+/// a machine where it is neither, the test either collides with a live session or — worse —
+/// resolves an ACTIVE session and the leg-2 assertion (`active: false`) fails for an
+/// environmental reason that reads as a wiring defect. Assumption, not measurement, in the
+/// test whose whole purpose was to measure.
+fn verified_spare_vt() -> Option<String> {
+    let want = std::env::var("DELPHI_TEST_DAEMON_VT").unwrap_or_else(|_| "tty3".to_owned());
+    // The seat's CURRENT foreground, from the kernel rather than from an assumption.
+    let foreground = std::fs::read_to_string("/sys/class/tty/tty0/active")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    if want == foreground {
+        eprintln!("SKIP: {want} is the seat's FOREGROUND VT; this test needs a non-foreground \
+                   one so the gate denies on `active`. Set DELPHI_TEST_DAEMON_VT.");
+        return None;
+    }
+    let busy = Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(" {want} ")))
+        .unwrap_or(true);
+    if busy {
+        eprintln!("SKIP: {want} already carries a logind session (or loginctl could not say). \
+                   Refusing to collide with it.");
+        return None;
+    }
+    Some(want)
+}
+
+/// Remove the anchor the DAEMON created for this session user (D0A-R5-09).
+///
+/// The daemon anchors at the hardcoded `DEFAULT_RUNTIME_BASE`, not at the test's temp dir, so
+/// `/run/delphi/<session>` outlives the test. Scoped to this test's own user and never to the
+/// base itself.
+fn clean_daemon_anchor(session_user: &str) {
+    let path = std::path::Path::new(delphi_runtime::anchor::DEFAULT_RUNTIME_BASE)
+        .join(session_user);
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 // ── D0A-R4-03: the PRODUCTION wiring, which had never executed ──────────────
 
 /// `LogindSource` + a real `shell_pidfd` + a real logind session, together.
@@ -511,7 +555,8 @@ fn the_real_logind_source_resolves_the_shells_session_d0a_r4_03() {
     // A VT that is NOT the seat's foreground, so a RESOLVED session is denied on `active`
     // specifically — the one axis whose falsity proves the query reached logind and got an
     // answer, rather than failing closed on the way.
-    let vt = VtName::new("tty3").expect("tty3");
+    let Some(vt_name) = verified_spare_vt() else { return };
+    let vt = VtName::new(&vt_name).expect("a valid ttyN");
     let spec = LaunchSpec {
         ready: delphi_runtime::readiness::ReadySemantics::ScaffoldEntry,
         shell_path: &shell_bin,
@@ -610,6 +655,7 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     let result = work.join("result");
     let exe_str = write_marker_exe(&work, &result).display().to_string();
     let work_str = work.display().to_string();
+    let Some(daemon_vt) = verified_spare_vt() else { return };
 
     // D0A-R4-07: SPAWN + BOUNDED WAIT + KILL, never `.output()`. `.output()` waits forever,
     // and when the operator interrupted the hang the daemon ORPHANED AS ROOT holding its VT —
@@ -624,7 +670,7 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         .env(delphi_runtime::scaffold_env::AI_EXE, &exe_str)
         .env(delphi_runtime::scaffold_env::AI_ARG, "R4-03D")
         .env(delphi_runtime::scaffold_env::AI_BIND_RW, &work_str)
-        .env("DELPHI_SHELL_VT", "tty3")
+        .env("DELPHI_SHELL_VT", &daemon_vt)
         // NOTE: the daemon anchors at the hardcoded DEFAULT_RUNTIME_BASE — it takes no base
         // override. An earlier draft of this test passed `DELPHI_RUNTIME_BASE`, a name that
         // exists NOWHERE in the binary; it was a silent no-op, which is D0A-R2-01's class
@@ -634,6 +680,8 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         .env_remove("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION")
     ;
     let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
+    // D0A-R5-09: the daemon anchors at DEFAULT_RUNTIME_BASE, not at this test's temp dir.
+    clean_daemon_anchor(&setup.user);
     assert!(!killed, "the daemon had to be KILLED at the deadline — the orphan condition");
     // D0A-R4-10: BOTH STREAMS. `tracing_subscriber::fmt()` writes to STDOUT by default, so the
     // daemon's own startup line never appeared in the stderr this assertion was reading — the

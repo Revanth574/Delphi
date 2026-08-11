@@ -530,8 +530,12 @@ impl DaemonGuard {
         Self::kill_group(child.id());
         let _ = reader.join();
         let seen = lines.lock().expect("line sink").join("\n");
-        let mut child = self.child.take().expect("child present");
-        let _ = child.wait();
+        // D0A-R6-06: reap THROUGH the guard rather than taking the child out first. `.take()`
+        // before fallible work leaves `Drop` with `None` if that work unwinds — the same
+        // "release the handle, then do something that can fail" shape as R5-01's fork guard and
+        // R6-05's `try_wait`, written here while fixing the finding that reports it.
+        let _ = self.child.as_mut().expect("child present").wait();
+        self.child = None;
         Self::sweep(&self.session_user);
         Witness { matched, seen, alive_at_conclusion }
     }
@@ -552,6 +556,9 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        // D0A-R6-06: the daemon's own anchor is this guard's business — it was cleaned by a
+        // statement in the test body, which a panic skips.
+        clean_daemon_anchor(&self.session_user);
         if let Some(mut child) = self.child.take() {
             // Reached only when the test panicked before `wait()` — the path that leaked.
             Self::kill_group(child.id());
@@ -575,19 +582,29 @@ impl Drop for DaemonGuard {
 fn verified_spare_vt() -> Option<String> {
     let want = std::env::var("DELPHI_TEST_DAEMON_VT").unwrap_or_else(|_| "tty3".to_owned());
     // The seat's CURRENT foreground, from the kernel rather than from an assumption.
-    let foreground = std::fs::read_to_string("/sys/class/tty/tty0/active")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
+    // D0A-R6-07: `unwrap_or_default()` turned an unreadable probe into "", which matches no
+    // VT — so an UNKNOWN foreground read as "not the foreground" and the test proceeded. A
+    // probe that cannot answer is not evidence of safety.
+    let Ok(foreground) = std::fs::read_to_string("/sys/class/tty/tty0/active") else {
+        eprintln!("SKIP: cannot read /sys/class/tty/tty0/active, so the seat's FOREGROUND VT is \
+                   UNKNOWN. Refusing to guess that {want} is free.");
+        return None;
+    };
+    let foreground = foreground.trim().to_owned();
     if want == foreground {
         eprintln!("SKIP: {want} is the seat's FOREGROUND VT; this test needs a non-foreground \
                    one so the gate denies on `active`. Set DELPHI_TEST_DAEMON_VT.");
         return None;
     }
-    let busy = Command::new("loginctl")
-        .args(["list-sessions", "--no-legend"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(" {want} ")))
-        .unwrap_or(true);
+    // `Command::output()` returning Ok only means the command SPAWNED. A non-zero exit with
+    // empty stdout would otherwise read as "no sessions" (D0A-R6-07).
+    let busy = match Command::new("loginctl").args(["list-sessions", "--no-legend"]).output() {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).contains(&format!(" {want} "))
+        }
+        // Spawned but failed, or did not spawn: UNKNOWN, which is not free.
+        _ => true,
+    };
     if busy {
         eprintln!("SKIP: {want} already carries a logind session (or loginctl could not say). \
                    Refusing to collide with it.");
@@ -791,7 +808,7 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     // surface shell's exit behaviour had to match a production ordering guarantee.
     let witness = DaemonGuard::spawn(cmd, &setup.user)
         .wait_for_line("DELPHI_GATE_WITNESS ", std::time::Duration::from_secs(60));
-    clean_daemon_anchor(&setup.user);
+    // (the anchor is cleaned by DaemonGuard::drop — D0A-R6-06 — on every path, not just this one)
 
     // THREE DISTINCT FAILURES, NAMED SEPARATELY. Conflating them is what made the old
     // assertion cause-blind: it accepted a PRE-GATE startup line for two rounds.

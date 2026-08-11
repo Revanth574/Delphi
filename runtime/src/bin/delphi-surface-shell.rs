@@ -19,6 +19,11 @@
 
 use std::os::fd::RawFd;
 
+/// Was the last syscall interrupted by a signal? A retry condition, never a terminus.
+fn errno_is_eintr() -> bool {
+    nix::errno::Errno::last() == nix::errno::Errno::EINTR
+}
+
 fn main() {
     let chan: RawFd = std::env::var(delphi_runtime::scaffold_env::CHANNEL_FD)
         .expect("DELPHI_CHANNEL_FD")
@@ -40,9 +45,18 @@ fn main() {
         let n = unsafe {
             nix::libc::read(chan, buf.as_mut_ptr().cast(), buf.len())
         };
-        if n <= 0 {
-            // EOF (0) or error: the daemon is done with us. Leave, so it can finish.
+        if n == 0 {
+            // EOF: the daemon released its channel end. Leave, so it can finish.
             break;
+        }
+        if n < 0 {
+            // D0A-R6-08: `n <= 0` treated EVERY error as EOF, so a signal (EINTR) ended the
+            // shell early and the daemon saw ProcessGone — a wrong cause that leg 1 could not
+            // distinguish before it got a witness. EINTR is a retry, not a terminus.
+            if errno_is_eintr() {
+                continue;
+            }
+            std::process::exit(70);
         }
     }
 }

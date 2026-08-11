@@ -773,6 +773,46 @@ mod tests {
         }
     }
 
+    /// D0A-R6-01: the WITNESS FORMAT that leg 1 parses, pinned here.
+    ///
+    /// The daemon prints `DELPHI_GATE_WITNESS {resolution:?}` and `b1_integration` matches on
+    /// `Resolved(`, `active: false`, `remote: false`, `seated: true`. That is a coupling across
+    /// two crates with nothing holding it — a `Debug` change would break the parse silently and
+    /// leg 1 would report "never reached the gate" for a formatting reason.
+    ///
+    /// It also MEASURES the R6-01 weaken instead of predicting it: substituting
+    /// `SessionSnapshot::DENIED` for the real source yields the string below, which fails leg
+    /// 1's `seated: true` check — the WRONG-CAUSE branch, not the absence branch.
+    #[test]
+    fn the_gate_witness_format_discriminates_denied_from_a_real_resolution() {
+        let expected = format!("{:?}", SessionResolution::Resolved(SessionSnapshot {
+            active: false,
+            remote: false,
+            seated: true,
+        }));
+        let denied = format!("{:?}", SessionResolution::Resolved(SessionSnapshot::DENIED));
+
+        // What leg 1 requires.
+        let passes = |w: &str| {
+            w.contains("Resolved(")
+                && w.contains("active: false")
+                && w.contains("remote: false")
+                && w.contains("seated: true")
+        };
+        assert!(passes(&expected), "the real non-foreground resolution must satisfy leg 1: {expected}");
+        assert!(
+            !passes(&denied),
+            "a DENIED substitution must FAIL leg 1 — this is the R6-01 weaken, measured rather \
+             than predicted. Got: {denied}"
+        );
+        assert!(
+            denied.contains("seated: false"),
+            "and it must fail on the AXIS, so the message names the wrong cause: {denied}"
+        );
+        // Absence is a different failure: an empty witness satisfies neither branch.
+        assert!(!passes(""), "an absent witness must not satisfy the wrong-cause check");
+    }
+
     /// Run `f` with a subscriber capturing everything it logs.
     fn capture_logs(f: impl FnOnce()) -> String {
         use std::sync::{Arc, Mutex};

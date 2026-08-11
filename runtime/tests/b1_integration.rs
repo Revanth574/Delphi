@@ -373,6 +373,17 @@ fn b1_happy_path_one_action_through_the_assembled_loop() {
 ///
 /// It is the same argument made for `ReportingTempDir` in D0-R7-07 — explicit cleanup runs only
 /// where it is called, a `Drop` runs everywhere — applied here only after it cost four orphans.
+/// What `wait_for_line` observed.
+struct Witness {
+    /// The matched line, if the prefix ever appeared.
+    matched: Option<String>,
+    /// Everything the daemon wrote, for diagnosis.
+    seen: String,
+    /// Whether the daemon was still running when the wait ended — the flag that makes an
+    /// ABSENT witness mean "never reached the gate" rather than "exited or timed out first".
+    alive_at_conclusion: bool,
+}
+
 struct DaemonGuard {
     child: Option<std::process::Child>,
     session_user: String,
@@ -450,6 +461,79 @@ impl DaemonGuard {
         let _ = Command::new("pkill")
             .args(["-9", "-f", &format!("delphi-runtimed --session {session_user}")])
             .status();
+    }
+
+    /// Wait for a line beginning with `prefix`, then tear the group down (D0A-R6-01).
+    ///
+    /// Returns the matched line, everything seen, and — critically — **whether the daemon was
+    /// still alive when the wait concluded**. Without that last flag ABSENCE IS SATISFIABLE TWO
+    /// WAYS: the gate was never reached, or the daemon exited before emitting / emitted after
+    /// the deadline. The same shape as the barrier's `rc != 0`, so the second way is excluded
+    /// explicitly rather than assumed away.
+    fn wait_for_line(mut self, prefix: &str, timeout: std::time::Duration) -> Witness {
+        use std::io::BufRead as _;
+        let child = self.child.as_mut().expect("child present");
+        let stdout = child.stdout.take().expect("stdout piped");
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&lines);
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                sink.lock().expect("line sink").push(line);
+            }
+        });
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut matched = None;
+        let mut alive_at_conclusion = true;
+        loop {
+            if let Some(l) = lines
+                .lock()
+                .expect("line sink")
+                .iter()
+                .find(|l| l.starts_with(prefix))
+            {
+                matched = Some(l.clone());
+                break;
+            }
+            // Liveness WITHOUT reaping (D0A-R6-05): a reaped pid is not a pid we own, and the
+            // group teardown below needs the identity still reserved.
+            let alive = matches!(
+                nix::sys::wait::waitid(
+                    nix::sys::wait::Id::Pid(pid),
+                    nix::sys::wait::WaitPidFlag::WEXITED
+                        | nix::sys::wait::WaitPidFlag::WNOHANG
+                        | nix::sys::wait::WaitPidFlag::WNOWAIT,
+                ),
+                Ok(nix::sys::wait::WaitStatus::StillAlive)
+            );
+            if !alive {
+                alive_at_conclusion = false;
+                // Drain briefly: the line may already be in the pipe.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                matched = lines
+                    .lock()
+                    .expect("line sink")
+                    .iter()
+                    .find(|l| l.starts_with(prefix))
+                    .cloned();
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        Self::kill_group(child.id());
+        let _ = reader.join();
+        let seen = lines.lock().expect("line sink").join("\n");
+        let mut child = self.child.take().expect("child present");
+        let _ = child.wait();
+        Self::sweep(&self.session_user);
+        Witness { matched, seen, alive_at_conclusion }
     }
 
     /// Kill the whole process GROUP, so no descendant is left holding the pipes (D0A-R5-04).
@@ -702,36 +786,49 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         // DELPHI_INSECURE_ASSUME_ACTIVE_SESSION is DELIBERATELY UNSET: the real gate runs.
         .env_remove("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION")
     ;
-    let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
-    // D0A-R5-09: the daemon anchors at DEFAULT_RUNTIME_BASE, not at this test's temp dir.
+    // D0A-R6-01 + Codex's lead judgement: wait for a STRUCTURED WITNESS, not for the flow to
+    // complete. No AI exchange, no terminal EOF — that removes R5-11's coupling, where the
+    // surface shell's exit behaviour had to match a production ordering guarantee.
+    let witness = DaemonGuard::spawn(cmd, &setup.user)
+        .wait_for_line("DELPHI_GATE_WITNESS ", std::time::Duration::from_secs(60));
     clean_daemon_anchor(&setup.user);
-    assert!(!killed, "the daemon had to be KILLED at the deadline — the orphan condition");
-    // D0A-R4-10: BOTH STREAMS. `tracing_subscriber::fmt()` writes to STDOUT by default, so the
-    // daemon's own startup line never appeared in the stderr this assertion was reading — the
-    // "presence" leg failed while the evidence sat in the stream next to it. The AI's and the
-    // shell's output WAS in stderr, which is why the capture looked populated.
-    let stderr = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+
+    // THREE DISTINCT FAILURES, NAMED SEPARATELY. Conflating them is what made the old
+    // assertion cause-blind: it accepted a PRE-GATE startup line for two rounds.
+    let Some(line) = witness.matched.clone() else {
+        assert!(
+            witness.alive_at_conclusion,
+            "the daemon EXITED before emitting the gate witness, so its absence says nothing \
+             about the gate — this is a timing/startup failure, not a gate failure. Output:\n{}",
+            witness.seen
+        );
+        panic!(
+            "NO gate witness: the daemon ran, stayed alive, and never reached the gate. The \
+             witness is printed from the resolution the decision consumes, so it cannot be \
+             missing if the gate was evaluated. Output:\n{}",
+            witness.seen
+        );
+    };
+
+    // Present-but-wrong-cause is a DIFFERENT failure from absence, and says so.
+    assert!(
+        line.contains("Resolved(")
+            && line.contains("active: false")
+            && line.contains("remote: false")
+            && line.contains("seated: true"),
+        "the daemon reached the gate and resolved DIFFERENTLY. Expected a resolved session on a \
+         non-foreground seat — Resolved(SessionSnapshot {{ active: false, remote: false, seated: \
+         true }}). A `LookupNoData` or an all-false snapshot means the daemon's own \
+         `LogindSource` did not resolve the shell's real session, which is exactly what leg 1 \
+         exists to catch and could not before. Got:\n  {line}"
     );
 
-    // PRESENCE FIRST — otherwise the absence below proves only that nothing ran.
-    // D0A-R5-05: "anchor + launcher up" is logged BEFORE the gate runs, so accepting it made
-    // this leg satisfiable by output that proves only that the daemon started — which is
-    // exactly what the eight attempts were spent NOT settling. The evidence must come from
-    // AFTER the gate: on a non-foreground VT the startup check logs this line, and it is
-    // emitted only once `gate_allows` has evaluated a real verdict.
+    // The seam must be absent from a run whose gate we just witnessed — presence established
+    // first (D0A-R5-05), and now by the witness itself rather than by a startup line.
     assert!(
-        stderr.contains("shell session is NOT active-local-seated"),
-        "the daemon must have REACHED AND EVALUATED the real gate — a startup line proves only \
-         that it launched. Without gate-side evidence the seam's absence below says nothing \
-         about whether the bypass was used. stderr:\n{stderr}"
-    );
-    // THEN absence, by name.
-    assert!(
-        !stderr.contains("INSECURE TEST SEAM ACTIVE"),
-        "the gate-bypass seam must NOT have engaged in this run. stderr:\n{stderr}"
+        !witness.seen.contains("INSECURE TEST SEAM ACTIVE"),
+        "the gate-bypass seam must NOT have engaged in this run. Output:\n{}",
+        witness.seen
     );
 }
 

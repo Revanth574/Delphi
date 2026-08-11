@@ -171,7 +171,19 @@ fn main() -> Result<()> {
     // aborting was "the gate re-checks per request" — and until A3 it did not. This read and
     // every gate read now go through `gate_allows`, so a VT switch after this point does change
     // the answer. Same conclusion, different standing. docs/READINESS_CONTRACT.md A3.
-    if !delphi_runtime::service::gate_allows(session_source.as_ref()) {
+    // D0A-R6-01: THE GATE WITNESS, emitted from the value the decision consumes.
+    //
+    // Leg 1 of the R4-03 test proved only that `gate_allows` returned false, so a
+    // `SessionSnapshot::DENIED` substitution, a wrong pidfd, or any fail-closed path passed it
+    // — cause-blind, and it accepted a PRE-GATE line for two rounds before that. A witness
+    // derived from a line printed NEAR the gate would be decoration; this one is the
+    // resolution the decision is made on, so it cannot exist unless the gate was reached.
+    //
+    // `println!`, not `tracing`: an `EnvFilter` can suppress a log line, and a witness that a
+    // filter can erase is a witness that can go absent for a reason unrelated to the gate.
+    let startup_resolution = session_source.current();
+    println!("DELPHI_GATE_WITNESS {startup_resolution:?}");
+    if !delphi_runtime::logind::session_passes_gate(startup_resolution.snapshot_or_denied()) {
         tracing::warn!(
             shell_pid = children.shell_pid,
             vt = %vt,

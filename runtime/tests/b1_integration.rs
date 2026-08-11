@@ -397,7 +397,7 @@ impl DaemonGuard {
     /// Wait to a deadline, then take the output. A kill is reported by the caller's assertion;
     /// the REAPING has already happened either way.
     fn wait(mut self) -> (std::process::Output, bool) {
-        let mut child = self.child.take().expect("child present");
+        let child = self.child.take().expect("child present");
         // D0A-R4-11: LONGER than the daemon's own 120 s accept bound, deliberately. At 45 s the
         // test always killed first, so the daemon's bounded exit was NEVER the thing observed —
         // one of the two deadlines was entirely unexercised, and a kill was reported where the
@@ -405,20 +405,39 @@ impl DaemonGuard {
         // own way first, and this bound is the backstop for a hang it does not cover.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
         let mut killed = false;
+        // D0A-R6-05: `try_wait()` REAPS on success (documented), and a reaped pid is not a pid
+        // we own — the group id can already belong to someone else by the time `kill_group`
+        // runs, as ROOT. Same class as R6-02, one language over. `waitid` with WNOWAIT observes
+        // the exit and LEAVES THE CHILD WAITABLE, so its identity stays reserved until we reap
+        // it deliberately, after the group kill.
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
         loop {
-            match child.try_wait().expect("try_wait") {
-                Some(_) => break,
-                None if std::time::Instant::now() >= deadline => {
-                    Self::kill_group(child.id());
+            let observed = nix::sys::wait::waitid(
+                nix::sys::wait::Id::Pid(pid),
+                nix::sys::wait::WaitPidFlag::WEXITED
+                    | nix::sys::wait::WaitPidFlag::WNOHANG
+                    | nix::sys::wait::WaitPidFlag::WNOWAIT,
+            );
+            match observed {
+                // Exited, NOT reaped: the pid is still ours to signal.
+                Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(_)
+                    if std::time::Instant::now() >= deadline =>
+                {
                     killed = true;
                     break;
                 }
-                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(_) => break,
+                Err(_) => break,
             }
         }
-        // D0A-R5-04: the daemon has exited, but its shell and AI may not have — and they hold
-        // the pipe write ends. Kill the GROUP before reading, or `wait_with_output()` blocks
-        // for an EOF no living descendant will send.
+        // D0A-R5-04: the daemon may have exited while its shell and AI have not — they hold the
+        // pipe write ends, so `wait_with_output()` would wait for an EOF no living descendant
+        // sends. Killing the GROUP is safe here and only here: the leader is exited-but-unreaped
+        // (or still alive), so the identity has not been released.
         Self::kill_group(child.id());
         let out = child.wait_with_output().expect("collect daemon output");
         Self::sweep(&self.session_user);

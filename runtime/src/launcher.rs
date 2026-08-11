@@ -420,11 +420,27 @@ impl Drop for ShellGuard {
 
 /// Reap `pid`, giving up after `timeout`. Returns whether it was reaped.
 ///
+/// `pub(crate)` since D0A-R6-03: `ChildReaper` in the daemon binary wrote its own UNBOUNDED
+/// `waitpid`, which is the wedge this function already existed to prevent. One implementation,
+/// so the reasoning below cannot be re-derived differently at a second site.
+///
 /// A blocking `waitpid` here can wedge the daemon's launch path: `SIGKILL` does not dislodge
 /// a task in uninterruptible sleep, the kill may have failed outright, and `EINTR` would
 /// restart an unbounded wait indefinitely. Bounded polling makes the worst case a logged,
 /// leaked UNREAPED CHILD instead of a hung service.
-fn reap_within(pid: i32, timeout: std::time::Duration) -> bool {
+///
+/// # Examples
+///
+/// ```
+/// // A pid that is not our child has NOTHING OUTSTANDING to reap: `waitpid` gives `ECHILD`,
+/// // which this reports as reaped. The property worth pinning is the BOUND — it returns
+/// // promptly rather than blocking, which is the whole reason the daemon shares it.
+/// let started = std::time::Instant::now();
+/// assert!(delphi_runtime::reap_within(1, std::time::Duration::from_millis(50)));
+/// assert!(started.elapsed() < std::time::Duration::from_secs(2));
+/// ```
+#[must_use]
+pub fn reap_within(pid: i32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {

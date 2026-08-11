@@ -52,6 +52,9 @@ pub mod consent_relay;
 pub mod execute;
 pub mod fdsec;
 pub mod launcher;
+
+/// Bounded child reaping, shared with the daemon binary (D0A-R6-03).
+pub use launcher::reap_within;
 pub mod logind;
 pub mod pam;
 pub mod pidfd;

@@ -63,7 +63,15 @@ impl Drop for ChildReaper {
             if pid > 0 {
                 // SAFETY: signalling children this process created.
                 unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
-                let _ = waitpid(Pid::from_raw(pid), None);
+                // D0A-R6-03: BOUNDED. An unbounded `waitpid` after SIGKILL wedges the daemon
+                // forever on a child in uninterruptible sleep — the very failure R5-03 added
+                // this guard to prevent, reintroduced inside it. The launcher already had the
+                // bounded implementation and the reasoning; this shares it rather than writing
+                // a second one that could drift.
+                if !delphi_runtime::reap_within(pid, Duration::from_secs(5)) {
+                    tracing::error!(pid, "child did not reap within 5s — leaked UNREAPED rather \
+                                          than wedging the daemon");
+                }
             }
         }
         tracing::error!(

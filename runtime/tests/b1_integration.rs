@@ -894,6 +894,12 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         );
     };
 
+    // D0A-R7-09: PRINT THE WITNESS ON SUCCESS. Leg 1 pipes the daemon's stdout into its own
+    // sink, so the line never reached the test's output and a passing run showed only `ok` —
+    // the evidence existed but was invisible, which is the shape this whole arc keeps finding.
+    // A pass now carries what it proved.
+    println!("  [leg 1 witness] {line}");
+
     // Present-but-wrong-cause is a DIFFERENT failure from absence, and says so.
     assert!(
         line.contains("Resolved(")

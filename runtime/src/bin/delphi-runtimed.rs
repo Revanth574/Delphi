@@ -228,7 +228,19 @@ fn main() -> Result<()> {
     let outcome = serve_one_action(&mut ai, &mut ctx).context("servicing the action")?;
     tracing::info!(?outcome, "B1: served one action");
     // A line the binary-flow test can observe to confirm main ran the loops.
-    println!("DELPHI_RUNTIMED_OUTCOME {outcome:?}");
+    //
+    // D0A-R8-05: non-fatal, for the reason R7-04 gave — `println!` PANICS on a write error, so
+    // a closed pipe or full disk turns a diagnostic into a daemon crash and, under systemd, a
+    // restart loop. R7-04 fixed the WITNESS and left this one, which is the same Class 17 shape
+    // the rest of this round is made of.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "DELPHI_RUNTIMED_OUTCOME {outcome:?}").is_err() {
+            tracing::warn!("could not emit the outcome line (stdout unwritable); continuing");
+        }
+        let _ = out.flush();
+    }
 
     // TERMINAL CONTRACT (B2A-R2-02): the shell interaction is terminal once
     // serve_one_action returns — release the daemon's channel end BEFORE reaping. This

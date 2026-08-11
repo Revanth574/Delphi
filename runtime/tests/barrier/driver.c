@@ -42,7 +42,16 @@ int main(void) {
     // The shim reads this at call time; the victim's pid is not knowable before exec.
     char buf[32];
     snprintf(buf, sizeof buf, "%d", (int)victim);
-    setenv("DELPHI_BARRIER_VICTIM", buf, 1);
+    // D0A-R8-01, THIRD SITE. The reported instance was one of three: unpublished, the shim
+    // never fires and the barrier silently does not run. Loud (the MATCHED assertions fail),
+    // but the victim would still be ours to clean up, so undo rather than continue.
+    if (setenv("DELPHI_BARRIER_VICTIM", buf, 1) != 0) {
+        fprintf(stderr, "DRIVER ERROR: cannot publish the victim pid\n");
+        kill(victim, SIGKILL);
+        int vst = 0;
+        waitpid(victim, &vst, 0);
+        return 2;
+    }
 
     // Positive control (D0A-R3-01): place the VICTIM in a real session, run WITHOUT a barrier,
     // and the call must resolve it. Without this leg, "the barrier run returned no session"

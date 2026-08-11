@@ -2110,7 +2110,17 @@ sweep answers the first and does nothing for the second.
 
 ---
 
-## 38. A sound check whose report carries none of what it verified  *(new — D0A-R7-09)*
+## 38. A sound check whose report carries none of what it verified  *(D0A-R7-09 — DEMOTED to a convention, D0A-R8)*
+
+**REVIEWER JUDGEMENT, ACCEPTED: this is a TRANSCRIPT CONVENTION, not a defect class.** It was
+promoted on my argument that a silent-but-correct check "never fails at all"; Codex judged that
+over-promoted, and the distinction holds — every other entry here describes something that can
+make a wrong claim, while this describes something that makes a *correct* claim illegibly. The
+discipline below is worth keeping and following; the framing as a defect class was mine and was
+too strong.
+
+Kept in place rather than deleted, because the argument for promoting it is the thing a later
+reader should be able to weigh.
 
 **Every prior entry in this corpus is a check that was WRONG. This one is a check that was
 RIGHT and unreadable.**

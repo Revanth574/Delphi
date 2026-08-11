@@ -135,7 +135,19 @@ static void reap_and_recycle(pid_t victim) {
     // the very recycling hazard this harness exists to demonstrate, and it was live here.
     char ibuf[32];
     snprintf(ibuf, sizeof ibuf, "%d", (int)impostor);
-    setenv("DELPHI_BARRIER_IMPOSTOR", ibuf, 1);
+    // D0A-R8-01: this `setenv` was still UNCHECKED — the sibling of the one R7-01 fixed, in the
+    // same function. If it fails the driver never learns the impostor exists: it holds the
+    // stdout pipe forever (a hung ROOT test) and is never reaped. Ordering cannot help here,
+    // because the impostor already exists by the time we try to publish it, so the recovery is
+    // to UNDO: kill and reap what we made, then leave nothing to misattribute.
+    if (setenv("DELPHI_BARRIER_IMPOSTOR", ibuf, 1) != 0) {
+        log_line("BARRIER ERROR: cannot publish impostor %d; killing it rather than leaking\n",
+                 (int)impostor);
+        kill(impostor, SIGKILL);
+        int ist = 0;
+        waitpid(impostor, &ist, 0);
+        return;
+    }
     // Both pids, so "it recycled" is checkable by the harness rather than claimed here.
     log_line("BARRIER FIRED victim=%d impostor=%d\n", (int)victim, (int)impostor);
 }

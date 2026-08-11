@@ -382,11 +382,32 @@ struct Witness {
     /// Whether the daemon was still running when the wait ended — the flag that makes an
     /// ABSENT witness mean "never reached the gate" rather than "exited or timed out first".
     alive_at_conclusion: bool,
+    /// D0A-R8-03: the identity was lost during the wait, so the group was never signalled and
+    /// descendants were ABANDONED. A witness recovered from the sink afterwards is not wrong,
+    /// but the RUN is not clean — and a test that reports success while having leaked is the
+    /// same false reassurance this arc keeps closing. Success requires both.
+    identity_lost: bool,
+}
+
+/// Whether the child's identity is still provably ours (D0A-R8-02, Codex's judgement).
+///
+/// "Do the irreversible thing last" is not sufficient on its own — it orders operations but
+/// says nothing about whether we still hold what we are about to act on. An EXPLICIT OWNERSHIP
+/// STATE does: every signal is gated on `Held`, so a path that loses the identity cannot signal
+/// by omission. The bool this replaced was consulted at ONE of the three `kill_group` sites.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum Identity {
+    /// Reserved: the child is alive, or exited-but-unreaped. Signalling the group is sound.
+    Held,
+    /// A `waitid` error, an external reap, or anything else that released the number. The pid
+    /// may now belong to someone else, so NOTHING may be signalled with it — ever again.
+    Lost,
 }
 
 struct DaemonGuard {
     child: Option<std::process::Child>,
     session_user: String,
+    identity: Identity,
 }
 
 impl DaemonGuard {
@@ -402,13 +423,14 @@ impl DaemonGuard {
             .process_group(0)
             .spawn()
             .expect("spawn the daemon binary");
-        Self { child: Some(child), session_user: session_user.to_owned() }
+        Self { child: Some(child), session_user: session_user.to_owned(), identity: Identity::Held }
     }
 
     /// Wait to a deadline, then take the output. A kill is reported by the caller's assertion;
     /// the REAPING has already happened either way.
     fn wait(mut self) -> (std::process::Output, bool) {
         let child = self.child.take().expect("child present");
+        let child_pid = child.id();
         // D0A-R4-11: LONGER than the daemon's own 120 s accept bound, deliberately. At 45 s the
         // test always killed first, so the daemon's bounded exit was NEVER the thing observed —
         // one of the two deadlines was entirely unexercised, and a kill was reported where the
@@ -422,7 +444,7 @@ impl DaemonGuard {
         // the exit and LEAVES THE CHILD WAITABLE, so its identity stays reserved until we reap
         // it deliberately, after the group kill.
         #[allow(clippy::cast_possible_wrap)]
-        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        let pid = nix::unistd::Pid::from_raw(child_pid as i32);
         loop {
             let observed = nix::sys::wait::waitid(
                 nix::sys::wait::Id::Pid(pid),
@@ -450,7 +472,26 @@ impl DaemonGuard {
         // sends. Killing the GROUP is safe here and only here: the leader is exited-but-unreaped
         // (or still alive), so the identity has not been released.
         Self::kill_group(child.id());
-        let out = child.wait_with_output().expect("collect daemon output");
+        // D0A-R8-04: `wait_with_output` is unbounded — a surviving descendant holding the pipe
+        // wedges it, which is R5-04's mechanism. Only `wait_for_line` got the bound; this
+        // sibling kept it, which is Class 17 inside the bounding fix.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(o)) => o,
+            _ => {
+                eprintln!("DaemonGuard: output collection did not finish in 30s — proceeding \
+                           without it rather than wedging (D0A-R8-04)");
+                std::process::Output {
+                    status: std::process::ExitStatus::default(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            }
+        };
+        drop(collector);
         Self::sweep(&self.session_user);
         (out, killed)
     }
@@ -472,6 +513,7 @@ impl DaemonGuard {
     /// explicitly rather than assumed away.
     fn wait_for_line(mut self, prefix: &str, timeout: std::time::Duration) -> Witness {
         use std::io::BufRead as _;
+        let child_pid = self.child.as_ref().expect("child present").id();
         let child = self.child.as_mut().expect("child present");
         let stdout = child.stdout.take().expect("stdout piped");
         // D0A-R7-06: stderr was piped and NEVER READ. A full pipe blocks the writer, so the
@@ -499,7 +541,6 @@ impl DaemonGuard {
         let mut matched = None;
         let mut alive_at_conclusion = true;
         // Do we still provably hold the leader's identity? Only then may the group be signalled.
-        let mut identity_held = true;
         loop {
             if let Some(l) = lines
                 .lock()
@@ -524,7 +565,7 @@ impl DaemonGuard {
                     | nix::sys::wait::WaitPidFlag::WNOWAIT,
             );
             if let Err(e) = observed {
-                identity_held = false;
+                self.identity = Identity::Lost;
                 alive_at_conclusion = false;
                 eprintln!(
                     "DaemonGuard: waitid failed ({e}); the child's identity is UNKNOWN, so the \
@@ -551,9 +592,7 @@ impl DaemonGuard {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        if identity_held {
-            Self::kill_group(child.id());
-        }
+        self.kill_group_if_held(child_pid);
         // D0A-R7-03: THE DEADLINE ENDED AT THE POLL, and everything after it was unbounded —
         // `join()` blocks until the pipe closes, which a surviving descendant prevents, and
         // `wait()` blocks on a child that may not die. A guard whose own cleanup can wedge is
@@ -587,17 +626,28 @@ impl DaemonGuard {
         // "release the handle, then do something that can fail" shape as R5-01's fork guard and
         // R6-05's `try_wait`, written here while fixing the finding that reports it.
         #[allow(clippy::cast_possible_wrap)]
-        let raw = child.id() as i32;
+        let raw = child_pid as i32;
         if !delphi_runtime::reap_within(raw, std::time::Duration::from_secs(5)) {
             eprintln!("DaemonGuard: child {raw} did not reap within 5s — leaked UNREAPED rather \
                        than wedging the test (D0A-R7-03)");
         }
         self.child = None;
         Self::sweep(&self.session_user);
-        Witness { matched, seen, alive_at_conclusion }
+        Witness { matched, seen, alive_at_conclusion, identity_lost: self.identity == Identity::Lost }
     }
 
     /// Kill the whole process GROUP, so no descendant is left holding the pipes (D0A-R5-04).
+    /// Signal the group, and ONLY while the identity is `Held` (D0A-R8-02).
+    fn kill_group_if_held(&self, pid: u32) {
+        match self.identity {
+            Identity::Held => Self::kill_group(pid),
+            Identity::Lost => eprintln!(
+                "DaemonGuard: identity LOST — refusing to signal process group {pid}, which may \
+                 now belong to someone else (D0A-R8-02)"
+            ),
+        }
+    }
+
     fn kill_group(pid: u32) {
         #[allow(clippy::cast_possible_wrap)]
         let pgid = pid as i32;
@@ -616,10 +666,18 @@ impl Drop for DaemonGuard {
         // D0A-R6-06: the daemon's own anchor is this guard's business — it was cleaned by a
         // statement in the test body, which a panic skips.
         clean_daemon_anchor(&self.session_user);
-        if let Some(mut child) = self.child.take() {
+        if let Some(child) = self.child.take() {
             // Reached only when the test panicked before `wait()` — the path that leaked.
-            Self::kill_group(child.id());
-            let _ = child.wait();
+            let pid = child.id();
+            self.kill_group_if_held(pid);
+            // D0A-R8-04: bounded here too. An unwinding test must not be able to hang the whole
+            // suite in a destructor.
+            #[allow(clippy::cast_possible_wrap)]
+            let raw = pid as i32;
+            if !delphi_runtime::reap_within(raw, std::time::Duration::from_secs(5)) {
+                eprintln!("DaemonGuard::drop: child {raw} unreaped after 5s — leaked rather \
+                           than wedging");
+            }
             eprintln!(
                 "DaemonGuard: the test unwound before wait(); killed the daemon for {}",
                 self.session_user
@@ -879,6 +937,17 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
 
     // THREE DISTINCT FAILURES, NAMED SEPARATELY. Conflating them is what made the old
     // assertion cause-blind: it accepted a PRE-GATE startup line for two rounds.
+    // D0A-R8-03: a recovered witness is not enough. If the identity was lost mid-wait, the
+    // group was never signalled and descendants were ABANDONED — the run leaked, whatever the
+    // witness says. A test that reports success while having leaked is the false reassurance
+    // this arc keeps closing, so success requires BOTH.
+    assert!(
+        !witness.identity_lost,
+        "the daemon's identity was LOST during the wait, so its process group was never torn \
+         down and descendants were abandoned. The witness may be valid, but this run is not \
+         clean and must not report success. Output:\n{}",
+        witness.seen
+    );
     let Some(line) = witness.matched.clone() else {
         assert!(
             witness.alive_at_conclusion,

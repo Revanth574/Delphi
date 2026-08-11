@@ -1283,6 +1283,21 @@ mod tests {
     }
 
 
+    /// D0A-R8-06: the non-positive guard had no COMMITTED regression — it was checked once
+    /// with a throwaway example and deleted, which is evidence that evaporates. `waitpid` reads
+    /// 0 as "any child in my process group" and -1 as "ANY child", so without this guard a
+    /// caller passing either would reap an unrelated child AND REPORT SUCCESS.
+    #[test]
+    fn reap_within_refuses_non_positive_pids() {
+        let budget = std::time::Duration::from_millis(20);
+        assert!(!reap_within(0, budget), "0 means 'any child in my group' to waitpid");
+        assert!(!reap_within(-1, budget), "-1 means 'ANY child' to waitpid");
+        assert!(!reap_within(i32::MIN, budget), "and any other non-positive id");
+        // The guard must not have swallowed the ordinary path: pid 1 is not our child, so
+        // `waitpid` gives ECHILD, which this function reports as "nothing outstanding".
+        assert!(reap_within(1, budget), "a positive non-child still resolves promptly");
+    }
+
     /// **D0-R2-04.** `reap_within` must return on a child that outlives the budget rather
     /// than blocking. The forced shape: a child that ignores nothing but is simply still
     /// alive — an unbounded `waitpid` here never returns, which is the wedge this bounds.

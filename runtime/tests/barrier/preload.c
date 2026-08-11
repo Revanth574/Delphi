@@ -60,14 +60,23 @@ static void reap_and_recycle(pid_t victim) {
         log_line("BARRIER ERROR: refusing to signal non-positive victim %d\n", (int)victim);
         return;
     }
+    // D0A-R6-02: once the victim is reaped its pid is RECYCLABLE, and every early return after
+    // that used to leave `DELPHI_BARRIER_IMPOSTOR` unset — which the driver reads as "the
+    // victim is still ours" and SIGKILLs, AS ROOT. Ownership must never be inferred from the
+    // ABSENCE of a variable, so the reap is published explicitly.
+    //
+    // D0A-R7-01: PUBLISHED BEFORE THE IRREVERSIBLE ACT, and CHECKED. The marker was set after
+    // the kill with an unchecked `setenv`; if it failed (ENOMEM), the victim was already dead
+    // and the driver would still believe it owned that pid. Ordering the publication first
+    // makes the failure SAFE — nothing has been killed yet, so "the victim is still ours" is
+    // true and bailing here is correct. That is my own R6-02 fix carrying the same hole one
+    // layer in, which is what Class 37 predicts.
+    if (setenv("DELPHI_BARRIER_VICTIM_REAPED", "1", 1) != 0) {
+        log_line("BARRIER ERROR: cannot publish the reap marker; NOT killing the victim\n");
+        return;
+    }
     kill(victim, SIGKILL);
     int st = 0;
-    // D0A-R6-02: from HERE the victim is reaped and its pid is RECYCLABLE. Every early return
-    // below used to leave `DELPHI_BARRIER_IMPOSTOR` unset, and the driver reads "unset" as
-    // "the victim is still ours and still the same process" — then SIGKILLs that number AS
-    // ROOT. My own R5-01 fork guard introduced two of these paths. Ownership must never be
-    // inferred from the ABSENCE of a variable, so the reap is published explicitly.
-    setenv("DELPHI_BARRIER_VICTIM_REAPED", "1", 1);
     if (waitpid(victim, &st, 0) != victim) {
         log_line("BARRIER ERROR: could not reap victim %d\n", (int)victim);
         return;

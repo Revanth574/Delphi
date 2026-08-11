@@ -441,6 +441,13 @@ impl Drop for ShellGuard {
 /// ```
 #[must_use]
 pub fn reap_within(pid: i32, timeout: std::time::Duration) -> bool {
+    // D0A-R7-07: `waitpid` reads 0 as "any child in my process group" and -1 as "ANY child".
+    // Harmless while this was crate-private and every caller passed a real pid; making it
+    // `pub` for D0A-R6-03 turned those into reachable arguments that would reap an unrelated
+    // child and report success. Same family as D0A-R5-01's kill guards, on the wait side.
+    if pid <= 0 {
+        return false;
+    }
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {

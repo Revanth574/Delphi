@@ -474,6 +474,10 @@ impl DaemonGuard {
         use std::io::BufRead as _;
         let child = self.child.as_mut().expect("child present");
         let stdout = child.stdout.take().expect("stdout piped");
+        // D0A-R7-06: stderr was piped and NEVER READ. A full pipe blocks the writer, so the
+        // daemon could wedge on its own logging — and every startup diagnostic was discarded
+        // exactly when a failure most needed it. Drained on its own thread into the same sink.
+        let stderr = child.stderr.take().expect("stderr piped");
         #[allow(clippy::cast_possible_wrap)]
         let pid = nix::unistd::Pid::from_raw(child.id() as i32);
 
@@ -484,10 +488,18 @@ impl DaemonGuard {
                 sink.lock().expect("line sink").push(line);
             }
         });
+        let err_sink = std::sync::Arc::clone(&lines);
+        let err_reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                err_sink.lock().expect("line sink").push(line);
+            }
+        });
 
         let deadline = std::time::Instant::now() + timeout;
         let mut matched = None;
         let mut alive_at_conclusion = true;
+        // Do we still provably hold the leader's identity? Only then may the group be signalled.
+        let mut identity_held = true;
         loop {
             if let Some(l) = lines
                 .lock()
@@ -500,15 +512,27 @@ impl DaemonGuard {
             }
             // Liveness WITHOUT reaping (D0A-R6-05): a reaped pid is not a pid we own, and the
             // group teardown below needs the identity still reserved.
-            let alive = matches!(
-                nix::sys::wait::waitid(
-                    nix::sys::wait::Id::Pid(pid),
-                    nix::sys::wait::WaitPidFlag::WEXITED
-                        | nix::sys::wait::WaitPidFlag::WNOHANG
-                        | nix::sys::wait::WaitPidFlag::WNOWAIT,
-                ),
-                Ok(nix::sys::wait::WaitStatus::StillAlive)
+            // D0A-R7-02: WNOWAIT pins the identity ONLY while the child is still waitable. If
+            // `waitid` ERRORS — ECHILD because something else reaped it, or anything else — we
+            // no longer know we hold that pid, and killing the group would target whoever owns
+            // the number now. An error is therefore NOT "it exited": it is "identity unknown",
+            // and the teardown below must not signal.
+            let observed = nix::sys::wait::waitid(
+                nix::sys::wait::Id::Pid(pid),
+                nix::sys::wait::WaitPidFlag::WEXITED
+                    | nix::sys::wait::WaitPidFlag::WNOHANG
+                    | nix::sys::wait::WaitPidFlag::WNOWAIT,
             );
+            if let Err(e) = observed {
+                identity_held = false;
+                alive_at_conclusion = false;
+                eprintln!(
+                    "DaemonGuard: waitid failed ({e}); the child's identity is UNKNOWN, so the \
+                     group will NOT be signalled (D0A-R7-02)"
+                );
+                break;
+            }
+            let alive = matches!(observed, Ok(nix::sys::wait::WaitStatus::StillAlive));
             if !alive {
                 alive_at_conclusion = false;
                 // Drain briefly: the line may already be in the pipe.
@@ -527,14 +551,47 @@ impl DaemonGuard {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        Self::kill_group(child.id());
-        let _ = reader.join();
+        if identity_held {
+            Self::kill_group(child.id());
+        }
+        // D0A-R7-03: THE DEADLINE ENDED AT THE POLL, and everything after it was unbounded —
+        // `join()` blocks until the pipe closes, which a surviving descendant prevents, and
+        // `wait()` blocks on a child that may not die. A guard whose own cleanup can wedge is
+        // the failure it exists to prevent, one level in.
+        //
+        // The reader is DETACHED rather than joined: it owns only the read end and the lines it
+        // has already delivered are in the mutex, so abandoning it costs nothing and cannot
+        // hang. `reap_within` bounds the reap, leaking an unreaped child rather than wedging —
+        // the trade the launcher already documents.
+        let drain_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while (!reader.is_finished() || !err_reader.is_finished())
+            && std::time::Instant::now() < drain_until
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let seen = lines.lock().expect("line sink").join("\n");
+        // D0A-R7-05: RECOMPUTE after draining. The poll's last look happened before the pipe
+        // finished delivering, so a witness written just before exit could be present in the
+        // sink and absent from `matched` — a load-dependent FALSE ABSENCE, which is the one
+        // verdict this test must never produce for a timing reason.
+        if matched.is_none() {
+            matched = lines
+                .lock()
+                .expect("line sink")
+                .iter()
+                .find(|l| l.starts_with(prefix))
+                .cloned();
+        }
         // D0A-R6-06: reap THROUGH the guard rather than taking the child out first. `.take()`
         // before fallible work leaves `Drop` with `None` if that work unwinds — the same
         // "release the handle, then do something that can fail" shape as R5-01's fork guard and
         // R6-05's `try_wait`, written here while fixing the finding that reports it.
-        let _ = self.child.as_mut().expect("child present").wait();
+        #[allow(clippy::cast_possible_wrap)]
+        let raw = child.id() as i32;
+        if !delphi_runtime::reap_within(raw, std::time::Duration::from_secs(5)) {
+            eprintln!("DaemonGuard: child {raw} did not reap within 5s — leaked UNREAPED rather \
+                       than wedging the test (D0A-R7-03)");
+        }
         self.child = None;
         Self::sweep(&self.session_user);
         Witness { matched, seen, alive_at_conclusion }
@@ -804,8 +861,18 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
         .env_remove("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION")
     ;
     // D0A-R6-01 + Codex's lead judgement: wait for a STRUCTURED WITNESS, not for the flow to
-    // complete. No AI exchange, no terminal EOF — that removes R5-11's coupling, where the
-    // surface shell's exit behaviour had to match a production ordering guarantee.
+    // complete.
+    //
+    // D0A-R7-08 CORRECTS WHAT THAT CLAIMED. "No AI exchange, no terminal EOF" was false as
+    // written: `launch()` forks the AI — that is part of what leg 1 exercises — and the daemon
+    // keeps running after the witness, so it may well enter accept/serve before the teardown
+    // lands. Observing stdout is not a barrier; it is a place to stop WATCHING.
+    //
+    // What is actually true, and is the property that matters: leg 1 no longer DEPENDS on any
+    // of it. The witness is printed before the daemon reaches accept, and the group is torn
+    // down as soon as it appears, so whether the AI connects and whether the shell dismisses on
+    // EOF are both irrelevant to the verdict. That is what removes R5-11's coupling — the
+    // surface shell's EXIT behaviour stopped mattering, not the flow stopped happening.
     let witness = DaemonGuard::spawn(cmd, &setup.user)
         .wait_for_line("DELPHI_GATE_WITNESS ", std::time::Duration::from_secs(60));
     // (the anchor is cleaned by DaemonGuard::drop — D0A-R6-06 — on every path, not just this one)

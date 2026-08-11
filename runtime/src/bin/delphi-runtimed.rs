@@ -182,7 +182,17 @@ fn main() -> Result<()> {
     // `println!`, not `tracing`: an `EnvFilter` can suppress a log line, and a witness that a
     // filter can erase is a witness that can go absent for a reason unrelated to the gate.
     let startup_resolution = session_source.current();
-    println!("DELPHI_GATE_WITNESS {startup_resolution:?}");
+    // D0A-R7-04: `println!` PANICS on a write error (closed pipe, full disk), which would turn
+    // a diagnostic into a daemon crash — and under systemd, a restart loop. The witness is
+    // worth emitting, never worth dying for.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "DELPHI_GATE_WITNESS {startup_resolution:?}").is_err() {
+            tracing::warn!("could not emit the gate witness (stdout unwritable); continuing");
+        }
+        let _ = out.flush();
+    }
     if !delphi_runtime::logind::session_passes_gate(startup_resolution.snapshot_or_denied()) {
         tracing::warn!(
             shell_pid = children.shell_pid,

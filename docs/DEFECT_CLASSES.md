@@ -2110,6 +2110,39 @@ sweep answers the first and does nothing for the second.
 
 ---
 
+## 38. A sound check whose report carries none of what it verified  *(new — D0A-R7-09)*
+
+**Every prior entry in this corpus is a check that was WRONG. This one is a check that was
+RIGHT and unreadable.**
+
+Leg 1 of the R4-03 test asserts a structured gate witness: absence panics on its own named
+branch, and `Resolved { active: false, remote: false, seated: true }` is checked field by field.
+The assertion is correct and the evidence existed. **The transcript printed `ok`** — because the
+test pipes the daemon's stdout into its own sink, so the witness surfaces only inside a FAILURE
+message.
+
+**Why that is a defect and not a cosmetic complaint: `ok` from a sound check is indistinguishable
+from `ok` from a skip, a vacuous assertion, or a check that never ran.** This project has shipped
+all three (Class 10's skip-scored-as-pass, D0A-R6-01's cause-blind gate assertion, D0A-R5-05's
+pre-gate false pass), and the reader cannot tell them apart from the output. The correctness of
+the check is invisible at exactly the moment someone is deciding whether to trust it.
+
+**The asymmetry that makes this worth its own entry:** a wrong check fails loudly the first time
+its subject changes. A silent-but-correct check never fails at all — it simply stops being
+believed, or worse, keeps being believed for the wrong reason. Nothing disturbs the pair.
+
+**Foreclosing discipline:** a passing check that establishes a non-obvious property must PRINT
+the evidence it established. Not the assertion text — the observed value. `[leg 1 witness]
+Resolved(SessionSnapshot { active: false, remote: false, seated: true })` is a transcript a
+reader can audit; `ok` is a transcript that requires trusting that an assertion exists and says
+what it should.
+
+**Related but distinct:** Class 10 is *the harness reporting success for work it did not do*;
+this is *the harness reporting success for work it DID do, without saying what*. The first is a
+false claim, the second is an unsupported one.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2148,6 +2181,7 @@ sweep answers the first and does nothing for the second.
 | 30. Stale binary — a rebuild that does not rebuild | `mtime` not hash: a library-only change leaves the test binary's hash unchanged; force the rebuild after any weaken/restore touching a lib crate | Discipline |
 | 29a. Holder-check names the wrong resource | one shared checker matching the SUBJECT's resource on ANY location (`scripts/check-stale-test-sessions.sh`), used by every caller | **Extracted** |
 | 31. Teardown failure unobservable | a teardown that CAN fail must REPORT its failure; if it cannot report, it must ASSERT. Capture the reason (`.output()`), never `let _ = …status()` | Discipline |
+| 38. Sound check, silent report | a passing check that establishes a non-obvious property PRINTS the observed value, not just `ok` | Discipline |
 | 37. Remediation is where a class reappears | read the fix for instance N as the likeliest home of instance N+1; keep 22's and 36's foreclosures intact rather than averaging them | Search rule |
 | 34. A deferral is an untested claim | quote the MEASURED blocker (skip line, error, missing file) in the ledger entry — never an environment category | Discipline |
 | 35. Cited boundary → falsifier design | ask a citation for its own boundary, build the configuration inside it, and PAIR it with a positive control | Technique |

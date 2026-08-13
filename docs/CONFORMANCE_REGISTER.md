@@ -26,6 +26,7 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §6 | "mount exactly `fs_binds`" | **PARTIAL** — bind sources are **path-resolved at launch**, so a symlink swap substitutes scope | D0A-R9-03 | binds resolve to what was approved, TOCTOU-proven |
 | §6 | "env is scrubbed to `env_delta`" | **LEAKS** — `env_delta` is passed in **bwrap's argv**, world-readable via `/proc/<pid>/cmdline` | D0A-R9-06 | secrets never transit argv |
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
+| §6 | "a uid that **cannot reach daemon IPC**" (the *check* side) | **VACUOUS IN A REACHABLE DEPLOYMENT** — `expected_uid` comes from `User::from_name(&session)` where `session` is the systemd instance name (`ExecStart=… --session %i`), **unvalidated**. `delphi-runtimed@root` sets `expected_uid = 0`; the root-running tool then reads back `SO_PEERCRED uid=0` and **matches**. Keystone breached with no attacker step and no remediation applied | **D0A-R9-11** (measurement 4) | the daemon refuses a root session user, RED-proven |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | a denylist refuses the daemon's runtime directory, RED-proven — **and it must land WITH the dedicated uid, since each is the other's only backstop** |
 
 **Proof-thinness (not clause violations, recorded so they are not mistaken for coverage):**
@@ -59,20 +60,51 @@ So **"any unprivileged uid strictly beats root" is FALSE here**, and "refining w
 later" is false with it. **The fix must be a DEDICATED SERVICE UID distinct from the session
 uid** — that *is* the decision, not a detail deferred past it.
 
-### The four measurements that precede any D1 design
+### The four measurements — RESULTS (2026-08-13, `scratch/d1-peercred-probe.sh`)
 
-`setuid()` inside the userns is **downstream and the wrong thing to measure**: what the daemon
-observes is fixed by the **uid map**, not by what the child does after `execve`, and `setuid`
-only moves within mapped ids.
+`setuid()` inside the userns was the wrong target: what the daemon observes is set by the **uid
+map**, not by what the child does after `execve`.
 
-1. **At the socket.** Connect from inside the jail and have the daemon **log the `SO_PEERCRED`
-   triple it actually reads**. Observed, never inferred from the bwrap invocation.
-2. **The map.** If bwrap is invoked such that inner 0 maps to the **session uid**, the keystone
-   is breached **now**, not conditionally.
-3. **`accept_requester`'s exact comparison.** `uid != expected && uid != 0` is the idiomatic
-   form; if a **root exemption** is present, the rejection verified above does not exist.
-4. **Can `expected_uid` ever be 0?** A root session or service context would make the daemon's
-   own check vacuous.
+**M1 — at the socket.** A peer inside the jail, connecting over a bound-in socket, is read by
+the outside listener as **the uid that launched bwrap** (`SO_PEERCRED pid=5304 uid=1000
+gid=1000` from an `OUTER uid=1000` launcher). Observed, not inferred. **Root leg outstanding.**
+
+**M2 — the map.** `/proc/self/uid_map` inside reads `1000 0 1`, which is *not* "inner 1000 →
+outer 0": `os.stat` on a file owned by outer-1000 returns **1000** inside, so the net mapping is
+**identity for the launching uid**. The `0` is w.r.t. an **intermediate userns** bwrap creates
+(mapping the launcher to 0 to obtain mount capability, then mapping back). So inner 0 maps to
+the **launcher** — root — **not** to the session uid. **Not breached via the map.**
+
+**M3 — `accept_requester`'s comparison.** `if cred.uid() != expected_uid` — a plain inequality,
+**no `&& uid != 0` root exemption**. The rejection is real and does what it appears to.
+
+**M4 — can `expected_uid` be 0? YES, and it is reachable.** See the R9-11 row: unvalidated
+`--session %i`. This is the one measurement that found a live breach rather than confirming a
+defence.
+
+### The measurement that decides the FIX, not the current state
+
+Leg B ran the profile with **`--uid 65534 --gid 65534`** — the obvious shape of "run under a
+dedicated service uid". Inside: `INNER uid=65534`. At the listener: **`SO_PEERCRED uid=1000`**
+— *the launcher, unchanged*. **bwrap's `--uid` sets the id INSIDE the namespace and does not
+change the credential the kernel reports outside it.** A fix built on `--uid` would show a
+non-root `id -u` inside the jail while remaining the launcher's uid to every check performed
+outside — cosmetic, and it would read as correct.
+
+**This negative is satisfiable two ways** (standard 3, applied to my own measurement): either
+(a) `--uid` never changes the outside credential, or (b) an *unprivileged* launcher owns exactly
+one id, so no other result was possible. The unprivileged leg cannot discriminate. **The root
+leg does** — root owns every id, so if `--uid 65534` still reports 0 outside, (a) holds.
+
+**Outstanding, and it is the operator's to run:**
+
+```
+sudo ./scratch/d1-peercred-probe.sh
+```
+
+Predictions, recorded before the run so they score: **leg A → `SO_PEERCRED uid=0`** (keystone
+holds today, by root). **Leg B → `SO_PEERCRED uid=0`** (`--uid` is inside-only; the fix needs a
+real credential change — `setresuid`/`setgid`/`setgroups` before `execve`, or systemd `User=`).
 
 ## Scheduling — decided 2026-08-12
 

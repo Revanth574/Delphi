@@ -239,6 +239,28 @@ mod tests {
         content.into_bytes()
     }
 
+    /// Rewrite `path`'s CONTENT in place — **same inode, no rename**. `fs::write`
+    /// opens the existing file `O_TRUNC`, so an fd already open on it observes the
+    /// new bytes. Returns (inode before, inode after) so a caller can PROVE the pin
+    /// was intact and simply did not apply (D0A-R9-02).
+    fn overwrite_in_place(path: &Path, marker: &str, out: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let before = fs::metadata(path).unwrap().ino();
+        let content = format!("#!/bin/sh\necho {marker} > {}\n", out.display());
+        fs::write(path, &content).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        (before, fs::metadata(path).unwrap().ino())
+    }
+
+    /// A script whose shebang names `interp` — the interpreter the KERNEL resolves
+    /// by path *after* the fd-pin has already fixed this file's inode.
+    fn write_script_with_interp(path: &Path, interp: &Path) -> Vec<u8> {
+        let content = format!("#!{}\n", interp.display());
+        fs::write(path, &content).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        content.into_bytes()
+    }
+
     /// Replace the script at `path` with a NEW inode (rename-over), so a fd opened
     /// on the old inode keeps the original content — the swap the fd-pin must defeat.
     fn swap_script(path: &Path, marker: &str, out: &Path) {
@@ -348,6 +370,81 @@ mod tests {
             fs::read_to_string(&env.result).unwrap().trim(),
             "SWAPPED",
             "RED: path-exec re-resolves the path → the swapped binary runs → executed != approved"
+        );
+    }
+
+    /// D0A-R9-02, reviewer reproduction 1 — **SAME-INODE substitution**.
+    ///
+    /// `red_proof_path_exec_runs_the_swapped_content` above attacks the property the
+    /// pin HAS: rename-over creates a new inode, and the pin catches it. This attacks
+    /// the property it does NOT have — **the pin fixes an inode, not bytes.** Here the
+    /// pin is intact and simply does not apply.
+    #[test]
+    fn same_inode_overwrite_executes_unapproved_content() {
+        if !bwrap_available() {
+            eprintln!("SKIP same_inode_overwrite_executes_unapproved_content: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("same-inode");
+        let bytes = write_script(&env.exe, "APPROVED", &env.result);
+        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let (ino_before, ino_after) = overwrite_in_place(&env.exe, "SUBSTITUTED", &env.result);
+        assert_eq!(
+            ino_before, ino_after,
+            "harness: the overwrite must keep the SAME inode, else this silently \
+             reproduces the rename case the pin already catches"
+        );
+
+        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("approved exec");
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            fs::read_to_string(&env.result).unwrap().trim(),
+            "APPROVED",
+            "D0A-R9-02: bytes written behind the pinned inode execute — the digest bound \
+             content that is no longer there"
+        );
+    }
+
+    /// D0A-R9-02, reviewer reproduction 2 — **NESTED-INTERPRETER substitution**.
+    ///
+    /// The pinned file is never modified: it still hashes to `executable_digest`, and
+    /// the test asserts that. What runs is the interpreter its shebang names, which the
+    /// kernel resolves **by path, after the pin**, and which nothing pins or seals.
+    /// (Nested shebang honoured through `/proc/self/fd/N` — measured on this kernel.)
+    #[test]
+    fn nested_interpreter_substitution_executes_unapproved_content() {
+        if !bwrap_available() {
+            eprintln!("SKIP nested_interpreter_substitution_executes_unapproved_content: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("nested");
+        let interp = env.out_dir.join("interp");
+        write_script(&interp, "APPROVED-INTERP", &env.result);
+        let bytes = write_script_with_interp(&env.exe, &interp);
+        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let (ino_before, ino_after) = overwrite_in_place(&interp, "SUBSTITUTED-INTERP", &env.result);
+        assert_eq!(ino_before, ino_after, "harness: the interpreter swap must be in place");
+        assert_eq!(
+            fs::read(&env.exe).unwrap(),
+            bytes,
+            "harness: the PINNED file must stay byte-identical, or this proves the wrong thing"
+        );
+
+        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("approved exec");
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            fs::read_to_string(&env.result).unwrap().trim(),
+            "APPROVED-INTERP",
+            "D0A-R9-02: the pinned inode is correct AND unmodified, yet the code that ran \
+             was resolved by path after the pin"
         );
     }
 

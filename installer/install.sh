@@ -226,6 +226,30 @@ copy_fd() {   # fd dest mode
             "fix the cause (disk space, permissions, read-only mount)"
 }
 
+# ── D0A-R9-01: the dedicated account approved actions run as ──────────────────
+# NOT root (the defect), and NOT the session user — SO_PEERCRED equality against the
+# session uid is exactly what would let the sandboxed tool answer its own approval
+# request. A third, dedicated identity is the only value that is neither.
+#
+# Static, because DynamicUser= is structurally unavailable: it applies to a systemd
+# UNIT, and the tool is a child the root daemon forks inside bwrap. See
+# docs/CONFORMANCE_REGISTER.md.
+#
+# --system keeps it below UID_MIN, so delphi-runtimed's own R9-11 guard would refuse
+# to serve a SESSION for it — correct, and deliberate: this account exists to be
+# dropped TO, never to be logged in as.
+TOOL_ACCOUNT=delphi-tool
+if getent passwd "$TOOL_ACCOUNT" >/dev/null; then
+    echo "  tool account $TOOL_ACCOUNT: already present"
+else
+    # This is the FIRST mutation the script performs, so a failure here has changed
+    # nothing — `refuse`, not `fail_after_mutation`. Re-running is safe: the getent
+    # check above makes account creation idempotent.
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$TOOL_ACCOUNT" || \
+        refuse "could not create the tool account $TOOL_ACCOUNT — approved actions have no unprivileged identity to run as. Create it manually: useradd --system --no-create-home --shell /usr/sbin/nologin $TOOL_ACCOUNT"
+    echo "  tool account $TOOL_ACCOUNT: created (uid $(id -u "$TOOL_ACCOUNT"))"
+fi
+
 install -d -m 0755 /usr/libexec
 copy_fd "${FD[delphi-runtimed]}"    /usr/libexec/delphi-runtimed    0755
 copy_fd "${FD[delphi-shell]}"       /usr/libexec/delphi-shell       0755

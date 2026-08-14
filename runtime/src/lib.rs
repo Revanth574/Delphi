@@ -148,6 +148,22 @@ pub enum RuntimeError {
     #[error("execution denied: the script content is not fully sealed (need F_SEAL_WRITE|SHRINK|GROW|SEAL) — its content or length could be mutated after approval (TRUST_MODEL.md §3, R4-02)")]
     UnsealedScript,
 
+    /// An approved action named the daemon's own runtime directory as an `fs_bind`
+    /// (D0A-R9-10, `docs/TRUST_MODEL.md` §6: the approval socket is "outside the
+    /// jail's mount set"). Nothing previously forbade *naming* it, so an action could
+    /// place the socket and the anchor inside its own jail.
+    ///
+    /// Distinct from D0A-R9-03, which is the TOCTOU on bind *resolution*: this refuses
+    /// the name; that one is about the name changing meaning after the check.
+    #[error("execution denied: `{}` is inside the daemon's runtime directory `{}` — an action may not mount the approval socket or anchor into its own jail (TRUST_MODEL.md §6, D0A-R9-10)", path.display(), base.display())]
+    DeniedBind { path: std::path::PathBuf, base: std::path::PathBuf },
+
+    /// The dedicated tool account is missing while running privileged (D0A-R9-01).
+    /// Fail closed: without it there is no unprivileged identity to drop to, and
+    /// running the action as root is the defect itself.
+    #[error("execution denied: the tool account `{account}` does not exist, so the action cannot be dropped off root. Create it: `useradd --system --no-create-home --shell /usr/sbin/nologin {account}` (TRUST_MODEL.md §6, D0A-R9-01)")]
+    MissingToolAccount { account: String },
+
     /// A wire-protocol fault on the AI↔daemon general socket (B1) — a malformed
     /// frame, an oversized message, a decode failure, or an unexpected message for
     /// the current state. Never carries user data.

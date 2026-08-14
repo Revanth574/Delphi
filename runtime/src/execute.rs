@@ -98,6 +98,30 @@ pub fn execute_approved(
     run_fd_pinned(action)
 }
 
+/// The dedicated account the approved action runs as — never root, and never the
+/// session user (`SO_PEERCRED` equality against the session uid is what would make
+/// the requester check admit the tool itself).
+pub const TOOL_ACCOUNT: &str = "delphi-tool";
+
+/// Credentials to drop to, or `None` when there is no privilege to drop.
+///
+/// Unprivileged callers cannot acquire another identity, and the action already runs
+/// as the non-root uid that started the daemon — so `None` is the honest answer, not
+/// a bypass. Running privileged with the account **absent** is a hard error: silently
+/// staying root would be the defect D0A-R9-01 names.
+fn tool_credentials() -> Result<Option<(u32, u32)>, RuntimeError> {
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return Ok(None);
+    }
+    let user = nix::unistd::User::from_name(TOOL_ACCOUNT)
+        .ok()
+        .flatten()
+        .ok_or_else(|| RuntimeError::MissingToolAccount {
+            account: TOOL_ACCOUNT.to_string(),
+        })?;
+    Ok(Some((user.uid.as_raw(), user.gid.as_raw())))
+}
+
 /// R4-02: a pinned script's content fd MUST carry the FULL immutability seal set
 /// ([`ScriptPin::FULL_SEALS`] — `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
 /// F_SEAL_SEAL`) so neither its content (write) nor its length (`ftruncate`
@@ -136,6 +160,14 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // seal set defeats script-CONTENT/LENGTH-mutation. Refuse before any exec path.
     if let Some(sp) = &action.script {
         require_fully_sealed(sp.script_memfd.as_raw_fd())?;
+    }
+    // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
+    // is defence in depth on top of the uid drop rather than the barrier itself.
+    for (path, _) in &action.fs_binds {
+        crate::sandbox::refuse_denied_bind(
+            path,
+            std::path::Path::new(crate::anchor::DEFAULT_RUNTIME_BASE),
+        )?;
     }
     // Which fd(s) the jailed tool must keep (the rest are closed before its exec).
     let (program_fd, script_arg_fd, keep): (RawFd, Option<RawFd>, Vec<RawFd>) =
@@ -185,10 +217,33 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // performs only `close_range`/`fcntl` + an errno read (no allocation), and
     // `io::Error::from_raw_os_error` wraps the errno integer inline — never
     // `io::Error::other`, which would `Box` (allocate).
+    // D0A-R9-01: resolved in the PARENT. `User::from_name` allocates and is not
+    // async-signal-safe, so it must never run in the forked child.
+    let creds = tool_credentials()?;
     unsafe {
         cmd.pre_exec(move || {
             crate::fdsec::mark_cloexec_except_raw(&keep)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            // D0A-R9-01 — drop off root before `execve`. Leg B of the peercred probe
+            // measured that bwrap's `--uid` changes only the id INSIDE the namespace
+            // (`INNER 65534` / `SO_PEERCRED 0`), so only a real credential change is
+            // visible to the daemon's socket or the host filesystem.
+            //
+            // Order is load-bearing and each step needs the privilege the next drops:
+            // supplementary groups first (setgroups requires CAP_SETGID), then gid,
+            // then uid last. All three are raw syscalls — no allocation, per the
+            // SAFETY note above.
+            // SAFETY (inherited from the enclosing block): these drop this child's own
+            // credentials and touch no caller memory — `setgroups(0, NULL)` clears the
+            // supplementary set.
+            if let Some((uid, gid)) = creds
+                && (nix::libc::setgroups(0, std::ptr::null()) != 0
+                    || nix::libc::setresgid(gid, gid, gid) != 0
+                    || nix::libc::setresuid(uid, uid, uid) != 0)
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         });
     }
     cmd.output().map_err(|source| RuntimeError::Filesystem {
@@ -371,6 +426,77 @@ mod tests {
             "SWAPPED",
             "RED: path-exec re-resolves the path → the swapped binary runs → executed != approved"
         );
+    }
+
+    /// D0A-R9-01 — the approved action runs as the dedicated tool account, not root.
+    ///
+    /// **ROOT-GATED, and the blocker is the measured one, not an environment name
+    /// (class 34).** Below root, `tool_credentials()` returns `None` because there is
+    /// no privilege to drop and no way to acquire another identity — so unprivileged
+    /// this test could only assert the test user's own uid, which holds with AND
+    /// without the fix (PASS/PASS, worthless per Iron Law #15 clause 2).
+    #[test]
+    fn an_approved_action_runs_as_the_tool_account_not_root() {
+        if !bwrap_available() {
+            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: requires bwrap + unprivileged userns");
+            return;
+        }
+        if nix::unistd::geteuid().as_raw() != 0 {
+            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: requires root — measured blocker: geteuid() != 0, so tool_credentials() returns None and no drop engages");
+            return;
+        }
+        let Ok(Some(tool)) = nix::unistd::User::from_name(TOOL_ACCOUNT) else {
+            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: measured blocker: getpwnam(\"{TOOL_ACCOUNT}\") returned no entry — installer/install.sh creates it");
+            return;
+        };
+        let env = Env::new("tool-uid");
+        // The tool is no longer root, so it cannot write into a root-owned directory.
+        // That is the POINT of the change, not a workaround: a real approved RW bind
+        // is a path the tool may write. Granting it here models that, and does not
+        // weaken the assertion, which is about WHICH uid ran.
+        std::os::unix::fs::chown(&env.out_dir, Some(tool.uid.as_raw()), None).unwrap();
+        let content = format!("#!/bin/sh\nid -u > {}\n", env.result.display());
+        fs::write(&env.exe, &content).unwrap();
+        fs::set_permissions(&env.exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let action = build_action(&env.exe, content.as_bytes(), &env.out_dir);
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("approved exec");
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        let observed = fs::read_to_string(&env.result).unwrap().trim().to_string();
+        assert_ne!(observed, "0", "D0A-R9-01: the action must not run as root");
+        assert_eq!(
+            observed,
+            tool.uid.as_raw().to_string(),
+            "D0A-R9-01: the action must run as `{TOOL_ACCOUNT}`"
+        );
+    }
+
+    /// D0A-R9-10, **WIRING**. `sandbox::tests` proves the predicate refuses; this
+    /// proves execution actually consults it. A guard that is defined and never called
+    /// passes its own unit tests forever.
+    #[test]
+    fn an_action_binding_the_daemon_runtime_directory_is_refused() {
+        let env = Env::new("denied-bind");
+        let bytes = write_script(&env.exe, "SHOULD-NOT-RUN", &env.result);
+        let mut action = build_action(&env.exe, &bytes, &env.out_dir);
+        action
+            .fs_binds
+            .push((PathBuf::from("/run/delphi/alice"), BindMode::ReadWrite));
+        // Minted AFTER the bind is added: the digest covers `fs_binds`, so this is a
+        // genuinely APPROVED action naming the runtime directory — which is the threat.
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let err = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect_err("a bind of the daemon's runtime directory must be refused");
+        assert!(
+            matches!(err, RuntimeError::DeniedBind { .. }),
+            "must be refused AS a denied bind, not incidentally; got: {err}"
+        );
+        assert!(!env.result.exists(), "nothing may have executed");
     }
 
     /// D0A-R9-02, reviewer reproduction 1 — **SAME-INODE substitution**.

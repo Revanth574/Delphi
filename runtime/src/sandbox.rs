@@ -32,6 +32,80 @@ pub struct SandboxProfile {
     args: Vec<String>,
 }
 
+/// Lexically normalise without touching the filesystem: fold `.` away and pop on
+/// `..`, so `/run/delphi/../delphi/x` cannot spell its way past a prefix compare.
+fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Refuse an `fs_bind` that names the daemon's own runtime directory (D0A-R9-10).
+///
+/// **Why this is defence in depth and not the barrier** — the asymmetry is the whole
+/// justification for shipping it with the uid drop, so it is stated where it is
+/// enforced rather than only in `docs/CONFORMANCE_REGISTER.md`:
+///
+/// * While the action runs as **root**, mode bits stop nothing (root overrides DAC),
+///   so *this check is the sole barrier* between the tool and the approval socket.
+/// * Once the action runs as the dedicated tool uid, the socket's `0660
+///   root:<session-gid>` and the anchor's `0711` already stop it, and `SO_PEERCRED`
+///   stops it again. Two mechanisms, neither of them this one.
+///
+/// So the uid drop is the enabling change; this makes a single point of failure into
+/// a third line. It does **not** close D0A-R9-03: a symlink swapped *after* this
+/// check still redirects the bind, which is that finding's TOCTOU.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use delphi_runtime::sandbox::refuse_denied_bind;
+///
+/// let base = Path::new("/run/delphi");
+/// assert!(refuse_denied_bind(Path::new("/home/alice/src"), base).is_ok());
+/// assert!(refuse_denied_bind(Path::new("/run/delphi/alice"), base).is_err());
+/// // Traversal cannot spell its way out.
+/// assert!(refuse_denied_bind(Path::new("/run/delphi/../delphi/alice"), base).is_err());
+/// ```
+///
+/// # Errors
+///
+/// [`RuntimeError::DeniedBind`] if `path` resolves inside `base`.
+#[must_use = "a refused bind must abort the execution, not be discarded"]
+pub fn refuse_denied_bind(
+    path: &std::path::Path,
+    base: &std::path::Path,
+) -> Result<(), crate::RuntimeError> {
+    let base_n = lexical_normalize(base);
+    // Both forms are checked: the lexical one always, and the symlink-resolved one
+    // when the path exists. Neither subsumes the other — canonicalize sees through a
+    // symlink but fails on a not-yet-created path, and the lexical form is the only
+    // one available then.
+    let candidates = [
+        Some(lexical_normalize(path)),
+        std::fs::canonicalize(path).ok().map(|p| lexical_normalize(&p)),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate == base_n || candidate.starts_with(&base_n) {
+            return Err(crate::RuntimeError::DeniedBind {
+                path: candidate,
+                base: base_n,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl SandboxProfile {
     /// Derive the default-deny profile from `action`'s approved scope.
     ///
@@ -86,6 +160,73 @@ impl SandboxProfile {
 
 #[cfg(test)]
 mod tests {
+    use super::refuse_denied_bind;
+    use std::path::Path;
+
+    const BASE: &str = "/run/delphi";
+
+    /// D0A-R9-10. Every shape that names the daemon's runtime directory, including
+    /// the ones a lexical prefix compare alone would miss (class 14 — a guard must
+    /// cover all FORMS of the thing it guards).
+    #[test]
+    fn every_spelling_of_the_runtime_directory_is_refused() {
+        for p in [
+            "/run/delphi",
+            "/run/delphi/alice",
+            "/run/delphi/alice/approve.sock",
+            "/run/delphi/../delphi/alice",
+            // THE DISCRIMINATING ONE. The case above starts with the prefix
+            // component-wise even UNFOLDED, so it proves nothing about normalization
+            // — found by weaken (b), which did not bite until these were added.
+            // These escape the prefix and re-enter, so only folding refuses them.
+            "/tmp/../run/delphi/alice",
+            "/run/user/../delphi/alice",
+            "/run/./delphi/alice",
+            "/run/delphi/alice/../alice",
+        ] {
+            assert!(
+                refuse_denied_bind(Path::new(p), Path::new(BASE)).is_err(),
+                "must refuse `{p}`"
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL (class 35): without this, "the runtime dir is refused" cannot
+    /// be told apart from "everything is refused".
+    #[test]
+    fn ordinary_paths_are_allowed() {
+        for p in ["/home/alice/src", "/usr", "/run/user/1000", "/run/delphi-other"] {
+            assert!(
+                refuse_denied_bind(Path::new(p), Path::new(BASE)).is_ok(),
+                "must allow `{p}`"
+            );
+        }
+    }
+
+    /// `/run/delphi-other` is the one a naive `starts_with` on the STRING admits as a
+    /// prefix match and wrongly refuses; component-wise `starts_with` does not.
+    #[test]
+    fn a_sibling_sharing_a_string_prefix_is_not_refused() {
+        assert!(refuse_denied_bind(Path::new("/run/delphi-other/x"), Path::new(BASE)).is_ok());
+    }
+
+    /// A symlink INTO the runtime directory is resolved and refused. This is the
+    /// canonicalize leg; it does not close D0A-R9-03, whose swap happens after it.
+    #[test]
+    fn a_symlink_into_the_runtime_directory_is_resolved_and_refused() {
+        let dir = std::env::temp_dir().join(format!("delphi-denylist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Base at the symlink's TARGET: the link's own path is outside it lexically,
+        // so only the resolved form can refuse this.
+        assert!(refuse_denied_bind(&link, &target).is_err(), "resolved form must refuse");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
     use std::path::PathBuf;
     use std::time::Duration;

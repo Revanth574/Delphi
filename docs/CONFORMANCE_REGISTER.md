@@ -26,8 +26,18 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §6 | "mount exactly `fs_binds`" | **PARTIAL** — bind sources are **path-resolved at launch**, so a symlink swap substitutes scope | D0A-R9-03 | binds resolve to what was approved, TOCTOU-proven |
 | §6 | "env is scrubbed to `env_delta`" | **LEAKS** — `env_delta` is passed in **bwrap's argv**, world-readable via `/proc/<pid>/cmdline` | D0A-R9-06 | secrets never transit argv |
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
-| §6 | "a uid that **cannot reach daemon IPC**" (the *check* side) | **VACUOUS IN A REACHABLE DEPLOYMENT** — `expected_uid` comes from `User::from_name(&session)` where `session` is the systemd instance name (`ExecStart=… --session %i`), **unvalidated**. `delphi-runtimed@root` sets `expected_uid = 0`; the root-running tool then reads back `SO_PEERCRED uid=0` and **matches**. Keystone breached with no attacker step and no remediation applied | **D0A-R9-11** (measurement 4) | the daemon refuses a root session user, RED-proven |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | a denylist refuses the daemon's runtime directory, RED-proven — **and it must land WITH the dedicated uid, since each is the other's only backstop** |
+
+**CLOSED — D0A-R9-11 (2026-08-15).** The daemon now refuses to serve a **system account**
+before the anchor: `uid == 0`, or outside the system's own `UID_MIN..=UID_MAX` from
+`/etc/login.defs`. Rejected as a **class**, not an instance — `UID_MIN` alone would have admitted
+`nobody` (uid 65534, above `UID_MIN` **and** above `UID_MAX`, which is the bound that excludes
+it). Both weakens verified to bite: removing the guard call makes the integration test fail with
+`got: Error: establishing the root-owned runtime directory` — the daemon proceeding past user
+resolution, which is the breach; narrowing the guard to `uid == 0` makes the class test fail on
+`daemon`/`bin`/`nobody`. Paired with a positive control so "root is refused" cannot be confused
+with "everything is refused". The row is removed from the table above per this register's rule
+that a row leaves only when a test proves it closed.
 
 **Proof-thinness (not clause violations, recorded so they are not mistaken for coverage):**
 D0A-R9-08 — the "exact approved scope" test ignores unsupported grant options, env fidelity,

@@ -84,6 +84,58 @@ impl Drop for ChildReaper {
 }
 
 
+/// Where the system declares the lowest uid it considers a regular login user.
+const LOGIN_DEFS: &str = "/etc/login.defs";
+
+/// Used when `/etc/login.defs` is absent or declares no bound.
+const DEFAULT_UID_MIN: u32 = 1000;
+const DEFAULT_UID_MAX: u32 = 60000;
+
+fn login_defs_key(text: &str, key: &str, default: u32) -> u32 {
+    text.lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find(|(k, _)| k.trim() == key)
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read the system's own regular-login-user range rather than hardcoding a threshold
+/// (`docs/DEFECT_CLASSES.md` class 4 — authoritative category, not hand-enumeration).
+///
+/// **Both ends are load-bearing.** `UID_MIN` alone would admit `nobody`, whose uid is
+/// 65534 on Debian/Ubuntu — above `UID_MIN`, and above `UID_MAX` (60000), which is the
+/// bound that actually excludes it.
+fn login_defs_uid_range(path: &std::path::Path) -> (u32, u32) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (DEFAULT_UID_MIN, DEFAULT_UID_MAX);
+    };
+    (
+        login_defs_key(&text, "UID_MIN", DEFAULT_UID_MIN),
+        login_defs_key(&text, "UID_MAX", DEFAULT_UID_MAX),
+    )
+}
+
+/// Refuse to serve a system account. `--session` comes from the unit's `%i` and is
+/// unvalidated, so `delphi-runtimed@root` instantiates as readily as a real user —
+/// and then `expected_uid` is 0, the requester check compares 0 to 0, and the
+/// root-launched tool is admitted as its own approver (D0A-R9-11).
+///
+/// The class, not the instance: `@daemon` and `@nobody` instantiate just as easily.
+fn refuse_system_account(name: &str, uid: u32, (uid_min, uid_max): (u32, u32)) -> Result<()> {
+    // `uid == 0` is held separately so the guard survives a `UID_MIN` of 0, which would
+    // otherwise disable it at the one value that matters most.
+    if uid == 0 || uid < uid_min || uid > uid_max {
+        bail!(
+            "refusing to serve system account `{name}` (uid {uid}): --session must name a \
+             regular login user ({uid_min}..={uid_max}, per {LOGIN_DEFS}). A system account \
+             makes the requester check vacuous — at uid 0 it compares 0 to 0 and admits the \
+             sandboxed tool itself as the approver (D0A-R9-11)."
+        );
+    }
+    Ok(())
+}
+
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -95,6 +147,12 @@ fn main() -> Result<()> {
     let user = User::from_name(&session)
         .with_context(|| format!("resolving session user `{session}`"))?
         .with_context(|| format!("no such session user `{session}`"))?;
+    // BEFORE the anchor: a refusal here must precede any system-state change.
+    refuse_system_account(
+        &session,
+        user.uid.as_raw(),
+        login_defs_uid_range(std::path::Path::new(LOGIN_DEFS)),
+    )?;
 
     // ── 1a: the root anchor ──────────────────────────────────────────────────
     let dir = ensure_runtime_dir(std::path::Path::new(DEFAULT_RUNTIME_BASE), &session)
@@ -300,5 +358,50 @@ fn parse_session_arg(mut args: impl Iterator<Item = String>) -> Result<String> {
         Some("--session") => args.next().context("`--session` requires a <username> argument"),
         Some(other) => bail!("unexpected argument `{other}`; usage: delphi-runtimed --session <username>"),
         None => bail!("missing `--session <username>`; usage: delphi-runtimed --session <username>"),
+    }
+}
+
+#[cfg(test)]
+mod system_account_guard {
+    use super::*;
+
+    /// The CLASS, enumerated (`docs/DEFECT_CLASSES.md` class 17): the reported instance
+    /// was `root`, and it is one of several. `nobody` is the one a `UID_MIN`-only guard
+    /// admits, which is why `UID_MAX` is in the range.
+    #[test]
+    fn every_system_account_shape_is_refused() {
+        let range = (1000, 60000);
+        for (name, uid) in [("root", 0), ("daemon", 1), ("bin", 2), ("nobody", 65534)] {
+            let err = refuse_system_account(name, uid, range)
+                .expect_err("system account must be refused")
+                .to_string();
+            assert!(err.contains(name) && err.contains(&uid.to_string()), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_regular_uid_is_admitted() {
+        assert!(refuse_system_account("alice", 1000, (1000, 60000)).is_ok());
+        assert!(refuse_system_account("bob", 60000, (1000, 60000)).is_ok());
+    }
+
+    /// A `UID_MIN` of 0 must not disable the guard for root.
+    #[test]
+    fn root_is_refused_even_when_the_range_would_admit_it() {
+        assert!(refuse_system_account("root", 0, (0, 60000)).is_err());
+    }
+
+    #[test]
+    fn range_is_read_from_login_defs_and_falls_back_when_absent() {
+        let dir = std::env::temp_dir().join(format!("delphi-logindefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("login.defs");
+        std::fs::write(&f, "# comment\nUID_MIN\t\t 500\nUID_MAX\t\t 50000\n").unwrap();
+        assert_eq!(login_defs_uid_range(&f), (500, 50000));
+        assert_eq!(
+            login_defs_uid_range(&dir.join("absent")),
+            (DEFAULT_UID_MIN, DEFAULT_UID_MAX)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

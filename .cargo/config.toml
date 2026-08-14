@@ -1,21 +1,20 @@
 # Delphi workspace Cargo configuration.
 #
-# Build artifacts are pinned to a WSL-native target directory so they live on
-# the Linux filesystem instead of the /mnt/c 9p mount (the mount is dramatically
-# slower for the heavily-churned target dir). This retires the previous manual
-# discipline of prefixing every cargo invocation with
-#   export CARGO_TARGET_DIR=/home/raven/delphi-target
+# NO `build.target-dir` PIN — cargo's default (`<workspace>/target`, already
+# gitignored) is used, because it is the only value that works on every tree
+# without per-machine setup.
 #
-# DEVELOPER-LOCAL ASSUMPTION (be honest about this — CODEBASE_REVIEW.md INF-6
-# flagged hardcoded paths as a cross-OS hazard, and cargo config cannot express a
-# per-OS target-dir cleanly). The path below is specific to the primary WSL dev
-# environment (Linux user `raven`). Adjust for your environment:
-#   * other WSL users  : change `raven` to your username, or any fast Linux path
-#   * native Windows / macOS / Linux : comment the [build] block out entirely
-#                        (cargo's default ./target is correct there)
-#   * CI               : set CARGO_TARGET_DIR in the workflow (the env var
-#                        overrides this file), so CI never depends on /home/raven
+# WHY THIS CHANGED (2026-08-15). This file pinned
+#     target-dir = "/home/raven/delphi-target"
+# to keep artifacts off WSL's slow /mnt/c 9p mount. That path exists on exactly
+# one machine, so on every other tree the FIRST cargo command of a session died
+# with `failed to create directory /home/raven: Permission denied (os error 13)`
+# — an error naming neither this file nor the fix. A default that hard-fails
+# everywhere but one box is worse than one that is merely slower on one box:
+# the failure is guaranteed, cryptic, and arrives before any work can start.
 #
-# The CARGO_TARGET_DIR environment variable always overrides this setting.
-[build]
-target-dir = "/home/raven/delphi-target"
+# IF YOUR REPO IS ON A SLOW MOUNT (WSL under /mnt/c, a network share), opt IN:
+#     export CARGO_TARGET_DIR="$HOME/delphi-target"
+# The env var overrides this file and outranks anything writable here. Put it in
+# your shell profile, so the setting lives with the environment that needs it
+# rather than in the repo shared by environments that do not. CI sets its own.

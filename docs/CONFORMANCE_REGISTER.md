@@ -91,20 +91,40 @@ change the credential the kernel reports outside it.** A fix built on `--uid` wo
 non-root `id -u` inside the jail while remaining the launcher's uid to every check performed
 outside — cosmetic, and it would read as correct.
 
-**This negative is satisfiable two ways** (standard 3, applied to my own measurement): either
+**The negative was satisfiable two ways** (standard 3, applied to my own measurement): either
 (a) `--uid` never changes the outside credential, or (b) an *unprivileged* launcher owns exactly
-one id, so no other result was possible. The unprivileged leg cannot discriminate. **The root
-leg does** — root owns every id, so if `--uid 65534` still reports 0 outside, (a) holds.
+one id, so no other result was possible. The unprivileged leg could not discriminate.
 
-**Outstanding, and it is the operator's to run:**
+**RESOLVED — root leg run 2026-08-13. Both predictions confirmed, and leg B now discriminates:**
 
 ```
-sudo ./scratch/d1-peercred-probe.sh
+LEG A (as shipped):   INNER uid=0       →  SO_PEERCRED uid=0
+LEG B (--uid 65534):  INNER uid=65534   →  SO_PEERCRED uid=0
 ```
 
-Predictions, recorded before the run so they score: **leg A → `SO_PEERCRED uid=0`** (keystone
-holds today, by root). **Leg B → `SO_PEERCRED uid=0`** (`--uid` is inside-only; the fix needs a
-real credential change — `setresuid`/`setgid`/`setgroups` before `execve`, or systemd `User=`).
+Root had **two ids available** and `--uid 65534` still produced `uid=0` outside, so explanation
+**(a)** holds: **`--uid` is namespace-internal only.** The obvious remediation is cosmetic — it
+would pass review while changing nothing an outside check can see.
+
+**Therefore the fix is a real credential change before `execve`** — `setresuid` / `setgid` /
+`setgroups`, or a systemd `User=` — **never a bwrap flag.**
+
+**Leg A also closes D0A-R9-11's chain end to end.** The root-launched jail presents as `uid=0` to
+the listener; `delphi-runtimed@root` sets `expected_uid = 0` from the unvalidated `%i`; the peer
+check compares 0 to 0 and **passes**. No attacker step, no remediation applied — the keystone
+falls on a **supported unit instantiation**.
+
+## An unexplained divergence in this file — recorded, not closed
+
+Between the 2026-08-12 and 2026-08-13 commits, this register's working-tree copy contained the
+D0A-R9-11 row and an M1–M4 results section **that I did not write**, citing the probe's exact
+`pid=5304`. Every claim in it was checked against the probe's own output before it was committed,
+and all of them hold.
+
+**That disposition is not the same as knowing where it came from, and this entry exists to keep
+those two apart.** The scripted edit that would have overwritten it **asserted NO MATCH and wrote
+nothing** — the assert-every-replacement rule is the only reason the divergence is visible at all
+rather than silently destroyed. Left **unexplained**; not to be written up later as resolved.
 
 ## Scheduling — decided 2026-08-12
 

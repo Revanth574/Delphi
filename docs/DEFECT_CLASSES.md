@@ -2153,6 +2153,44 @@ false claim, the second is an unsupported one.
 
 ---
 
+## 39. A first-ordered check that never fires in time  *(new — the D1 measurement session; a DISCIPLINE failure, and the corpus's first entry with nothing to build)*
+
+**The root filesystem reached 97% (1.5 G free). Git wrote six zero-byte objects, advanced the
+branch ref to one of them, and corrupted `.git/index`.** `fatal: could not parse HEAD`. No commits
+were lost — the reflog named the last good commit and every *reachable* object still read cleanly
+— but the tree was one careless `--hard` away from real loss.
+
+**It presented as a Python `AssertionError`.** That assert was correct and was firing for an
+unrelated reason. Then it presented as git object corruption. **Two layers of misattribution
+before the substrate was suspected.**
+
+**Why this is not Class 29.** 29 is a resource the *test* owns, leaking across iterations,
+presenting as flakiness. This is a **global** resource whose exhaustion presents as an unrelated
+tool's bug — and, crucially, one whose check **already existed and was already ordered first**.
+
+**The distinguishing fact, and the reason the remedy differs from every other entry here:
+`scripts/check-free-space.sh` exists, names WHICH path is short, and §13.4 orders it FIRST. It
+would have caught this. It was not run.** There is nothing to extract. Every other class in this
+corpus ends in a primitive or a rule that did not exist yet; this one ends in a rule that did.
+
+**Where the discipline actually fails, stated precisely rather than as "remember to run it":**
+§13.4's audit runs at the **end** of a work block. Exhaustion corrupts **during** one. A check
+ordered first *within a terminal audit* still runs after the damage. The defect is in the
+**trigger**, not the tool.
+
+**Foreclosing discipline (two triggers, not one):**
+
+1. Run the space check at the **start** of a block and before any **bulk write** — a multi-file
+   commit, a cargo build, a full test run — not only in the closing audit.
+2. **On any unexplained tool failure, check the shared substrate before diagnosing the tool.**
+
+**This extends Iron Law #15 clause 5 one layer down.** Clause 5 says suspect the *harness* before
+the code. This says suspect the *substrate* before the harness — and it inherits clause 5's
+asymmetry unchanged: substrate exhaustion must be **demonstrated** (`df`, the checker's own
+output), never offered as a guess to explain an inconvenient red.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2196,3 +2234,4 @@ false claim, the second is an unsupported one.
 | 34. A deferral is an untested claim | quote the MEASURED blocker (skip line, error, missing file) in the ledger entry — never an environment category | Discipline |
 | 35. Cited boundary → falsifier design | ask a citation for its own boundary, build the configuration inside it, and PAIR it with a positive control | Technique |
 | 32. Mechanical substitution, undocumented property | ask at substitution: **what unstated property is the caller relying on?**; make it explicit in the replacement rather than trusting the new default | Discipline |
+| 39. First-ordered check that never fires in time | discipline — **the mechanism already exists** (`scripts/check-free-space.sh`): run it at block START and before any bulk write; on an unexplained tool failure suspect the SUBSTRATE before the harness | Discipline (nothing to extract) |

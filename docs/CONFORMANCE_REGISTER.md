@@ -26,7 +26,7 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §6 | "mount exactly `fs_binds`" | **PARTIAL** — bind sources are **path-resolved at launch**, so a symlink swap substitutes scope | D0A-R9-03 | binds resolve to what was approved, TOCTOU-proven |
 | §6 | "env is scrubbed to `env_delta`" | **LEAKS** — `env_delta` is passed in **bwrap's argv**, world-readable via `/proc/<pid>/cmdline` | D0A-R9-06 | secrets never transit argv |
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
-| §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | a denylist refuses the daemon's runtime directory, RED-proven — **and it must land WITH the dedicated uid, since each is the other's only backstop** |
+| §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | a denylist refuses the daemon's runtime directory, RED-proven — **lands WITH the dedicated uid, because without it root overrides DAC and this denylist is the SOLE barrier** (see Scheduling: the halves are asymmetric, not mutual) |
 
 **CLOSED — D0A-R9-11 (2026-08-15).** The daemon now refuses to serve a **system account**
 before the anchor: `uid == 0`, or outside the system's own `UID_MIN..=UID_MAX` from
@@ -142,12 +142,37 @@ rather than silently destroyed. Left **unexplained**; not to be written up later
 boundary means re-reviewing all of it later): **D0A-R9-01 + D0A-R9-10 TOGETHER**, and
 **D0A-R9-06**.
 
-**R9-01 and R9-10 are one item, not two.** Dropping to an unprivileged uid without the denylist
-*removes* today's protection; the denylist without the uid leaves the §6 clause violated. Each
-is the other's only backstop, so shipping either alone is a regression in one direction or a
-half-measure in the other. The uid must be a **dedicated service uid**, distinct from the
-session uid — chosen up front, because `SO_PEERCRED` equality is what makes "which uid" the
-whole decision.
+**R9-01 and R9-10 land together — but NOT because "each is the other's only backstop", which is
+what this register said until 2026-08-15 and is wrong. Corrected before the fix, not with it,
+because an overstated row reads as established and gets cited.**
+
+Measured: the approval socket is `root:<session-gid>` mode **0660** (`anchor.rs`, "group-
+connectable, owner stays root"), and `/run/delphi/<session>` is **0711** root-owned. A bind mount
+preserves both. So the two halves are **asymmetric**:
+
+- **Denylist alone** (the tool still root): root **overrides DAC**, so mode bits stop nothing and
+  absence-from-the-mount-namespace is the **sole** barrier. One mechanism, one failure.
+- **Uid alone** (no denylist): a `delphi-tool` peer is stopped by the socket's **mode** *and* by
+  the **`SO_PEERCRED`** mismatch. Two independent mechanisms, neither of them the denylist.
+
+**So the uid is the ENABLING change and the denylist is defence in depth on top of it — while
+the tool is root, the mode bits provide nothing at all.** They ship together because the denylist
+is a single point of failure without the uid, not because they mutually backstop. The uid must be
+a **dedicated service uid**, distinct from the session uid, since `SO_PEERCRED` equality is what
+makes "which uid" the whole decision.
+
+**`DynamicUser=` is STRUCTURALLY EXCLUDED, not merely unattractive — recorded so it is not
+re-proposed.** It applies to a **systemd unit**; the tool is a child the root daemon *forks*
+inside bwrap and is not a unit. Making it one requires `systemd-run` per action, which this
+register's own scope cap forbids. Dynamic uid **recycling** is a separate hazard against files a
+prior tenant left behind. Provisioning is therefore a **static system account created by the
+installer**.
+
+**Predicted, before implementation, so it is not later misread as breakage:** dropping the tool
+off root **removes its access to root-owned bound paths**. That is the point of the change. Any
+test that fails because of it is **correct**, and the finding is that the test depended on the
+tool being root — widening the new uid's access to turn that red green would be the weaken this
+project forbids.
 
 **Schedulable:** seccomp (R9-05) and cgroups (R9-04). **Scope cap, deliberate:** seccomp policy
 for *arbitrary tools* is open-ended and must not become the next Phase 3B. D1 ships a policy for

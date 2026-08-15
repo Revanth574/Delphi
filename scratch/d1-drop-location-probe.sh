@@ -45,6 +45,18 @@ PY
 # first OPEN a script adds a failure mode that has nothing to do with what is measured —
 # it is what made leg E inconclusive on the first run.
 PAYLOAD='
+import os, sys
+# WHY the connect fails, not just THAT it does. Walk the path and report search
+# permission per component: the first False is the blocking directory. Three
+# consecutive failures here were diagnosed by guessing; this one is measured.
+p = "/"
+for part in sys.argv[1].split("/")[1:-1]:
+    p = os.path.join(p, part)
+    try:
+        st = os.stat(p)
+        print("  COMPONENT %-28s mode=%o uid=%d X_OK=%s" % (p, st.st_mode & 0o7777, st.st_uid, os.access(p, os.X_OK)), flush=True)
+    except OSError as e:
+        print("  COMPONENT %-28s UNREACHABLE: %s" % (p, e), flush=True); break
 import os, socket, sys, time
 print("  INNER id: %d:%d" % (os.getuid(), os.getgid()), flush=True)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -96,6 +108,52 @@ leg "E: bwrap as root, every namespace EXCEPT user, payload drops to the real ui
   bwrap --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try --unshare-net \
   "${BASE[@]}" -- \
   setpriv --reuid="$TUID" --regid="$TGID" --clear-groups -- /usr/bin/python3 -c "$PAYLOAD" "$SOCK"
+
+# E2 — the OBSERVATION half, over an ABSTRACT socket (no filesystem path at all).
+# NARROWING, not weakening (Iron Law #15 clause 3): --unshare-net is not part of the
+# property (which uid the kernel reports for a peer) and is exactly what blocks the
+# observation channel. E already proved bwrap builds the jail WITH it.
+if [ "$ONLY" = E2 ] || [ -z "$ONLY" ]; then
+  RAN=$((RAN + 1))
+  echo "── E2: no userns, netns SHARED, abstract socket — the payload connects itself"
+  python3 - "$TUID" "$TGID" <<'E2PY' &
+import os, socket, struct, subprocess, sys
+uid, gid = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind("\0delphi-d1-probe"); s.listen(1); s.settimeout(20)
+print("  listener bound to abstract name (no filesystem path)", flush=True)
+open("/tmp/.d1-e2-ready", "w").close()
+try:
+    c, _ = s.accept()
+    pid, u, g = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    print(f"  SO_PEERCRED uid={u} gid={g}", flush=True)
+except socket.timeout:
+    print("  SO_PEERCRED: (no peer connected)", flush=True)
+E2PY
+  LP=$!
+  for _ in $(seq 1 40); do [ -e /tmp/.d1-e2-ready ] && break; sleep 0.1; done
+  rm -f /tmp/.d1-e2-ready
+  bwrap --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try \
+    --die-with-parent --new-session --clearenv --proc /proc --dev /dev \
+    --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+    --symlink usr/bin /bin --symlink usr/sbin /sbin --chdir / -- \
+    setpriv --reuid="$TUID" --regid="$TGID" --clear-groups -- \
+    /usr/bin/python3 -c '
+import os, socket, sys
+print("  INNER id: %d:%d" % (os.getuid(), os.getgid()), flush=True)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect("\0delphi-d1-probe")
+    print("  payload connected (it performed the connect, so SO_PEERCRED reflects IT)", flush=True)
+    s.send(b"x")
+    import time; time.sleep(1)
+except OSError as e:
+    print("  PAYLOAD could not connect: %s" % e, flush=True); sys.exit(4)
+' 2>&1 | sed 's/^/  /'
+  echo "  CHAIN rc=${PIPESTATUS[0]}"
+  wait $LP 2>/dev/null
+  echo
+fi
 
 # A mistyped leg name must not look like a clean run: no output and exit 0 is the
 # silent-no-op shape this project treats as a false green.

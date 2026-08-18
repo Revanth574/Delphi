@@ -103,25 +103,6 @@ pub fn execute_approved(
 /// the requester check admit the tool itself).
 pub const TOOL_ACCOUNT: &str = "delphi-tool";
 
-/// Credentials to drop to, or `None` when there is no privilege to drop.
-///
-/// Unprivileged callers cannot acquire another identity, and the action already runs
-/// as the non-root uid that started the daemon — so `None` is the honest answer, not
-/// a bypass. Running privileged with the account **absent** is a hard error: silently
-/// staying root would be the defect D0A-R9-01 names.
-fn tool_credentials() -> Result<Option<(u32, u32)>, RuntimeError> {
-    if nix::unistd::geteuid().as_raw() != 0 {
-        return Ok(None);
-    }
-    let user = nix::unistd::User::from_name(TOOL_ACCOUNT)
-        .ok()
-        .flatten()
-        .ok_or_else(|| RuntimeError::MissingToolAccount {
-            account: TOOL_ACCOUNT.to_string(),
-        })?;
-    Ok(Some((user.uid.as_raw(), user.gid.as_raw())))
-}
-
 /// R4-02: a pinned script's content fd MUST carry the FULL immutability seal set
 /// ([`ScriptPin::FULL_SEALS`] — `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
 /// F_SEAL_SEAL`) so neither its content (write) nor its length (`ftruncate`
@@ -217,33 +198,15 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // performs only `close_range`/`fcntl` + an errno read (no allocation), and
     // `io::Error::from_raw_os_error` wraps the errno integer inline — never
     // `io::Error::other`, which would `Box` (allocate).
-    // D0A-R9-01: resolved in the PARENT. `User::from_name` allocates and is not
-    // async-signal-safe, so it must never run in the forked child.
-    let creds = tool_credentials()?;
+    // SAFETY: pre_exec runs in the forked child between fork and execve, so it must
+    // be async-signal-safe and MUST NOT allocate (a malloc could deadlock on the
+    // allocator lock if a non-surviving thread held it). `mark_cloexec_except_raw`
+    // performs only `close_range`/`fcntl` + an errno read (no allocation), and
+    // `io::Error::from_raw_os_error` wraps the errno integer inline.
     unsafe {
         cmd.pre_exec(move || {
             crate::fdsec::mark_cloexec_except_raw(&keep)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-            // D0A-R9-01 — drop off root before `execve`. Leg B of the peercred probe
-            // measured that bwrap's `--uid` changes only the id INSIDE the namespace
-            // (`INNER 65534` / `SO_PEERCRED 0`), so only a real credential change is
-            // visible to the daemon's socket or the host filesystem.
-            //
-            // Order is load-bearing and each step needs the privilege the next drops:
-            // supplementary groups first (setgroups requires CAP_SETGID), then gid,
-            // then uid last. All three are raw syscalls — no allocation, per the
-            // SAFETY note above.
-            // SAFETY (inherited from the enclosing block): these drop this child's own
-            // credentials and touch no caller memory — `setgroups(0, NULL)` clears the
-            // supplementary set.
-            if let Some((uid, gid)) = creds
-                && (nix::libc::setgroups(0, std::ptr::null()) != 0
-                    || nix::libc::setresgid(gid, gid, gid) != 0
-                    || nix::libc::setresuid(uid, uid, uid) != 0)
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
         });
     }
     cmd.output().map_err(|source| RuntimeError::Filesystem {
@@ -430,11 +393,15 @@ mod tests {
 
     /// D0A-R9-01 — the approved action runs as the dedicated tool account, not root.
     ///
-    /// **ROOT-GATED, and the blocker is the measured one, not an environment name
-    /// (class 34).** Below root, `tool_credentials()` returns `None` because there is
-    /// no privilege to drop and no way to acquire another identity — so unprivileged
-    /// this test could only assert the test user's own uid, which holds with AND
-    /// without the fix (PASS/PASS, worthless per Iron Law #15 clause 2).
+    /// **THIS IS A RED. D0A-R9-01 IS OPEN.** The `pre_exec` credential drop was
+    /// reverted (it made bwrap fail its own sandbox setup — `RTM_NEWADDR`, because
+    /// bwrap was already dropped and could not bring up loopback). This test fails at
+    /// root until the drop re-lands in a measured shape, and that is the honest state.
+    ///
+    /// **ROOT-GATED, blocker measured rather than named (class 34):** unprivileged
+    /// there is no privilege to drop and no way to acquire another identity, so the
+    /// test could only assert the test user's own uid — true with AND without the fix
+    /// (PASS/PASS, worthless per Iron Law #15 clause 2).
     #[test]
     fn an_approved_action_runs_as_the_tool_account_not_root() {
         if !bwrap_available() {
@@ -442,7 +409,7 @@ mod tests {
             return;
         }
         if nix::unistd::geteuid().as_raw() != 0 {
-            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: requires root — measured blocker: geteuid() != 0, so tool_credentials() returns None and no drop engages");
+            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: requires root — measured blocker: geteuid() != 0, so no credential drop is possible at all");
             return;
         }
         let Ok(Some(tool)) = nix::unistd::User::from_name(TOOL_ACCOUNT) else {

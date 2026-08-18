@@ -158,12 +158,6 @@ pub enum RuntimeError {
     #[error("execution denied: `{}` is inside the daemon's runtime directory `{}` — an action may not mount the approval socket or anchor into its own jail (TRUST_MODEL.md §6, D0A-R9-10)", path.display(), base.display())]
     DeniedBind { path: std::path::PathBuf, base: std::path::PathBuf },
 
-    /// The dedicated tool account is missing while running privileged (D0A-R9-01).
-    /// Fail closed: without it there is no unprivileged identity to drop to, and
-    /// running the action as root is the defect itself.
-    #[error("execution denied: the tool account `{account}` does not exist, so the action cannot be dropped off root. Create it: `useradd --system --no-create-home --shell /usr/sbin/nologin {account}` (TRUST_MODEL.md §6, D0A-R9-01)")]
-    MissingToolAccount { account: String },
-
     /// A wire-protocol fault on the AI↔daemon general socket (B1) — a malformed
     /// frame, an oversized message, a decode failure, or an unexpected message for
     /// the current state. Never carries user data.

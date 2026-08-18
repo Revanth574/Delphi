@@ -74,7 +74,11 @@ FPY
   # NOTE: netns is NOT unshared here, for the same reason as E2 — an abstract socket is
   # the only observation channel with no traversal, and abstract names are netns-scoped.
   # Whether the jail BUILDS with --unshare-net in this userns is the second line below.
-  bwrap --userns "/proc/$HPID/ns/user" --uid 0 --gid 0 \
+  # `--userns FD` is an fd NUMBER, not a path — passing the path made bwrap reject the
+  # ARGUMENT ("Invalid fd"), so the mapping was never exercised. Explicitly numbered bash
+  # fds are inherited across exec (verified), unlike `{var}<` which bash marks CLOEXEC.
+  exec 9< "/proc/$HPID/ns/user" || { echo "  cannot open the holder's userns"; kill $HOLDER; exit 1; }
+  bwrap --userns 9 --uid 0 --gid 0 \
     --unshare-ipc --unshare-pid --unshare-uts --die-with-parent --new-session \
     --clearenv --proc /proc --dev /dev --ro-bind /usr /usr \
     --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin \
@@ -93,11 +97,12 @@ except OSError as e:
   wait $LP 2>/dev/null
 
   echo "  --- does the SAME userns still build a netns (the leg-C failure)? ---"
-  bwrap --userns "/proc/$HPID/ns/user" --uid 0 --gid 0 --unshare-net --unshare-ipc \
+  bwrap --userns 9 --uid 0 --gid 0 --unshare-net --unshare-ipc \
     --die-with-parent --clearenv --proc /proc --ro-bind /usr /usr \
     --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
     --chdir / -- /usr/bin/true 2>&1 | sed 's/^/  /'
   echo "  NETNS rc=${PIPESTATUS[0]}   (0 = loopback came up; the E trade may be unnecessary)"
+  exec 9<&-
   kill $HOLDER 2>/dev/null; wait $HOLDER 2>/dev/null
   echo
 fi
@@ -119,26 +124,38 @@ import time; time.sleep(300)
   chmod 0660 "$SESS/approve.sock"
   echo "  host modes: $(stat -c '%n %a %U:%G' "$BASE" "$SESS" "$SESS/approve.sock" | tr '\n' ' ')"
 
-  bwrap --unshare-ipc --unshare-pid --die-with-parent --clearenv --proc /proc \
-    --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
-    --symlink usr/lib64 /lib64 --bind "$BASE" "$BASE" --chdir / -- \
-    setpriv --reuid="$TUID" --regid="$TGID" --clear-groups -- \
-    /usr/bin/python3 -c '
+  # `--perms 0755 --dir /run` FIRST: bwrap otherwise auto-creates /run as 0700 owned by
+  # the sandbox uid (measured), so a dropped payload never reaches the modes under test
+  # and P's refusal would be indistinguishable from its success condition.
+  run_leg() {   # label  socket-mode  expectation
+    echo "  -- $1 (socket mode $2)"
+    chmod "$2" "$SESS/approve.sock"
+    bwrap --unshare-ipc --unshare-pid --die-with-parent --clearenv --proc /proc \
+      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
+      --symlink usr/lib64 /lib64 --perms 0755 --dir /run --bind "$BASE" "$BASE" \
+      --chdir / -- \
+      setpriv --reuid="$TUID" --regid="$TGID" --clear-groups -- \
+      /usr/bin/python3 -c '
 import os, socket, sys
 p = "/"
 for part in sys.argv[1].split("/")[1:-1]:
     p = os.path.join(p, part)
     try:
         st = os.stat(p)
-        print("  COMPONENT %-26s mode=%o uid=%d X_OK=%s" % (p, st.st_mode & 0o7777, st.st_uid, os.access(p, os.X_OK)), flush=True)
+        print("    %-26s mode=%o uid=%d X_OK=%s" % (p, st.st_mode & 0o7777, st.st_uid, os.access(p, os.X_OK)), flush=True)
     except OSError as e:
-        print("  COMPONENT %-26s UNREACHABLE: %s" % (p, e), flush=True); sys.exit(5)
+        print("    %-26s UNREACHABLE: %s" % (p, e), flush=True); sys.exit(5)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
-    s.connect(sys.argv[1]); print("  CONNECTED — the tool CAN reach the approval socket", flush=True)
+    s.connect(sys.argv[1]); print("    CONNECTED", flush=True)
 except OSError as e:
-    print("  REFUSED: %s   <-- production would fail here too" % e, flush=True)
+    print("    REFUSED: %s" % e, flush=True)
 ' "$SESS/approve.sock" 2>&1 | sed 's/^/  /'
+  }
+  # POSITIVE CONTROL FIRST. Without it a refusal caused by traversal is indistinguishable
+  # from a refusal caused by the mode — which is exactly how this leg failed before.
+  run_leg "POSITIVE CONTROL: must CONNECT, or the refusal below proves nothing" 0666
+  run_leg "THE REAL TEST: production 0660 root:<session-gid>, must be REFUSED" 0660
   kill $PL 2>/dev/null; wait $PL 2>/dev/null; rm -rf "$BASE"
   echo
 fi

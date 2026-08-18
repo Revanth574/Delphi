@@ -2191,6 +2191,46 @@ output), never offered as a guess to explain an inconvenient red.
 
 ---
 
+## 40. The sandbox's own scaffolding blocks the measurement  *(new — D0A-R9-01; THREE instances before it was named)*
+
+**Measured, unprivileged, in one command:**
+
+```
+/run             mode=700 uid=1000     <- auto-created intermediate
+/run/deep        mode=700 uid=1000     <- auto-created intermediate
+/run/deep/probe  mode=777 uid=1000     <- the bind, showing the SOURCE's mode
+```
+
+**bwrap creates every auto-intermediate directory as `0700`, owned by the sandbox uid.** Only the
+bind target itself carries the source's mode. So any measurement of a path beneath a bind whose
+parent does not already exist in the jail measures **the scaffolding, not the property**.
+
+**Three instances before it was named**, which is what earns it an entry: leg E died on `/tmp`
+three times (diagnosed by guessing twice, then by walking the path), and leg P then died on
+`/run` — a different path, the same cause, one round later.
+
+**Why it is more than a probe nuisance — it is a PRODUCTION constraint on D0A-R9-01.** The
+sandbox uid is whoever ran bwrap:
+
+* If the payload keeps the uid bwrap ran as, it **owns** the `0700` intermediates and traverses
+  them. This is why the defect was invisible while the tool ran as root.
+* If the payload **drops to a different uid**, every bind under a not-yet-existing parent becomes
+  unreachable to it. Closing that requires the profile to emit `--perms 0755 --dir <ancestor>`
+  for **every ancestor of every approved bind** — real complexity for arbitrary paths, and a
+  requirement that only appears once the tool stops being root.
+
+**Foreclosing discipline, two parts:**
+
+1. **In production:** a profile that drops the payload's uid must create the ancestors of every
+   bind explicitly, with traversable modes. Never rely on bwrap's defaults.
+2. **In any probe:** pair the measurement with a **positive control** (class 35). A traversal
+   failure and the property being measured are frequently indistinguishable — leg P's desired
+   result was a *refused* connect, so scaffolding that blocked traversal produced the exact
+   output a success would produce. **A probe whose failure mode is indistinguishable from its
+   success condition is not a measurement.**
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2235,3 +2275,4 @@ output), never offered as a guess to explain an inconvenient red.
 | 35. Cited boundary → falsifier design | ask a citation for its own boundary, build the configuration inside it, and PAIR it with a positive control | Technique |
 | 32. Mechanical substitution, undocumented property | ask at substitution: **what unstated property is the caller relying on?**; make it explicit in the replacement rather than trusting the new default | Discipline |
 | 39. First-ordered check that never fires in time | discipline — **the mechanism already exists** (`scripts/check-free-space.sh`): run it at block START and before any bulk write; on an unexplained tool failure suspect the SUBSTRATE before the harness | Discipline (nothing to extract) |
+| 40. Sandbox scaffolding blocks the measurement | bwrap auto-creates intermediates `0700` owned by the sandbox uid: emit `--perms 0755 --dir` per ancestor when the payload's uid differs, and pair every such probe with a positive control | Discipline + production constraint |

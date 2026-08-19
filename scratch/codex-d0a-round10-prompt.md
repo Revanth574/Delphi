@@ -20,9 +20,14 @@ box** — measured here at `rc=0`, with `apparmor_restrict_unprivileged_userns=1
 
 ## Target
 
-`git diff 09dadae..HEAD` — **25 commits, 19 files, +2078 / −27.** Round 9 was measured at
-`09dadae`; everything since is this round's subject. If your diff stat disagrees with that,
-say so as a finding before reviewing anything: the scope has drifted.
+`git diff 09dadae..4d3815f` — **31 commits, 20 files changed, 2492 insertions(+), 27 deletions(-).**
+
+**The ending SHA is PINNED, not `HEAD` (D0A-R10-02).** The first version said `..HEAD`
+with a manifest captured when it was written; by the time it ran, HEAD had moved and the
+manifest described a range four commits short — including the fix for the round's own
+first finding. A moving endpoint cannot be checked against a fixed manifest, which is the
+drift this instruction exists to catch. **If your diff stat disagrees with the line above,
+report it as a finding before reviewing anything.**
 
 **Read the tree through the CLI (`git show`, `git diff`), not from a supplied diff.** Verify
 library/API claims against Context7 / docs.rs / `--help` rather than memory — several findings

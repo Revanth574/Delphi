@@ -93,6 +93,42 @@ refusal that is the actual clause.** The gap between "mechanism closed" and "cla
 therefore wider than recorded, and `997` was read from a test that proves one of six things it is
 cited for.
 
+**OPENED 2026-08-16 — D0A-R10-12: the PRE-DROP window runs with initial-namespace
+capabilities.** Its own row deliberately: it is neither R9-01's mechanism (*the tool runs as
+`delphi-tool`*) nor §6's clause (*cannot reach daemon IPC*), and folding it into either would
+hide it.
+
+**What is true.** Under E, `bwrap`'s setup and `delphi-drop` up to `setresuid` execute as
+initial-namespace root **with capabilities that are no longer confined to a child user
+namespace**. Before E the same code held caps only within bwrap's userns, where
+`ns_capable(init_user_ns, …)` fails for initial-namespace objects. This is a **real enlargement of
+the pre-drop TCB's power**, not a bookkeeping change.
+
+**Why it is accepted.** Both occupants are shipped, root-owned, installer-placed components —
+the same trust class as `delphi-runtimed` itself. The decisive asymmetry is *whose code occupies
+each window*: **pre-drop holds code we wrote; post-drop holds code the user approved**, and the
+consent apparatus exists to constrain the latter. Strengthening an attacker's position inside our
+own code to weaken it inside the user's is the right direction — **and it is a trade, not
+dominance.**
+
+**The mitigation is NAMED AND UNIMPLEMENTED, which is what keeps this from being a
+rationalization:** restrict the helper payload to the minimal `CAP_SETUID`/`CAP_SETGID` set. A
+named unimplemented mitigation is an obligation; an unexamined acceptance is a hole.
+
+**The reviewer's alternative — retain a mapped user namespace — is NOT available**, and is
+recorded as closed rather than unexplored: that is leg F, abandoned after three harness failures
+(path-instead-of-fd, then `EOVERFLOW` from bwrap's newroot setup wanting an id outside a
+single-entry map). It was never falsified, only unmeasured.
+
+**Closes when** either the helper runs with the minimal capability set, or the window is measured
+and the trade re-decided against that measurement.
+
+**BOUNDED BY EVIDENCE, NOT ASSUMED SHORT (obligation, 2026-08-16).** "The pre-drop window is
+short" is currently an **intuition**. bwrap's setup does mount work, `--dir` creation and now
+ancestor emission; the helper performs two `execve`s. If that is milliseconds the trade is
+comfortable; if ancestor emission on a deep path makes it materially longer, the calculus shifts.
+**Measurable rather than arguable, and not yet measured.**
+
 **AUDIT DISCONTINUITY — `sandbox_profile_digest` values are not comparable across
 2026-08-15.** `audit.rs` records a digest of the derived profile args, and two changes landed
 that alter those args for **every** action: ancestor emission (`--perms 0755 --dir <ancestor>`

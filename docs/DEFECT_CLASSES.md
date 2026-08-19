@@ -2231,6 +2231,31 @@ sandbox uid is whoever ran bwrap:
 
 ---
 
+## Calibration — the one suspicion this arc raised that did NOT hold *(2026-08-15)*
+
+Recorded deliberately, because **a rule that only ever fires correctly stops being checked**, and
+every other entry here is a suspicion that paid off.
+
+R9-01's root test passed in **0.03 s** and printed nothing. The suspicion — "too fast to have
+spawned bwrap, built a jail, exec'd a helper, dropped credentials and run a tool" — was reasonable
+and was the right instinct given this session's history of greens that could not fail.
+
+**It was wrong, and measurement is what settled it**, not argument: a full jail + `/bin/sh` +
+`id -u` takes **11 ms** on that box, and the sibling bwrap-spawning tests finish in 0.01–0.02 s.
+0.03 s was the *slow* end. The re-run, provably doing the work, took 0.01 s.
+
+**The silence was a separate and real defect** (class 38): the tool wrote `id -u` to a FILE and the
+test asserted on the contents without surfacing them, so a correct pass printed exactly what a
+vacuous one would. Two independent signals, one sound and one not — and reading them as a single
+"something is wrong here" would have sent the fix at the wrong target.
+
+**The discipline that generalises:** an anomaly flag is a hypothesis, and it owes the same
+measurement a harness excuse owes (Iron Law #15 clause 5's asymmetry, applied in the other
+direction). *Timing* is the weakest of these signals, because it has no baseline until one is
+taken — so take the baseline before spending a round on the anomaly.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

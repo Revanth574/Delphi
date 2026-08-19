@@ -154,6 +154,13 @@ preserves both. So the two halves are **asymmetric**:
   absence-from-the-mount-namespace is the **sole** barrier. One mechanism, one failure.
 - **Uid alone** (no denylist): a `delphi-tool` peer is stopped by the socket's **mode** *and* by
   the **`SO_PEERCRED`** mismatch. Two independent mechanisms, neither of them the denylist.
+  **The mode half is CONDITIONAL, and the condition is load-bearing (sharpened 2026-08-15):**
+  `0660 root:<session-gid>` excludes the tool **only while the tool is outside the session
+  group**. Put it inside — which is exactly what the naive R9-01 fix (drop to the *session* uid)
+  would do — and `0660` grants it group access. A probe run that chowned the socket to the
+  **tool's own** gid measured precisely that misconfiguration and connected; that fixture did not
+  model production (`bind_approval_socket(&dir, session_gid)`), so it is **not** evidence the mode
+  fails, but it is a live warning about which uid is chosen.
 
 **So the uid is the ENABLING change and the denylist is defence in depth on top of it — while
 the tool is root, the mode bits provide nothing at all.** They ship together because the denylist

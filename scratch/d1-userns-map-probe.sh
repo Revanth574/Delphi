@@ -120,7 +120,19 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(sys.argv[1]); s.li
 import time; time.sleep(300)
 ' "$SESS/approve.sock" & PL=$!
   for _ in $(seq 1 40); do [ -S "$SESS/approve.sock" ] && break; sleep 0.1; done
-  chown root:"$TGID" "$SESS/approve.sock" 2>/dev/null || true
+  # PRODUCTION'S GROUP IS THE **SESSION USER'S**, NOT THE TOOL'S.
+  # anchor.rs: bind_approval_socket(&dir, session_gid); delphi-runtimed.rs passes
+  # `user.gid` where `user` is the SESSION user. The first version of this leg chowned
+  # to the TOOL's own gid — the single configuration in which 0660 admits it — and so
+  # measured a fixture that differed from its subject (class 25). Use a group the tool
+  # is NOT in, which is what production has.
+  SESSGRP=delphi-probe-session
+  getent group "$SESSGRP" >/dev/null || groupadd --system "$SESSGRP"
+  SGID=$(getent group "$SESSGRP" | cut -d: -f3)
+  if id -nG "$TOOL" | tr ' ' '\n' | grep -qx "$SESSGRP"; then
+      echo "  REFUSING: $TOOL is in $SESSGRP — that is the misconfiguration under test, not the fixture"; exit 1
+  fi
+  chown root:"$SGID" "$SESS/approve.sock"
   chmod 0660 "$SESS/approve.sock"
   echo "  host modes: $(stat -c '%n %a %U:%G' "$BASE" "$SESS" "$SESS/approve.sock" | tr '\n' ' ')"
 
@@ -155,7 +167,14 @@ except OSError as e:
   # POSITIVE CONTROL FIRST. Without it a refusal caused by traversal is indistinguishable
   # from a refusal caused by the mode — which is exactly how this leg failed before.
   run_leg "POSITIVE CONTROL: must CONNECT, or the refusal below proves nothing" 0666
-  run_leg "THE REAL TEST: production 0660 root:<session-gid>, must be REFUSED" 0660
+  run_leg "THE REAL TEST: production shape, root:$SESSGRP 0660 — must be REFUSED" 0660
+  # The CONDITIONAL. The mode excludes the tool only while the tool is outside the
+  # socket's group. Re-owning to the tool's group is what the FIRST run of this leg
+  # accidentally measured, and it is also what the naive R9-01 fix (drop to the SESSION
+  # uid) would have produced. Documented as a real misconfiguration, not a pass.
+  chown root:"$TGID" "$SESS/approve.sock"
+  run_leg "MISCONFIGURATION: socket group == the TOOL's group — expected to CONNECT" 0660
+  chown root:"$SGID" "$SESS/approve.sock"
   kill $PL 2>/dev/null; wait $PL 2>/dev/null; rm -rf "$BASE"
   echo
 fi

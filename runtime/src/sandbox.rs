@@ -106,6 +106,31 @@ pub fn refuse_denied_bind(
     Ok(())
 }
 
+/// Refuse a bind whose destination path does not exist (D0A-R10-01).
+///
+/// bwrap creates a missing destination path, and when that path lies inside an
+/// enclosing bind the creation goes **through the mount into the host filesystem** —
+/// measured: `--bind OUTER OUTER --bind SRC OUTER/x/y` leaves `x/y` on the host.
+///
+/// The profile always emits `source == dest`, so destinations exist by construction and
+/// this cannot currently fire. That is exactly why it is here: **the invariant is what
+/// protects, and it was undocumented and unenforced.** A future remapping bind would
+/// open the hole with nothing to catch it.
+///
+/// # Errors
+///
+/// [`RuntimeError::BindWouldCreateOnHost`] if a bind path does not exist.
+pub fn refuse_host_creating_bind(
+    binds: &[(std::path::PathBuf, BindMode)],
+) -> Result<(), crate::RuntimeError> {
+    for (path, _) in binds {
+        if !path.exists() {
+            return Err(crate::RuntimeError::BindWouldCreateOnHost { path: path.clone() });
+        }
+    }
+    Ok(())
+}
+
 /// Directories that must exist, traversable, before the binds are applied.
 ///
 /// **Why this is production logic and not a convenience** (`docs/DEFECT_CLASSES.md`
@@ -114,11 +139,17 @@ pub fn refuse_denied_bind(
 /// payload drops to a different uid it cannot traverse them, and every bind under a
 /// not-yet-existing parent becomes unreachable.
 ///
-/// Two exclusions, both load-bearing:
+/// Two exclusions:
 ///
 /// * **the bind path itself** — bwrap creates that mountpoint;
-/// * **any ancestor lying inside another bind** — `--dir` there would create the
-///   directory *through* the mount, in the **host** filesystem.
+/// * **any ancestor lying inside another bind.**
+///
+/// **CORRECTED (D0A-R10-01): the second exclusion does NOT prevent a host write.** It
+/// stops *this code* emitting `--dir` there; bwrap still creates that ancestor while
+/// installing the inner bind, and — measured — that creation lands in the **host**
+/// filesystem through the enclosing mount. What actually prevents it is the profile's
+/// `source == dest` invariant, which [`refuse_host_creating_bind`] now enforces rather
+/// than leaving accidental.
 fn ancestor_dirs(binds: &[(std::path::PathBuf, BindMode)]) -> Vec<String> {
     use std::collections::BTreeSet;
     let norm: Vec<std::path::PathBuf> =
@@ -215,7 +246,7 @@ impl SandboxProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_denied_bind;
+    use super::{refuse_denied_bind, refuse_host_creating_bind};
     use std::path::Path;
 
     const BASE: &str = "/run/delphi";
@@ -298,6 +329,81 @@ mod tests {
             !dirs.iter().any(|d| d == "/opt/vendor"),
             "creating a dir inside a bind writes through to the HOST; got {dirs:?}"
         );
+    }
+
+    /// D0A-R10-01 — observed on the FILESYSTEM, not in the emitted args.
+    ///
+    /// The previous ancestor tests assert on `--perms/--dir` strings: an argv-level
+    /// observation of a filesystem-level effect. That is why they could not see this
+    /// at all — filtering an ancestor stops *Delphi* emitting `--dir`, and bwrap
+    /// creates it anyway while installing the inner bind, **through the enclosing
+    /// mount, in the host filesystem** (measured: `--bind OUTER OUTER --bind SRC
+    /// OUTER/x/y` leaves `x/y` on the host).
+    ///
+    /// This asserts the host is unchanged after a real bwrap run.
+    #[test]
+    fn a_nested_bind_does_not_create_anything_in_the_host() {
+        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
+            eprintln!("SKIP a_nested_bind_does_not_create_anything_in_the_host: measured blocker: bwrap not executable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("delphi-r1001-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("vendor/tool")).unwrap();
+        std::fs::write(root.join("vendor/tool/f"), b"x").unwrap();
+
+        let before = tree(&root);
+        let a = action_with(
+            vec![
+                (root.clone(), BindMode::ReadWrite),
+                (root.join("vendor/tool"), BindMode::ReadOnly),
+            ],
+            NetPolicy::None,
+        );
+        // The profile is what production emits, run for real.
+        let mut args = SandboxProfile::derive(&a).args().to_vec();
+        args.extend(["--ro-bind".into(), "/usr".into(), "/usr".into()]);
+        args.extend(["--symlink".into(), "usr/bin".into(), "/bin".into()]);
+        args.extend(["--symlink".into(), "usr/lib".into(), "/lib".into()]);
+        args.extend(["--symlink".into(), "usr/lib64".into(), "/lib64".into()]);
+        args.extend(["--".into(), "/bin/true".into()]);
+        let out = std::process::Command::new("bwrap").args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "bwrap must build this jail, or the test proves nothing: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            tree(&root),
+            before,
+            "D0A-R10-01: the host tree changed — bwrap created a path through a bind"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn tree(root: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                out.push(e.path().to_string_lossy().into_owned());
+                if e.path().is_dir() {
+                    stack.push(e.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The invariant that ACTUALLY protects, enforced rather than assumed.
+    #[test]
+    fn a_bind_whose_path_does_not_exist_is_refused() {
+        let missing = std::path::PathBuf::from("/nonexistent-delphi-r1001/x/y");
+        assert!(refuse_host_creating_bind(&[(missing, BindMode::ReadOnly)]).is_err());
+        // Positive control: an existing path is admitted.
+        assert!(refuse_host_creating_bind(&[(std::path::PathBuf::from("/usr"), BindMode::ReadOnly)]).is_ok());
     }
 
     /// D0A-R9-10. Every shape that names the daemon's runtime directory, including

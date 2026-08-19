@@ -56,6 +56,15 @@ namespace. `--unshare-all` was an implementation choice in `sandbox.rs`, never r
 adopting E **closes** the line-665 clause ("the tool runs under a uid that cannot reach daemon
 IPC") and **violates none** — it creates no new row here.
 
+**ESCAPE-CLAIM NARROWED (2026-08-15, D0A-R10 review).** The register recorded E's escape
+improvement — 997 instead of 0 — **unqualified**, and that is an overstatement of the same class
+as R9-02's and the original R9-01/R9-10 symmetry claim. **It holds only for a POST-DROP payload
+escape.** bwrap and `delphi-drop` both run **pre-drop, as initial-namespace root**, so an escape
+during the setup window lands on **root exactly as before**. E was never aimed at that window and
+does not improve it. What E changes is the escape surface of the *tool*, which is the long-lived
+part; the setup window is short and code we ship, but it is not zero and the register no longer
+implies it is.
+
 **AUDIT DISCONTINUITY — `sandbox_profile_digest` values are not comparable across
 2026-08-15.** `audit.rs` records a digest of the derived profile args, and two changes landed
 that alter those args for **every** action: ancestor emission (`--perms 0755 --dir <ancestor>`

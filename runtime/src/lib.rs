@@ -176,6 +176,19 @@ pub enum RuntimeError {
         path: String,
     },
 
+    /// A bind would make bwrap CREATE a destination ancestor, and that creation would
+    /// land in the **host** filesystem through an enclosing bind (D0A-R10-01).
+    ///
+    /// Measured: with `--bind OUTER OUTER --bind SRC OUTER/x/y`, bwrap creates `x/y`
+    /// **on the host**. The profile's `source == dest` invariant is what prevents this
+    /// today — *not* the ancestor-emitter's exclusion, which only stops Delphi emitting
+    /// its own `--dir`. This error enforces the invariant so it cannot be lost silently.
+    #[error("execution denied: bind `{}` does not exist, so bwrap would create its destination path — inside an enclosing bind that write lands in the HOST filesystem (D0A-R10-01)", path.display())]
+    BindWouldCreateOnHost {
+        /// The bind whose destination path does not exist.
+        path: std::path::PathBuf,
+    },
+
     /// A wire-protocol fault on the AI↔daemon general socket (B1) — a malformed
     /// frame, an oversized message, a decode failure, or an unexpected message for
     /// the current state. Never carries user data.

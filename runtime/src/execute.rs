@@ -195,6 +195,8 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     }
     // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
     // is defence in depth on top of the uid drop rather than the barrier itself.
+    // D0A-R10-01: refuse before bwrap can create a destination path through a mount.
+    crate::sandbox::refuse_host_creating_bind(&action.fs_binds)?;
     for (path, _) in &action.fs_binds {
         crate::sandbox::refuse_denied_bind(
             path,

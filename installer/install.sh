@@ -368,7 +368,7 @@ rm -rf "$OLD"
 systemctl daemon-reload
 
 echo "installed:"
-ls -l /usr/libexec/delphi-runtimed /usr/libexec/delphi-shell /usr/libexec/delphi-minimal-ai
+ls -l /usr/libexec/delphi-runtimed /usr/libexec/delphi-drop /usr/libexec/delphi-shell /usr/libexec/delphi-minimal-ai
 echo "Brain address intentionally absent: $(ls /usr/libexec/delphi-ai 2>&1)"
 echo "PAM stack: $(ls -l /etc/pam.d/delphi-runtime)"
 echo "shell bundle: $(find "$CUR" -type f | wc -l) files under $CUR"

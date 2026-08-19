@@ -514,10 +514,19 @@ mod tests {
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
+        // PRINT THE EVIDENCE, not just `ok`. The tool writes `id -u` to a FILE, so
+        // without this the test asserts on a value it never surfaces — a correct pass
+        // is then indistinguishable from a vacuous one, which is the whole reason
+        // `docs/DEFECT_CLASSES.md` 38 exists.
+        eprintln!(
+            "[R9-01] euid=0, {TOOL_ACCOUNT} uid={}, helper={DROP_HELPER} — running the action",
+            tool.uid.as_raw()
+        );
         let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
             .expect("approved exec");
         assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
         let observed = fs::read_to_string(&env.result).unwrap().trim().to_string();
+        eprintln!("[R9-01] the action's own `id -u` reported: {observed}  (root would be 0)");
         assert_ne!(observed, "0", "D0A-R9-01: the action must not run as root");
         assert_eq!(
             observed,

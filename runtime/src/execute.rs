@@ -195,14 +195,19 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     }
     // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
     // is defence in depth on top of the uid drop rather than the barrier itself.
-    // D0A-R10-01: refuse before bwrap can create a destination path through a mount.
-    crate::sandbox::refuse_host_creating_bind(&action.fs_binds)?;
+    // ORDER IS PART OF THE CONTRACT (D0A-R10-08). The SECURITY denial classifies
+    // first: a bind naming the daemon's runtime directory must report DeniedBind even
+    // when it also does not exist. My R10-01 guard was appended in front and silently
+    // reclassified that case as BindWouldCreateOnHost — a fix breaking the contract of
+    // the check it was added beside.
     for (path, _) in &action.fs_binds {
         crate::sandbox::refuse_denied_bind(
             path,
             std::path::Path::new(crate::anchor::DEFAULT_RUNTIME_BASE),
         )?;
     }
+    // D0A-R10-01: only then, refuse a bind bwrap would have to CREATE.
+    crate::sandbox::refuse_host_creating_bind(&action.fs_binds)?;
     // Which fd(s) the jailed tool must keep (the rest are closed before its exec).
     let (program_fd, script_arg_fd, mut keep): (RawFd, Option<RawFd>, Vec<RawFd>) =
         match &action.script {

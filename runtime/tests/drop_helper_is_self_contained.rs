@@ -90,10 +90,26 @@ fn the_shipped_helper_runs_in_a_jail_binding_nothing() {
 
 /// The helper must never "drop" to root — that is what a mis-supplied argument looks
 /// like, and it would make the whole mechanism a silent no-op.
+/// Each id is checked INDEPENDENTLY, so weakening `||` to `&&` bites (D0A-R10-09).
+#[test]
+fn dropping_to_root_is_refused_for_either_id() {
+    for (uid, gid) in [("0", "0"), ("0", "997"), ("997", "0")] {
+        let out = Command::new(HELPER)
+            .args([uid, gid, "/bin/true", "true"])
+            .output()
+            .expect("spawn helper");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "uid={uid} gid={gid}: {err}");
+        assert!(err.contains("refusing"), "uid={uid} gid={gid}: {err}");
+    }
+}
+
 #[test]
 fn dropping_to_root_is_refused() {
     let out = Command::new(HELPER)
-        .args(["0", "0", "/bin/true"])
+        // FOUR args: the helper takes argv0 explicitly. With three it exits through
+        // USAGE and never reaches the root check this test names (D0A-R10-09).
+        .args(["0", "0", "/bin/true", "true"])
         .output()
         .expect("spawn helper");
     assert_eq!(out.status.code(), Some(2));

@@ -25,6 +25,34 @@ fn main() {
     // versioned soname (a plain `-l systemd` would demand the unversioned dev symlink).
     println!("cargo:rustc-link-lib=dylib:+verbatim=libsystemd.so.0");
 
+    // D0A-R9-01: build the credential-drop helper as a SELF-CONTAINED binary.
+    //
+    // It is handed to bwrap by fd so it needs no bind (§6 "mount exactly `fs_binds`"),
+    // but a DYNAMICALLY linked binary still needs its loader and libc inside the jail —
+    // the same dependency wearing different clothes. Measured: a dynamic binary in a
+    // jail binding nothing dies `execvp: No such file or directory`.
+    //
+    // WHY A BARE `rustc` AND NOT A CARGO BIN TARGET. Static linking needs
+    // `-C target-feature=+crt-static`, which is a RUSTFLAG, and cargo has no per-target
+    // rustflags — setting it workspace-wide would statically link the daemon too, which
+    // must stay dynamic (PAM `dlopen`s its modules). The alternative, a decoupled crate
+    // with its own config, is the `shell-host` pattern; it was rejected because §13.4
+    // records that decoupled crates are invisible to `--workspace` and that this exact
+    // gap shipped D0-R2-03. Keeping the helper inside this crate keeps it audited.
+    //
+    // `-C link-arg=-static` alone is NOT a substitute: measured, it produces a binary
+    // that links, reports as `ELF ... executable`, and SEGFAULTS (rc 139).
+    println!("cargo:rerun-if-changed=helper/delphi-drop.rs");
+    let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let helper = std::path::Path::new(&out).join("delphi-drop");
+    let status = std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["-O", "-C", "target-feature=+crt-static", "--edition", "2024", "-o"])
+        .arg(&helper)
+        .arg("helper/delphi-drop.rs")
+        .status()
+        .expect("spawn rustc for the drop helper");
+    assert!(status.success(), "building the drop helper failed");
+
     // B1: compile the AI↔daemon general-socket wire schema (protobuf, prost).
     println!("cargo:rerun-if-changed=proto/runtime_wire.proto");
     prost_build::compile_protos(&["proto/runtime_wire.proto"], &["proto"])

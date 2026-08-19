@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MIT
+//
+// D0A-R9-01 — the drop helper must run in a jail that binds NOTHING.
+//
+// WRITTEN BEFORE THE HELPER'S BUILD CONFIG, deliberately: the shape of the helper
+// depends on this answer, so the test is the thing that forces the answer rather than
+// ratifying one already chosen. Against a default (dynamically linked) build it FAILS.
+//
+// WHAT THE EARLIER PREMISE TEST DID NOT COVER. `a_second_kept_fd_survives_a_second_exec`
+// proved an fd survives a second `execve` and can be exec'd — but its helper was a
+// `#!/bin/sh` script in a jail that bound `/usr`. That is a different claim. A
+// dynamically linked helper needs its loader and libc reachable inside the jail, which
+// is the same `/usr` dependency wearing different clothes. Measured on this box:
+//
+//     static  (crt-static) in a jail binding nothing -> ran (its own exit code)
+//     dynamic              in a jail binding nothing -> execvp: No such file or directory
+//
+// So the assertion is "binds nothing", not "binds nothing from /usr".
+
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+
+/// Built by `runtime/build.rs` with `crt-static` into `OUT_DIR` — deliberately NOT a
+/// cargo bin target, because cargo would link it dynamically and no per-target rustflag
+/// exists to stop that.
+const HELPER: &str = concat!(env!("OUT_DIR"), "/delphi-drop");
+
+fn bwrap_available() -> bool {
+    Command::new("bwrap")
+        .args(["--unshare-all", "--die-with-parent", "--proc", "/proc", "--", "/proc/self/fd/0"])
+        .output()
+        .map(|o| o.status.code().is_some())
+        .unwrap_or(false)
+}
+
+/// The helper, handed to bwrap by fd, in a jail with **no binds at all** — not even
+/// `/usr`. Exercised via its own argument validation so the leg needs no second binary:
+/// a helper that could not start could not report `2` for a bad argument count.
+#[test]
+fn the_shipped_helper_runs_in_a_jail_binding_nothing() {
+    if !bwrap_available() {
+        eprintln!("SKIP the_shipped_helper_runs_in_a_jail_binding_nothing: requires bwrap + unprivileged userns");
+        return;
+    }
+    let f = std::fs::File::open(HELPER).expect("open the shipped helper");
+    let fd = f.as_raw_fd();
+    // `File::open` sets O_CLOEXEC, so the fd would NOT survive into bwrap and the test
+    // would fail whatever the helper's linkage was — a red with no discriminating power.
+    // Production clears it through this exact call; the test uses the same one.
+    let keep = vec![fd];
+    let mut cmd = Command::new("bwrap");
+    cmd.args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--clearenv",
+            "--proc",
+            "/proc",
+            "--chdir",
+            "/",
+            "--",
+            &format!("/proc/self/fd/{fd}"),
+    ]);
+    // SAFETY: as the production path — `mark_cloexec_except` is async-signal-safe and
+    // does not allocate.
+    unsafe {
+        cmd.pre_exec(move || {
+            delphi_runtime::mark_cloexec_except(&keep)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+    }
+    let out = cmd.output().expect("spawn bwrap");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    // A dynamically linked helper dies HERE, before any of its own code runs.
+    assert!(
+        !err.contains("No such file or directory"),
+        "the helper did not start in an empty jail — it is not self-contained. \
+         A dynamically linked binary needs its loader and libc bound, which the \
+         profile cannot guarantee for an arbitrary action. stderr: {err}"
+    );
+    // Its OWN diagnostic, which only a running helper can produce.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected the helper's own usage exit; stderr: {err}"
+    );
+    assert!(err.contains("usage: delphi-drop"), "stderr: {err}");
+}
+
+/// The helper must never "drop" to root — that is what a mis-supplied argument looks
+/// like, and it would make the whole mechanism a silent no-op.
+#[test]
+fn dropping_to_root_is_refused() {
+    let out = Command::new(HELPER)
+        .args(["0", "0", "/bin/true"])
+        .output()
+        .expect("spawn helper");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("refusing"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -1,0 +1,153 @@
+# Codex adversarial review — D0-A round 10: shape E, adopted as one decision
+
+<!-- Invocation: codex review - < scratch/codex-d0a-round10-prompt.md
+     All three range-selection flags reject a PROMPT positional; scope is carried here. -->
+
+## Target
+
+`git diff 09dadae..HEAD` — **25 commits, 19 files, +2078 / −27.** Round 9 was measured at
+`09dadae`; everything since is this round's subject. If your diff stat disagrees with that,
+say so as a finding before reviewing anything: the scope has drifted.
+
+**Read the tree through the CLI (`git show`, `git diff`), not from a supplied diff.** Verify
+library/API claims against Context7 / docs.rs / `--help` rather than memory — several findings
+below exist *because* an API behaved differently from how it reads.
+
+---
+
+## LEAD WITH THIS: shape E is ONE decision, not three fixes
+
+The largest change here is a **single architectural adoption** that a file-by-file read will
+present as three unrelated edits. Judge it as one thing:
+
+1. **`sandbox.rs` drops `--unshare-user`** — the profile now names every namespace *except*
+   user. The jail loses a user namespace it previously had.
+2. **`execute.rs` interposes `delphi-drop`** — a new statically linked binary, passed to bwrap
+   **by fd**, which does `setgroups([]) → setresgid → setresuid` and then execs the pinned
+   program fd. **The TCB gains a member.**
+3. **The helper is opened by PATH** — so it carries the same inode-vs-content gap that
+   D0A-R9-02 names for the tool, for itself.
+
+**Why (1) was done, since it looks like a straight weakening and is the thing most worth
+attacking:** bwrap's own userns maps `sandbox_uid → parent_uid`. Measured at root, the jail was
+`INNER uid=0 / SO_PEERCRED uid=0` — **identity-transparent**. It supplied isolation, never
+identity, and an escape landed on **real root**. It also maps exactly *one* uid, so nothing
+inside could drop to another (`setresuid` → `EINVAL`, measured). The route was narrowed by
+measurement, not preference:
+
+| leg | result |
+|---|---|
+| B | bwrap's `--uid` is namespace-internal — `INNER 65534` while the listener still read the launcher |
+| C | dropping *before* bwrap drops **bwrap**, which then cannot build its own sandbox (`loopback: Failed RTM_NEWADDR`) |
+| D | dropping *inside* bwrap's userns is impossible — `setresuid EINVAL`, one uid mapped |
+| E1/E2 | no userns: the jail builds, the payload holds a real host uid, and an outside listener reads **997** |
+| F | an externally-mapped userns — **abandoned unmeasured** after three harness failures |
+
+**The question for you on this:** is the trade stated correctly? The claim recorded is that E
+exchanges *a namespace that supplied isolation but not identity* for *a real identity* — and
+that on the escape axis it is **strictly better** (997 rather than 0). If that reasoning is
+wrong, everything built on it is.
+
+---
+
+## `docs/DEFECT_CLASSES.md` — the (a)/(b) partition
+
+**(a) Pre-foreclosed — do NOT spend budget re-hunting these:**
+Class 1 (`canonical_hash`), 2 (`safe_open`), 3 (`pragma_setup`), 25 (fixture uses the production
+constructor — `mark_cloexec_except` is now called by the helper test for exactly this reason),
+29a (shared holder-check), 26 (stale observation), 31 (teardown reports its failure).
+
+**(b) Applicable and NOT foreclosed — concentrate here:**
+
+- **Class 40 (new, this round)** — bwrap auto-creates a bind's missing parents as **`0700` owned
+  by the sandbox uid**. Now production logic: `ancestor_dirs` emits `--perms 0755 --dir` per
+  ancestor. It excludes (i) the bind itself and (ii) **any ancestor inside another bind**, because
+  `--dir` there creates the directory *through* the mount, **in the host filesystem**. That
+  exclusion is the dangerous case; attack the enumeration.
+- **Class 17 (breadth)** — the ancestor emitter, the denylist's spellings, and the helper's
+  argument validation are all enumerations. Class 17 scored six-for-six in round 8.
+- **Class 14 (all forms)** — `refuse_denied_bind` checks a lexical fold *and* a canonicalized
+  form. Is there a third spelling?
+- **Class 33 / 38** — a diagnostic naming one side of a comparison; and a sound check whose
+  report carries none of what it verified. Both bit this round (below).
+- **Class 22 / 37** — remediation is where a class reappears. Several fixes here are fixes *to
+  fixes*.
+
+---
+
+## What I already know is wrong or unproven — do not spend the round rediscovering it
+
+Stated so your budget goes to what I have **not** seen:
+
+- **`delphi-drop` is opened by PATH.** Opening once per process shrinks the window to process
+  start; it does not close it. Recorded as an obligation on R9-02, which **may not close without
+  answering the helper**. The helper is the one component whose substitution grants **uid
+  control**.
+- **All actions share one uid** (`D0A-R9-12`, open). No isolation between actions.
+- **§6's clause is not closed.** R9-01 closes on the **mechanism** (the action runs as
+  `delphi-tool`, proven at root). The clause is *cannot reach daemon IPC*, which rests on a
+  socket refusal measured against a **probe fixture**, not the real daemon.
+- **Two tests are deliberately RED** — `same_inode_overwrite_...` and
+  `nested_interpreter_substitution_...`, the reviewer's own R9-02 reproductions, landed before
+  any fix design. The suite is *intentionally* 97 passed / 2 failed.
+
+---
+
+## THE QUESTION — sharper than "find defects"
+
+**Three of this round's defects were found by weakening, and two were defects in the TESTS, not
+the code. Which of the assertions added here would survive their own weaken?**
+
+Grounded, because each of these actually happened in this diff:
+
+- `an_ancestor_inside_another_bind_is_never_created` **passed against an empty implementation** —
+  nothing was emitted, so "does not contain `/opt/vendor`" was vacuously true. It acquired
+  discriminating power only once emission existed.
+- The drop-helper's first RED was **false**: it failed with `execvp: No such file or directory`,
+  which is the signature of a missing loader **and** of a missing fd — it was the second
+  (`File::open` sets `O_CLOEXEC`). It would have failed identically with a perfectly static
+  helper.
+- The `argv0` test's first version was **wrong about the kernel**, not about the code: for a
+  shebang script the kernel builds the interpreter's argv from the script path, so `$0` cannot
+  observe `--argv0` at all.
+- R9-01's root test **proved its property and printed nothing** — a correct pass emitted exactly
+  what a vacuous one would.
+
+So: **assume the tests here are the weakest part of the change**, and say which greens you would
+not trust.
+
+---
+
+## Named attack surfaces, in priority order
+
+1. **The credential drop itself** (`helper/delphi-drop.rs`) — order of `setgroups`/`setresgid`/
+   `setresuid`; the post-drop verification; the refusal to drop to 0; argv reconstruction. It is
+   a static binary with **no crate dependencies** (bare `rustc`, so not even `libc`) — the four
+   entry points are hand-declared `unsafe extern "C"`. Are the signatures right?
+2. **`ancestor_dirs`** — traversal, ordering, dedupe, and the inside-a-bind exclusion.
+3. **The wiring in `run_fd_pinned`** — the helper fd joins the `keep` list; `--argv0` is emitted
+   only on the no-helper path; the script path's argument order becomes
+   `PROG argv0 [interp_arg] SCRIPT [rest]`.
+4. **`build.rs` compiling a binary with a bare `rustc`** — `-C link-arg=-static` was measured to
+   produce a segfaulting false-static, so `crt-static` is load-bearing. The helper is also copied
+   out of `OUT_DIR` to the profile dir so `installer/build.sh` can name it.
+5. **The installer** — `delphi-drop` staged, fstat-trusted, installed `0755` root-owned.
+
+---
+
+## Verdict
+
+**APPROVE / REVISE / FAIL**; per finding: ID (`D0A-R10-NN`), severity, root cause, impact, fix
+sketch.
+
+Two things beyond findings would be worth more than a long list:
+
+1. **Is shape E's trade stated correctly?** It is the load-bearing argument, and if it is wrong
+   the rest follows it down.
+2. **Which greens here would you not trust?** Given four test defects in one round — two of them
+   tests that were wrong rather than code that was wrong — the honest answer may be that the
+   verification is the weak half of this change.
+
+**Current state:** lib+bins **97 passed / 2 failed** (the two intentional R9-02 REDs); clippy
+`-p delphi-runtime --all-targets -D warnings` rc=0; `install.sh` and `build.sh` parse; the staged
+helper is confirmed `static-pie linked` and runs in a jail binding **nothing**.

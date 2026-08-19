@@ -441,6 +441,62 @@ mod tests {
         );
     }
 
+    /// D0A-R9-01 **PREMISE CHECK**, before any code is built on it.
+    ///
+    /// E's shape needs a drop-helper between bwrap and the tool, passed **by fd** so it
+    /// needs no bind. That rests on a claim the existing code does *not* demonstrate:
+    /// the script path keeps two fds, but fd B is **opened** by the interpreter — here
+    /// fd B must survive a **second `execve`** (the helper's) and then be **exec'd**.
+    ///
+    /// Assuming it because it resembles the existing mechanism is the shape that was
+    /// wrong twice already this session (`--uid` being namespace-internal; `--userns`
+    /// taking an fd, not a path). So it is measured.
+    ///
+    /// Scope: proves fd survival across a second exec. It does **not** show the helper
+    /// can be a shell script in production — `/usr` is not guaranteed bound for an
+    /// arbitrary action, which is why the shipped helper must be a real binary.
+    #[test]
+    fn a_second_kept_fd_survives_a_second_exec_and_is_executable() {
+        if !bwrap_available() {
+            eprintln!("SKIP a_second_kept_fd_survives_a_second_exec_and_is_executable: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("twofd");
+        // Helper: execs whatever path it is handed — the drop-helper's exec shape.
+        let helper = env.dir.join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\nexec \"$1\"\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let bytes = write_script(&env.exe, "REACHED-VIA-HELPER", &env.result);
+
+        let hf = fs::File::open(&helper).unwrap();
+        let pf = fs::File::open(&env.exe).unwrap();
+        let (h, p) = (hf.as_raw_fd(), pf.as_raw_fd());
+
+        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let mut args = SandboxProfile::derive(&action).args().to_vec();
+        args.push("--".into());
+        args.push(format!("/proc/self/fd/{h}"));
+        args.push(format!("/proc/self/fd/{p}"));
+
+        let keep = vec![h, p];
+        let mut cmd = Command::new("bwrap");
+        cmd.args(&args);
+        // SAFETY: as the production path — async-signal-safe, no allocation.
+        unsafe {
+            cmd.pre_exec(move || {
+                crate::fdsec::mark_cloexec_except_raw(&keep)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            fs::read_to_string(&env.result).unwrap().trim(),
+            "REACHED-VIA-HELPER",
+            "a second kept fd must survive the helper's own execve and remain executable"
+        );
+    }
+
     /// D0A-R9-10, **WIRING**. `sandbox::tests` proves the predicate refuses; this
     /// proves execution actually consults it. A guard that is defined and never called
     /// passes its own unit tests forever.

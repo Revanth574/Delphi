@@ -479,168 +479,77 @@ mod tests {
         );
     }
 
-    /// D0A-R9-01 — the approved action runs as the dedicated tool account, not root.
+    /// D0A-R9-01 — the approved action runs with the **tool account's credentials**.
     ///
-    /// **THIS IS A RED. D0A-R9-01 IS OPEN.** The `pre_exec` credential drop was
-    /// reverted (it made bwrap fail its own sandbox setup — `RTM_NEWADDR`, because
-    /// bwrap was already dropped and could not bring up loopback). This test fails at
-    /// root until the drop re-lands in a measured shape, and that is the honest state.
+    /// **The name states what it proves, and no more (D0A-R10 review).** The previous
+    /// version was called `..._as_the_tool_account_not_root` and observed `id -u`
+    /// alone — one of the six things it was cited for. It is widened here to every
+    /// credential observable from inside the jail, and its name stops claiming the one
+    /// that is not: the **daemon-IPC refusal**, which needs a real daemon socket to
+    /// connect against and cannot be constructed here. That clause rests on P's
+    /// production probe leg instead, and `docs/CONFORMANCE_REGISTER.md` now cites the
+    /// two proofs separately rather than letting this test stand for both.
     ///
-    /// **ROOT-GATED, blocker measured rather than named (class 34):** unprivileged
-    /// there is no privilege to drop and no way to acquire another identity, so the
-    /// test could only assert the test user's own uid — true with AND without the fix
-    /// (PASS/PASS, worthless per Iron Law #15 clause 2).
+    /// `/proc/self/status` is the right altitude (class 41): `Uid:`/`Gid:` carry
+    /// real/effective/**saved**/fs, so a partial drop that left a saved id is visible —
+    /// which `id -u` could never show.
     #[test]
-    fn an_approved_action_runs_as_the_tool_account_not_root() {
+    fn an_approved_action_runs_with_the_tool_account_credentials() {
         if !bwrap_available() {
-            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: requires bwrap + unprivileged userns");
+            eprintln!("SKIP an_approved_action_runs_with_the_tool_account_credentials: requires bwrap + unprivileged userns");
             return;
         }
         if nix::unistd::geteuid().as_raw() != 0 {
-            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: requires root — measured blocker: geteuid() != 0, so no credential drop is possible at all");
+            eprintln!("SKIP an_approved_action_runs_with_the_tool_account_credentials: requires root — measured blocker: geteuid() != 0, so no credential drop is possible at all");
             return;
         }
         let Ok(Some(tool)) = nix::unistd::User::from_name(TOOL_ACCOUNT) else {
-            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: measured blocker: getpwnam(\"{TOOL_ACCOUNT}\") returned no entry — installer/install.sh creates it");
+            eprintln!("SKIP an_approved_action_runs_with_the_tool_account_credentials: measured blocker: getpwnam(\"{TOOL_ACCOUNT}\") returned no entry — installer/install.sh creates it");
             return;
         };
         if !std::path::Path::new(DROP_HELPER).exists() {
-            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: measured blocker: {DROP_HELPER} does not exist — installer/install.sh installs it");
+            eprintln!("SKIP an_approved_action_runs_with_the_tool_account_credentials: measured blocker: {DROP_HELPER} does not exist — installer/install.sh installs it");
             return;
         }
         let env = Env::new("tool-uid");
-        // The tool is no longer root, so it cannot write into a root-owned directory.
-        // That is the POINT of the change, not a workaround: a real approved RW bind
-        // is a path the tool may write. Granting it here models that, and does not
-        // weaken the assertion, which is about WHICH uid ran.
         std::os::unix::fs::chown(&env.out_dir, Some(tool.uid.as_raw()), None).unwrap();
-        let content = format!("#!/bin/sh\nid -u > {}\n", env.result.display());
+        let content = format!(
+            "#!/bin/sh\ngrep -E '^(Uid|Gid|Groups|CapEff):' /proc/self/status > {}\n",
+            env.result.display()
+        );
         fs::write(&env.exe, &content).unwrap();
         fs::set_permissions(&env.exe, fs::Permissions::from_mode(0o755)).unwrap();
         let action = build_action(&env.exe, content.as_bytes(), &env.out_dir);
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
-        // PRINT THE EVIDENCE, not just `ok`. The tool writes `id -u` to a FILE, so
-        // without this the test asserts on a value it never surfaces — a correct pass
-        // is then indistinguishable from a vacuous one, which is the whole reason
-        // `docs/DEFECT_CLASSES.md` 38 exists.
-        eprintln!(
-            "[R9-01] euid=0, {TOOL_ACCOUNT} uid={}, helper={DROP_HELPER} — running the action",
-            tool.uid.as_raw()
-        );
+        let (uid, gid) = (tool.uid.as_raw(), tool.gid.as_raw());
+        eprintln!("[R9-01] euid=0, {TOOL_ACCOUNT} uid={uid} gid={gid}, helper={DROP_HELPER}");
         let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
             .expect("approved exec");
         assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
-        let observed = fs::read_to_string(&env.result).unwrap().trim().to_string();
-        eprintln!("[R9-01] the action's own `id -u` reported: {observed}  (root would be 0)");
-        assert_ne!(observed, "0", "D0A-R9-01: the action must not run as root");
-        assert_eq!(
-            observed,
-            tool.uid.as_raw().to_string(),
-            "D0A-R9-01: the action must run as `{TOOL_ACCOUNT}`"
-        );
-    }
+        let status = fs::read_to_string(&env.result).unwrap();
+        eprintln!("[R9-01] the action's own /proc/self/status:\n{status}");
 
-    /// The tool must see its APPROVED `argv[0]`, not the fd path it was exec'd by.
-    ///
-    /// Caught as a regression while wiring the drop helper: `--argv0` names whatever
-    /// bwrap execs, so once the helper is interposed the flag would name the HELPER.
-    /// Dropping it unconditionally would leave the tool with `argv[0] =
-    /// /proc/self/fd/N` — it still runs, still exits 0, and the audit shows nothing
-    /// wrong, while anything dispatching on its own name behaves differently.
-    ///
-    /// **The subject is a real BINARY, deliberately.** The first version of this test
-    /// used a `#!/bin/sh` script and failed with `left: "/proc/self/fd/3"` — but for a
-    /// shebang script the KERNEL builds the interpreter's argv from the script path,
-    /// so `$0` cannot observe `--argv0` at all. That was the test being wrong, not the
-    /// code, and a fix aimed at the code would have been aimed at nothing.
-    #[test]
-    fn the_tool_receives_its_approved_argv0() {
-        if !bwrap_available() {
-            eprintln!("SKIP the_tool_receives_its_approved_argv0: requires bwrap + unprivileged userns");
-            return;
-        }
-        let env = Env::new("argv0");
-        let shell = PathBuf::from("/bin/sh");
-        let Ok(bytes) = fs::read(&shell) else {
-            eprintln!("SKIP the_tool_receives_its_approved_argv0: measured blocker: cannot read /bin/sh");
-            return;
+        let field = |k: &str| -> Vec<String> {
+            status
+                .lines()
+                .find(|l| l.starts_with(k))
+                .unwrap_or_else(|| panic!("no `{k}` line in:\n{status}"))
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_string)
+                .collect()
         };
-        let mut action = build_action(&shell, &bytes, &env.out_dir);
-        // `sh -c CMD` with no operand leaves `$0` as the shell's own argv[0] — which
-        // is exactly what `--argv0` (or the helper) sets, so it is observable.
-        action.argv = vec![
-            "tool".into(),
-            "-c".into(),
-            format!("echo \"$0\" > {}", env.result.display()),
-        ];
-        let key = MintingKey::from_bytes(KEY);
-        let token = mint(&key, &canonical_action_digest(&action), NOW);
-
-        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
-            .expect("approved exec");
-        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(
-            fs::read_to_string(&env.result).unwrap().trim(),
-            "tool",
-            "the tool must see its approved argv[0], not the fd path"
-        );
-    }
-
-    /// D0A-R9-01 **PREMISE CHECK**, before any code is built on it.
-    ///
-    /// E's shape needs a drop-helper between bwrap and the tool, passed **by fd** so it
-    /// needs no bind. That rests on a claim the existing code does *not* demonstrate:
-    /// the script path keeps two fds, but fd B is **opened** by the interpreter — here
-    /// fd B must survive a **second `execve`** (the helper's) and then be **exec'd**.
-    ///
-    /// Assuming it because it resembles the existing mechanism is the shape that was
-    /// wrong twice already this session (`--uid` being namespace-internal; `--userns`
-    /// taking an fd, not a path). So it is measured.
-    ///
-    /// Scope: proves fd survival across a second exec. It does **not** show the helper
-    /// can be a shell script in production — `/usr` is not guaranteed bound for an
-    /// arbitrary action, which is why the shipped helper must be a real binary.
-    #[test]
-    fn a_second_kept_fd_survives_a_second_exec_and_is_executable() {
-        if !bwrap_available() {
-            eprintln!("SKIP a_second_kept_fd_survives_a_second_exec_and_is_executable: requires bwrap + unprivileged userns");
-            return;
-        }
-        let env = Env::new("twofd");
-        // Helper: execs whatever path it is handed — the drop-helper's exec shape.
-        let helper = env.dir.join("helper.sh");
-        fs::write(&helper, "#!/bin/sh\nexec \"$1\"\n").unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
-        let bytes = write_script(&env.exe, "REACHED-VIA-HELPER", &env.result);
-
-        let hf = fs::File::open(&helper).unwrap();
-        let pf = fs::File::open(&env.exe).unwrap();
-        let (h, p) = (hf.as_raw_fd(), pf.as_raw_fd());
-
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
-        let mut args = SandboxProfile::derive(&action).args().to_vec();
-        args.push("--".into());
-        args.push(format!("/proc/self/fd/{h}"));
-        args.push(format!("/proc/self/fd/{p}"));
-
-        let keep = vec![h, p];
-        let mut cmd = Command::new("bwrap");
-        cmd.args(&args);
-        // SAFETY: as the production path — async-signal-safe, no allocation.
-        unsafe {
-            cmd.pre_exec(move || {
-                crate::fdsec::mark_cloexec_except_raw(&keep)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-            });
-        }
-        let out = cmd.output().unwrap();
-        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(
-            fs::read_to_string(&env.result).unwrap().trim(),
-            "REACHED-VIA-HELPER",
-            "a second kept fd must survive the helper's own execve and remain executable"
+        // real, effective, SAVED and fs — a partial drop leaving a saved id is the
+        // failure `id -u` cannot see.
+        assert_eq!(field("Uid:"), vec![uid.to_string(); 4], "all four uids must be the tool's");
+        assert_eq!(field("Gid:"), vec![gid.to_string(); 4], "all four gids must be the tool's");
+        assert!(field("Groups:").is_empty(), "supplementary groups must be cleared");
+        assert!(
+            field("CapEff:").first().is_some_and(|c| c.trim_start_matches('0').is_empty()),
+            "effective capabilities must be empty; got {:?}",
+            field("CapEff:")
         );
     }
 

@@ -92,9 +92,10 @@ constructor — `mark_cloexec_except` is now called by the helper test for exact
 
 - **Class 40 (new, this round)** — bwrap auto-creates a bind's missing parents as **`0700` owned
   by the sandbox uid**. Now production logic: `ancestor_dirs` emits `--perms 0755 --dir` per
-  ancestor. It excludes (i) the bind itself and (ii) **any ancestor inside another bind**, because
-  `--dir` there creates the directory *through* the mount, **in the host filesystem**. That
-  exclusion is the dangerous case; attack the enumeration.
+  ancestor. It excludes (i) the bind itself and (ii) any ancestor inside another bind — **but see
+  R10-01 above: that second exclusion does NOT prevent the host write it was credited with.**
+  What prevents it is `source == dest`, now enforced by `refuse_host_creating_bind`. Attack the
+  *enumeration* (traversal, ordering, dedupe) and the *new check*, not the falsified claim.
 - **Class 17 (breadth)** — the ancestor emitter, the denylist's spellings, and the helper's
   argument validation are all enumerations. Class 17 scored six-for-six in round 8.
 - **Class 14 (all forms)** — `refuse_denied_bind` checks a lexical fold *and* a canonicalized

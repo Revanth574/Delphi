@@ -103,6 +103,57 @@ pub fn execute_approved(
 /// the requester check admit the tool itself).
 pub const TOOL_ACCOUNT: &str = "delphi-tool";
 
+/// Where the installer places the credential-drop helper.
+///
+/// A fixed path with **no environment override**: a redirectable helper path would be
+/// an attack vector in precisely the component that grants uid control.
+pub const DROP_HELPER: &str = "/usr/libexec/delphi-drop";
+
+/// The helper, opened **once per process** rather than per action.
+///
+/// It is opened by PATH, so it inherits D0A-R9-02's own gap (inode-pinned, not
+/// content-pinned) for itself. Opening once shrinks the substitution window from
+/// every action to process start; closing it fully is recorded as an obligation on
+/// R9-02 in `docs/CONFORMANCE_REGISTER.md`.
+static DROP_HELPER_FD: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+
+fn drop_helper() -> Result<&'static std::fs::File, RuntimeError> {
+    DROP_HELPER_FD
+        .get_or_init(|| std::fs::File::open(DROP_HELPER).ok())
+        .as_ref()
+        .ok_or_else(|| RuntimeError::MissingDropHelper { path: DROP_HELPER.to_string() })
+}
+
+/// Open the drop helper at daemon startup, so the pin is taken before any action runs.
+///
+/// # Errors
+///
+/// [`RuntimeError::MissingDropHelper`] if it is not installed.
+pub fn preopen_drop_helper() -> Result<(), RuntimeError> {
+    // Whether the helper is NEEDED is decided in exactly one place — the same call the
+    // exec path uses — so startup and execution cannot disagree about it.
+    if tool_credentials()?.is_none() {
+        return Ok(());
+    }
+    drop_helper().map(|_| ())
+}
+
+/// Credentials to drop to, or `None` when there is no privilege to drop.
+///
+/// Unprivileged callers cannot acquire another identity and the action already runs as
+/// a non-root uid, so `None` is the honest answer, not a bypass. Running privileged
+/// with the account absent is a hard error.
+fn tool_credentials() -> Result<Option<(u32, u32)>, RuntimeError> {
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return Ok(None);
+    }
+    let user = nix::unistd::User::from_name(TOOL_ACCOUNT)
+        .ok()
+        .flatten()
+        .ok_or_else(|| RuntimeError::MissingToolAccount { account: TOOL_ACCOUNT.to_string() })?;
+    Ok(Some((user.uid.as_raw(), user.gid.as_raw())))
+}
+
 /// R4-02: a pinned script's content fd MUST carry the FULL immutability seal set
 /// ([`ScriptPin::FULL_SEALS`] — `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
 /// F_SEAL_SEAL`) so neither its content (write) nor its length (`ftruncate`
@@ -151,7 +202,7 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
         )?;
     }
     // Which fd(s) the jailed tool must keep (the rest are closed before its exec).
-    let (program_fd, script_arg_fd, keep): (RawFd, Option<RawFd>, Vec<RawFd>) =
+    let (program_fd, script_arg_fd, mut keep): (RawFd, Option<RawFd>, Vec<RawFd>) =
         match &action.script {
             Some(sp) => {
                 let interp = sp.interpreter_fd.as_raw_fd();
@@ -164,13 +215,43 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
             }
         };
 
+    // D0A-R9-01: the credential drop is bwrap's PAYLOAD, not bwrap itself. Dropping
+    // before bwrap drops BWRAP, which then cannot build its own sandbox (leg C:
+    // `loopback: Failed RTM_NEWADDR`), and bwrap's `--uid` is namespace-internal
+    // (leg B). The helper goes in by FD, so it needs no bind and cannot widen the
+    // approved mount set.
+    let creds = tool_credentials()?;
+    let helper_fd = match creds {
+        Some(_) => Some(drop_helper()?.as_raw_fd()),
+        None => None,
+    };
+    if let Some(h) = helper_fd {
+        keep.push(h);
+    }
+
     let mut args = SandboxProfile::derive(action).args().to_vec();
-    if let Some(argv0) = action.argv.first() {
+    // `--argv0` names whatever bwrap execs. With the helper interposed that is the
+    // HELPER, so the flag is dropped and the helper applies argv0 to the tool itself.
+    // WITHOUT a helper bwrap execs the tool directly and the flag is still correct —
+    // omitting it in both cases would silently give the tool `argv[0] =
+    // /proc/self/fd/N`, which nothing in the audit would show.
+    if helper_fd.is_none()
+        && let Some(argv0) = action.argv.first()
+    {
         args.push("--argv0".to_string());
         args.push(argv0.clone());
     }
     args.push("--".to_string());
+    if let (Some(h), Some((uid, gid))) = (helper_fd, creds) {
+        args.push(format!("/proc/self/fd/{h}"));
+        args.push(uid.to_string());
+        args.push(gid.to_string());
+    }
     args.push(format!("/proc/self/fd/{program_fd}"));
+    // The approved argv[0], passed through the helper rather than via `--argv0`.
+    if helper_fd.is_some() {
+        args.push(action.argv.first().cloned().unwrap_or_else(|| format!("/proc/self/fd/{program_fd}")));
+    }
     if let Some(script) = script_arg_fd {
         // The shebang's optional interpreter arg (e.g. `-I`), passed BEFORE the
         // script exactly as the kernel would — it is part of what executes, bound by
@@ -416,6 +497,10 @@ mod tests {
             eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: measured blocker: getpwnam(\"{TOOL_ACCOUNT}\") returned no entry — installer/install.sh creates it");
             return;
         };
+        if !std::path::Path::new(DROP_HELPER).exists() {
+            eprintln!("SKIP an_approved_action_runs_as_the_tool_account_not_root: measured blocker: {DROP_HELPER} does not exist — installer/install.sh installs it");
+            return;
+        }
         let env = Env::new("tool-uid");
         // The tool is no longer root, so it cannot write into a root-owned directory.
         // That is the POINT of the change, not a workaround: a real approved RW bind
@@ -438,6 +523,52 @@ mod tests {
             observed,
             tool.uid.as_raw().to_string(),
             "D0A-R9-01: the action must run as `{TOOL_ACCOUNT}`"
+        );
+    }
+
+    /// The tool must see its APPROVED `argv[0]`, not the fd path it was exec'd by.
+    ///
+    /// Caught as a regression while wiring the drop helper: `--argv0` names whatever
+    /// bwrap execs, so once the helper is interposed the flag would name the HELPER.
+    /// Dropping it unconditionally would leave the tool with `argv[0] =
+    /// /proc/self/fd/N` — it still runs, still exits 0, and the audit shows nothing
+    /// wrong, while anything dispatching on its own name behaves differently.
+    ///
+    /// **The subject is a real BINARY, deliberately.** The first version of this test
+    /// used a `#!/bin/sh` script and failed with `left: "/proc/self/fd/3"` — but for a
+    /// shebang script the KERNEL builds the interpreter's argv from the script path,
+    /// so `$0` cannot observe `--argv0` at all. That was the test being wrong, not the
+    /// code, and a fix aimed at the code would have been aimed at nothing.
+    #[test]
+    fn the_tool_receives_its_approved_argv0() {
+        if !bwrap_available() {
+            eprintln!("SKIP the_tool_receives_its_approved_argv0: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("argv0");
+        let shell = PathBuf::from("/bin/sh");
+        let Ok(bytes) = fs::read(&shell) else {
+            eprintln!("SKIP the_tool_receives_its_approved_argv0: measured blocker: cannot read /bin/sh");
+            return;
+        };
+        let mut action = build_action(&shell, &bytes, &env.out_dir);
+        // `sh -c CMD` with no operand leaves `$0` as the shell's own argv[0] — which
+        // is exactly what `--argv0` (or the helper) sets, so it is observable.
+        action.argv = vec![
+            "tool".into(),
+            "-c".into(),
+            format!("echo \"$0\" > {}", env.result.display()),
+        ];
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("approved exec");
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            fs::read_to_string(&env.result).unwrap().trim(),
+            "tool",
+            "the tool must see its approved argv[0], not the fd path"
         );
     }
 

@@ -53,6 +53,10 @@ CARGO_TARGET_DIR="$TARGET" cargo build --release -p delphi-runtime \
     --bin delphi-runtimed --bin delphi-minimal-ai
 stage "$TARGET/release/delphi-runtimed" delphi-runtimed
 stage "$TARGET/release/delphi-minimal-ai" delphi-minimal-ai
+# D0A-R9-01: the credential-drop helper. Built by runtime/build.rs with crt-static (a
+# RUSTFLAG cargo cannot scope to one target), which is why it is not a cargo bin target
+# and is copied beside the others rather than emitted there directly.
+stage "$TARGET/release/delphi-drop" delphi-drop
 
 echo "== [2/3] REAL WRY shell host (decoupled crate — own workspace, own target) =="
 # shell-host has its own [workspace]; give it its own target dir so its wry/WebKit tree

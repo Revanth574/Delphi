@@ -53,6 +53,16 @@ fn main() {
         .expect("spawn rustc for the drop helper");
     assert!(status.success(), "building the drop helper failed");
 
+    // Also place it beside the other binaries so `installer/build.sh` can name it.
+    // OUT_DIR is `<target>/<profile>/build/<pkg>-<hash>/out`, so three levels up is
+    // `<target>/<profile>` — derived, not guessed, and stable across hash changes.
+    // Writing outside OUT_DIR is discouraged by cargo; done deliberately because the
+    // alternative is the installer parsing `--message-format=json` to discover a path
+    // this script already knows.
+    if let Some(profile_dir) = helper.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).and_then(|p| p.parent()) {
+        let _ = std::fs::copy(&helper, profile_dir.join("delphi-drop"));
+    }
+
     // B1: compile the AI↔daemon general-socket wire schema (protobuf, prost).
     println!("cargo:rerun-if-changed=proto/runtime_wire.proto");
     prost_build::compile_protos(&["proto/runtime_wire.proto"], &["proto"])

@@ -143,14 +143,24 @@ fn ancestor_dirs(binds: &[(std::path::PathBuf, BindMode)]) -> Vec<String> {
 impl SandboxProfile {
     /// Derive the default-deny profile from `action`'s approved scope.
     ///
-    /// Default-deny base: `--unshare-all` (all namespaces, incl. net),
+    /// Default-deny base: every namespace EXCEPT user (D0A-R9-01),
     /// `--die-with-parent`, `--new-session` (detach the controlling tty),
     /// `--clearenv`. Then exactly the approved `fs_binds` (`--ro-bind`/`--bind`),
     /// the `env_delta`, `--chdir`, and `--share-net` **only** for `NetPolicy::Full`.
     #[must_use]
     pub fn derive(action: &PendingAction) -> Self {
         let mut args = vec![
-            "--unshare-all".to_string(),
+            // E (D0A-R9-01): every namespace EXCEPT user. `--unshare-all` implies
+            // `--unshare-user-try`, and bwrap's own userns maps sandbox_uid ->
+            // parent_uid — measured identity-transparent (leg A: INNER 0 /
+            // SO_PEERCRED 0), so it supplied isolation, never identity. Worse, it
+            // maps exactly ONE uid, so nothing inside can drop to another (leg D:
+            // setresuid EINVAL). Dropping it is what lets the payload reach a real
+            // host uid. §6 mandates no user namespace — only `--unshare-net`.
+            "--unshare-ipc".to_string(),
+            "--unshare-pid".to_string(),
+            "--unshare-uts".to_string(),
+            "--unshare-cgroup-try".to_string(),
             "--die-with-parent".to_string(),
             "--new-session".to_string(),
             "--clearenv".to_string(),
@@ -162,8 +172,12 @@ impl SandboxProfile {
             "--dev".to_string(),
             "/dev".to_string(),
         ];
-        if matches!(action.net_policy, NetPolicy::Full) {
-            args.push("--share-net".to_string());
+        // Emitted BOTH ways now that there is no `--unshare-all` to counteract:
+        // `--unshare-net` for `None`, `--share-net` for `Full`. Explicit in each
+        // direction rather than one being the absence of the other.
+        match action.net_policy {
+            NetPolicy::None => args.push("--unshare-net".to_string()),
+            NetPolicy::Full => args.push("--share-net".to_string()),
         }
         // Ancestors BEFORE the binds: bwrap applies arguments in order (class 40).
         for dir in ancestor_dirs(&action.fs_binds) {
@@ -411,7 +425,16 @@ mod tests {
             NetPolicy::Full if !has_share_net => return false, // none where net
             _ => {}
         }
-        args.iter().any(|a| a == "--unshare-all") // default-deny base present
+        // Default-deny base present. STRONGER than the old `--unshare-all` check:
+        // every namespace is named, and `--unshare-user` must be ABSENT — its
+        // presence would put the tool back in a one-uid namespace it cannot drop
+        // out of (D0A-R9-01, leg D).
+        if args.iter().any(|a| a == "--unshare-user" || a == "--unshare-all") {
+            return false;
+        }
+        ["--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup-try"]
+            .iter()
+            .all(|want| args.iter().any(|a| a == want))
     }
 
     /// A broadening derivation (the RED variant): emits `--bind` where the scope

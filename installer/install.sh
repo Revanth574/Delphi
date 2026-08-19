@@ -68,7 +68,7 @@ fstat_trust "$STAGE_FD" "$STAGE" dir
 # Each staged file: bind its inode + fstat-trust it. build.sh stages the binaries AND the unit
 # + PAM here (tight), so this ONE dir is the only source — never the group-writable repo tree.
 declare -A FD
-for f in delphi-runtimed delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam delphi-shell.apparmor; do
+for f in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam delphi-shell.apparmor; do
     exec {fd}< "$STAGE/$f" || refuse "cannot open $STAGE/$f — run installer/build.sh first"
     fstat_trust "$fd" "$STAGE/$f" file
     FD[$f]=$fd
@@ -252,6 +252,10 @@ fi
 
 install -d -m 0755 /usr/libexec
 copy_fd "${FD[delphi-runtimed]}"    /usr/libexec/delphi-runtimed    0755
+# D0A-R9-01: the credential-drop helper. 0755 and root-owned like the daemon — it is in
+# the same trust class (installer-placed, never named by an action), and its substitution
+# would grant uid control, so it must not be writable by anyone the daemon is not.
+copy_fd "${FD[delphi-drop]}"        /usr/libexec/delphi-drop        0755
 copy_fd "${FD[delphi-shell]}"       /usr/libexec/delphi-shell       0755
 copy_fd "${FD[delphi-minimal-ai]}"  /usr/libexec/delphi-minimal-ai  0755
 

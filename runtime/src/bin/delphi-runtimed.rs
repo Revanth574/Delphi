@@ -154,6 +154,12 @@ fn main() -> Result<()> {
         login_defs_uid_range(std::path::Path::new(LOGIN_DEFS)),
     )?;
 
+    // D0A-R9-01: pin the credential-drop helper BEFORE any action runs, so the
+    // substitution window is process start rather than per-action, and a missing
+    // helper is a startup failure rather than an action that silently runs as root.
+    delphi_runtime::execute::preopen_drop_helper()
+        .context("pinning the credential-drop helper")?;
+
     // ── 1a: the root anchor ──────────────────────────────────────────────────
     let dir = ensure_runtime_dir(std::path::Path::new(DEFAULT_RUNTIME_BASE), &session)
         .context("establishing the root-owned runtime directory")?;

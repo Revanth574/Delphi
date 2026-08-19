@@ -8,7 +8,12 @@
 //! cannot build its own sandbox (leg C — `loopback: Failed RTM_NEWADDR`). So the drop
 //! belongs to bwrap's **payload**, which is this.
 //!
-//! Usage: `delphi-drop <uid> <gid> <program> [args...]`
+//! Usage: `delphi-drop <uid> <gid> <program> <argv0> [args...]`
+//!
+//! `argv0` is passed SEPARATELY from `program`: bwrap's `--argv0` would apply to
+//! this helper, not to the tool, so without it the tool would see `argv[0]` as
+//! `/proc/self/fd/N` instead of its approved name — a difference nothing in the
+//! audit would show.
 //!
 //! # Why this binary must be STATICALLY linked
 //!
@@ -48,8 +53,8 @@ fn fail(what: &str) -> ! {
 
 fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if args.len() < 4 {
-        eprintln!("usage: delphi-drop <uid> <gid> <program> [args...]");
+    if args.len() < 5 {
+        eprintln!("usage: delphi-drop <uid> <gid> <program> <argv0> [args...]");
         std::process::exit(2);
     }
     let uid: u32 = args[1].to_string_lossy().parse().unwrap_or_else(|_| {
@@ -91,7 +96,8 @@ fn main() {
         eprintln!("delphi-drop: program path contains NUL");
         std::process::exit(2);
     });
-    let argv: Vec<std::ffi::CString> = args[3..]
+    // argv[0] is the APPROVED name (args[4]), not the program path (args[3]).
+    let argv: Vec<std::ffi::CString> = args[4..]
         .iter()
         .map(|a| std::ffi::CString::new(a.as_bytes()).unwrap_or_default())
         .collect();

@@ -18,11 +18,11 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 
 | § | ratified clause | status | finding | closes when |
 |---|---|---|---|---|
-| §6 | "the tool runs under a uid that **cannot reach daemon IPC**" | **STILL VIOLATED — the action runs as root.** A `pre_exec` drop was implemented and **reverted 2026-08-15**: dropping before `execve` drops *bwrap*, which then cannot build its own sandbox (`loopback: Failed RTM_NEWADDR`). Measured since: `--uid` is cosmetic (leg B); dropping *inside* bwrap's userns is impossible (leg D, `EINVAL` — one uid mapped); dropping with **no** userns works end-to-end (E1+E2, `SO_PEERCRED uid=997`). Leg F — an externally-mapped userns — may give both and is unmeasured | D0A-R9-01 | the ROOT run shows the action's own `id -u` == `delphi-tool`; its RED test is committed and fails at root today |
+| §6 | "the tool runs under a uid that **cannot reach daemon IPC**" | **IMPLEMENTED 2026-08-15 (shape E); PROOF IS ROOT-GATED AND HAS NOT RUN.** The profile drops `--unshare-user` (§6 mandates no user namespace — only `--unshare-net`), and bwrap's payload is `delphi-drop`, a statically linked helper passed **by fd** so it adds no bind, which does `setgroups([]) → setresgid → setresuid` and then execs the pinned program fd. Measured route: `--uid` cosmetic (leg B), drop-before-bwrap breaks setup (leg C), in-userns drop impossible (leg D, `EINVAL`), no-userns drop works end-to-end (E1+E2, `SO_PEERCRED uid=997`). **Not closed:** the `id -u` test skips unprivileged, since below root there is no privilege to drop | D0A-R9-01 | the ROOT run shows the action's own `id -u` == `delphi-tool` |
 | §6 | "**seccomp default-deny**" | **ABSENT** — no `--seccomp` anywhere in `sandbox.rs` | D0A-R9-05 | a policy is attached and a denied syscall is proven denied |
 | §6 | "**cgroup v2 mem/pids/CPU caps**" | **ABSENT** | D0A-R9-04 | caps applied and a breach proven contained |
 | §6 | "**timeout + kill-on-expiry**" | **ABSENT** — `action.timeout` is unenforced | D0A-R9-04 | an over-running action is killed, RED-proven |
-| §3 | "**the digest is the binding** for preview = approval = sandbox = audit" | **PARTIAL, AND NARROWER THAN FIRST RECORDED (corrected 2026-08-13, before the tests were written).** The **script body IS content-pinned** — `execute.rs:138` enforces `ScriptPin::FULL_SEALS` on `script_memfd`, so its bytes and length cannot change after the digest. The gap is the **binary and interpreter** side: `executable_fd` and `interpreter_fd` are plain `File::open` fds — **inode-pinned, never sealed, and `executable_digest` is not re-verified at exec**. Same-inode overwrite and nested-shebang swap execute unapproved bytes **there** (both reproduced by the reviewer) | D0A-R9-02 | the binary/interpreter side is content-pinned, with both substitutions as failing-then-passing tests |
+| §3 | "**the digest is the binding** for preview = approval = sandbox = audit" | **PARTIAL, AND NARROWER THAN FIRST RECORDED (corrected 2026-08-13, before the tests were written).** The **script body IS content-pinned** — `execute.rs:138` enforces `ScriptPin::FULL_SEALS` on `script_memfd`, so its bytes and length cannot change after the digest. The gap is the **binary and interpreter** side: `executable_fd` and `interpreter_fd` are plain `File::open` fds — **inode-pinned, never sealed, and `executable_digest` is not re-verified at exec**. Same-inode overwrite and nested-shebang swap execute unapproved bytes **there** (both reproduced by the reviewer) | D0A-R9-02 | the binary/interpreter side is content-pinned, with both substitutions as failing-then-passing tests — **AND the drop helper is covered by it.** `execute.rs` opens `/usr/libexec/delphi-drop` by PATH, so it carries this same inode-vs-content gap for itself; opening once per process shrinks the window to process start but does not close it. The helper is the one component whose substitution grants **uid control**, so it is the worst candidate for an exemption: **R9-02 may not be closed without answering it** |
 | §6 | "mount exactly `fs_binds`" | **PARTIAL** — bind sources are **path-resolved at launch**, so a symlink swap substitutes scope | D0A-R9-03 | binds resolve to what was approved, TOCTOU-proven |
 | §6 | "env is scrubbed to `env_delta`" | **LEAKS** — `env_delta` is passed in **bwrap's argv**, world-readable via `/proc/<pid>/cmdline` | D0A-R9-06 | secrets never transit argv |
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
@@ -55,6 +55,25 @@ observe or signal each other.
 namespace. `--unshare-all` was an implementation choice in `sandbox.rs`, never ratified text. So
 adopting E **closes** the line-665 clause ("the tool runs under a uid that cannot reach daemon
 IPC") and **violates none** — it creates no new row here.
+
+**AUDIT DISCONTINUITY — `sandbox_profile_digest` values are not comparable across
+2026-08-15.** `audit.rs` records a digest of the derived profile args, and two changes landed
+that alter those args for **every** action: ancestor emission (`--perms 0755 --dir <ancestor>`
+per bind) and the namespace change (`--unshare-all` → the explicit list minus
+`--unshare-user`). So every entry after that date differs from every entry before it, for all
+actions, with no attack and no defect. Recorded because someone diffing audit history later
+would otherwise read a universal change as an anomaly. The `action_digest` is **unaffected** —
+the approved action did not change, only the enforced scope's spelling.
+
+**TCB ENLARGED BY ONE MEMBER — `delphi-drop` (2026-08-15).** The credential-drop helper is not
+covered by the action digest, not previewed, and not named by any action. That is acceptable on
+a **bounded** argument, not on "it is trusted": `bwrap` is already an undigested,
+installer-placed, root-owned component the action never names, and the helper joins that
+existing class on the same basis rather than establishing a new kind of trust. The enlargement
+is real, is small, and is recorded here rather than left implicit. What did **not** change: the
+program executed is still the same pinned fd with the same `executable_digest`, and the tool's
+`argv` is still exactly `action.argv` — the helper takes `argv0` explicitly so the approved name
+still lands in the tool's own `argv[0]`.
 
 **Proof-thinness (not clause violations, recorded so they are not mistaken for coverage):**
 D0A-R9-08 — the "exact approved scope" test ignores unsupported grant options, env fidelity,

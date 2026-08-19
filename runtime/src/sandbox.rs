@@ -106,6 +106,40 @@ pub fn refuse_denied_bind(
     Ok(())
 }
 
+/// Directories that must exist, traversable, before the binds are applied.
+///
+/// **Why this is production logic and not a convenience** (`docs/DEFECT_CLASSES.md`
+/// class 40): bwrap auto-creates a bind's missing parents as **`0700` owned by the
+/// sandbox uid**. While the tool kept bwrap's own uid that was invisible; once the
+/// payload drops to a different uid it cannot traverse them, and every bind under a
+/// not-yet-existing parent becomes unreachable.
+///
+/// Two exclusions, both load-bearing:
+///
+/// * **the bind path itself** — bwrap creates that mountpoint;
+/// * **any ancestor lying inside another bind** — `--dir` there would create the
+///   directory *through* the mount, in the **host** filesystem.
+fn ancestor_dirs(binds: &[(std::path::PathBuf, BindMode)]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let norm: Vec<std::path::PathBuf> =
+        binds.iter().map(|(p, _)| lexical_normalize(p)).collect();
+    let mut wanted: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for b in &norm {
+        let mut cur = b.parent();
+        while let Some(a) = cur {
+            if a.parent().is_none() {
+                break; // `/` always exists
+            }
+            wanted.insert(a.to_path_buf());
+            cur = a.parent();
+        }
+    }
+    wanted.retain(|a| !norm.iter().any(|b| a == b || a.starts_with(b)));
+    // `BTreeSet<PathBuf>` orders component-wise, so a prefix precedes what it
+    // contains — parent-first, which is what bwrap's in-order application needs.
+    wanted.into_iter().map(|p| p.to_string_lossy().into_owned()).collect()
+}
+
 impl SandboxProfile {
     /// Derive the default-deny profile from `action`'s approved scope.
     ///
@@ -130,6 +164,13 @@ impl SandboxProfile {
         ];
         if matches!(action.net_policy, NetPolicy::Full) {
             args.push("--share-net".to_string());
+        }
+        // Ancestors BEFORE the binds: bwrap applies arguments in order (class 40).
+        for dir in ancestor_dirs(&action.fs_binds) {
+            args.push("--perms".to_string());
+            args.push("0755".to_string());
+            args.push("--dir".to_string());
+            args.push(dir);
         }
         for (path, mode) in &action.fs_binds {
             let flag = match mode {
@@ -164,6 +205,86 @@ mod tests {
     use std::path::Path;
 
     const BASE: &str = "/run/delphi";
+
+    /// Emitted `--perms MODE --dir PATH` triples, in order.
+    fn emitted_dirs(args: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 < args.len() {
+            if args[i] == "--perms" && args[i + 2] == "--dir" {
+                out.push(args[i + 3].clone());
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn index_of(args: &[String], needle: &str) -> Option<usize> {
+        args.iter().position(|a| a == needle)
+    }
+
+    /// D0A-R9-01 / class 40 — the profile must create every bind's ancestors with a
+    /// traversable mode. bwrap otherwise auto-creates them `0700` owned by the SANDBOX
+    /// uid, which a dropped payload cannot traverse.
+    ///
+    /// This is the case an implementation gets right for the paths it thought of.
+    #[test]
+    fn every_ancestor_of_every_bind_is_created_traversable() {
+        let a = action_with(
+            vec![
+                (PathBuf::from("/run/delphi-x/sess"), BindMode::ReadOnly),
+                (PathBuf::from("/opt/vendor/tool/bin"), BindMode::ReadWrite),
+            ],
+            NetPolicy::None,
+        );
+        let args = SandboxProfile::derive(&a).args().to_vec();
+        let dirs = emitted_dirs(&args);
+        for want in ["/run", "/run/delphi-x", "/opt", "/opt/vendor", "/opt/vendor/tool"] {
+            assert!(dirs.iter().any(|d| d == want), "missing ancestor `{want}`; got {dirs:?}");
+        }
+        // The bind target itself is bwrap's mountpoint — creating it would be wrong.
+        assert!(!dirs.iter().any(|d| d == "/run/delphi-x/sess"), "must not --dir the bind itself");
+        // Parent-first, and before the bind that needs it: bwrap applies args in order.
+        let (p, c) = (index_of(&args, "/run").unwrap(), index_of(&args, "/run/delphi-x").unwrap());
+        assert!(p < c, "ancestors must be emitted parent-first");
+        let bind_at = args.iter().position(|x| x == "--ro-bind").unwrap();
+        assert!(c < bind_at, "ancestors must precede the bind that needs them");
+    }
+
+    /// Shared ancestors are emitted ONCE. A repeat is not merely noise: bwrap applies
+    /// each in order, so a second `--dir` over an existing path re-applies the mode.
+    #[test]
+    fn shared_ancestors_are_not_emitted_twice() {
+        let a = action_with(
+            vec![
+                (PathBuf::from("/srv/data/one"), BindMode::ReadOnly),
+                (PathBuf::from("/srv/data/two"), BindMode::ReadOnly),
+            ],
+            NetPolicy::None,
+        );
+        let dirs = emitted_dirs(SandboxProfile::derive(&a).args());
+        assert_eq!(dirs.iter().filter(|d| *d == "/srv").count(), 1, "got {dirs:?}");
+        assert_eq!(dirs.iter().filter(|d| *d == "/srv/data").count(), 1, "got {dirs:?}");
+    }
+
+    /// THE DANGEROUS ONE. If `/opt` is itself bound, `/opt/vendor` lives INSIDE that
+    /// bind — and `--dir` there creates the directory in the HOST filesystem through
+    /// the mount. An ancestor that falls inside another bind must NOT be emitted.
+    #[test]
+    fn an_ancestor_inside_another_bind_is_never_created() {
+        let a = action_with(
+            vec![
+                (PathBuf::from("/opt"), BindMode::ReadOnly),
+                (PathBuf::from("/opt/vendor/tool"), BindMode::ReadOnly),
+            ],
+            NetPolicy::None,
+        );
+        let dirs = emitted_dirs(SandboxProfile::derive(&a).args());
+        assert!(
+            !dirs.iter().any(|d| d == "/opt/vendor"),
+            "creating a dir inside a bind writes through to the HOST; got {dirs:?}"
+        );
+    }
 
     /// D0A-R9-10. Every shape that names the daemon's runtime directory, including
     /// the ones a lexical prefix compare alone would miss (class 14 — a guard must

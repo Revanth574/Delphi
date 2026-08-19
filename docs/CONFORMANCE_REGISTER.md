@@ -56,14 +56,42 @@ namespace. `--unshare-all` was an implementation choice in `sandbox.rs`, never r
 adopting E **closes** the line-665 clause ("the tool runs under a uid that cannot reach daemon
 IPC") and **violates none** — it creates no new row here.
 
-**ESCAPE-CLAIM NARROWED (2026-08-15, D0A-R10 review).** The register recorded E's escape
-improvement — 997 instead of 0 — **unqualified**, and that is an overstatement of the same class
-as R9-02's and the original R9-01/R9-10 symmetry claim. **It holds only for a POST-DROP payload
-escape.** bwrap and `delphi-drop` both run **pre-drop, as initial-namespace root**, so an escape
-during the setup window lands on **root exactly as before**. E was never aimed at that window and
-does not improve it. What E changes is the escape surface of the *tool*, which is the long-lived
-part; the setup window is short and code we ship, but it is not zero and the register no longer
-implies it is.
+**THE E TRADE, RESTATED HONESTLY (2026-08-16, D0A-R10-03).** The previous two versions of this
+entry were both wrong, in the same direction, and the second was written while *correcting* the
+first. Superseded rather than edited, so the drift is visible.
+
+**What was measured and still holds:** bwrap's own userns maps `sandbox_uid → parent_uid`, so at
+root the jail was `INNER 0 / SO_PEERCRED 0` — **identity**-transparent. That measurement is sound.
+
+**What was inferred and never examined:** that identity-transparency meant the namespace "contained
+nothing". It did not. **Capabilities are relative to a user namespace.** A process in a child
+userns holds a full capability set *in that namespace*, but the kernel checks against the userns
+that **owns the resource** — so capabilities never reached initial-namespace objects, whatever the
+identity map said. `--unshare-all` was supplying a **capability boundary independent of identity**,
+and E removes it. bwrap under real root retains the caller's capabilities through setup, so under E
+that code runs with **initial-namespace** capabilities.
+
+**So E is a TRADE ACROSS A TIME BOUNDARY, not a dominance:**
+
+| window | before E | after E |
+|---|---|---|
+| **pre-drop** (bwrap setup + `delphi-drop` up to `setresuid`) | uid 0, capabilities confined to a child userns | uid 0, **initial-namespace capabilities** — *more powerful* |
+| **post-drop** (the tool — the long-lived part) | uid 0 with userns-confined caps | uid **997**, caps dropped with the uid — *less powerful* |
+
+"Strictly better on the escape axis" and "an escape lands on root exactly as before" are **both
+false**. E improves the window that lasts and worsens the window that is short. That may still be
+the right call — the tool is the untrusted part and the setup is code we ship — but it is a
+judgement, and the reasoning that chose it was incomplete.
+
+**A THIRD WINDOW NEITHER R9-01 NOR §6 COVERS.** R9-01's mechanism is *the tool runs as
+delphi-tool*; §6's clause is *cannot reach daemon IPC*. The **pre-drop window** is neither, and it
+is now the more powerful of the two states. It has no row, no test, and no owner.
+
+**AND R9-01's PROOF IS NARROWER THAN ITS ROW CLAIMS.** The root test observes `id -u` and nothing
+else: **not gid, not supplementary groups, not saved ids, not capabilities, and not the daemon-IPC
+refusal that is the actual clause.** The gap between "mechanism closed" and "clause closed" is
+therefore wider than recorded, and `997` was read from a test that proves one of six things it is
+cited for.
 
 **AUDIT DISCONTINUITY — `sandbox_profile_digest` values are not comparable across
 2026-08-15.** `audit.rs` records a digest of the derived profile args, and two changes landed

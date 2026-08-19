@@ -2256,6 +2256,42 @@ taken — so take the baseline before spending a round on the anomaly.
 
 ---
 
+## 41. The assertion is at the wrong ALTITUDE  *(new — D0A-R10; THREE instances in one round)*
+
+**THE DISCRIMINATING QUESTION: does the assertion observe the layer where the property would
+actually be VIOLATED?**
+
+Three instances in a single round, which is what earns the entry:
+
+| the assertion observed | the property lives in | what was missed |
+|---|---|---|
+| bwrap's emitted `--argv0` flag | the **kernel's exec handling** — for a shebang script the kernel rebuilds the interpreter's argv from the script path | `$0` cannot observe `--argv0` at all; the test was wrong, not the code |
+| the emitted `--perms/--dir` args | the **filesystem** — bwrap creates a missing bind ancestor itself, through the enclosing mount | filtering the ancestor stopped *our* emission, never bwrap's write to the host |
+| the error **string** `execvp: No such file or directory` | the **process** — that errno is the signature of a missing loader **and** of a missing fd | a red with no discriminating power; it would have failed identically either way |
+
+**Why it happens, and it is not carelessness:** the assertion drifts to where **observation is
+cheap**. Args are a `Vec<String>` you can inspect in a unit test; filesystems, kernels and errnos
+need a real run, a before/after comparison, or a second discriminating leg. So the test gets
+written at the altitude that is convenient rather than the altitude the property occupies, and it
+then passes for reasons unrelated to the claim.
+
+**Distinct from two neighbours it is easily confused with:**
+
+* **Class 25** — the *fixture* diverges from its subject. There the altitude is right and the
+  setup is wrong.
+* **Class 38** — the check is correct and its *output* carries none of what it verified. There
+  the altitude is right and the report is silent.
+* **This** — the check is pointed at the wrong altitude entirely, so no amount of better fixture
+  or louder output would help.
+
+**Foreclosing discipline:** before writing the assertion, name the layer at which a violation
+would first become observable, and assert **there**. If that requires a real run, a before/after
+snapshot, or a second leg to separate two causes of one symptom, that cost *is* the test — an
+argv-level proxy for a filesystem-level property is not a cheaper version of the test, it is a
+different test that does not bite.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2301,3 +2337,4 @@ taken — so take the baseline before spending a round on the anomaly.
 | 32. Mechanical substitution, undocumented property | ask at substitution: **what unstated property is the caller relying on?**; make it explicit in the replacement rather than trusting the new default | Discipline |
 | 39. First-ordered check that never fires in time | discipline — **the mechanism already exists** (`scripts/check-free-space.sh`): run it at block START and before any bulk write; on an unexplained tool failure suspect the SUBSTRATE before the harness | Discipline (nothing to extract) |
 | 40. Sandbox scaffolding blocks the measurement | bwrap auto-creates intermediates `0700` owned by the sandbox uid: emit `--perms 0755 --dir` per ancestor when the payload's uid differs, and pair every such probe with a positive control | Discipline + production constraint |
+| 41. Assertion at the wrong altitude | discipline: **does the assertion observe the layer where the property would be violated?** Assert there, even when it costs a real run, a before/after snapshot, or a second discriminating leg | Discipline |

@@ -39,6 +39,23 @@ resolution, which is the breach; narrowing the guard to `uid == 0` makes the cla
 with "everything is refused". The row is removed from the table above per this register's rule
 that a row leaves only when a test proves it closed.
 
+**OPENED 2026-08-15 — D0A-R9-12: actions have no isolation FROM EACH OTHER.** Recorded as its
+own item, deliberately **not** folded into R9-01, because E does not solve it and must not be read
+as having done so. Under E every action runs as the **same** `delphi-tool` uid, so two actions —
+or one action and a later one — can signal each other, and anything one leaves owner-writable is
+reachable by the next. This is **better than today** (they currently share *root*) and **worse
+than nothing shared**. It is a different problem with a different fix (a per-action uid, which
+`DynamicUser=` cannot supply here for the reason already recorded above). Not a §6 clause
+violation — §6 says nothing about inter-action isolation — so it is logged here as a known gap
+rather than a conformance delta. **Closes when** two concurrent actions are proven unable to
+observe or signal each other.
+
+**NOT a §6 change (checked 2026-08-15, before implementing E).** §6's only namespace clause is
+**network** (`--unshare-net` / `--share-net`, line 662); nothing in it mandates a *user*
+namespace. `--unshare-all` was an implementation choice in `sandbox.rs`, never ratified text. So
+adopting E **closes** the line-665 clause ("the tool runs under a uid that cannot reach daemon
+IPC") and **violates none** — it creates no new row here.
+
 **Proof-thinness (not clause violations, recorded so they are not mistaken for coverage):**
 D0A-R9-08 — the "exact approved scope" test ignores unsupported grant options, env fidelity,
 cwd, and removal of `--clearenv`. D0A-R9-09 — `fdsec`'s sole test proves neither high

@@ -91,11 +91,64 @@ const LOGIN_DEFS: &str = "/etc/login.defs";
 const DEFAULT_UID_MIN: u32 = 1000;
 const DEFAULT_UID_MAX: u32 = 60000;
 
+/// `strtoul(v, NULL, 0)`'s accepted forms and no others: an optional `+`, then `0x`/`0X`
+/// hex, a leading-`0` octal, or decimal — the whole value or nothing.
+///
+/// Deliberate divergence, the only one: a value above `u32::MAX` yields `None` (and so the
+/// built-in default) where shadow takes it as `unsigned long` and truncates — measured,
+/// `UID_MIN 4294967296` made `useradd` allocate uid **0**. Falling back beats wrapping.
+fn parse_c_ulong(v: &str) -> Option<u32> {
+    let v = v.strip_prefix('+').unwrap_or(v);
+    let (digits, radix) = match v.as_bytes() {
+        [b'0', b'x' | b'X', rest @ ..] if !rest.is_empty() => (&v[2..], 16),
+        [b'0', rest @ ..] if !rest.is_empty() => (&v[1..], 8),
+        _ => (v, 10),
+    };
+    // `from_str_radix` accepts its own sign prefix; `strtoul` does not accept one after the
+    // radix prefix (`0x+1388` is rejected — measured). Admit alphanumerics only.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    u32::from_str_radix(digits, radix).ok()
+}
+
+/// One `/etc/login.defs` line, parsed the way shadow parses it.
+///
+/// Every step here is a MEASURED behaviour of `useradd --prefix` on shadow 1:4.17.4
+/// (`scratch/d1-login-defs-probe.sh`), not a reading of `login.defs(5)`: the trailing-blank
+/// trim happens BEFORE the quote strip (`" 5000 "` is rejected, `"5000"  ` is accepted), and
+/// the trim covers space and tab only (`5000\r` from a CRLF file is rejected).
+fn login_defs_line(line: &str, key: &str) -> Option<u32> {
+    let line = line.trim_start_matches([' ', '\t']);
+    if line.starts_with('#') {
+        return None;
+    }
+    let (k, value) = line.split_once([' ', '\t'])?;
+    if k != key {
+        return None;
+    }
+    let value = value.trim_end_matches([' ', '\t']);
+    let value = value.strip_prefix('"').unwrap_or(value);
+    let value = value.strip_suffix('"').unwrap_or(value);
+    // `strtoul` skips leading whitespace of its own accord; the trailing side is already
+    // trimmed above, and anything left there (a `\r`) must still fail, as it does for shadow.
+    parse_c_ulong(value.trim_start_matches([' ', '\t']))
+}
+
+/// D0A-R10-07: the value shadow itself would use for `key`.
+///
+/// **The grammar must be shadow's, not a reasonable one.** These bounds classify accounts
+/// (`refuse_system_account`, `refuse_unsafe_tool_account`), and shadow's `useradd` is what
+/// hands out the uids being classified. A parser that disagrees about a form disagrees about
+/// which accounts are login accounts — which is the class D0A-R9-11 closed, reopened one
+/// level down. Seven of thirteen forms disagreed before this.
 fn login_defs_key(text: &str, key: &str, default: u32) -> u32 {
-    text.lines()
-        .filter_map(|line| line.split_once(char::is_whitespace))
-        .find(|(k, _)| k.trim() == key)
-        .and_then(|(_, v)| v.trim().parse().ok())
+    // `split('\n')`, NOT `.lines()`: `lines()` strips a trailing `\r` and shadow does not —
+    // it rejects `5000\r` and falls back to its default. Measured in both directions.
+    text.split('\n')
+        .filter_map(|line| login_defs_line(line, key))
+        // LAST definition wins, measured: `UID_MIN 5000` then `UID_MIN 6000` allocates 6000.
+        .next_back()
         .unwrap_or(default)
 }
 
@@ -105,14 +158,37 @@ fn login_defs_key(text: &str, key: &str, default: u32) -> u32 {
 /// **Both ends are load-bearing.** `UID_MIN` alone would admit `nobody`, whose uid is
 /// 65534 on Debian/Ubuntu — above `UID_MIN`, and above `UID_MAX` (60000), which is the
 /// bound that actually excludes it.
-fn login_defs_uid_range(path: &std::path::Path) -> (u32, u32) {
+/// Returns `Err` on an inverted range rather than leaving that to a call the next edit can
+/// forget: the validation lives on the ONLY path that produces a range, so a caller cannot
+/// hold one that was not checked (`docs/DEFECT_CLASSES.md` class 8 — one choke point).
+fn login_defs_uid_range(path: &std::path::Path) -> Result<(u32, u32)> {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (DEFAULT_UID_MIN, DEFAULT_UID_MAX);
+        return Ok((DEFAULT_UID_MIN, DEFAULT_UID_MAX));
     };
-    (
+    let range = (
         login_defs_key(&text, "UID_MIN", DEFAULT_UID_MIN),
         login_defs_key(&text, "UID_MAX", DEFAULT_UID_MAX),
-    )
+    );
+    refuse_inverted_uid_range(range)?;
+    Ok(range)
+}
+
+/// Refuse an inverted range (D0A-R10-07). Not defensiveness for its own sake: under
+/// `UID_MIN > UID_MAX` the login-range leg of `refuse_unsafe_tool_account` can never fire,
+/// so every tool account passes the check that exists to keep it out of the login range —
+/// a guard silently disabled by a config file. `useradd` refuses to allocate under the same
+/// condition (`Invalid configuration: UID_MIN (60000), UID_MAX (5000)`, rc=4, measured), so
+/// refusing here follows the system rather than departing from it.
+fn refuse_inverted_uid_range((uid_min, uid_max): (u32, u32)) -> Result<()> {
+    if uid_min > uid_max {
+        bail!(
+            "refusing to run: {LOGIN_DEFS} declares an inverted login range (UID_MIN {uid_min} \
+             > UID_MAX {uid_max}). No uid is inside it, so the tool account's login-range \
+             check could never refuse anything (D0A-R10-07). `useradd` refuses to allocate \
+             under this configuration too — fix {LOGIN_DEFS}."
+        );
+    }
+    Ok(())
 }
 
 /// Refuse to serve a system account. `--session` comes from the unit's `%i` and is
@@ -182,12 +258,11 @@ fn main() -> Result<()> {
     let user = User::from_name(&session)
         .with_context(|| format!("resolving session user `{session}`"))?
         .with_context(|| format!("no such session user `{session}`"))?;
+    // Read ONCE and hand the same value to both guards: two reads could see two different
+    // files, and the second guard's decision would then rest on a range the first never saw.
+    let uid_range = login_defs_uid_range(std::path::Path::new(LOGIN_DEFS))?;
     // BEFORE the anchor: a refusal here must precede any system-state change.
-    refuse_system_account(
-        &session,
-        user.uid.as_raw(),
-        login_defs_uid_range(std::path::Path::new(LOGIN_DEFS)),
-    )?;
+    refuse_system_account(&session, user.uid.as_raw(), uid_range)?;
 
     // D0A-R10-06: the tool identity is validated against the session being served,
     // before anything is pinned or anchored.
@@ -197,7 +272,7 @@ fn main() -> Result<()> {
         refuse_unsafe_tool_account(
             (tool.uid.as_raw(), tool.gid.as_raw()),
             (user.uid.as_raw(), user.gid.as_raw()),
-            login_defs_uid_range(std::path::Path::new(LOGIN_DEFS)),
+            uid_range,
         )?;
     }
 
@@ -467,15 +542,120 @@ mod system_account_guard {
         assert!(refuse_system_account("root", 0, (0, 60000)).is_err());
     }
 
+    /// D0A-R10-07 — every row here is a MEASUREMENT of shadow 1:4.17.4, taken by
+    /// `scratch/d1-login-defs-probe.sh`: it writes the body into a throwaway
+    /// `useradd --prefix` tree and reads back the uid `useradd` actually allocated.
+    /// `1000` means shadow did not honour the form and fell back to its own built-in
+    /// default — agreement in the fallback is as load-bearing as agreement in the value,
+    /// since a form we honour and shadow rejects widens our range against the system's.
+    ///
+    /// The transcript prints, so a pass shows the grammar it agreed on rather than `ok`
+    /// (`docs/DEFECT_CLASSES.md` class 38).
+    #[test]
+    fn the_grammar_agrees_with_shadows_measured_behaviour() {
+        // (what the file says, what `useradd` allocated under it)
+        let measured: &[(&str, &str, u32)] = &[
+            ("plain", "UID_MIN 5000\n", 5000),
+            ("leading spaces", "   UID_MIN 5000\n", 5000),
+            ("leading tab", "\tUID_MIN 5000\n", 5000),
+            ("hex", "UID_MIN 0x1388\n", 5000),
+            ("hex, capital X", "UID_MIN 0X1388\n", 5000),
+            ("octal", "UID_MIN 011610\n", 5000),
+            ("plus-prefixed", "UID_MIN +5000\n", 5000),
+            ("many blanks before the value", "UID_MIN    5000\n", 5000),
+            ("trailing blanks", "UID_MIN 5000   \n", 5000),
+            ("double-quoted", "UID_MIN \"5000\"\n", 5000),
+            ("opening quote only", "UID_MIN \"5000\n", 5000),
+            ("closing quote only", "UID_MIN 5000\"\n", 5000),
+            ("quoted, then trailing blanks", "UID_MIN \"5000\"  \n", 5000),
+            ("quoted hex", "UID_MIN \"0x1388\"\n", 5000),
+            ("no trailing newline", "UID_MAX 50000\nUID_MIN 5000", 5000),
+            ("bare zero", "UID_MIN 0\n", 0),
+            // Forms shadow REFUSES — it reports `cannot parse UID_MIN value` (or never sees
+            // the key) and uses its built-in default.
+            ("trailing comment", "UID_MIN 5000 # x\n", 1000),
+            ("single-quoted", "UID_MIN '5000'\n", 1000),
+            ("blanks inside the quotes", "UID_MIN \" 5000 \"\n", 1000),
+            ("CRLF line ending", "UID_MIN 5000\r\n", 1000),
+            ("sign after the radix prefix", "UID_MIN 0x+1388\n", 1000),
+            ("key=value", "UID_MIN=5000\n", 1000),
+            ("commented out", "#UID_MIN 5000\n", 1000),
+            ("indented comment", "   #UID_MIN 5000\n", 1000),
+            ("lowercase key", "uid_min 5000\n", 1000),
+            ("negative", "UID_MIN -1\n", 1000),
+            ("empty value", "UID_MIN \nUID_MAX 50000\n", 1000),
+            // Precedence: the LAST definition is the one `useradd` allocated under.
+            ("duplicate keys — last wins", "UID_MIN 5000\nUID_MIN 6000\n", 6000),
+        ];
+        let mut disagreed = Vec::new();
+        for (form, body, shadow) in measured {
+            let ours = login_defs_key(body, "UID_MIN", DEFAULT_UID_MIN);
+            println!(
+                "  {:<30} shadow={:<6} ours={:<6} {}",
+                form,
+                shadow,
+                ours,
+                if ours == *shadow { "agree" } else { "DISAGREE" }
+            );
+            if ours != *shadow {
+                disagreed.push(*form);
+            }
+        }
+        assert!(
+            disagreed.is_empty(),
+            "the parser disagrees with shadow on {} form(s): {disagreed:?} — it would \
+             classify accounts differently from the tool that assigns their uids",
+            disagreed.len()
+        );
+    }
+
+    /// The ONE deliberate divergence, in its own test so it cannot be read as agreement:
+    /// above `u32::MAX` shadow keeps parsing as `unsigned long` and the value truncates
+    /// (measured: `UID_MIN 4294967296` made `useradd` allocate uid **0** — root's). We
+    /// refuse the value and take the built-in default instead of wrapping.
+    #[test]
+    fn an_out_of_range_value_falls_back_rather_than_truncating() {
+        assert_eq!(login_defs_key("UID_MIN 4294967296\n", "UID_MIN", DEFAULT_UID_MIN), DEFAULT_UID_MIN);
+        assert_eq!(parse_c_ulong("4294967296"), None);
+        assert_eq!(parse_c_ulong("4294967295"), Some(u32::MAX));
+    }
+
+    /// An inverted range disables the tool-account login-range check silently, so the
+    /// daemon refuses to start under it — as `useradd` refuses to allocate under it.
+    ///
+    /// Asserted THROUGH `login_defs_uid_range`, the only path that produces a range, not
+    /// only against the predicate: a test that calls the predicate alone would pass just as
+    /// happily with the call site deleted.
+    #[test]
+    fn an_inverted_login_range_is_refused_and_a_normal_one_is_not() {
+        let err = refuse_inverted_uid_range((60000, 5000)).expect_err("inverted must refuse");
+        assert!(err.to_string().contains("inverted login range"), "got: {err}");
+        // POSITIVE CONTROL — including the degenerate single-value range, which is valid.
+        assert!(refuse_inverted_uid_range((1000, 60000)).is_ok());
+        assert!(refuse_inverted_uid_range((1000, 1000)).is_ok());
+
+        let dir = tmpdir("inverted");
+        let f = dir.join("login.defs");
+        std::fs::write(&f, "UID_MIN 60000\nUID_MAX 5000\n").unwrap();
+        let err = login_defs_uid_range(&f).expect_err("the range reader must refuse it too");
+        assert!(err.to_string().contains("inverted login range"), "got: {err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("delphi-logindefs-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn range_is_read_from_login_defs_and_falls_back_when_absent() {
-        let dir = std::env::temp_dir().join(format!("delphi-logindefs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmpdir("range");
         let f = dir.join("login.defs");
         std::fs::write(&f, "# comment\nUID_MIN\t\t 500\nUID_MAX\t\t 50000\n").unwrap();
-        assert_eq!(login_defs_uid_range(&f), (500, 50000));
+        assert_eq!(login_defs_uid_range(&f).unwrap(), (500, 50000));
         assert_eq!(
-            login_defs_uid_range(&dir.join("absent")),
+            login_defs_uid_range(&dir.join("absent")).unwrap(),
             (DEFAULT_UID_MIN, DEFAULT_UID_MAX)
         );
         std::fs::remove_dir_all(&dir).unwrap();

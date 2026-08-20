@@ -231,7 +231,7 @@ impl SandboxProfile {
         // parent while an argv-level scope check still sees both flags. Sorting
         // component-wise puts a prefix before what it contains.
         let mut ordered: Vec<&(std::path::PathBuf, BindMode)> = action.fs_binds.iter().collect();
-        ordered.sort_by(|a, b| lexical_normalize(&a.0).cmp(&lexical_normalize(&b.0)));
+        ordered.sort_by_key(|b| lexical_normalize(&b.0));
         for (path, mode) in ordered {
             let flag = match mode {
                 BindMode::ReadOnly => "--ro-bind",

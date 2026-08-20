@@ -59,11 +59,24 @@ DAEMON="$TREE/runtime/src/bin/delphi-runtimed.rs"
 
 # ── one measured run ───────────────────────────────────────────────────────────────────
 # Sets: RUN_RC, RUN_COMPILED, RUN_RESULT_LINES, RUN_FAILURES (sorted, newline-separated),
-#       RUN_EXECUTED, RUN_SKIPPED
+#       RUN_RAN (passed + failed), RUN_SKIPPED.
+#
+# TWO THINGS THIS GOT WRONG ON ITS FIRST RUN, both worth stating because both produced a
+# confident-looking wrong answer:
+#
+#   * `--nocapture` is REQUIRED to see skips at all. The project's gated tests `eprintln!`
+#     their SKIP marker, and libtest captures stderr for passing tests — without it the run
+#     reported SKIPPED=0 for a suite with a known skip, i.e. a skipped test counted as
+#     executed. `scripts/test-count.sh` documents exactly this and I did not carry it over.
+#   * The stability invariant is PASSED + FAILED, not EXECUTED. A CAUGHT mutant moves tests
+#     from passed to failed, so an executed-count derived from `passed` alone drops on every
+#     successful catch — which the first run then reported as UNEXPLAINED, for thirteen
+#     mutants including several that were plainly caught. The number that must not move is
+#     how many tests RAN.
 measure() {
     local log="$WORK/log"
     ( cd "$TREE" && cargo test -p delphi-runtime --lib --bins --no-fail-fast \
-        -- --test-threads=1 ) &> "$log"
+        -- --test-threads=1 --nocapture ) &> "$log"
     RUN_RC=$?
     if grep -qE '^error(\[|: could not compile)' "$log"; then
         RUN_COMPILED=0
@@ -72,12 +85,13 @@ measure() {
     fi
     RUN_RESULT_LINES=$(grep -cE '^test result:' "$log")
     RUN_FAILURES=$(grep -oE '^test [^ ]+ \.\.\. FAILED' "$log" | awk '{print $2}' | sort -u)
-    local reported skipped
-    reported=$(grep -E '^test result:' "$log" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' \
+    local passed failed
+    passed=$(grep -E '^test result:' "$log" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' \
         | awk '{s+=$1} END {print s+0}')
-    skipped=$(grep -cE '^test [^ ]+ \.\.\. (SKIP|DEFER)' "$log")
-    RUN_SKIPPED=$skipped
-    RUN_EXECUTED=$(( reported - skipped ))
+    failed=$(grep -E '^test result:' "$log" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' \
+        | awk '{s+=$1} END {print s+0}')
+    RUN_RAN=$(( passed + failed ))
+    RUN_SKIPPED=$(grep -cE '^test [^ ]+ \.\.\. (SKIP|DEFER)' "$log")
 }
 
 apply() {  # apply <file> <old> <new>  -> 0 applied, 1 not applied
@@ -104,10 +118,10 @@ measure
 BASE_RC=$RUN_RC
 BASE_LINES=$RUN_RESULT_LINES
 BASE_FAILURES=$RUN_FAILURES
-BASE_EXECUTED=$RUN_EXECUTED
+BASE_RAN=$RUN_RAN
 BASE_SKIPPED=$RUN_SKIPPED
-printf 'baseline: cargo rc=%s  result lines=%s  EXECUTED=%s SKIPPED=%s\n' \
-    "$BASE_RC" "$BASE_LINES" "$BASE_EXECUTED" "$BASE_SKIPPED"
+printf 'baseline: cargo rc=%s  result lines=%s  RAN=%s (of which SKIPPED=%s)\n' \
+    "$BASE_RC" "$BASE_LINES" "$BASE_RAN" "$BASE_SKIPPED"
 if [ -n "$BASE_FAILURES" ]; then
     echo "baseline FAILURES (these cancel out of every verdict below):"
     printf '  %s\n' $BASE_FAILURES
@@ -122,11 +136,11 @@ verdict() {  # verdict <label>
     if [ "$RUN_COMPILED" -eq 0 ]; then
         caught=$((caught+1)); printf '  %-46s CAUGHT (does not compile)\n' "$label"; return
     fi
-    if [ "$RUN_RESULT_LINES" -ne "$BASE_LINES" ] || [ "$RUN_EXECUTED" -ne "$BASE_EXECUTED" ] \
+    if [ "$RUN_RESULT_LINES" -ne "$BASE_LINES" ] || [ "$RUN_RAN" -ne "$BASE_RAN" ] \
        || [ "$RUN_SKIPPED" -ne "$BASE_SKIPPED" ]; then
         unexplained=$((unexplained+1))
-        printf '  %-46s UNEXPLAINED — lines %s/%s exec %s/%s skip %s/%s (no verdict)\n' \
-            "$label" "$RUN_RESULT_LINES" "$BASE_LINES" "$RUN_EXECUTED" "$BASE_EXECUTED" \
+        printf '  %-46s UNEXPLAINED — lines %s/%s ran %s/%s skip %s/%s (no verdict)\n' \
+            "$label" "$RUN_RESULT_LINES" "$BASE_LINES" "$RUN_RAN" "$BASE_RAN" \
             "$RUN_SKIPPED" "$BASE_SKIPPED"
         return
     fi
@@ -169,11 +183,11 @@ run_case "denylist: ancestor-containment leg removed" "$SANDBOX" \
   '            || base_n.starts_with(&candidate)
 ' '
 '
-run_case "denylist: equality leg removed" "$SANDBOX" \
+run_case "denylist: equality leg removed (redundant?)" "$SANDBOX" \
   '        if candidate == base_n
             || candidate.starts_with(&base_n)' \
   '        if candidate.starts_with(&base_n)'
-run_case "lexical_normalize: `..` folding removed" "$SANDBOX" \
+run_case "lexical_normalize: parent-dir folding removed" "$SANDBOX" \
   '            Component::ParentDir => {
                 out.pop();
             }' \
@@ -183,8 +197,10 @@ run_case "lexical_normalize: `..` folding removed" "$SANDBOX" \
 # Codex named this omission: read-only -> read-write is R10-05's vulnerability in mutation
 # form, and the first set did not contain it.
 run_case "binds: ro-bind TRANSLATED to rw (R10-05's shape)" "$SANDBOX" \
-  '                BindMode::ReadOnly => "--ro-bind",' \
-  '                BindMode::ReadOnly => "--bind",'
+  '            let flag = match mode {
+                BindMode::ReadOnly => "--ro-bind",' \
+  '            let flag = match mode {
+                BindMode::ReadOnly => "--bind",'
 run_case "binds: parent-first ordering removed" "$SANDBOX" \
   '        ordered.sort_by_key(|b| lexical_normalize(&b.0));' '        '
 run_case "binds: env_delta never emitted" "$SANDBOX" \

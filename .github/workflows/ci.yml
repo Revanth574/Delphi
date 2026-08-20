@@ -16,9 +16,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The workspace .cargo/config.toml pins build.target-dir to a WSL-dev path
-  # (/home/raven/...) that does not exist on CI runners. The env var overrides the
-  # config file (documented in .cargo/config.toml), so CI never depends on it.
+  # Set explicitly so CI never depends on whatever .cargo/config.toml happens to say.
+  # (It used to pin build.target-dir to a WSL-dev path; that pin was removed 2026-08-15,
+  # and this line is now belt-and-braces rather than a workaround.)
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
 jobs:
@@ -80,6 +80,27 @@ jobs:
 
       - name: cargo deny check (unmaintained advisories, licenses, sources, bans)
         run: cargo deny check
+
+  shell-suites:
+    name: Shell suites — installer, scripts, hooks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The suites shell out to these. Named explicitly rather than assumed present on the
+      # runner image: a missing tool would otherwise surface as an unrelated assertion
+      # failing deep inside a suite. (`apparmor_parser` = apparmor; `unshare` = util-linux.)
+      - name: Install the tools the suites invoke
+        run: sudo apt-get update && sudo apt-get install -y apparmor strace
+
+      # D0A-R10-10: nothing ran these before — not cargo, not this workflow, not the
+      # pre-commit hook — so installer/tests/{build-staging,tree-install} sat RED for 12
+      # commits, the second being the tier-1 sole evidence for the tree-replace invariant.
+      # UNVERIFIED ON A RUNNER at the time of writing: green on the dev box (9/9), never yet
+      # executed by GitHub Actions. If the first run is red, that is information about the
+      # runner image, not necessarily about the suites.
+      - name: Run every *.test.sh
+        run: bash scripts/run-shell-suites.sh
 
   shell:
     name: Shell — TypeScript test + build

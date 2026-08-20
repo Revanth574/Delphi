@@ -21,6 +21,22 @@ REAL=$PWD/installer/build.sh
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 pass=0; fail=0
 
+# The build products build.sh stages, DERIVED FROM build.sh rather than listed here.
+#
+# D0A-R10-10: this fixture listed three products while build.sh staged four. `delphi-drop`
+# was added at cdc3418 and the fixture was not, so every leg below failed with
+# `MISSING BUILD PRODUCT` and the suite has been RED for 12 commits — unnoticed because
+# nothing runs it (cargo does not, and the pre-commit gate is scoped to staged runtime/
+# paths). A fixture that enumerates what its subject reads is a second copy of a list, and
+# the copy drifts (class 17). Deriving it means the next artifact needs no edit here; a
+# derivation that yields nothing REFUSES rather than quietly testing an empty set.
+products_of() {  # products_of <build.sh> -> one relative path per line
+    grep -oE '^stage "\$TARGET/[^"]+"' "$1" | sed 's/^stage "\$TARGET\///; s/"$//'
+}
+mapfile -t PRODUCTS < <(products_of "$REAL")
+[ "${#PRODUCTS[@]}" -gt 0 ] || { echo "REFUSING: could not derive the staged products from $REAL"; exit 2; }
+printf 'build.sh stages %d product(s): %s\n\n' "${#PRODUCTS[@]}" "${PRODUCTS[*]}"
+
 # A fake repo with everything build.sh reads, and stub cargo/pnpm so no real build runs.
 mkrepo() {  # mkrepo <build.sh-to-link> -> repo dir
     local sut=$1 r="$work/repo-$RANDOM"
@@ -30,11 +46,15 @@ mkrepo() {  # mkrepo <build.sh-to-link> -> repo dir
     echo "pam"     > "$r/installer/pam/delphi-runtime"
     echo "profile" > "$r/installer/apparmor/delphi-shell"
     echo "<html>"  > "$r/shell/dist/index.html"
-    local t="$r/target"
-    mkdir -p "$t/release" "$t/shell-host/release"
-    echo "REAL-DAEMON-BYTES" > "$t/release/delphi-runtimed"
-    echo "REAL-AI-BYTES"     > "$t/release/delphi-minimal-ai"
-    echo "REAL-SHELL-BYTES"  > "$t/shell-host/release/delphi-shell"
+    local t="$r/target" rel
+    # Derived from THE SUBJECT of this run, not from the shipped script: that is what makes
+    # the fixture follow build.sh instead of tracking it.
+    while read -r rel; do
+        [ -n "$rel" ] || continue
+        mkdir -p "$t/$(dirname "$rel")"
+        # Distinct bytes per product, so a mixed-up copy is visible rather than benign.
+        printf 'REAL-BYTES-%s\n' "$(basename "$rel")" > "$t/$rel"
+    done < <(products_of "$sut")
     printf '#!/bin/bash\nexit 0\n' > "$r/bin/cargo"
     printf '#!/bin/bash\nexit 0\n' > "$r/bin/pnpm"
     chmod +x "$r/bin/cargo" "$r/bin/pnpm"
@@ -70,7 +90,7 @@ R=$(mkrepo "$REAL")
 run "honest cp — staged == built" 0 "$R"
 case "$LAST_OUT" in *"staged delphi-shell"*sha256*) echo "    ...and prints delphi-shell's sha ✓"; pass=$((pass+1));;
   *) echo "    ...but printed no sha for delphi-shell"; fail=$((fail+1));; esac
-if [ "$(cat "$R/installer/staging/delphi-shell")" = "REAL-SHELL-BYTES" ]; then
+if [ "$(cat "$R/installer/staging/delphi-shell")" = "REAL-BYTES-delphi-shell" ]; then
     pass=$((pass+1)); echo "    ...and staging holds the built bytes ✓"
 else fail=$((fail+1)); echo "    ...but staging does NOT hold the built bytes"; fi
 
@@ -96,6 +116,24 @@ run "weakened + corrupting cp -> passes silently" 0 "$R" "$(mkbadcp)"
 if [ "$(cat "$R/installer/staging/delphi-shell")" = "STALE-BYTES" ]; then
     pass=$((pass+1)); echo "    ^ staged STALE-BYTES and exited 0 — lane run 2's defect, reconstructed."
 else fail=$((fail+1)); echo "    ^ expected STALE-BYTES in staging; the weaken proved nothing."; fi
+
+# --- the fixture must FOLLOW build.sh, not track it -----------------------------------------
+# The proof that the derivation is load-bearing: give a copy of build.sh a FIFTH product it
+# has never staged before. A fixture with a hard-coded list fails with MISSING BUILD PRODUCT
+# (this suite's state for the last 12 commits); a derived one just works.
+echo
+echo "  --- a fifth staged artifact needs no edit here ---"
+sed 's#^stage "\$TARGET/release/delphi-drop" delphi-drop$#&\nstage "$TARGET/release/delphi-future" delphi-future#' \
+    "$REAL" > "$work/build-five.sh"
+chmod +x "$work/build-five.sh"
+if [ "$(products_of "$work/build-five.sh" | wc -l)" -ne 5 ]; then
+    echo "  SETUP DID NOT APPLY — the next result would not be about a fifth artifact"; fail=$((fail+1))
+else
+    R=$(mkrepo "$work/build-five.sh")
+    run "build.sh gains a 5th product -> fixture follows it" 0 "$R"
+    [ -f "$R/installer/staging/delphi-future" ] && { pass=$((pass+1)); echo "    ...and it reached staging ✓"; } \
+        || { fail=$((fail+1)); echo "    ...but it never reached staging"; }
+fi
 
 echo
 echo "passed=$pass failed=$fail"

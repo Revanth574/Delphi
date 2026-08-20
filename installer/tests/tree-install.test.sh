@@ -28,6 +28,31 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REAL_INSTALL="$REPO/installer/install.sh"
 [ -f "$REAL_INSTALL" ] || { echo "cannot find $REAL_INSTALL"; exit 1; }
 
+# ── FIXTURE-DRIFT PRE-FLIGHT (D0A-R10-10) ─────────────────────────────────────────────
+# What install.sh opens is enumerated in install.sh; this fixture must stage exactly that
+# set, and the comparison is against THE SCRIPT rather than against a second copy of the
+# list kept in step by hand. `delphi-drop` was added to install.sh at cdc3418 and not here,
+# and all 16 tree legs have failed ever since with `cannot open .../delphi-drop` — for 12
+# commits, in the suite CLAUDE.md §6 names as the tier-1 SOLE EVIDENCE for the tree-replace
+# invariant. Absent, not passing.
+#
+# It runs HERE, at file scope, and not inside make_sandbox: that function is called from a
+# command substitution, where an `exit` kills only the subshell and the drift is reported
+# once per leg while the run continues on a broken sandbox. A pre-flight stops.
+FIXTURE_ARTIFACTS="delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam delphi-shell.apparmor"
+install_opens=$(sed -n 's/^for f in \(.*\); do$/\1/p' "$REAL_INSTALL")
+if [ -z "$install_opens" ]; then
+    echo "REFUSING: could not read the staged-artifact list out of $REAL_INSTALL" >&2
+    exit 2
+fi
+if [ "$install_opens" != "$FIXTURE_ARTIFACTS" ]; then
+    echo "REFUSING: install.sh opens a different artifact set than this fixture stages." >&2
+    echo "  install.sh: $install_opens" >&2
+    echo "  fixture:    $FIXTURE_ARTIFACTS" >&2
+    echo "  Add the missing artifact to make_sandbox and to FIXTURE_ARTIFACTS." >&2
+    exit 2
+fi
+
 pass=0; fail=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
@@ -43,7 +68,7 @@ make_sandbox() {
     ln -s "$REAL_INSTALL" "$tmp/installer/install.sh"
 
     local f
-    for f in delphi-runtimed delphi-shell delphi-minimal-ai; do
+    for f in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
         printf 'ELF-stub-%s\n' "$f" > "$tmp/installer/staging/$f"
     done
     printf 'unit-stub\n' > "$tmp/installer/staging/delphi-runtimed@.service"

@@ -19,8 +19,12 @@ umask 022
 cd "$(dirname "$0")/.."   # repo root
 
 STAGE="installer/staging"
-# The workspace .cargo/config.toml pins target-dir to a WSL path that does not exist here;
-# override it (honour an explicit CARGO_TARGET_DIR if the caller set one).
+# Where to build. The stated reason for this default was that ".cargo/config.toml pins
+# target-dir to a WSL path that does not exist here" — that pin was REMOVED on 2026-08-15
+# (see .cargo/config.toml), so the rationale is gone even though the default is unchanged.
+# Kept as-is deliberately: the lane procedure builds and runs under this path, and moving it
+# would silently rebuild everything somewhere else mid-arc. It is now an explicit choice
+# rather than a workaround for something that no longer exists.
 TARGET="${CARGO_TARGET_DIR:-$HOME/delphi-target}"
 mkdir -p "$STAGE"
 
@@ -110,8 +114,15 @@ cp -f installer/apparmor/delphi-shell         "$STAGE/delphi-shell.apparmor"
 
 # Tighten perms explicitly (covers a pre-existing group-writable staging dir/file that umask
 # alone would not fix, since umask only affects NEWLY created inodes).
+#
+# D0A-R10-10: the blanket `go-w` comes FIRST and covers the whole tree, because the property
+# install.sh actually checks is "no group/other-write on any inode I open" — a CLASS, not a
+# list. The per-name chmods below only set the 0755/0644 distinction. `delphi-drop` was
+# missing from that list from the day it was added (cdc3418); with an enumeration as the sole
+# mechanism, the next artifact would have been missing too.
+chmod -R go-w "$STAGE"
 chmod 0755 "$STAGE"
-chmod 0755 "$STAGE"/delphi-runtimed "$STAGE"/delphi-shell "$STAGE"/delphi-minimal-ai
+chmod 0755 "$STAGE"/delphi-runtimed "$STAGE"/delphi-drop "$STAGE"/delphi-shell "$STAGE"/delphi-minimal-ai
 chmod 0644 "$STAGE"/delphi-runtimed@.service "$STAGE"/delphi-runtime.pam "$STAGE"/delphi-shell.apparmor
 # The bundle tree: dirs traversable, files read-only. Same no-group/other-write requirement
 # as the binaries — `install.sh` refuses a group/other-writable source inode.

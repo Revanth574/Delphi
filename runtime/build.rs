@@ -59,9 +59,30 @@ fn main() {
     // Writing outside OUT_DIR is discouraged by cargo; done deliberately because the
     // alternative is the installer parsing `--message-format=json` to discover a path
     // this script already knows.
-    if let Some(profile_dir) = helper.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).and_then(|p| p.parent()) {
-        let _ = std::fs::copy(&helper, profile_dir.join("delphi-drop"));
-    }
+    //
+    // D0A-R10-10: CHECKED, and via a temp file + rename.
+    //
+    // `let _ = copy(…)` meant a failed copy left the PREVIOUS build's helper sitting there,
+    // and `installer/build.sh` cannot detect that: its staging assertion shas the source and
+    // the destination, which are then the same stale bytes agreeing with each other. A
+    // silent failure here is a stale root-owned binary installed on a machine.
+    //
+    // Rename rather than copy-in-place for two reasons, both real: a concurrent
+    // `installer/build.sh` can otherwise stage a HALF-WRITTEN helper, and copying onto a
+    // binary another process is executing fails with ETXTBSY, which as a hard error would
+    // turn a rare race into a broken build.
+    let profile_dir = helper
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .unwrap_or_else(|| panic!("deriving <target>/<profile> from OUT_DIR {out}"));
+    let staged = profile_dir.join("delphi-drop");
+    let tmp = profile_dir.join(format!("delphi-drop.tmp{}", std::process::id()));
+    std::fs::copy(&helper, &tmp)
+        .unwrap_or_else(|e| panic!("copying the drop helper {} -> {}: {e}", helper.display(), tmp.display()));
+    std::fs::rename(&tmp, &staged)
+        .unwrap_or_else(|e| panic!("renaming the drop helper {} -> {}: {e}", tmp.display(), staged.display()));
 
     // B1: compile the AI↔daemon general-socket wire schema (protobuf, prost).
     println!("cargo:rerun-if-changed=proto/runtime_wire.proto");

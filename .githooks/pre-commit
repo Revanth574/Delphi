@@ -40,3 +40,25 @@ for m in "${!manifests[@]}"; do
     echo "[pre-commit] cargo clippy --manifest-path $m --all-targets -- -D warnings"
     cargo clippy --manifest-path "$m" --all-targets -- -D warnings
 done
+
+# ── TEST GATE (added 2026-08-20) ────────────────────────────────────────────────
+# Clippy alone does not stop the failure that actually happened twice: a commit whose
+# MESSAGE reports a verification the command never produced. 52a91e8 published a subset
+# as the whole tree; 362e449 published a red clippy as rc=0 — both while writing about
+# the previous one. Care was the instrument and it failed twice in three commits, so the
+# gate is mechanical: an unreported red cannot reach the log.
+#
+# The two intentional D0A-R9-02 REDs are expected; the gate asserts the count rather than
+# demanding zero, so a THIRD failure blocks while those two do not.
+if git diff --cached --name-only | grep -qE '^runtime/'; then
+    echo "pre-commit: runtime test gate"
+    out=$(cargo test -p delphi-runtime --lib --bins -- --test-threads=1 2>&1) || true
+    line=$(printf '%s' "$out" | grep -E '^test result:' | tail -1)
+    failed=$(printf '%s' "$line" | sed -n 's/.* \([0-9]\+\) failed.*/\1/p')
+    echo "pre-commit: $line"
+    if [ "${failed:-99}" -gt 2 ]; then
+        echo "REFUSING: $failed failures; only the 2 intentional D0A-R9-02 REDs are allowed." >&2
+        printf '%s\n' "$out" | grep -E '^    (execute|sandbox)::' >&2
+        exit 1
+    fi
+fi

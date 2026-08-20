@@ -136,6 +136,41 @@ fn refuse_system_account(name: &str, uid: u32, (uid_min, uid_max): (u32, u32)) -
 }
 
 
+/// Refuse a tool account that is not a distinct, non-login identity (D0A-R10-06).
+///
+/// The name `delphi-tool` is not a credential. The installer creates the account only if
+/// it is absent, so a **pre-existing** entry — or an NSS alias — sharing the session's
+/// uid or gid would make the helper drop to precisely the identity `SO_PEERCRED` and the
+/// socket's `0660 root:<session-gid>` are built to admit. Validated at startup against
+/// the session actually being served, because that is the comparison that matters and it
+/// is not knowable at install time.
+fn refuse_unsafe_tool_account(
+    tool: (u32, u32),
+    session: (u32, u32),
+    (uid_min, uid_max): (u32, u32),
+) -> Result<()> {
+    let (tuid, tgid) = tool;
+    let (suid, sgid) = session;
+    if tuid == suid || tgid == sgid {
+        bail!(
+            "refusing to run: the tool account shares the served session's identity \
+             (tool {tuid}:{tgid}, session {suid}:{sgid}). The drop would land on exactly \
+             the uid/gid the requester check and the socket's group admit (D0A-R10-06)."
+        );
+    }
+    if tuid == 0 || tgid == 0 {
+        bail!("refusing to run: the tool account is root ({tuid}:{tgid}) — the drop would be a no-op (D0A-R10-06)");
+    }
+    if tuid >= uid_min && tuid <= uid_max {
+        bail!(
+            "refusing to run: the tool account uid {tuid} is inside the LOGIN range \
+             {uid_min}..={uid_max}; it must be a system account, so a human session can \
+             never share it (D0A-R10-06)."
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -153,6 +188,18 @@ fn main() -> Result<()> {
         user.uid.as_raw(),
         login_defs_uid_range(std::path::Path::new(LOGIN_DEFS)),
     )?;
+
+    // D0A-R10-06: the tool identity is validated against the session being served,
+    // before anything is pinned or anchored.
+    if nix::unistd::geteuid().as_raw() == 0
+        && let Ok(Some(tool)) = User::from_name(delphi_runtime::execute::TOOL_ACCOUNT)
+    {
+        refuse_unsafe_tool_account(
+            (tool.uid.as_raw(), tool.gid.as_raw()),
+            (user.uid.as_raw(), user.gid.as_raw()),
+            login_defs_uid_range(std::path::Path::new(LOGIN_DEFS)),
+        )?;
+    }
 
     // D0A-R9-01: pin the credential-drop helper BEFORE any action runs, so the
     // substitution window is process start rather than per-action, and a missing
@@ -389,6 +436,29 @@ mod system_account_guard {
     fn a_regular_uid_is_admitted() {
         assert!(refuse_system_account("alice", 1000, (1000, 60000)).is_ok());
         assert!(refuse_system_account("bob", 60000, (1000, 60000)).is_ok());
+    }
+
+    /// D0A-R10-06 — the tool identity is validated, not trusted by name. Each rejection
+    /// leg is exercised independently so weakening any one of them bites.
+    #[test]
+    fn a_tool_account_sharing_the_session_identity_is_refused() {
+        let range = (1000, 60000);
+        let session = (1000, 1000);
+        // Shared uid, shared gid, root, and inside the login range — four distinct ways
+        // the drop lands somewhere it must not.
+        for tool in [(1000, 972), (997, 1000), (0, 0), (997, 0), (1500, 972)] {
+            assert!(
+                refuse_unsafe_tool_account(tool, session, range).is_err(),
+                "must refuse tool {tool:?} against session {session:?}"
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL: a genuine system account distinct from the session is admitted,
+    /// so "shared identity is refused" cannot be confused with "everything is refused".
+    #[test]
+    fn a_distinct_system_tool_account_is_admitted() {
+        assert!(refuse_unsafe_tool_account((997, 972), (1000, 1000), (1000, 60000)).is_ok());
     }
 
     /// A `UID_MIN` of 0 must not disable the guard for root.

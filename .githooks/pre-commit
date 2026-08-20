@@ -53,6 +53,11 @@ done
 # The hook PRINTS WHAT IT VERIFIED so a commit message can quote it. Three figures were
 # published today that were typed while composing the message rather than read from
 # output — a number that can only come from the tool cannot be composed from memory.
+# KNOWN GAP, recorded rather than left implicit: this gate is scoped to staged
+# `runtime/` paths, so a change to THIS FILE skips it — hook edits are the one class that
+# lands unchecked, and 1867b25 (the commit that fixed the gate's own `tail -1` defect) did
+# exactly that. Defensible, since a hook cannot meaningfully gate its own edit without
+# running the whole suite on every docs commit; but a gate with an exemption should say so.
 if git diff --cached --name-only | grep -qE '^runtime/'; then
     echo "[pre-commit] runtime test gate"
     out=$(cargo test -p delphi-runtime --lib --bins -- --test-threads=1 2>&1) || true

@@ -1,0 +1,146 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# RED proofs for .githooks/pre-commit's test gate.
+#
+# WHY THIS FILE EXISTS. The hook is scoped to staged `runtime/` paths, so a change to the
+# hook skips it — hook edits are the one class that lands unexecuted, and it has now shipped
+# broken twice on exactly that exemption (`tail -1`, then G1/G2/G3 below). A gate that cannot
+# run itself needs something else that runs it. This is that something.
+#
+# TIER 1 by §6 clause (d): the hook's printed figures are quoted in commit messages as the
+# evidence a commit was verified. So: RED plus a second weaken, per leg.
+#
+# The subject is the REAL hook, reached through a SYMLINK into a fake repo (DEFECT_CLASSES
+# 25 — a copy would be a different artifact). `cargo` and `scripts/test-count.sh` are stubs
+# that MODEL the real tools' measured behaviour, including the two that caused G1 and G3:
+# test-count.sh exits non-zero whenever the suite has any failure, and cargo without
+# --no-fail-fast stops at the first failing target.
+
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+REAL=$PWD/.githooks/pre-commit
+
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+pass=0; fail=0
+
+# mkrepo <hook> <lib-failures> <bins-failures> <cargo-mode> -> repo dir
+#   cargo-mode: normal | compile-error
+mkrepo() {
+    local hook=$1 libf=$2 binsf=$3 mode=$4 r="$work/repo-$RANDOM$RANDOM"
+    mkdir -p "$r"/{runtime/src,scripts,bin,.githooks}
+    ln -s "$hook" "$r/.githooks/pre-commit"
+    echo '[package]' > "$r/runtime/Cargo.toml"
+    echo 'fn main() {}' > "$r/runtime/src/main.rs"
+
+    # Stub cargo. `clippy` passes. `test` MODELS cargo's fail-fast behaviour: without
+    # --no-fail-fast it stops after the first failing target, so only ONE result line exists.
+    cat > "$r/bin/cargo" <<STUB
+#!/bin/bash
+case "\$1" in
+  clippy) exit 0 ;;
+  test)
+    if [ "$mode" = "compile-error" ]; then
+        echo "error[E0004]: non-exhaustive patterns" >&2
+        echo "error: could not compile \\\`delphi-runtime\\\` (lib test) due to 1 previous error" >&2
+        exit 101
+    fi
+    echo "test result: FAILED. 99 passed; $libf failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.46s"
+    case " \$* " in *" --no-fail-fast "*)
+        echo "test result: FAILED. 8 passed; $binsf failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s" ;;
+    esac
+    [ $((libf + binsf)) -eq 0 ] && exit 0 || exit 101 ;;
+esac
+exit 0
+STUB
+    # Stub test-count.sh — exits NON-ZERO on any failure, exactly as the real one does.
+    # That exit status is what killed the shipped hook under `set -e` (G1).
+    cat > "$r/scripts/test-count.sh" <<STUB
+#!/bin/bash
+echo "EXECUTED 98 / SKIPPED 1 / reported 99   (3660ms total, 37ms per executed test)"
+[ $((libf + binsf)) -eq 0 ] && exit 0 || exit 101
+STUB
+    chmod +x "$r/bin/cargo" "$r/scripts/test-count.sh"
+
+    git -C "$r" init -q 2>/dev/null
+    git -C "$r" add -A 2>/dev/null
+    printf '%s' "$r"
+}
+
+# run <name> <want-rc> <repo> [want-substring]
+run() {
+    local name=$1 want=$2 r=$3 want_str=${4:-} out rc
+    out=$(cd "$r" && PATH="$r/bin:$PATH" bash .githooks/pre-commit 2>&1); rc=$?
+    LAST_OUT=$out
+    if [ "$rc" != "$want" ]; then
+        fail=$((fail+1)); printf '  FAIL %-52s rc=%s, wanted %s\n' "$name" "$rc" "$want"
+        printf '%s\n' "$out" | tail -4 | sed 's/^/       | /'; return
+    fi
+    if [ -n "$want_str" ] && [[ "$out" != *"$want_str"* ]]; then
+        fail=$((fail+1)); printf '  FAIL %-52s rc ok but message lacked: %s\n' "$name" "$want_str"
+        printf '%s\n' "$out" | tail -4 | sed 's/^/       | /'; return
+    fi
+    pass=$((pass+1)); printf '  PASS %-52s (rc=%s)\n' "$name" "$rc"
+}
+
+echo "=== .githooks/pre-commit test gate ==="
+
+run "clean suite -> allow"                        0 "$(mkrepo "$REAL" 0 0 normal)" "FAILED across all targets: 0"
+run "the 2 intentional R9-02 REDs -> allow"       0 "$(mkrepo "$REAL" 2 0 normal)" "FAILED across all targets: 2"
+run "a third failure -> REFUSE"                   1 "$(mkrepo "$REAL" 3 0 normal)" "only the 2 intentional"
+run "failures SPLIT across targets (2+1) -> REFUSE" 1 "$(mkrepo "$REAL" 2 1 normal)" "only the 2 intentional"
+run "suite did not COMPILE -> REFUSE"             1 "$(mkrepo "$REAL" 0 0 compile-error)" "did not RUN"
+
+# POSITIVE CONTROL for the scope condition: no staged runtime/ path means no test gate at
+# all, so "allow" above cannot be confused with "the gate never ran".
+R=$(mkrepo "$REAL" 3 0 normal)
+git -C "$R" rm -q --cached -r runtime >/dev/null 2>&1
+echo doc > "$R/README.md"; git -C "$R" add README.md
+run "nothing staged under runtime/ -> gate skipped" 0 "$R"
+case "$LAST_OUT" in *"runtime test gate"*) fail=$((fail+1)); echo "       ^ but the gate RAN";;
+  *) pass=$((pass+1)); echo "       ...and the gate did not run ✓";; esac
+
+echo
+echo "  --- weakens: each must let a defect through ---"
+# G1: restore the `set -e`-killing pipeline (no `|| true` on test-count).
+sed 's#^        | grep -E .\^EXECUTED. | sed .s/\^/\[pre-commit\]   /. || true#        | grep -E "^EXECUTED" | sed "s/^/[pre-commit]   /"#' \
+    "$REAL" > "$work/hook-g1"; chmod +x "$work/hook-g1"
+if diff -q "$REAL" "$work/hook-g1" >/dev/null; then
+    echo "  WEAKEN G1 DID NOT APPLY — the next line would be about the SHIPPED hook"; fail=$((fail+1))
+else
+    # 101, not 1: `set -e` propagates test-count.sh's OWN exit status, so the hook never
+    # reaches a decision of its own. The expectation was written as 1 and corrected to the
+    # measured value — the leg still discriminates (an unweakened hook allows with 0), and
+    # 101 is itself the diagnosis: that status belongs to the counter, not to the gate.
+    run "G1 weakened: 2 intentional REDs -> hook DIES"  101 "$(mkrepo "$work/hook-g1" 2 0 normal)"
+    echo "       ^ this is what blocked every runtime commit on this branch"
+fi
+
+# G2: drop the no-result-line refusal.
+python3 - "$REAL" "$work/hook-g2" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+old = '''    if [ "$result_lines" -eq 0 ]; then
+        echo "REFUSING: no 'test result:' line — the suite did not RUN (compile error?)." >&2
+        printf '%s\\n' "$out" | tail -15 >&2
+        exit 1
+    fi
+'''
+assert s.count(old) == 1, f"WEAKEN G2 DID NOT APPLY ({s.count(old)} matches)"
+open(dst, 'w').write(s.replace(old, ''))
+PY
+chmod +x "$work/hook-g2"
+run "G2 weakened: compile error -> PASSES as green"   0 "$(mkrepo "$work/hook-g2" 0 0 compile-error)"
+echo "       ^ zero result lines parses as zero failures — the tail -1 defect's shape"
+
+# G3: drop --no-fail-fast, so the second target's failure is never counted.
+sed 's/cargo test --no-fail-fast /cargo test /' "$REAL" > "$work/hook-g3"; chmod +x "$work/hook-g3"
+grep -q 'cargo test -p delphi-runtime' "$work/hook-g3" || { echo "  WEAKEN G3 DID NOT APPLY"; fail=$((fail+1)); }
+run "G3 weakened: 2+1 failures -> PASSES (counted 2)" 0 "$(mkrepo "$work/hook-g3" 2 1 normal)"
+echo "       ^ cargo stopped at the failing lib; the bins' failure was never in the sum"
+
+echo
+echo "passed=$pass failed=$fail"
+[ "$fail" -eq 0 ] && { echo "ALL PASS"; exit 0; }
+echo "SUITE FAILED"; exit 1

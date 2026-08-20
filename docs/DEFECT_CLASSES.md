@@ -2292,6 +2292,42 @@ different test that does not bite.
 
 ---
 
+## 42. A negative assertion whose sufficiency rested on a default the change removed  *(new — D0A-R10, found by mutation audit)*
+
+**The test did not change. What its assertion was sufficient to prove did.**
+
+`net_policy_maps_faithfully_and_cannot_express_an_allowlist` asserted, for
+`NetPolicy::None`, that `--share-net` is **absent**. That was a complete proof while the
+profile began with `--unshare-all`, which implies the unshare: absence of the opt-in meant
+isolation. Shape E replaced `--unshare-all` with an explicit namespace list, so isolation
+became an **opt-in of its own** (`--unshare-net`) — and bwrap's default is a **shared**
+network. Deleting the `NetPolicy::None` arm entirely left the old assertion true and the
+approved-no-network action on the host's network. Measured: the deletion passed the whole
+suite.
+
+**Why it evades every existing rule.** The test was not weakened, was not vacuous when
+written, is at the right altitude, and its fixture is faithful. Nothing about *it* is
+wrong. The defect is that a **negative** ("the widening flag is absent") is only equivalent
+to a **positive** ("the narrowing is applied") under an assumption held elsewhere, and that
+assumption was deleted three files away by a change nobody connected to this test.
+
+**Distinct from its neighbours:** class 22 is a *fix* inheriting the class it closed; class
+26 is a *captured value* read as current; class 41 is the *wrong layer*. This is a
+still-correct assertion that quietly stopped being *sufficient*.
+
+**Foreclosing discipline — assert the POSITIVE for any property that has one.** "The
+dangerous flag is absent" is evidence only alongside "the protective flag is present". When
+a change removes an umbrella default (`--unshare-all`, a deny-by-default base, a global
+`set -e`), the audit is not "which behaviours changed" but **"which assertions were
+relying on that default to mean what they say"** — and those are found by deleting the new
+explicit thing and seeing whether anything fails, not by reading.
+
+**Grounded twice in one audit:** `--clearenv` had the same shape — §6's "env is scrubbed
+to `env_delta`" was checked by no assertion at all once the umbrella was gone
+(D0A-R9-08 had recorded the gap in prose; the mutation measured it).
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2338,3 +2374,4 @@ different test that does not bite.
 | 39. First-ordered check that never fires in time | discipline — **the mechanism already exists** (`scripts/check-free-space.sh`): run it at block START and before any bulk write; on an unexplained tool failure suspect the SUBSTRATE before the harness | Discipline (nothing to extract) |
 | 40. Sandbox scaffolding blocks the measurement | bwrap auto-creates intermediates `0700` owned by the sandbox uid: emit `--perms 0755 --dir` per ancestor when the payload's uid differs, and pair every such probe with a positive control | Discipline + production constraint |
 | 41. Assertion at the wrong altitude | discipline: **does the assertion observe the layer where the property would be violated?** Assert there, even when it costs a real run, a before/after snapshot, or a second discriminating leg | Discipline |
+| 42. Negative assertion resting on a removed default | assert the POSITIVE wherever one exists ("the narrowing is applied", not only "the widening is absent"); when an umbrella default is removed, find the assertions that relied on it by DELETING the new explicit thing and seeing what fails — `scratch/d0a-mutation-audit.sh` is that search, mechanised | Discipline + a mutation harness |

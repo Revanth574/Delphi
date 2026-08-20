@@ -178,6 +178,63 @@ fn require_fully_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// The bwrap tail: the `--argv0` flag when nothing is interposed, `--`, and the payload.
+///
+/// **Extracted to be provable without root (D0A-R10).** The interposition only happens
+/// when `tool_credentials()` returns `Some`, which requires euid 0, so an unprivileged
+/// suite never reaches it: a mutation audit measured that removing the helper entirely,
+/// and dropping the tool's approved `argv[0]`, both passed the whole suite. Those are
+/// argument-assembly properties, and a pure function makes them testable with injected
+/// credentials rather than only on a root lane.
+///
+/// Layout with the helper: `<helper> <uid> <gid> <program> <argv0> [interp_arg] [script] [args…]`
+/// Without it: `--argv0 <argv0> -- <program> [interp_arg] [script] [args…]`
+fn exec_tail(
+    action: &PendingAction,
+    helper_fd: Option<RawFd>,
+    creds: Option<(u32, u32)>,
+    program_fd: RawFd,
+    script_arg_fd: Option<RawFd>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    // `--argv0` names whatever bwrap execs. With the helper interposed that is the
+    // HELPER, so the flag is dropped and the helper applies argv0 to the tool itself.
+    // WITHOUT a helper bwrap execs the tool directly and the flag is still correct —
+    // omitting it in both cases would silently give the tool `argv[0] =
+    // /proc/self/fd/N`, which nothing in the audit would show.
+    if helper_fd.is_none()
+        && let Some(argv0) = action.argv.first()
+    {
+        args.push("--argv0".to_string());
+        args.push(argv0.clone());
+    }
+    args.push("--".to_string());
+    if let (Some(h), Some((uid, gid))) = (helper_fd, creds) {
+        args.push(format!("/proc/self/fd/{h}"));
+        args.push(uid.to_string());
+        args.push(gid.to_string());
+    }
+    args.push(format!("/proc/self/fd/{program_fd}"));
+    // The approved argv[0], passed through the helper rather than via `--argv0`.
+    if helper_fd.is_some() {
+        args.push(action.argv.first().cloned().unwrap_or_else(|| format!("/proc/self/fd/{program_fd}")));
+    }
+    if let Some(script) = script_arg_fd {
+        // The shebang's optional interpreter arg (e.g. `-I`), passed BEFORE the
+        // script exactly as the kernel would — it is part of what executes, bound by
+        // the digest + previewed, so execute == approved (B1-02).
+        if let Some(arg) = action.script.as_ref().and_then(|sp| sp.interpreter_arg.as_deref()) {
+            args.push(arg.to_string());
+        }
+        // The sealed script, passed to the pinned interpreter (not exec'd directly).
+        args.push(format!("/proc/self/fd/{script}"));
+    }
+    for arg in action.argv.iter().skip(1) {
+        args.push(arg.clone());
+    }
+    args
+}
+
 /// Build the bwrap invocation and execute the **fd-pinned** program inside it
 /// (`/proc/self/fd/N` — the swap-proof inode).
 ///
@@ -237,41 +294,7 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     }
 
     let mut args = SandboxProfile::derive(action).args().to_vec();
-    // `--argv0` names whatever bwrap execs. With the helper interposed that is the
-    // HELPER, so the flag is dropped and the helper applies argv0 to the tool itself.
-    // WITHOUT a helper bwrap execs the tool directly and the flag is still correct —
-    // omitting it in both cases would silently give the tool `argv[0] =
-    // /proc/self/fd/N`, which nothing in the audit would show.
-    if helper_fd.is_none()
-        && let Some(argv0) = action.argv.first()
-    {
-        args.push("--argv0".to_string());
-        args.push(argv0.clone());
-    }
-    args.push("--".to_string());
-    if let (Some(h), Some((uid, gid))) = (helper_fd, creds) {
-        args.push(format!("/proc/self/fd/{h}"));
-        args.push(uid.to_string());
-        args.push(gid.to_string());
-    }
-    args.push(format!("/proc/self/fd/{program_fd}"));
-    // The approved argv[0], passed through the helper rather than via `--argv0`.
-    if helper_fd.is_some() {
-        args.push(action.argv.first().cloned().unwrap_or_else(|| format!("/proc/self/fd/{program_fd}")));
-    }
-    if let Some(script) = script_arg_fd {
-        // The shebang's optional interpreter arg (e.g. `-I`), passed BEFORE the
-        // script exactly as the kernel would — it is part of what executes, bound by
-        // the digest + previewed, so execute == approved (B1-02).
-        if let Some(arg) = action.script.as_ref().and_then(|sp| sp.interpreter_arg.as_deref()) {
-            args.push(arg.to_string());
-        }
-        // The sealed script, passed to the pinned interpreter (not exec'd directly).
-        args.push(format!("/proc/self/fd/{script}"));
-    }
-    for arg in action.argv.iter().skip(1) {
-        args.push(arg.clone());
-    }
+    args.extend(exec_tail(action, helper_fd, creds, program_fd, script_arg_fd));
 
     let mut cmd = Command::new("bwrap");
     cmd.args(&args);
@@ -396,6 +419,77 @@ mod tests {
             required_tier: RequiredTier::Biometric,
             script: None,
         }
+    }
+
+    /// D0A-R10 — THE INTERPOSITION, PROVEN WITHOUT ROOT.
+    ///
+    /// The credential drop only engages when `tool_credentials()` returns `Some`, which
+    /// needs euid 0, so on an unprivileged box the whole helper path is dead code and the
+    /// root test that covers it SKIPs. A mutation audit measured the consequence: removing
+    /// the helper entirely, and dropping the tool's approved `argv[0]`, each passed the
+    /// entire suite. `exec_tail` is pure, so the assembly is checkable here with injected
+    /// credentials; what still needs root is that the drop TAKES, which is
+    /// `an_approved_action_runs_with_the_tool_account_credentials`.
+    #[test]
+    fn the_helper_is_interposed_with_the_credentials_and_the_approved_argv0() {
+        let dir = std::env::temp_dir().join(format!("delphi-tail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("t");
+        fs::write(&exe, b"x").unwrap();
+        let mut action = build_action(&exe, b"x", &dir);
+        action.argv = vec!["approved-name".into(), "--flag".into()];
+
+        let with = exec_tail(&action, Some(9), Some((997, 972)), 7, None);
+        println!("  with helper:    {with:?}");
+        assert_eq!(
+            with,
+            vec!["--", "/proc/self/fd/9", "997", "972", "/proc/self/fd/7", "approved-name", "--flag"],
+            "the helper must be exec'd with uid, gid, the pinned program, and the APPROVED argv[0]"
+        );
+        // `--argv0` would name the HELPER, not the tool, so it must not be emitted here.
+        assert!(!with.iter().any(|a| a == "--argv0"), "--argv0 names the helper when one is interposed");
+
+        // Without credentials nothing is interposed and the flag carries argv0 instead —
+        // the POSITIVE CONTROL, so "the helper is present" cannot be satisfied vacuously.
+        let without = exec_tail(&action, None, None, 7, None);
+        println!("  without helper: {without:?}");
+        assert_eq!(
+            without,
+            vec!["--argv0", "approved-name", "--", "/proc/self/fd/7", "--flag"],
+            "with no helper bwrap execs the tool directly and --argv0 is the only way to name it"
+        );
+        // In BOTH shapes the tool's argv[0] is the approved name, never /proc/self/fd/N.
+        assert!(with.contains(&"approved-name".to_string()) && without.contains(&"approved-name".to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A script action keeps the interpreter/script ordering the kernel would use, with
+    /// the helper interposed in front of it.
+    #[test]
+    fn a_script_tail_passes_interp_arg_then_script_after_the_helper() {
+        let dir = std::env::temp_dir().join(format!("delphi-tail-s-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("t");
+        fs::write(&exe, b"x").unwrap();
+        let mut action = build_action(&exe, b"x", &dir);
+        action.argv = vec!["approved-name".into(), "rest".into()];
+        action.script = Some(ScriptPin {
+            interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_digest: [0u8; 32],
+            interpreter_arg: Some("-e".into()),
+            script_memfd: write_sealed_only_memfd(b"#!/bin/sh\n"),
+            script_digest: [0u8; 32],
+        });
+        let tail = exec_tail(&action, Some(9), Some((997, 972)), 7, Some(8));
+        println!("  script tail: {tail:?}");
+        assert_eq!(
+            tail,
+            vec![
+                "--", "/proc/self/fd/9", "997", "972", "/proc/self/fd/7", "approved-name",
+                "-e", "/proc/self/fd/8", "rest"
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The RED exec variant: bind the executable PATH and exec it (re-resolvable),

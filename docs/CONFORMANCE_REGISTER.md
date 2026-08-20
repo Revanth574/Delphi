@@ -153,6 +153,27 @@ D0A-R9-08 — the "exact approved scope" test ignores unsupported grant options,
 cwd, and removal of `--clearenv`. D0A-R9-09 — `fdsec`'s sole test proves neither high
 descriptors, nor actual exec behaviour, nor the `CLOSE_RANGE_UNSHARE` race-defence leg.
 
+**MEASURED 2026-08-20 — which greens actually bite (`scratch/d0a-mutation-audit.sh`).**
+Twelve realistic defects were introduced into the shape-E guards one at a time; five passed
+the entire suite. Not read off the tests — measured, and re-measured after the fixes.
+
+| defect introduced | before | now |
+|---|---|---|
+| ancestor `--perms 0755` → `0700` (bwrap's own default — the value class 40 exists to override) | **NOT CAUGHT** | caught, incl. a real-jail `stat` of the created ancestor |
+| `--unshare-net` dropped for `NetPolicy::None` (bwrap then SHARES the host network) | **NOT CAUGHT** | caught by two tests |
+| `--clearenv` dropped (the R9-08 gap above, now measured) | **NOT CAUGHT** | caught |
+| the approved `argv[0]` never reaches the tool | **NOT CAUGHT** | caught (`exec_tail` extracted so it is provable unprivileged) |
+| the drop helper never interposed at all | **NOT CAUGHT** | **STILL NOT CAUGHT** — see below |
+| the other seven (denylist legs, ancestor exclusion/ordering/emission, host-creating bind, full seals) | caught | caught |
+
+**The one that remains, stated exactly.** `tool_credentials()` returns `None` unless euid is
+0, so on an unprivileged box the interposition is unreachable and no test can observe the
+daemon *deciding* to drop. What is now proven without root is the **assembly** (`exec_tail`
+— helper, uid, gid, pinned program, approved argv0, in that order). What still needs root is
+that **the drop takes**, which is
+`an_approved_action_runs_with_the_tool_account_credentials` — and it SKIPs here, so on this
+box that property has no live evidence at all. **Closes when** a root lane runs it.
+
 ## Claims whose scope was believed wider than their proof
 
 A different kind of row from the table above. Nothing here is a violated clause — each is a

@@ -268,11 +268,17 @@ mod tests {
 
     /// Emitted `--perms MODE --dir PATH` triples, in order.
     fn emitted_dirs(args: &[String]) -> Vec<String> {
+        emitted_dir_perms(args).into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// The same triples, keeping the MODE — which nothing asserted until D0A-R10's
+    /// mutation audit measured `0755 -> 0700` surviving the entire suite.
+    fn emitted_dir_perms(args: &[String]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut i = 0;
         while i + 3 < args.len() {
             if args[i] == "--perms" && args[i + 2] == "--dir" {
-                out.push(args[i + 3].clone());
+                out.push((args[i + 1].clone(), args[i + 3].clone()));
             }
             i += 1;
         }
@@ -301,6 +307,14 @@ mod tests {
         let dirs = emitted_dirs(&args);
         for want in ["/run", "/run/delphi-x", "/opt", "/opt/vendor", "/opt/vendor/tool"] {
             assert!(dirs.iter().any(|d| d == want), "missing ancestor `{want}`; got {dirs:?}");
+        }
+        // THE MODE THIS TEST'S NAME CLAIMS. Until D0A-R10 it asserted only that the
+        // ancestors were emitted, so `--perms 0755 -> 0700` — bwrap's own default, the
+        // exact value class 40 exists to override — passed the whole suite (measured by
+        // scratch/d0a-mutation-audit.sh). A name that promises `traversable` while the
+        // assertion checks presence is the R9-01 shape: cited for more than it observes.
+        for (mode, dir) in emitted_dir_perms(&args) {
+            assert_eq!(mode, "0755", "ancestor `{dir}` is emitted with mode {mode}, not 0755");
         }
         // The bind target itself is bwrap's mountpoint — creating it would be wrong.
         assert!(!dirs.iter().any(|d| d == "/run/delphi-x/sess"), "must not --dir the bind itself");
@@ -458,6 +472,50 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// CLASS 40 AT THE LAYER THE PROPERTY LIVES IN — the mode bwrap actually applied,
+    /// read from inside the jail, not the mode we emitted.
+    ///
+    /// The argv assertion above catches a changed constant. It cannot catch bwrap
+    /// declining to honour `--perms`, applying it to the wrong operation, or a later
+    /// argument re-creating the directory with a different mode — all of which are how
+    /// the payload would find an untraversable ancestor despite a correct-looking
+    /// profile. `0700` is bwrap's own default and therefore the value this must exclude.
+    #[test]
+    fn a_created_ancestor_is_0755_inside_a_real_jail() {
+        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
+            eprintln!("SKIP a_created_ancestor_is_0755_inside_a_real_jail: measured blocker: bwrap not executable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("delphi-r10perm-{}", std::process::id()));
+        let leaf = root.join("deep/tool");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&leaf).unwrap();
+
+        let a = action_with(vec![(leaf.clone(), BindMode::ReadOnly)], NetPolicy::None);
+        let mut args = SandboxProfile::derive(&a).args().to_vec();
+        args.extend(["--ro-bind".into(), "/usr".into(), "/usr".into()]);
+        args.extend(["--symlink".into(), "usr/bin".into(), "/bin".into()]);
+        args.extend(["--symlink".into(), "usr/lib".into(), "/lib".into()]);
+        args.extend(["--symlink".into(), "usr/lib64".into(), "/lib64".into()]);
+        let ancestor = root.join("deep");
+        args.extend([
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("stat -c %a {}", ancestor.display()),
+        ]);
+        let out = std::process::Command::new("bwrap").args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "bwrap must build this jail, or the test proves nothing: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mode = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        println!("  in-jail mode of {}: {mode}", ancestor.display());
+        assert_eq!(mode, "755", "the ancestor bwrap created is not traversable by a dropped uid");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     fn tree(root: &std::path::Path) -> Vec<String> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -603,10 +661,20 @@ mod tests {
             }
         }
         let has_share_net = args.iter().any(|a| a == "--share-net");
+        let has_unshare_net = args.iter().any(|a| a == "--unshare-net");
         match action.net_policy {
-            NetPolicy::None if has_share_net => return false, // net where none
-            NetPolicy::Full if !has_share_net => return false, // none where net
+            // D0A-R10: both directions. `!--share-net` alone was sufficient only while
+            // `--unshare-all` implied the unshare; under E the absence of BOTH flags
+            // means bwrap's default, which SHARES the host network.
+            NetPolicy::None if has_share_net || !has_unshare_net => return false,
+            NetPolicy::Full if !has_share_net || has_unshare_net => return false,
             _ => {}
+        }
+        // §6 "env is scrubbed to `env_delta`" starts with dropping the daemon's own
+        // environment. Nothing asserted this: removing `--clearenv` passed the whole
+        // suite (D0A-R9-08 recorded the gap; the mutation audit measured it).
+        if !args.iter().any(|a| a == "--clearenv") {
+            return false;
         }
         // Default-deny base present. STRONGER than the old `--unshare-all` check:
         // every namespace is named, and `--unshare-user` must be ABSENT — its
@@ -661,12 +729,30 @@ mod tests {
     }
 
     /// net=full is the only way to get `--share-net`; net=none never emits it.
+    ///
+    /// **BOTH DIRECTIONS, because the negative alone stopped being sufficient when E
+    /// landed (D0A-R10).** This asserted only `!--share-net` for `None`, which was
+    /// enough while `--unshare-all` supplied the unshare implicitly. E replaced that
+    /// with an explicit list, so `NetPolicy::None` now depends on emitting
+    /// `--unshare-net` — and bwrap's default is a SHARED network, so deleting that arm
+    /// gives an approved-no-network action the host's network. Measured: the deletion
+    /// passed the entire suite (scratch/d0a-mutation-audit.sh). The test did not change;
+    /// what its assertion was sufficient to prove did.
     #[test]
     fn net_policy_maps_faithfully_and_cannot_express_an_allowlist() {
         let none = SandboxProfile::derive(&action_with(vec![], NetPolicy::None));
         assert!(!none.args().iter().any(|a| a == "--share-net"));
+        assert!(
+            none.args().iter().any(|a| a == "--unshare-net"),
+            "NetPolicy::None must UNSHARE the network; bwrap shares it by default. got {:?}",
+            none.args()
+        );
         let full = SandboxProfile::derive(&action_with(vec![], NetPolicy::Full));
         assert!(full.args().iter().any(|a| a == "--share-net"));
+        assert!(
+            !full.args().iter().any(|a| a == "--unshare-net"),
+            "NetPolicy::Full must not also unshare the network"
+        );
         // NetPolicy has only None/Full — there is no allowlist variant to derive an
         // unenforceable scope from (F5 honesty at the type level).
     }

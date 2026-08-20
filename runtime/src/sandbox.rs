@@ -536,7 +536,17 @@ mod tests {
     #[test]
     fn a_bind_whose_path_does_not_exist_is_refused() {
         let missing = std::path::PathBuf::from("/nonexistent-delphi-r1001/x/y");
-        assert!(refuse_host_creating_bind(&[(missing, BindMode::ReadOnly)]).is_err());
+        // THE VARIANT, not merely `is_err()` (D0A-R11-01's audit). R10-08 WAS a
+        // misclassification — this guard was ordered in front of the security denial and
+        // silently relabelled a denied bind as a missing one — and a bare `is_err()`
+        // cannot tell the two apart. Measured: swapping the variant here passed the whole
+        // suite before this assertion existed.
+        let err = refuse_host_creating_bind(&[(missing, BindMode::ReadOnly)])
+            .expect_err("a nonexistent bind path must be refused");
+        assert!(
+            matches!(err, crate::RuntimeError::BindWouldCreateOnHost { .. }),
+            "must be refused for NOT EXISTING, not reclassified: {err:?}"
+        );
         // Positive control: an existing path is admitted.
         assert!(refuse_host_creating_bind(&[(std::path::PathBuf::from("/usr"), BindMode::ReadOnly)]).is_ok());
     }
@@ -676,6 +686,23 @@ mod tests {
         if !args.iter().any(|a| a == "--clearenv") {
             return false;
         }
+        // …and the OTHER half of that clause: exactly `env_delta`, nothing more and
+        // nothing less. Dropping the emission entirely also passed the whole suite
+        // (D0A-R11-01's rebuilt audit) — `--clearenv` alone leaves the approved variables
+        // missing, which is a different failure from leaking the daemon's.
+        let setenv: Vec<(&String, &String)> = args
+            .windows(3)
+            .filter(|w| w[0] == "--setenv")
+            .map(|w| (&w[1], &w[2]))
+            .collect();
+        if setenv.len() != action.env_delta.len() {
+            return false;
+        }
+        for (k, v) in &action.env_delta {
+            if !setenv.iter().any(|(sk, sv)| *sk == k && *sv == v) {
+                return false;
+            }
+        }
         // Default-deny base present. STRONGER than the old `--unshare-all` check:
         // every namespace is named, and `--unshare-user` must be ABSENT — its
         // presence would put the tool back in a one-uid namespace it cannot drop
@@ -702,16 +729,39 @@ mod tests {
     /// stays rw, net none has no --share-net, no extra binds).
     #[test]
     fn derivation_enforces_exactly_the_approved_scope() {
-        let action = action_with(
+        let mut action = action_with(
             vec![
                 (PathBuf::from("/data"), BindMode::ReadOnly),
                 (PathBuf::from("/out"), BindMode::ReadWrite),
             ],
             NetPolicy::None,
         );
+        // A NON-EMPTY env_delta, because the env half of the scope check is vacuous
+        // without one — and vacuous is how "env_delta never emitted" survived the audit.
+        action.env_delta = vec![("LANG".into(), "C".into()), ("TZ".into(), "UTC".into())];
         assert!(
             args_enforce_scope(SandboxProfile::derive(&action).args(), &action),
             "the real derivation must enforce exactly the approved scope"
+        );
+
+        // …and the check must FAIL on env divergence in either direction, or the leg above
+        // proves only that it agrees with itself.
+        let mut extra = SandboxProfile::derive(&action).args().to_vec();
+        extra.extend(["--setenv".into(), "SECRET".into(), "leaked".into()]);
+        assert!(
+            !args_enforce_scope(&extra, &action),
+            "an env var beyond the approved delta must not pass as the approved scope"
+        );
+        let dropped: Vec<String> = {
+            let args = SandboxProfile::derive(&action).args().to_vec();
+            let at = args.iter().position(|a| a == "--setenv").expect("a --setenv is emitted");
+            let mut v = args.clone();
+            v.drain(at..at + 3);
+            v
+        };
+        assert!(
+            !args_enforce_scope(&dropped, &action),
+            "a MISSING approved env var must not pass either"
         );
     }
 

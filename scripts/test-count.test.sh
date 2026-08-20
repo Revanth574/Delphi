@@ -162,6 +162,37 @@ check "an oversized floor REFUSES (must not disable itself)" "not a positive int
 OUT=$(DELPHI_TESTCOUNT_LOG=testdata/real-libtest-serial.log "$EXTRACTOR" 2>&1); RC=$?
 check "parses REAL captured libtest output" "EXECUTED 2 / SKIPPED 3 / reported 5" "$OUT" 0 "$RC"
 
+# ── 9. THE INVOCATION PATH — everything above tests the PARSER ─────────────────────────
+# Every case above feeds a log through DELPHI_TESTCOUNT_LOG, so the parse is well covered and
+# the CARGO INVOCATION was covered by nothing. A missing `--no-fail-fast` was therefore
+# invisible here while the tool under-reported a whole target on any tree with a failure —
+# `reported 99` for `--lib --bins` where the answer was 108. The assertion has to observe the
+# layer where that happens (class 41), so this leg uses a stub `cargo` that MODELS the
+# measured behaviour: without the flag it stops after the first failing target and only one
+# result line exists.
+stub=$(mktemp -d); trap 'rm -rf "$stub"' EXIT
+cat > "$stub/cargo" <<'STUB'
+#!/bin/bash
+echo "test result: FAILED. 99 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.00s"
+case " $* " in *" --no-fail-fast "*)
+    echo "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s" ;;
+esac
+exit 101
+STUB
+chmod +x "$stub/cargo"
+OUT=$(PATH="$stub:$PATH" "$EXTRACTOR" -p delphi-runtime --lib --bins 2>&1); RC=$?
+check "a red first target does not truncate the count" "reported 108" "$OUT" 101 "$RC"
+
+# WEAKEN, in-place: strip the flag from a copy and the count silently loses the second
+# target — the shipped defect, reconstructed.
+sed 's/cargo test --no-fail-fast /cargo test /' "$EXTRACTOR" > "$stub/weak.sh"; chmod +x "$stub/weak.sh"
+if diff -q "$EXTRACTOR" "$stub/weak.sh" >/dev/null; then
+    printf '  FAIL  weaken did not apply — the next line would be about the SHIPPED script\n'; fail=1
+else
+    OUT=$(PATH="$stub:$PATH" "$stub/weak.sh" -p delphi-runtime --lib --bins 2>&1); RC=$?
+    check "weakened: the same tree reports 99 instead of 108" "reported 99" "$OUT" 101 "$RC"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES ABOVE"; fi
 exit "$fail"

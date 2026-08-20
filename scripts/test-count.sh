@@ -53,7 +53,13 @@ else
     # on some runs and mid-line on others. That made the count DRIFT run to run (measured:
     # 17/18/19 for the same tree). Serial output is deterministic. This is a counting run, not
     # a stability run — parallel stability is measured separately.
-    cargo test "$@" -- --nocapture --test-threads=1 &> "$log"
+    # --no-fail-fast is NOT optional either, and its absence made this tool UNDER-REPORT
+    # exactly when it mattered most. Without it cargo stops at the first failing target, so
+    # a caller asking for `--lib --bins` against a tree with a red lib got the LIB's count
+    # printed as though it answered the question — measured on this tree: `reported 99`
+    # (lib only) where the full set is 108 across four result lines. A subset presented as
+    # the whole is the defect this script exists to prevent, so it may not commit it.
+    cargo test --no-fail-fast "$@" -- --nocapture --test-threads=1 &> "$log"
     rc=$?
 fi
 

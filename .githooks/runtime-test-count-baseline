@@ -25,9 +25,9 @@
 #
 # ENVIRONMENT-SPECIFIC, like its workspace sibling. Measured UNPRIVILEGED, where
 # `an_approved_action_runs_with_the_tool_account_credentials` skips. On a root lane it
-# EXECUTES, so the pair there is EXECUTED=113 SKIPPED=0 — point the hook at another file via
+# EXECUTES, so the pair there is EXECUTED=114 SKIPPED=0 — point the hook at another file via
 # DELPHI_TEST_COUNT_BASELINE rather than editing these values for one run.
 #
 # Scope: `-p delphi-runtime --lib --bins`, which is what the hook runs.
-EXECUTED=112
+EXECUTED=113
 SKIPPED=1

@@ -112,44 +112,75 @@ fn parse_c_ulong(v: &str) -> Option<u32> {
     u32::from_str_radix(digits, radix).ok()
 }
 
-/// One `/etc/login.defs` line, parsed the way shadow parses it.
+/// PHASE 1 — the last RAW value `key` is given, exactly as shadow stores it.
 ///
-/// Every step here is a MEASURED behaviour of `useradd --prefix` on shadow 1:4.17.4
-/// (`scratch/d1-login-defs-probe.sh`), not a reading of `login.defs(5)`: the trailing-blank
-/// trim happens BEFORE the quote strip (`" 5000 "` is rejected, `"5000"  ` is accepted), and
-/// the trim covers space and tab only (`5000\r` from a CRLF file is rejected).
-fn login_defs_line(line: &str, key: &str) -> Option<u32> {
-    let line = line.trim_start_matches([' ', '\t']);
-    if line.starts_with('#') {
-        return None;
+/// **Raw, and separated from interpretation, because shadow separates them** (D0A-R11-05).
+/// The previous version parsed each line and kept the last one that *parsed*, so
+/// `UID_MIN 5000` followed by `UID_MIN garbage` resurrected 5000 where shadow stores
+/// `garbage`, fails to parse it, and uses its built-in default. Measured both ways:
+/// `5000` then `garbage` → shadow allocates **1000**; `garbage` then `5000` → **5000**.
+///
+/// A line that gives no value does not define the key at all — measured: `UID_MIN 5000`
+/// followed by a bare `UID_MIN ` still allocates 5000.
+fn login_defs_raw<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let mut found = None;
+    // `split('\n')`, NOT `.lines()`: `lines()` strips a trailing `\r` and shadow does not —
+    // it rejects `5000\r` and falls back to its default. Measured in both directions.
+    for line in text.split('\n') {
+        let line = line.trim_start_matches([' ', '\t']);
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((k, value)) = line.split_once([' ', '\t']) else { continue };
+        if k != key {
+            continue;
+        }
+        let value = value.trim_end_matches([' ', '\t']);
+        if value.is_empty() {
+            continue;
+        }
+        found = Some(value);
     }
-    let (k, value) = line.split_once([' ', '\t'])?;
-    if k != key {
-        return None;
-    }
-    let value = value.trim_end_matches([' ', '\t']);
-    let value = value.strip_prefix('"').unwrap_or(value);
-    let value = value.strip_suffix('"').unwrap_or(value);
-    // `strtoul` skips leading whitespace of its own accord; the trailing side is already
-    // trimmed above, and anything left there (a `\r`) must still fail, as it does for shadow.
-    parse_c_ulong(value.trim_start_matches([' ', '\t']))
+    found
 }
 
-/// D0A-R10-07: the value shadow itself would use for `key`.
+/// PHASE 2 — shadow's quote handling, then `strtoul` base 0.
+///
+/// **A SCAN, not a strip (D0A-R11-05).** Stripping one quote from each end got three
+/// measured forms wrong. Shadow skips **any number** of leading quotes and then terminates
+/// at the **first subsequent** quote, which is why `"50"00"` yields **50** — the sharpest
+/// of the measurements, because no strip-based reading produces that.
+///
+/// | form | shadow |
+/// |---|---|
+/// | `"5000" # comment` | 5000 — the comment is past the terminating quote |
+/// | `""5000` | 5000 |
+/// | `5000"ignored` | 5000 |
+/// | `"""5000"""` | 5000 |
+/// | `"50"00"` | **50** |
+/// | `""` | no value → default |
+fn login_defs_interpret(raw: &str) -> Option<u32> {
+    let scanned = raw.trim_start_matches('"');
+    let scanned = scanned.split('"').next().unwrap_or(scanned);
+    // `strtoul` skips leading whitespace of its own accord; trailing whitespace INSIDE the
+    // quotes is not trimmed and must still fail, as it does for shadow (`" 5000 "` → default).
+    parse_c_ulong(scanned.trim_start_matches([' ', '\t']))
+}
+
+/// D0A-R10-07 / R11-05: the value shadow itself would use for `key`.
 ///
 /// **The grammar must be shadow's, not a reasonable one.** These bounds classify accounts
 /// (`refuse_system_account`, `refuse_unsafe_tool_account`), and shadow's `useradd` is what
 /// hands out the uids being classified. A parser that disagrees about a form disagrees about
 /// which accounts are login accounts — which is the class D0A-R9-11 closed, reopened one
-/// level down. Seven of thirteen forms disagreed before this.
+/// level down.
+///
+/// **Three rounds found forms in this parser, so the METHOD changed rather than the form
+/// list**: collect the last raw value (phase 1), then interpret it once (phase 2), which is
+/// the shape shadow's own `getdef` has. Adding a fourth special case to a single-pass
+/// strip-and-parse was the approach that kept losing.
 fn login_defs_key(text: &str, key: &str, default: u32) -> u32 {
-    // `split('\n')`, NOT `.lines()`: `lines()` strips a trailing `\r` and shadow does not —
-    // it rejects `5000\r` and falls back to its default. Measured in both directions.
-    text.split('\n')
-        .filter_map(|line| login_defs_line(line, key))
-        // LAST definition wins, measured: `UID_MIN 5000` then `UID_MIN 6000` allocates 6000.
-        .next_back()
-        .unwrap_or(default)
+    login_defs_raw(text, key).and_then(login_defs_interpret).unwrap_or(default)
 }
 
 /// Read the system's own regular-login-user range rather than hardcoding a threshold
@@ -162,8 +193,22 @@ fn login_defs_key(text: &str, key: &str, default: u32) -> u32 {
 /// forget: the validation lives on the ONLY path that produces a range, so a caller cannot
 /// hold one that was not checked (`docs/DEFECT_CLASSES.md` class 8 — one choke point).
 fn login_defs_uid_range(path: &std::path::Path) -> Result<(u32, u32)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok((DEFAULT_UID_MIN, DEFAULT_UID_MAX));
+    // ABSENT is not the same as UNREADABLE (D0A-R11-05). shadow uses its built-in defaults
+    // when the file is not there, so we do too — but a permission error, an I/O error or
+    // non-UTF-8 content meant the same silent defaults, which is a guard quietly widening
+    // its own range because it could not read the authority. Those refuse.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((DEFAULT_UID_MIN, DEFAULT_UID_MAX))
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "reading {} — the login-uid range decides which accounts are system \
+                 accounts, so an unreadable file is refused rather than defaulted",
+                path.display()
+            )))
+        }
     };
     let range = (
         login_defs_key(&text, "UID_MIN", DEFAULT_UID_MIN),
@@ -586,6 +631,18 @@ mod system_account_guard {
             ("empty value", "UID_MIN \nUID_MAX 50000\n", 1000),
             // Precedence: the LAST definition is the one `useradd` allocated under.
             ("duplicate keys — last wins", "UID_MIN 5000\nUID_MIN 6000\n", 6000),
+            // D0A-R11-05: the quote SCAN, and last-RAW-then-parse. Every row measured the
+            // same way; `"50"00"` is the one no strip-based reading can produce.
+            ("quoted, then a comment", "UID_MIN \"5000\" # comment\n", 5000),
+            ("two leading quotes", "UID_MIN \"\"5000\n", 5000),
+            ("terminates at the first quote", "UID_MIN 5000\"ignored\n", 5000),
+            ("three quotes each side", "UID_MIN \"\"\"5000\"\"\"\n", 5000),
+            ("quotes around a hex value", "UID_MIN \"0x1388\" # x\n", 5000),
+            ("a quote INSIDE the digits", "UID_MIN \"50\"00\"\n", 50),
+            ("empty quotes", "UID_MIN \"\"\n", 1000),
+            ("last raw wins even UNPARSEABLE", "UID_MIN 5000\nUID_MIN garbage\n", 1000),
+            ("unparseable then good", "UID_MIN garbage\nUID_MIN 5000\n", 5000),
+            ("a valueless line does not define", "UID_MIN 5000\nUID_MIN \n", 5000),
         ];
         let mut disagreed = Vec::new();
         for (form, body, shadow) in measured {
@@ -646,6 +703,36 @@ mod system_account_guard {
         let dir = std::env::temp_dir().join(format!("delphi-logindefs-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// D0A-R11-05 — ABSENT and UNREADABLE are different answers.
+    ///
+    /// shadow uses its built-in defaults when the file is not there, so we do too. But any
+    /// other read failure previously took the same silent path: a guard widening its own
+    /// range because it could not read the authority that defines it.
+    #[test]
+    fn an_unreadable_login_defs_refuses_where_an_absent_one_defaults() {
+        let dir = tmpdir("unreadable");
+        let f = dir.join("login.defs");
+        std::fs::write(&f, "UID_MIN 5000\nUID_MAX 50000\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&f).is_ok() {
+            // Running as root, where mode 000 is not a barrier. A SKIP proves nothing, so
+            // say which condition was absent rather than claiming a pass.
+            eprintln!("SKIP an_unreadable_login_defs_refuses…: measured blocker: this uid can read a 0000 file");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let err = login_defs_uid_range(&f).expect_err("an unreadable login.defs must refuse");
+        assert!(err.to_string().contains("unreadable file is refused"), "got: {err}");
+        // POSITIVE CONTROL: absent still defaults, so "refuses" is not "refuses everything".
+        assert_eq!(
+            login_defs_uid_range(&dir.join("absent")).unwrap(),
+            (DEFAULT_UID_MIN, DEFAULT_UID_MAX)
+        );
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

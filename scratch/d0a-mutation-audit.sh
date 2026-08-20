@@ -84,7 +84,17 @@ measure() {
         RUN_COMPILED=1
     fi
     RUN_RESULT_LINES=$(grep -cE '^test result:' "$log")
-    RUN_FAILURES=$(grep -oE '^test [^ ]+ \.\.\. FAILED' "$log" | awk '{print $2}' | sort -u)
+    # FROM LIBTEST'S `failures:` SUMMARY BLOCK, not from the per-test verdict lines.
+    # `--nocapture` interleaves a failing test's own output between `test <name> ... ` and
+    # `FAILED`, so `^test <name> \.\.\. FAILED` matches NOTHING — measured: the baseline
+    # reported zero failures for a suite with two known ones, and every mutant then read
+    # NOT CAUGHT. The end-of-run block lists fully-qualified names one per line and is
+    # unaffected by interleaving.
+    RUN_FAILURES=$(awk '
+        /^failures:$/ { inblock = 1; next }
+        inblock && /^    [A-Za-z0-9_:]+$/ { gsub(/^ +/, ""); print; next }
+        inblock { inblock = 0 }
+    ' "$log" | sort -u)
     local passed failed
     passed=$(grep -E '^test result:' "$log" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' \
         | awk '{s+=$1} END {print s+0}')

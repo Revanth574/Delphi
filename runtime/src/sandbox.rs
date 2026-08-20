@@ -96,7 +96,15 @@ pub fn refuse_denied_bind(
         std::fs::canonicalize(path).ok().map(|p| lexical_normalize(&p)),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if candidate == base_n || candidate.starts_with(&base_n) {
+        // THREE relations, not one (D0A-R10-04). Rejecting only `candidate inside base`
+        // admitted every ANCESTOR — binding `/run`, or `/`, mounts `/run/delphi` and its
+        // socket into the jail just as surely as naming it directly. `base.starts_with`
+        // is the containment leg. `/run/delphi/..` folds to `/run` and is caught by it,
+        // which is the third spelling this predicate has now missed twice.
+        if candidate == base_n
+            || candidate.starts_with(&base_n)
+            || base_n.starts_with(&candidate)
+        {
             return Err(crate::RuntimeError::DeniedBind {
                 path: candidate,
                 base: base_n,
@@ -217,7 +225,14 @@ impl SandboxProfile {
             args.push("--dir".to_string());
             args.push(dir);
         }
-        for (path, mode) in &action.fs_binds {
+        // PARENT-FIRST (D0A-R10-05). bwrap applies setup operations sequentially, so a
+        // parent emitted after a nested child mounts OVER it and the child's mode is
+        // silently lost — `child=ro, parent=rw` leaves the child WRITABLE through the
+        // parent while an argv-level scope check still sees both flags. Sorting
+        // component-wise puts a prefix before what it contains.
+        let mut ordered: Vec<&(std::path::PathBuf, BindMode)> = action.fs_binds.iter().collect();
+        ordered.sort_by(|a, b| lexical_normalize(&a.0).cmp(&lexical_normalize(&b.0)));
+        for (path, mode) in ordered {
             let flag = match mode {
                 BindMode::ReadOnly => "--ro-bind",
                 BindMode::ReadWrite => "--bind",
@@ -329,6 +344,68 @@ mod tests {
             !dirs.iter().any(|d| d == "/opt/vendor"),
             "creating a dir inside a bind writes through to the HOST; got {dirs:?}"
         );
+    }
+
+    /// D0A-R10-04 — an ANCESTOR bind mounts the denied base in just as effectively.
+    #[test]
+    fn a_bind_containing_the_runtime_directory_is_refused() {
+        for p in ["/run", "/", "/run/delphi/..", "/run/./delphi/../.."] {
+            assert!(
+                refuse_denied_bind(Path::new(p), Path::new(BASE)).is_err(),
+                "binding `{p}` places {BASE} inside the jail"
+            );
+        }
+        // Positive control: a sibling that contains nothing of the base is still fine.
+        assert!(refuse_denied_bind(Path::new("/run/user/1000"), Path::new(BASE)).is_ok());
+    }
+
+    /// D0A-R10-05 — proven by ATTEMPTING THE WRITE, not by reading flags.
+    ///
+    /// The argv-level scope test sees `--ro-bind CHILD` and `--bind PARENT` and passes
+    /// either way; the mount topology is where the property lives (class 41).
+    #[test]
+    fn a_read_only_child_stays_read_only_when_its_parent_is_bound_after_it() {
+        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
+            eprintln!("SKIP a_read_only_child_stays_read_only_when_its_parent_is_bound_after_it: measured blocker: bwrap not executable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("delphi-r1005-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("ro")).unwrap();
+        let target = root.join("ro/witness");
+        std::fs::write(&target, b"original").unwrap();
+
+        // REVERSED proposal order: the read-only child FIRST, its writable parent after.
+        let a = action_with(
+            vec![
+                (root.join("ro"), BindMode::ReadOnly),
+                (root.clone(), BindMode::ReadWrite),
+            ],
+            NetPolicy::None,
+        );
+        let mut args = SandboxProfile::derive(&a).args().to_vec();
+        args.extend(["--ro-bind".into(), "/usr".into(), "/usr".into()]);
+        args.extend(["--symlink".into(), "usr/bin".into(), "/bin".into()]);
+        args.extend(["--symlink".into(), "usr/lib".into(), "/lib".into()]);
+        args.extend(["--symlink".into(), "usr/lib64".into(), "/lib64".into()]);
+        args.extend([
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("echo TAMPERED > {}", target.display()),
+        ]);
+        let out = std::process::Command::new("bwrap").args(&args).output().unwrap();
+        eprintln!(
+            "[R10-05] write attempt rc={:?} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "D0A-R10-05: the read-only child was written through its parent bind"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// D0A-R10-01 — observed on the FILESYSTEM, not in the emitted args.

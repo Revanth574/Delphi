@@ -492,6 +492,123 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// **RESTORED 2026-08-20.** This test was DELETED by `f380085`, a commit whose
+    /// message describes only widening a different test and renaming it — 135 lines came
+    /// out of this file and the removal was not mentioned. Round 10 named this test as a
+    /// green it did not trust; by then it no longer existed. The mutation audit then
+    /// measured the consequence: "the approved argv[0] never reaches the tool" survived
+    /// the whole suite.
+    ///
+    /// It observes `$0` IN THE RUNNING TOOL, which is the layer the property lives in;
+    /// `the_helper_is_interposed_with_the_credentials_and_the_approved_argv0` observes
+    /// the assembled arguments. Both are kept: the unit test covers the helper shape
+    /// unprivileged, this one covers what the process actually receives.
+    ///
+    /// Caught as a regression while wiring the drop helper: `--argv0` names whatever
+    /// bwrap execs, so once the helper is interposed the flag would name the HELPER.
+    /// Dropping it unconditionally would leave the tool with `argv[0] =
+    /// /proc/self/fd/N` — it still runs, still exits 0, and the audit shows nothing
+    /// wrong, while anything dispatching on its own name behaves differently.
+    ///
+    /// **The subject is a real BINARY, deliberately.** The first version of this test
+    /// used a `#!/bin/sh` script and failed with `left: "/proc/self/fd/3"` — but for a
+    /// shebang script the KERNEL builds the interpreter's argv from the script path,
+    /// so `$0` cannot observe `--argv0` at all. That was the test being wrong, not the
+    /// code, and a fix aimed at the code would have been aimed at nothing.
+    #[test]
+    fn the_tool_receives_its_approved_argv0() {
+        if !bwrap_available() {
+            eprintln!("SKIP the_tool_receives_its_approved_argv0: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("argv0");
+        let shell = PathBuf::from("/bin/sh");
+        let Ok(bytes) = fs::read(&shell) else {
+            eprintln!("SKIP the_tool_receives_its_approved_argv0: measured blocker: cannot read /bin/sh");
+            return;
+        };
+        let mut action = build_action(&shell, &bytes, &env.out_dir);
+        // `sh -c CMD` with no operand leaves `$0` as the shell's own argv[0] — which
+        // is exactly what `--argv0` (or the helper) sets, so it is observable.
+        action.argv = vec![
+            "tool".into(),
+            "-c".into(),
+            format!("echo \"$0\" > {}", env.result.display()),
+        ];
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("approved exec");
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            fs::read_to_string(&env.result).unwrap().trim(),
+            "tool",
+            "the tool must see its approved argv[0], not the fd path"
+        );
+    }
+
+    /// **RESTORED 2026-08-20**, deleted by the same commit (`f380085`) and equally
+    /// unmentioned. It measures the mechanism the shipped helper DEPENDS on — a kept fd
+    /// surviving a second `execve` and remaining executable. A premise measurement is
+    /// not spent once the thing is built: it is what tells you the premise still holds.
+    ///
+    /// D0A-R9-01 **PREMISE CHECK**, before any code is built on it.
+    ///
+    /// E's shape needs a drop-helper between bwrap and the tool, passed **by fd** so it
+    /// needs no bind. That rests on a claim the existing code does *not* demonstrate:
+    /// the script path keeps two fds, but fd B is **opened** by the interpreter — here
+    /// fd B must survive a **second `execve`** (the helper's) and then be **exec'd**.
+    ///
+    /// Assuming it because it resembles the existing mechanism is the shape that was
+    /// wrong twice already this session (`--uid` being namespace-internal; `--userns`
+    /// taking an fd, not a path). So it is measured.
+    ///
+    /// Scope: proves fd survival across a second exec. It does **not** show the helper
+    /// can be a shell script in production — `/usr` is not guaranteed bound for an
+    /// arbitrary action, which is why the shipped helper must be a real binary.
+    #[test]
+    fn a_second_kept_fd_survives_a_second_exec_and_is_executable() {
+        if !bwrap_available() {
+            eprintln!("SKIP a_second_kept_fd_survives_a_second_exec_and_is_executable: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("twofd");
+        // Helper: execs whatever path it is handed — the drop-helper's exec shape.
+        let helper = env.dir.join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\nexec \"$1\"\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let bytes = write_script(&env.exe, "REACHED-VIA-HELPER", &env.result);
+
+        let hf = fs::File::open(&helper).unwrap();
+        let pf = fs::File::open(&env.exe).unwrap();
+        let (h, p) = (hf.as_raw_fd(), pf.as_raw_fd());
+
+        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let mut args = SandboxProfile::derive(&action).args().to_vec();
+        args.push("--".into());
+        args.push(format!("/proc/self/fd/{h}"));
+        args.push(format!("/proc/self/fd/{p}"));
+
+        let keep = vec![h, p];
+        let mut cmd = Command::new("bwrap");
+        cmd.args(&args);
+        // SAFETY: as the production path — async-signal-safe, no allocation.
+        unsafe {
+            cmd.pre_exec(move || {
+                crate::fdsec::mark_cloexec_except_raw(&keep)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            fs::read_to_string(&env.result).unwrap().trim(),
+            "REACHED-VIA-HELPER",
+            "a second kept fd must survive the helper's own execve and remain executable"
+        );
+    }
+
     /// The RED exec variant: bind the executable PATH and exec it (re-resolvable),
     /// instead of the pinned fd.
     fn execute_via_path(action: &PendingAction, exe_path: &Path) -> Output {

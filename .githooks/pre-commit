@@ -80,9 +80,36 @@ if git diff --cached --name-only | grep -qE '^runtime/'; then
         printf '%s\n' "$out" | sed -n 's/^test result:.* \([0-9]\+\) failed.*/\1/p'
     )
     printf '%s\n' "$out" | grep -E '^test result:' | sed 's/^/[pre-commit]   /' || true
-    scripts/test-count.sh -p delphi-runtime --lib --bins 2>/dev/null \
-        | grep -E '^EXECUTED' | sed 's/^/[pre-commit]   /' || true
+    counts=$(scripts/test-count.sh -p delphi-runtime --lib --bins 2>/dev/null || true)
+    printf '%s\n' "$counts" | grep -E '^EXECUTED' | sed 's/^/[pre-commit]   /' || true
     echo "[pre-commit]   result lines: $result_lines   FAILED across all targets: $total_failed"
+
+    # ── DISAPPEARANCE GATE (2026-08-20) ────────────────────────────────────────────
+    # Counting FAILURES cannot see a test that is no longer there. `f380085` deleted two
+    # tests in a commit that described neither, and the loss surfaced five commits later
+    # as a property nothing covered. Equality on BOTH numbers, per the baseline file.
+    baseline="${DELPHI_TEST_COUNT_BASELINE:-.githooks/runtime-test-count-baseline}"
+    if [ -r "$baseline" ]; then
+        want_exec=$(sed -n 's/^EXECUTED=\([0-9]\+\)$/\1/p' "$baseline")
+        want_skip=$(sed -n 's/^SKIPPED=\([0-9]\+\)$/\1/p' "$baseline")
+        got_exec=$(printf '%s\n' "$counts" | grep -oE '^EXECUTED [0-9]+' | grep -oE '[0-9]+' || true)
+        got_skip=$(printf '%s\n' "$counts" | grep -oE 'SKIPPED [0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+        if [ -z "$got_exec" ] || [ -z "$got_skip" ]; then
+            echo "REFUSING: could not measure the test counts — the count is UNKNOWN, not unchanged." >&2
+            exit 1
+        fi
+        if [ "$got_exec" != "$want_exec" ] || [ "$got_skip" != "$want_skip" ]; then
+            echo "REFUSING: test counts differ from $baseline." >&2
+            echo "  recorded: EXECUTED=$want_exec SKIPPED=$want_skip" >&2
+            echo "  measured: EXECUTED=$got_exec SKIPPED=$got_skip" >&2
+            echo "  If this is intended, update the baseline IN THIS COMMIT and say why." >&2
+            echo "  A DROP in EXECUTED needs the test named: removed on purpose, or started skipping?" >&2
+            exit 1
+        fi
+        echo "[pre-commit]   counts match $baseline (EXECUTED=$want_exec SKIPPED=$want_skip)"
+    else
+        echo "[pre-commit]   NO BASELINE at $baseline — disappearance is UNGATED for this commit."
+    fi
     if [ "$result_lines" -eq 0 ]; then
         echo "REFUSING: no 'test result:' line — the suite did not RUN (compile error?)." >&2
         printf '%s\n' "$out" | tail -15 >&2

@@ -1,0 +1,33 @@
+# delphi-runtime test counts — EXACT values, checked by .githooks/pre-commit.
+#
+#     EXECUTED=<n>
+#     SKIPPED=<n>
+#
+# WHY THIS EXISTS (2026-08-20). `f380085` deleted TWO tests —
+# `the_tool_receives_its_approved_argv0` and
+# `a_second_kept_fd_survives_a_second_exec_and_is_executable` — in a commit whose message
+# describes only widening a THIRD test and renaming it. 135 lines left execute.rs and the
+# removal was not mentioned anywhere. Nothing noticed: the pre-commit gate counts FAILURES,
+# not tests; `.github/rust-test-count-baseline` is deliberately unrecorded (a workspace
+# count cannot be produced off-CI), so the disappearance guard that exists for exactly this
+# was inert. The consequence was measured five commits later — "the approved argv[0] never
+# reaches the tool" survived the entire mutation audit, because its test was gone.
+#
+# EQUALITY, NOT A FLOOR — the reasoning in `.github/rust-test-count-baseline` applies here
+# unchanged: a floor is satisfied forever by a test that starts SKIPPING, which is the
+# disappearance the guard is for. Both numbers are recorded because EXECUTED alone is blind
+# to a compensating pair (one test deleted while another stops skipping).
+#
+# PROTOCOL. Any change to either number — up OR down — updates this file IN THE SAME COMMIT,
+# with the reason in the message. The hook prints the measured pair when it refuses, so the
+# update is a paste, not an investigation. A DROP in EXECUTED needs the specific test named:
+# removed on purpose, or started skipping? The second is a defect wearing the first's clothes.
+#
+# ENVIRONMENT-SPECIFIC, like its workspace sibling. Measured UNPRIVILEGED, where
+# `an_approved_action_runs_with_the_tool_account_credentials` skips. On a root lane it
+# EXECUTES, so the pair there is EXECUTED=113 SKIPPED=0 — point the hook at another file via
+# DELPHI_TEST_COUNT_BASELINE rather than editing these values for one run.
+#
+# Scope: `-p delphi-runtime --lib --bins`, which is what the hook runs.
+EXECUTED=112
+SKIPPED=1

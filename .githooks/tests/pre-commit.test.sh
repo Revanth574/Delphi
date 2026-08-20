@@ -24,11 +24,14 @@ REAL=$PWD/.githooks/pre-commit
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 pass=0; fail=0
 
-# mkrepo <hook> <lib-failures> <bins-failures> <cargo-mode> -> repo dir
+# mkrepo <hook> <lib-failures> <bins-failures> <cargo-mode> [baseline "EXEC SKIP"] -> repo dir
 #   cargo-mode: normal | compile-error
 mkrepo() {
-    local hook=$1 libf=$2 binsf=$3 mode=$4 r="$work/repo-$RANDOM$RANDOM"
+    local hook=$1 libf=$2 binsf=$3 mode=$4 baseline=${5:-} r="$work/repo-$RANDOM$RANDOM"
     mkdir -p "$r"/{runtime/src,scripts,bin,.githooks}
+    if [ -n "$baseline" ]; then
+        printf 'EXECUTED=%s\nSKIPPED=%s\n' ${baseline} > "$r/.githooks/runtime-test-count-baseline"
+    fi
     ln -s "$hook" "$r/.githooks/pre-commit"
     echo '[package]' > "$r/runtime/Cargo.toml"
     echo 'fn main() {}' > "$r/runtime/src/main.rs"
@@ -100,10 +103,21 @@ run "nothing staged under runtime/ -> gate skipped" 0 "$R"
 case "$LAST_OUT" in *"runtime test gate"*) fail=$((fail+1)); echo "       ^ but the gate RAN";;
   *) pass=$((pass+1)); echo "       ...and the gate did not run ✓";; esac
 
+# ── The DISAPPEARANCE gate (2026-08-20) ───────────────────────────────────────────────
+# The stub emits EXECUTED 98 / SKIPPED 1, so a baseline of "98 1" matches.
+echo
+echo "  --- disappearance gate: counts must equal the recorded pair ---"
+run "counts match the baseline -> allow"            0 "$(mkrepo "$REAL" 2 0 normal "98 1")" "counts match"
+run "a test VANISHED (99 recorded, 98 measured) -> REFUSE" 1 "$(mkrepo "$REAL" 2 0 normal "99 1")" "measured: EXECUTED=98 SKIPPED=1"
+run "a test started SKIPPING (0 recorded, 1 measured) -> REFUSE" 1 "$(mkrepo "$REAL" 2 0 normal "98 0")" "recorded: EXECUTED=98 SKIPPED=0"
+# The no-baseline path must ANNOUNCE that it is ungated rather than pass silently — an
+# absent guard reported as a pass is the shape this whole session has been about.
+run "no baseline present -> allowed, but SAYS it is ungated" 0 "$(mkrepo "$REAL" 2 0 normal)" "disappearance is UNGATED"
+
 echo
 echo "  --- weakens: each must let a defect through ---"
-# G1: restore the `set -e`-killing pipeline (no `|| true` on test-count).
-sed 's#^        | grep -E .\^EXECUTED. | sed .s/\^/\[pre-commit\]   /. || true#        | grep -E "^EXECUTED" | sed "s/^/[pre-commit]   /"#' \
+# G1: restore the `set -e`-killing form (the command substitution without `|| true`).
+sed 's#counts=\$(scripts/test-count.sh -p delphi-runtime --lib --bins 2>/dev/null || true)#counts=$(scripts/test-count.sh -p delphi-runtime --lib --bins 2>/dev/null)#' \
     "$REAL" > "$work/hook-g1"; chmod +x "$work/hook-g1"
 if diff -q "$REAL" "$work/hook-g1" >/dev/null; then
     echo "  WEAKEN G1 DID NOT APPLY — the next line would be about the SHIPPED hook"; fail=$((fail+1))

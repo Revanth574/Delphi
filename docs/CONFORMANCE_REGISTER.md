@@ -174,6 +174,67 @@ that **the drop takes**, which is
 `an_approved_action_runs_with_the_tool_account_credentials` — and it SKIPs here, so on this
 box that property has no live evidence at all. **Closes when** a root lane runs it.
 
+## OPENED-AND-CLOSED 2026-08-20 — the tree-replace invariant had NO LIVE EVIDENCE for 15 commits
+
+Recorded as its own item rather than inside D0A-R10-10's fixture repair, because "the fixture
+is fixed" and "the invariant was unproven for a window" are different statements and only the
+second is about the clause.
+
+**The clause.** `installer/install.sh` replaces the shell bundle by a two-rename swap whose
+invariant is *at every instant there is at least one of `shell` or `shell.old`; it is never
+the case that both are absent*. CLAUDE.md §6 names `installer/tests/tree-install.test.sh` as
+the **tier-1 SOLE EVIDENCE** for it — tier 1 under clause (d), *cited as the evidence that a
+property holds*, despite never shipping.
+
+**What was true.** `cdc3418` added `delphi-drop` to install.sh's staged-artifact loop and not
+to that suite's fixture. From `cdc3418` until `10d4d65` — **15 further commits** (`git
+rev-list --count cdc3418..9a45679`) — all 16 of the suite's install legs failed in pre-flight
+with `cannot open installer/staging/delphi-drop`, before reaching a single assertion about
+renames. Measured, not inferred: a worktree at `cdc3418~1` runs **26 passed / 0 failed**; at
+`9a45679`, **10 passed / 16 failed**.
+
+**So for that window the invariant was ABSENT, not passing** — the same distinction this file
+already records for `runtime/shell-host` and for `cargo check --workspace`, now applied to a
+clause the project cites as proven. The install code was not modified in that window, so
+there is no reason to believe the invariant was violated; the point is narrower and worse:
+**nothing was in a position to notice if it had been.**
+
+**Why nothing noticed.** The suite is run by nothing — not `cargo test` (it is a shell
+script), not the pre-commit hook (scoped to staged `runtime/` paths), and not CI, which had
+no shell-suite step at all. A tier-1 artifact with no runner is a tier-1 artifact that
+reports whatever it last reported.
+
+**Closed** (`10d4d65`): the fixture is repaired and the suite is back to 26/0 — now 29/0 with
+the R10-11 legs; `scripts/run-shell-suites.sh` discovers and runs every `*.test.sh`; CI runs
+that script. The CI leg is **unverified on a runner** — green on the dev box, never yet
+executed by GitHub Actions.
+
+## OPENED-AND-CLOSED 2026-08-20 — two tests were DELETED in a commit that described neither
+
+`f380085` ("widen R9-01's proof to every credential it CAN observe; shrink its name") removed
+**135 lines** from `runtime/src/execute.rs`, and two of the things in them were whole tests:
+
+* `the_tool_receives_its_approved_argv0` — a real bwrap run asserting the tool's `$0` is its
+  approved name and not `/proc/self/fd/N`;
+* `a_second_kept_fd_survives_a_second_exec_and_is_executable` — the **premise measurement**
+  the drop helper's entire design rests on.
+
+Neither removal is mentioned in that message. The consequence was measured five commits
+later by `scratch/d0a-mutation-audit.sh`: *the approved `argv[0]` never reaches the tool*
+survived the entire suite, because the test for it no longer existed. Round 10 had named
+that test as a green it did not trust; by the time the round was answered it was gone.
+
+**Both restored 2026-08-20**, verified passing, and kept alongside the unit-level
+`the_helper_is_interposed_…` (which observes the assembled arguments — a different, lower
+altitude than the running process's `$0`).
+
+**Foreclosed mechanically, because nothing caught this either**: the pre-commit gate counted
+FAILURES, which cannot see a test that is absent, and `.github/rust-test-count-baseline` is
+deliberately unrecorded, so the disappearance guard built for exactly this was inert.
+`.githooks/runtime-test-count-baseline` now records EXECUTED/SKIPPED for
+`-p delphi-runtime --lib --bins` and the hook refuses on any change to either number, up or
+down, printing the measured pair. Its RED legs are in `.githooks/tests/pre-commit.test.sh`.
+
 ## Claims whose scope was believed wider than their proof
 
 A different kind of row from the table above. Nothing here is a violated clause — each is a

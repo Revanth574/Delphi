@@ -42,16 +42,29 @@ fn main() {
     //
     // `-C link-arg=-static` alone is NOT a substitute: measured, it produces a binary
     // that links, reports as `ELF ... executable`, and SEGFAULTS (rc 139).
+    //
+    // D0A-R10-11: `--target $TARGET`, because a bare `rustc` builds for the HOST and knows
+    // nothing about what cargo was asked to compile. Under `cargo build --target <foreign>`
+    // the daemon is cross-compiled while this helper is not, and the host binary is copied
+    // into `<target>/<triple>/<profile>/` for `installer/build.sh` to stage BESIDE the
+    // foreign daemon — a root-owned 0755 file that cannot execute on the machine it ships to.
+    //
+    // Cargo always sets TARGET for a build script (measured: `TARGET=Ok("x86_64-unknown-
+    // linux-gnu")`), and it equals HOST for a native build, so this is a no-op there. When
+    // the target's std is absent, rustc fails LOUDLY here rather than silently emitting a
+    // host binary — that failure is the point, not a regression.
     println!("cargo:rerun-if-changed=helper/delphi-drop.rs");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let target = std::env::var("TARGET").expect("TARGET is set by cargo for build scripts");
     let helper = std::path::Path::new(&out).join("delphi-drop");
     let status = std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--target", &target])
         .args(["-O", "-C", "target-feature=+crt-static", "--edition", "2024", "-o"])
         .arg(&helper)
         .arg("helper/delphi-drop.rs")
         .status()
         .expect("spawn rustc for the drop helper");
-    assert!(status.success(), "building the drop helper failed");
+    assert!(status.success(), "building the drop helper for {target} failed");
 
     // Also place it beside the other binaries so `installer/build.sh` can name it.
     // OUT_DIR is `<target>/<profile>/build/<pkg>-<hash>/out`, so three levels up is

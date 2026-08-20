@@ -40,7 +40,11 @@ REAL_INSTALL="$REPO/installer/install.sh"
 # command substitution, where an `exit` kills only the subshell and the drift is reported
 # once per leg while the run continues on a broken sandbox. A pre-flight stops.
 FIXTURE_ARTIFACTS="delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai delphi-runtimed@.service delphi-runtime.pam delphi-shell.apparmor"
-install_opens=$(sed -n 's/^for f in \(.*\); do$/\1/p' "$REAL_INSTALL")
+# Anchored to the loop that POPULATES FD, not to any `for f in …` line: install.sh has more
+# than one such loop, and a shape-matched extraction picked up both the moment one was added
+# (which this guard caught, doing exactly its job). The FD table is the semantic anchor —
+# that loop IS the staged-artifact set.
+install_opens=$(sed -n '/^declare -A FD$/{n;s/^for f in \(.*\); do$/\1/p;}' "$REAL_INSTALL")
 if [ -z "$install_opens" ]; then
     echo "REFUSING: could not read the staged-artifact list out of $REAL_INSTALL" >&2
     exit 2
@@ -62,6 +66,15 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 # caller shape the bundle tree.
 #
 # Emits the sandbox path on stdout.
+# D0A-R10-11: install.sh now reads the ELF header of every staged binary, so the stubs must
+# BE ELF-shaped. 20 bytes of real header (magic, 64-bit, little-endian, e_type EXEC, the
+# caller's e_machine) followed by identifying text, so each file still has distinct content.
+ELF_MACHINE_X86_64='\076\000'   # 0x3e
+ELF_MACHINE_AARCH64='\267\000'  # 0xb7
+elf_stub() {   # path machine-bytes label
+    printf '\177ELF\002\001\001\000\000\000\000\000\000\000\000\000\002\000'"$2"'stub-%s\n' "$3" > "$1"
+}
+
 make_sandbox() {
     local tmp; tmp="$(mktemp -d)"
     mkdir -p "$tmp/installer/staging" "$tmp/fakebin"
@@ -69,7 +82,7 @@ make_sandbox() {
 
     local f
     for f in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
-        printf 'ELF-stub-%s\n' "$f" > "$tmp/installer/staging/$f"
+        elf_stub "$tmp/installer/staging/$f" "$ELF_MACHINE_X86_64" "$f"
     done
     printf 'unit-stub\n' > "$tmp/installer/staging/delphi-runtimed@.service"
     printf 'pam-stub\n'  > "$tmp/installer/staging/delphi-runtime.pam"
@@ -198,6 +211,56 @@ refuse_case "group/other-writable SUBDIRECTORY" shape_untrusted_subdir \
                                           "group/other-writable inode"
 refuse_case "empty tree"                  shape_empty    "contains no regular files"
 refuse_case "missing index.html"          shape_no_index "index.html is missing"
+
+# ── D0A-R10-11 — the ELF identity of the staged binaries ──────────────────────────────
+# runtime/build.rs built the drop helper with a bare `rustc`, which ignores cargo's TARGET,
+# so `cargo build --target <foreign>` produced a HOST helper and build.sh staged it beside a
+# cross-compiled daemon. The property is not "build.rs passes a flag" — it is that the
+# binaries installed together can run on the same machine, which lives in their ELF headers
+# (class 41). So the check is asserted where it bites, and it bites whatever caused the
+# mismatch: a cross build, a hand-placed file, an artifact carried from another box.
+#
+# The POSITIVE CONTROL is the whole rest of this file: every other case stages four stubs of
+# the SAME machine and installs, so "a mismatch is refused" cannot be "everything is refused".
+binary_refuse_case() {   # description  perturb-fn  expected-refusal-substring
+    local desc="$1" perturb="$2" expect="$3" tmp
+    tmp="$(make_sandbox)"
+    stage_valid_tree "$tmp/installer/staging"
+    tighten_tree "$tmp/installer/staging/shell"
+    "$perturb" "$tmp/installer/staging"
+    run_installer "$tmp" >/dev/null 2>&1
+    local rc=$?
+    local log; log="$(cat "$tmp/out.log" 2>/dev/null)"
+    local libexec; libexec="$(cat "$tmp/libexec.txt" 2>/dev/null)"
+    if [ "$rc" -eq 0 ] || [[ "$log" != *"$expect"* ]]; then
+        bad "$desc — expected refusal containing '$expect' (rc=$rc). log: ${log:0:220}"
+    elif [ -n "$libexec" ]; then
+        # The check is in PRE-FLIGHT, so `refuse`'s "no system change made" must be true.
+        bad "$desc — refused, but /usr/libexec is not empty: $libexec"
+    else
+        ok "$desc — refused in pre-flight, nothing installed"
+    fi
+    rm -rf "$tmp"
+}
+perturb_foreign_helper() {
+    elf_stub "$1/delphi-drop" "$ELF_MACHINE_AARCH64" delphi-drop; chmod 0755 "$1/delphi-drop"
+}
+# Deliberately LONGER than an ELF header: at 18 bytes this refused for the length reason and
+# never reached the magic check, so the leg passed while testing the neighbouring assertion.
+perturb_not_elf() {
+    printf 'this file is definitely not an ELF binary at all\n' > "$1/delphi-drop"
+    chmod 0755 "$1/delphi-drop"
+}
+perturb_truncated() { printf '\177ELF\002\001' > "$1/delphi-drop"; chmod 0755 "$1/delphi-drop"; }
+
+echo
+echo "D0A-R10-11 — staged-binary ELF identity:"
+binary_refuse_case "helper built for another machine (aarch64 vs x86-64)" \
+                   perturb_foreign_helper "was built for a different machine"
+binary_refuse_case "staged binary is not an ELF at all" \
+                   perturb_not_elf "does not start with the ELF magic"
+binary_refuse_case "staged binary is a truncated header" \
+                   perturb_truncated "shorter than an ELF header"
 
 # ── The happy path + the replace/no-clobber discipline ────────────────────────────────
 echo

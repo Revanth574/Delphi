@@ -74,6 +74,47 @@ for f in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai delphi-runti
     FD[$f]=$fd
 done
 
+# ── D0A-R10-11: every staged BINARY must be the same machine as the daemon ────────────
+# runtime/build.rs builds `delphi-drop` with a bare `rustc`, and `delphi-shell` comes from a
+# separate cargo invocation with its own target dir. Neither is guaranteed to have been built
+# for the same target as the daemon: `cargo build --target <foreign>` cross-compiles the
+# daemon while a bare rustc keeps producing HOST binaries, and build.sh stages whatever is in
+# the profile directory. The result installs cleanly and cannot execute.
+#
+# Checked HERE, not only at build time, because this is the layer where the mismatch bites —
+# a helper the daemon `execve`s on the machine it was installed on. Whatever produced the
+# mismatch (cross build, a hand-placed file, a stale artifact from another box), it is
+# refused here. Table-free by construction: two artifacts are compared with each other, so
+# there is no triple->machine map to fall out of date.
+#
+# Reads the ALREADY-BOUND fds, so it inspects the same inodes that will be copied.
+elf_ident() {   # fd name -> sets IDENT to "<class> <data> <machine>"; refuses otherwise
+    local fd="$1" name="$2" machine
+    local -a b
+    # Process substitution, NOT `$(…)`: `refuse` must exit the SCRIPT, and inside a command
+    # substitution it would only exit the subshell and leave IDENT empty.
+    #
+    # `|| true` because `tr` leaves no trailing newline, so `read` fills the array and THEN
+    # reports EOF with status 1 — which `set -e` turns into a silent death before any check
+    # runs. The array length below is what decides, not read's status.
+    read -r -a b < <(od -An -tu1 -N20 "/proc/self/fd/$fd" | tr -s ' \n' ' ') || true
+    [ "${#b[@]}" -eq 20 ] || refuse "$name is shorter than an ELF header (${#b[@]} bytes) — a truncated or empty build product"
+    [ "${b[0]} ${b[1]} ${b[2]} ${b[3]}" = "127 69 76 70" ] || \
+        refuse "$name does not start with the ELF magic — it is not an executable this installer may place in /usr/libexec"
+    if [ "${b[5]}" = "2" ]; then machine=$(( b[18] * 256 + b[19] )); else machine=$(( b[18] + 256 * b[19] )); fi
+    IDENT="${b[4]} ${b[5]} $machine"
+}
+elf_ident "${FD[delphi-runtimed]}" delphi-runtimed
+REF_IDENT="$IDENT"
+for bin in delphi-drop delphi-shell delphi-minimal-ai; do
+    elf_ident "${FD[$bin]}" "$bin"
+    [ "$IDENT" = "$REF_IDENT" ] || refuse "$bin was built for a different machine than delphi-runtimed
+  delphi-runtimed: ELF class/data/machine $REF_IDENT
+  $bin: ELF class/data/machine $IDENT
+  Installing it would place a binary that cannot execute on this system. Rebuild everything
+  for one target (installer/build.sh) and re-run."
+done
+
 # ── The shell bundle TREE (P1) — pre-flight ───────────────────────────────────────────
 # FIRST directory-tree install. The per-file discipline above (open → fstat_trust the BOUND
 # fd → copy from /proc/self/fd) extends here PER ENTRY, unchanged, and carries the same

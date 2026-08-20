@@ -25,9 +25,10 @@ pass=0; fail=0
 #
 # D0A-R10-10: this fixture listed three products while build.sh staged four. `delphi-drop`
 # was added at cdc3418 and the fixture was not, so every leg below failed with
-# `MISSING BUILD PRODUCT` and the suite has been RED for 12 commits — unnoticed because
-# nothing runs it (cargo does not, and the pre-commit gate is scoped to staged runtime/
-# paths). A fixture that enumerates what its subject reads is a second copy of a list, and
+# `MISSING BUILD PRODUCT` and the suite has been RED ever since — 15 further commits landed
+# on top — unnoticed because nothing runs it (cargo does not, and the pre-commit gate is
+# scoped to staged runtime/ paths).
+# A fixture that enumerates what its subject reads is a second copy of a list, and
 # the copy drifts (class 17). Deriving it means the next artifact needs no edit here; a
 # derivation that yields nothing REFUSES rather than quietly testing an empty set.
 products_of() {  # products_of <build.sh> -> one relative path per line
@@ -120,7 +121,7 @@ else fail=$((fail+1)); echo "    ^ expected STALE-BYTES in staging; the weaken p
 # --- the fixture must FOLLOW build.sh, not track it -----------------------------------------
 # The proof that the derivation is load-bearing: give a copy of build.sh a FIFTH product it
 # has never staged before. A fixture with a hard-coded list fails with MISSING BUILD PRODUCT
-# (this suite's state for the last 12 commits); a derived one just works.
+# (this suite's state since cdc3418); a derived one just works.
 echo
 echo "  --- a fifth staged artifact needs no edit here ---"
 sed 's#^stage "\$TARGET/release/delphi-drop" delphi-drop$#&\nstage "$TARGET/release/delphi-future" delphi-future#' \

@@ -5,9 +5,10 @@
 #
 # WHY THIS EXISTS. The shell suites were run by NOTHING — not `cargo test`, not CI (which
 # has no step for them), not the pre-commit hook (scoped to staged `runtime/` paths). Two of
-# them were RED for 12 commits after `delphi-drop` entered the installer without their
-# fixtures, and one of those two is the tier-1 SOLE EVIDENCE for the tree-replace invariant
-# (CLAUDE.md §6). Nobody noticed because nothing looked. This is the something that looks.
+# them were RED from cdc3418 onward — 15 further commits landed on top — after `delphi-drop`
+# entered the installer without their fixtures, and one of those two is the tier-1 SOLE
+# EVIDENCE for the tree-replace invariant (CLAUDE.md §6). Nobody noticed because nothing
+# looked. This is the something that looks.
 #
 # DISCOVERED, NOT ENUMERATED (class 17): a list here would be the fourth copy of a list this
 # repo has already let drift. Zero discoveries REFUSES — a runner that finds nothing must

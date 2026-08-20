@@ -39,9 +39,22 @@ that shape in this arc.
 not CI, which had no shell-suite step at all. `scripts/run-shell-suites.sh` discovers every
 `*.test.sh` (zero found REFUSES) and CI now runs it — **UNVERIFIED on a runner**, green here.
 
-**R10-11 — the cross-compile.** `build.rs` now passes `--target $TARGET`; the native path
-is byte-identical (sha256 `d9ce49055ddddb85` before and after) and a missing target std
-fails loudly. The backstop is at the layer where it bites (class 41): `install.sh`'s
+**R10-11 — the cross-compile, now MEASURED rather than argued.** `build.rs` passes
+`--target $TARGET`; the native path is byte-identical (sha256 `d9ce49055ddddb85` before and
+after). With `rustup target add aarch64-unknown-linux-gnu` installed, the real compiled
+build script was driven with the environment cargo sets for that target:
+
+| build script | rc | artifact |
+|---|---|---|
+| pre-fix (bare `rustc`) | **0 — silent success** | 5.3MB `delphi-drop`, **ELF x86-64** (`e_machine 62`), in the **aarch64** profile dir |
+| shipped (`--target $TARGET`) | **101** | none — `rust-lld: … is incompatible with elf64-x86-64` |
+
+Two things this does NOT show, stated because the arc's recurring error is exactly one step
+past the evidence: a cargo-driven cross build cannot reach our build script here at all
+(`libsqlite3-sys` needs a cross C toolchain first), and producing a *runnable* aarch64
+helper needs an aarch64 linker + glibc that rustup's std does not supply. What is proven is
+the direction — no wrong-arch artifact is produced — plus the installer backstop for one
+arriving by another route. The backstop is at the layer where it bites (class 41): `install.sh`'s
 pre-flight refuses unless `delphi-drop`, `delphi-shell` and `delphi-minimal-ai` match
 `delphi-runtimed`'s ELF class/data/machine, read from the already-bound fds. Weaken: the
 guard removed, the aarch64 stub **installs as root**.

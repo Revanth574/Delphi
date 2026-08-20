@@ -49,10 +49,17 @@ fn main() {
     // into `<target>/<triple>/<profile>/` for `installer/build.sh` to stage BESIDE the
     // foreign daemon — a root-owned 0755 file that cannot execute on the machine it ships to.
     //
-    // Cargo always sets TARGET for a build script (measured: `TARGET=Ok("x86_64-unknown-
-    // linux-gnu")`), and it equals HOST for a native build, so this is a no-op there. When
-    // the target's std is absent, rustc fails LOUDLY here rather than silently emitting a
-    // host binary — that failure is the point, not a regression.
+    // MEASURED, not argued (2026-08-20), by driving THIS compiled build script with the
+    // environment cargo sets for `--target aarch64-unknown-linux-gnu`:
+    //   without `--target`: rc=0 and a 5.3MB **x86-64** `delphi-drop` in the aarch64
+    //                       profile dir — silently staged beside a foreign daemon;
+    //   with it:            rc=101, `rust-lld: … is incompatible with elf64-x86-64`,
+    //                       and NO artifact. Loud beats wrong.
+    // (A cargo-driven cross build cannot get this far on this box — `libsqlite3-sys` needs
+    // a cross C toolchain first — and producing a RUNNABLE aarch64 helper additionally
+    // needs an aarch64 linker + glibc, which rustup's std does not supply. What is proven
+    // is the direction: no wrong-arch artifact is produced. `installer/install.sh`'s ELF
+    // check is the backstop for one arriving by any other route.)
     println!("cargo:rerun-if-changed=helper/delphi-drop.rs");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let target = std::env::var("TARGET").expect("TARGET is set by cargo for build scripts");

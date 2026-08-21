@@ -66,14 +66,31 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 # caller shape the bundle tree.
 #
 # Emits the sandbox path on stdout.
-# D0A-R10-11: install.sh now reads the ELF header of every staged binary, so the stubs must
-# BE ELF-shaped. 20 bytes of real header (magic, 64-bit, little-endian, e_type EXEC, the
-# caller's e_machine) followed by identifying text, so each file still has distinct content.
-ELF_MACHINE_X86_64='\076\000'   # 0x3e
-ELF_MACHINE_AARCH64='\267\000'  # 0xb7
-elf_stub() {   # path machine-bytes label
-    printf '\177ELF\002\001\001\000\000\000\000\000\000\000\000\000\002\000'"$2"'stub-%s\n' "$3" > "$1"
-}
+# D0A-R11-07: install.sh now validates the FULL identification header against
+# /proc/self/exe, the ELF type, the machine, and PT_INTERP — so a 20-byte fabricated header
+# is no longer a faithful stub, and staging one would test the refusal path on every leg.
+#
+# The stubs are therefore REAL native binaries (class 25 — a fixture constructed differently
+# from its subject is how the last three fixtures went wrong):
+#   * the dynamic three  -> /bin/true, which is native and whose loader exists;
+#   * delphi-drop        -> a STATIC binary, because install.sh requires the helper to have
+#                           no PT_INTERP (it is exec'd inside a jail that binds nothing).
+# The repo's own built helper is the honest choice for the static one. If it has not been
+# built, the suite says so and skips rather than fabricating a header that would exercise a
+# different path than production.
+NATIVE_DYN=/bin/true
+NATIVE_STATIC=""
+for c in target/debug/delphi-drop target/release/delphi-drop \
+         "${CARGO_TARGET_DIR:-}/debug/delphi-drop" "${CARGO_TARGET_DIR:-}/release/delphi-drop" \
+         installer/staging/delphi-drop; do
+    [ -n "$c" ] && [ -f "$REPO/$c" ] && { NATIVE_STATIC="$REPO/$c"; break; }
+    [ -n "$c" ] && [ -f "$c" ] && { NATIVE_STATIC="$c"; break; }
+done
+if [ -z "$NATIVE_STATIC" ]; then
+    echo "SKIP tree-install: measured blocker: no built delphi-drop to use as the STATIC stub."
+    echo "  (cargo build -p delphi-runtime --bin delphi-runtimed produces target/debug/delphi-drop)"
+    exit 0
+fi
 
 make_sandbox() {
     local tmp; tmp="$(mktemp -d)"
@@ -81,9 +98,10 @@ make_sandbox() {
     ln -s "$REAL_INSTALL" "$tmp/installer/install.sh"
 
     local f
-    for f in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
-        elf_stub "$tmp/installer/staging/$f" "$ELF_MACHINE_X86_64" "$f"
+    for f in delphi-runtimed delphi-shell delphi-minimal-ai; do
+        cp "$NATIVE_DYN" "$tmp/installer/staging/$f"
     done
+    cp "$NATIVE_STATIC" "$tmp/installer/staging/delphi-drop"
     printf 'unit-stub\n' > "$tmp/installer/staging/delphi-runtimed@.service"
     printf 'pam-stub\n'  > "$tmp/installer/staging/delphi-runtime.pam"
     # The AppArmor profile is a required staged artifact; a REAL one (not a stub), because
@@ -242,9 +260,16 @@ binary_refuse_case() {   # description  perturb-fn  expected-refusal-substring
     fi
     rm -rf "$tmp"
 }
+# A REAL native binary with its e_machine byte overwritten — everything else about the file
+# is genuine, so the leg isolates the machine field.
 perturb_foreign_helper() {
-    elf_stub "$1/delphi-drop" "$ELF_MACHINE_AARCH64" delphi-drop; chmod 0755 "$1/delphi-drop"
+    cp "$NATIVE_STATIC" "$1/delphi-drop"
+    printf '\267' | dd of="$1/delphi-drop" bs=1 seek=18 count=1 conv=notrunc status=none
+    chmod 0755 "$1/delphi-drop"
 }
+# A dynamically linked helper: native, valid, executable — and unusable inside a jail that
+# binds nothing, which is the property install.sh asserts for delphi-drop specifically.
+perturb_dynamic_helper() { cp "$NATIVE_DYN" "$1/delphi-drop"; chmod 0755 "$1/delphi-drop"; }
 # Deliberately LONGER than an ELF header: at 18 bytes this refused for the length reason and
 # never reached the magic check, so the leg passed while testing the neighbouring assertion.
 perturb_not_elf() {
@@ -256,11 +281,13 @@ perturb_truncated() { printf '\177ELF\002\001' > "$1/delphi-drop"; chmod 0755 "$
 echo
 echo "D0A-R10-11 — staged-binary ELF identity:"
 binary_refuse_case "helper built for another machine (aarch64 vs x86-64)" \
-                   perturb_foreign_helper "was built for a different machine"
+                   perturb_foreign_helper "this system runs"
 binary_refuse_case "staged binary is not an ELF at all" \
-                   perturb_not_elf "does not start with the ELF magic"
+                   perturb_not_elf "identification header differs"
 binary_refuse_case "staged binary is a truncated header" \
-                   perturb_truncated "shorter than an ELF header"
+                   perturb_truncated "shorter than an ELF identification header"
+binary_refuse_case "the helper is DYNAMIC (no loader inside the jail)" \
+                   perturb_dynamic_helper "must be statically linked"
 
 # ── The happy path + the replace/no-clobber discipline ────────────────────────────────
 echo

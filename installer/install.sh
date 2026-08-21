@@ -74,45 +74,98 @@ for f in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai delphi-runti
     FD[$f]=$fd
 done
 
-# ── D0A-R10-11: every staged BINARY must be the same machine as the daemon ────────────
+# ── D0A-R10-11 / R11-07: every staged BINARY must be RUNNABLE ON THIS MACHINE ─────────
 # runtime/build.rs builds `delphi-drop` with a bare `rustc`, and `delphi-shell` comes from a
-# separate cargo invocation with its own target dir. Neither is guaranteed to have been built
-# for the same target as the daemon: `cargo build --target <foreign>` cross-compiles the
-# daemon while a bare rustc keeps producing HOST binaries, and build.sh stages whatever is in
-# the profile directory. The result installs cleanly and cannot execute.
+# separate cargo invocation with its own target dir, so neither is guaranteed to have been
+# built for the target the daemon was. The first version compared 20 header bytes of the
+# three binaries against delphi-runtimed's — which R11-07 showed establishes almost nothing:
+# four mutually-matching FOREIGN binaries pass it, and a fabricated 20-byte header followed
+# by garbage passes it (this installer's own test fixtures were exactly that).
 #
-# Checked HERE, not only at build time, because this is the layer where the mismatch bites —
-# a helper the daemon `execve`s on the machine it was installed on. Whatever produced the
-# mismatch (cross build, a hand-placed file, a stale artifact from another box), it is
-# refused here. Table-free by construction: two artifacts are compared with each other, so
-# there is no triple->machine map to fall out of date.
+# So: compare against a TRUSTED NATIVE reference — /proc/self/exe, the interpreter running
+# this script, which by construction executes on this machine — and validate the whole
+# identification header plus the fields that decide loadability.
+#
+#   magic, class, data, version, OSABI     from the reference, not from a table
+#   e_type                                 EXEC (2) or DYN (3); anything else is not a program
+#   e_machine                              the reference's
+#   PT_INTERP                              if the program names a dynamic loader, that loader
+#                                          must EXIST — a missing one fails at exec, which is
+#                                          the failure this check exists to pre-empt
+#
+# `delphi-drop` additionally must have NO PT_INTERP: it is handed to bwrap by fd into a jail
+# that binds nothing, so a dynamically linked helper cannot find its loader there. That is a
+# documented property of the helper (runtime/helper/delphi-drop.rs), asserted here rather
+# than assumed.
 #
 # Reads the ALREADY-BOUND fds, so it inspects the same inodes that will be copied.
-elf_ident() {   # fd name -> sets IDENT to "<class> <data> <machine>"; refuses otherwise
-    local fd="$1" name="$2" machine
-    local -a b
-    # Process substitution, NOT `$(…)`: `refuse` must exit the SCRIPT, and inside a command
-    # substitution it would only exit the subshell and leave IDENT empty.
-    #
-    # `|| true` because `tr` leaves no trailing newline, so `read` fills the array and THEN
-    # reports EOF with status 1 — which `set -e` turns into a silent death before any check
-    # runs. The array length below is what decides, not read's status.
-    read -r -a b < <(od -An -tu1 -N20 "/proc/self/fd/$fd" | tr -s ' \n' ' ') || true
-    [ "${#b[@]}" -eq 20 ] || refuse "$name is shorter than an ELF header (${#b[@]} bytes) — a truncated or empty build product"
-    [ "${b[0]} ${b[1]} ${b[2]} ${b[3]}" = "127 69 76 70" ] || \
-        refuse "$name does not start with the ELF magic — it is not an executable this installer may place in /usr/libexec"
-    if [ "${b[5]}" = "2" ]; then machine=$(( b[18] * 256 + b[19] )); else machine=$(( b[18] + 256 * b[19] )); fi
-    IDENT="${b[4]} ${b[5]} $machine"
+#
+# RESIDUAL, STATED RATHER THAN IMPLIED: this establishes LOADABILITY PRECONDITIONS, not
+# executability. A file with a well-formed native header, a valid e_type and no PT_INTERP —
+# followed by garbage — still passes. Proving executability means executing it, and running
+# an unvalidated staged binary as root is worse than the risk this check reduces. R11-07's
+# phrasing is right and the fix does not reach it; what it does reach is every mismatch that
+# a build or a transfer produces, which is the class that actually occurs.
+
+# Read a little-endian unsigned integer of <width> bytes at <offset> from an open fd.
+elf_u() {   # fd offset width -> value on stdout
+    local bytes v=0 i=0
+    bytes=$(od -An -tu1 -j"$2" -N"$3" "/proc/self/fd/$1" | tr -s ' ' '\n' | grep -E '^[0-9]+$')
+    for b in $bytes; do v=$(( v + b * (1 << (8 * i)) )); i=$((i+1)); done
+    printf '%s' "$v"
 }
-elf_ident "${FD[delphi-runtimed]}" delphi-runtimed
-REF_IDENT="$IDENT"
-for bin in delphi-drop delphi-shell delphi-minimal-ai; do
-    elf_ident "${FD[$bin]}" "$bin"
-    [ "$IDENT" = "$REF_IDENT" ] || refuse "$bin was built for a different machine than delphi-runtimed
-  delphi-runtimed: ELF class/data/machine $REF_IDENT
-  $bin: ELF class/data/machine $IDENT
-  Installing it would place a binary that cannot execute on this system. Rebuild everything
-  for one target (installer/build.sh) and re-run."
+
+# The identification header (first 16 bytes) as decimal, space separated.
+elf_ident() {   # fd -> "b0 b1 … b15"
+    od -An -tu1 -N16 "/proc/self/fd/$1" | tr -s ' \n' ' ' | sed 's/^ //; s/ $//'
+}
+
+# The PT_INTERP path, or empty if the program has none (statically linked).
+elf_interp() {   # fd -> path or ""
+    local phoff phentsize phnum i off p_type p_offset p_filesz
+    phoff=$(elf_u "$1" 32 8); phentsize=$(elf_u "$1" 54 2); phnum=$(elf_u "$1" 56 2)
+    [ "$phentsize" -gt 0 ] 2>/dev/null || return 0
+    for (( i = 0; i < phnum; i++ )); do
+        off=$(( phoff + i * phentsize ))
+        p_type=$(elf_u "$1" "$off" 4)
+        [ "$p_type" = "3" ] || continue          # PT_INTERP
+        p_offset=$(elf_u "$1" $(( off + 8 )) 8)
+        p_filesz=$(elf_u "$1" $(( off + 32 )) 8)
+        [ "$p_filesz" -gt 0 ] && [ "$p_filesz" -lt 4096 ] || return 0
+        dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null
+        return 0
+    done
+}
+
+exec {REF_FD}< /proc/self/exe || refuse "cannot open /proc/self/exe as a native ELF reference"
+REF_IDENT=$(elf_ident "$REF_FD")
+REF_MACHINE=$(elf_u "$REF_FD" 18 2)
+[ "${REF_IDENT%% *}" = "127" ] || refuse "/proc/self/exe is not an ELF — cannot establish a native reference"
+
+for bin in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
+    fd="${FD[$bin]}"
+    ident=$(elf_ident "$fd")
+    # A 16-byte identification header must be PRESENT and match the reference in every
+    # field: magic, class (32/64), data (endianness), ELF version, OSABI, ABI version, pad.
+    [ "$(printf '%s' "$ident" | wc -w)" -eq 16 ] || refuse "$bin is shorter than an ELF identification header"
+    [ "$ident" = "$REF_IDENT" ] || refuse "$bin's ELF identification header differs from this machine's
+  reference (/proc/self/exe): $REF_IDENT
+  $bin: $ident
+  Rebuild everything for one target (installer/build.sh) and re-run."
+    machine=$(elf_u "$fd" 18 2)
+    [ "$machine" = "$REF_MACHINE" ] || refuse "$bin was built for machine $machine; this system runs $REF_MACHINE (e_machine). It would install and then fail at exec."
+    etype=$(elf_u "$fd" 16 2)
+    case "$etype" in
+        2|3) ;;   # ET_EXEC, ET_DYN
+        *) refuse "$bin has ELF type $etype — not an executable or PIE, so it is not a program this installer may place in /usr/libexec" ;;
+    esac
+    interp=$(elf_interp "$fd")
+    if [ "$bin" = "delphi-drop" ]; then
+        # The helper enters a jail that binds NOTHING; a dynamic loader would be absent there.
+        [ -z "$interp" ] || refuse "delphi-drop names a dynamic loader ($interp), but it is exec'd inside a jail that binds nothing — it must be statically linked (crt-static). See runtime/helper/delphi-drop.rs."
+    elif [ -n "$interp" ]; then
+        [ -e "$interp" ] || refuse "$bin needs the dynamic loader $interp, which does not exist on this system — it would install and fail at exec."
+    fi
 done
 
 # ── The shell bundle TREE (P1) — pre-flight ───────────────────────────────────────────

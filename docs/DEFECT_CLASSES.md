@@ -2322,9 +2322,16 @@ a change removes an umbrella default (`--unshare-all`, a deny-by-default base, a
 relying on that default to mean what they say"** — and those are found by deleting the new
 explicit thing and seeing whether anything fails, not by reading.
 
-**Grounded twice in one audit:** `--clearenv` had the same shape — §6's "env is scrubbed
-to `env_delta`" was checked by no assertion at all once the umbrella was gone
-(D0A-R9-08 had recorded the gap in prose; the mutation measured it).
+**ONE instance, not two — corrected 2026-08-21 (D0A-R11-08).** `--clearenv` was written up
+here as a second instance and it is not one: no assertion's sufficiency changed, because no
+assertion ever covered it. That is ordinary missing coverage, found by mutation, and filing
+it here inflated a class with a case that does not exhibit it. The distinction the entry
+turns on is precisely that the network assertion **was complete when written** — so an
+example where nothing was ever written cannot illustrate it.
+
+**The class therefore rests on a single grounded instance.** Recorded as such rather than
+padded: a corpus entry supported by one real case and one miscategorised case is weaker
+than one supported by one real case, because the reader learns the wrong boundary.
 
 ---
 

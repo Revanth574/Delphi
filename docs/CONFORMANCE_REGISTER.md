@@ -235,6 +235,63 @@ deliberately unrecorded, so the disappearance guard built for exactly this was i
 `-p delphi-runtime --lib --bins` and the hook refuses on any change to either number, up or
 down, printing the measured pair. Its RED legs are in `.githooks/tests/pre-commit.test.sh`.
 
+## Round 11 (2026-08-21) — the instrument was wrong, and three remedies carried their own defect
+
+**D0A-R11-01 invalidated the previous round's item-4 answer, and that answer is superseded
+rather than repaired.** The first mutation harness had no baseline: "caught" meant *any* test
+in four hard-coded namespaces failed, minus two known names. In a sandbox with two AMBIENT
+bwrap failures that is true for every mutant including the null one — the reviewer's run
+reported 12/12 caught, including `tool_credentials() -> None`, which catches nothing. So
+"11 of 12" was **unsupported, not wrong**, and is withdrawn.
+
+Rebuilt against a measured baseline (cargo status, result-line count, ran/skipped, the
+fully-qualified failure set), with compilation failure scored as CAUGHT, no verdict on
+unexplained state, `--lib --bins`, and an isolated git worktree so an interrupt cannot leave
+the tree mutated. **It was wrong twice more before it was right** — no `--nocapture` (so a
+skip counted as executed), an executed-count that drops on every catch (13 spurious
+UNEXPLAINED), and a failure regex that `--nocapture` interleaving defeated (0/16 caught).
+Each produced confident output.
+
+**Re-measured, 24 mutants: CAUGHT 21 / NOT CAUGHT 4 / UNEXPLAINED 0.** The four:
+
+| not caught | status |
+|---|---|
+| the denylist's equality leg | **not a gap** — `starts_with` is reflexive, so the mutation is a semantic no-op |
+| `env_delta` never emitted | **FIXED** — the scope check now requires exactly the approved set, both directions |
+| the host-creating-bind error VARIANT swapped | **FIXED** — R10-08 *was* a misclassification; `is_err()` was blind to it |
+| `tool_credentials() -> None` | **open, root-only** — the interposition is unreachable unprivileged |
+
+**D0A-R11-05 — the parser's METHOD, not its form list.** Three rounds found forms, so the
+single-pass strip-and-parse was replaced by shadow's own two phases: store the last RAW
+value, then interpret it (quote SCAN — skip any number of leading quotes, terminate at the
+first subsequent one — then `strtoul` base 0). Measured: `"50"00"` → **50**, which no
+strip-based reading produces. Precedence corrected: `5000` then `garbage` is shadow's
+default, not 5000. And ABSENT is no longer the same answer as UNREADABLE — a permission or
+UTF-8 error refused to be silently defaulted into a wider range.
+
+**D0A-R11-06 — the validated credentials were not the used credentials.** Three independent
+resolutions existed and only one was checked; the startup check also *skipped validation
+entirely* on a lookup error (`if let Ok(Some(…))`). Now one resolution, validated, recorded,
+and read. **Unprovable unprivileged:** restoring the re-resolution leaves the suite green,
+because the path needs euid 0. The planner's decision is covered by injection; "execution
+reads the plan" is root-lane evidence.
+
+**D0A-R11-07 — twenty bytes established almost nothing.** Replaced by a full identification
+header compared against `/proc/self/exe` (a trusted NATIVE reference, not the daemon —
+four mutually-matching foreign binaries passed the old check), plus e_type, e_machine, and
+PT_INTERP: a named loader must exist, and `delphi-drop` must name none, since it is exec'd
+in a jail that binds nothing. Weaken-proven — under the old check a **dynamic helper
+installs (rc=0)**. **Residual, stated in the script:** this is loadability preconditions, not
+executability; a well-formed header followed by garbage still passes, and proving otherwise
+means executing an unvalidated binary as root.
+
+**D0A-R11-02/03/04 — every remedy from round 10 carried the defect it was built to prevent.**
+The hook validated counts, not the identity of the expected failures (a red/green swap
+passed) and exited 0 when its baseline was missing; the suite runner refused only at ZERO
+discoveries, so deleting one suite while eight survived stayed green; the fixture hard-coded
+"5" for a fifth artifact. All fixed — and the hook's first fix had the same bug backwards
+(identity without count let a third failure through), caught by the hook's own test suite.
+
 ## Claims whose scope was believed wider than their proof
 
 A different kind of row from the table above. Nothing here is a violated clause — each is a

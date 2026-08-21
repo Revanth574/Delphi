@@ -107,7 +107,16 @@ done
 # phrasing is right and the fix does not reach it; what it does reach is every mismatch that
 # a build or a transfer produces, which is the class that actually occurs.
 
+# THE PARSING BELOW IS THE MOST INTRICATE CODE IN THIS ROOT SCRIPT, so its limits are
+# declared rather than discovered. It handles **ELF64, little-endian, ELF version 1** and
+# REFUSES anything else instead of misreading it: the offsets are hard-coded for that layout
+# (`e_phoff` at 32, `e_phentsize` at 54, `e_phnum` at 56), and a 32-bit or big-endian file
+# parsed with them yields garbage that would either refuse a valid install or accept a bad
+# one. The reference is /proc/self/exe, so on a host this installer does not support, the
+# refusal names the host rather than the artifact.
+
 # Read a little-endian unsigned integer of <width> bytes at <offset> from an open fd.
+# Empty (offset past EOF) reads as 0; every caller treats 0 as "absent", never as valid.
 elf_u() {   # fd offset width -> value on stdout
     local bytes v=0 i=0
     bytes=$(od -An -tu1 -j"$2" -N"$3" "/proc/self/fd/$1" | tr -s ' ' '\n' | grep -E '^[0-9]+$')
@@ -120,18 +129,46 @@ elf_ident() {   # fd -> "b0 b1 … b15"
     od -An -tu1 -N16 "/proc/self/fd/$1" | tr -s ' \n' ' ' | sed 's/^ //; s/ $//'
 }
 
+# The layout this parser can read at all. Checked on the REFERENCE once; every subject is
+# then required to have a byte-identical identification header, so this covers them too.
+elf_layout_supported() {   # fd -> 0 if ELF64 little-endian version 1
+    local -a b
+    read -r -a b < <(elf_ident "$1") || true
+    [ "${#b[@]}" -eq 16 ] || return 1
+    [ "${b[0]} ${b[1]} ${b[2]} ${b[3]}" = "127 69 76 70" ] || return 1
+    [ "${b[4]}" = "2" ] || return 1   # EI_CLASS  ELFCLASS64
+    [ "${b[5]}" = "1" ] || return 1   # EI_DATA   ELFDATA2LSB
+    [ "${b[6]}" = "1" ] || return 1   # EI_VERSION
+}
+
 # The PT_INTERP path, or empty if the program has none (statically linked).
-elf_interp() {   # fd -> path or ""
-    local phoff phentsize phnum i off p_type p_offset p_filesz
+#
+# BOUNDED IN THREE WAYS, because this walks attacker-influenced numbers in a root script:
+#   * `e_phnum` is capped — the field is 16-bit, so an unbounded loop is up to 65535
+#     iterations each spawning `od`, which is a stall the installer would present as a hang.
+#     NOT INDEPENDENTLY PROVEN: two attempts to construct an input where only this bound
+#     decides both failed — the other bounds refuse the same files first. It bounds WORK,
+#     not the verdict, and the test leg says so rather than claiming a cause;
+#   * the program-header TABLE must lie inside the file, so a truncated binary cannot read
+#     as "no PT_INTERP" (which for delphi-drop is the PASSING answer);
+#   * the interpreter string is length-bounded and used ONLY as an argument to `[ -e ]` —
+#     never evaluated, never expanded into a command.
+MAX_PHNUM=256
+elf_interp() {   # fd -> path or ""; refuses (exit 1) on a header it will not walk
+    local phoff phentsize phnum size i off p_type p_offset p_filesz
     phoff=$(elf_u "$1" 32 8); phentsize=$(elf_u "$1" 54 2); phnum=$(elf_u "$1" 56 2)
-    [ "$phentsize" -gt 0 ] 2>/dev/null || return 0
+    [ "$phentsize" -ge 56 ] || return 0        # no usable program headers
+    [ "$phnum" -le "$MAX_PHNUM" ] || return 1
+    size=$(stat -L -c '%s' "/proc/self/fd/$1")
+    [ $(( phoff + phnum * phentsize )) -le "$size" ] || return 1
     for (( i = 0; i < phnum; i++ )); do
         off=$(( phoff + i * phentsize ))
         p_type=$(elf_u "$1" "$off" 4)
         [ "$p_type" = "3" ] || continue          # PT_INTERP
         p_offset=$(elf_u "$1" $(( off + 8 )) 8)
         p_filesz=$(elf_u "$1" $(( off + 32 )) 8)
-        [ "$p_filesz" -gt 0 ] && [ "$p_filesz" -lt 4096 ] || return 0
+        [ "$p_filesz" -gt 1 ] && [ "$p_filesz" -lt 4096 ] || return 1
+        [ $(( p_offset + p_filesz )) -le "$size" ] || return 1
         dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null
         return 0
     done
@@ -140,7 +177,9 @@ elf_interp() {   # fd -> path or ""
 exec {REF_FD}< /proc/self/exe || refuse "cannot open /proc/self/exe as a native ELF reference"
 REF_IDENT=$(elf_ident "$REF_FD")
 REF_MACHINE=$(elf_u "$REF_FD" 18 2)
-[ "${REF_IDENT%% *}" = "127" ] || refuse "/proc/self/exe is not an ELF — cannot establish a native reference"
+elf_layout_supported "$REF_FD" || refuse "this installer's ELF checks support ELF64 little-endian only,
+  and /proc/self/exe on this host is not that (ident: $REF_IDENT). Refusing rather than
+  misreading every staged binary with offsets that do not apply."
 
 for bin in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
     fd="${FD[$bin]}"
@@ -159,7 +198,9 @@ for bin in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
         2|3) ;;   # ET_EXEC, ET_DYN
         *) refuse "$bin has ELF type $etype — not an executable or PIE, so it is not a program this installer may place in /usr/libexec" ;;
     esac
-    interp=$(elf_interp "$fd")
+    interp=$(elf_interp "$fd") || refuse "$bin has a program-header table this installer will not walk
+  (absurd e_phnum, or a table/interpreter string extending past the end of the file).
+  A binary whose headers do not describe itself is not one to install at /usr/libexec."
     if [ "$bin" = "delphi-drop" ]; then
         # The helper enters a jail that binds NOTHING; a dynamic loader would be absent there.
         [ -z "$interp" ] || refuse "delphi-drop names a dynamic loader ($interp), but it is exec'd inside a jail that binds nothing — it must be statically linked (crt-static). See runtime/helper/delphi-drop.rs."

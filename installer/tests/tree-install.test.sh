@@ -277,6 +277,28 @@ perturb_not_elf() {
     chmod 0755 "$1/delphi-drop"
 }
 perturb_truncated() { printf '\177ELF\002\001' > "$1/delphi-drop"; chmod 0755 "$1/delphi-drop"; }
+# D0A-R12 pre-emptive: e_phnum is a 16-bit field, so an unbounded walk is up to 65535
+# iterations each spawning `od` — a stall the installer would present as a hang.
+#
+# THIS LEG DOES NOT ISOLATE `MAX_PHNUM`, AND SAYS SO. Removing that bound leaves the case
+# still refusing: walking 4096 entries of a real binary reaches a garbage entry whose
+# p_type happens to be 3 and whose p_filesz then fails its own bound. Two attempts to
+# isolate it failed (65535 first, then 4096), so the claim is narrowed to what the leg
+# actually shows — an absurd e_phnum is REFUSED, by one of three bounds — rather than
+# naming a cause it cannot establish. `MAX_PHNUM` bounds WORK, not the verdict; its effect
+# is time, and nothing here measures time.
+perturb_absurd_phnum() {
+    cp "$NATIVE_STATIC" "$1/delphi-drop"
+    printf '\000\020' | dd of="$1/delphi-drop" bs=1 seek=56 count=2 conv=notrunc status=none
+    chmod 0755 "$1/delphi-drop"
+}
+# A full identification header and a program-header table that runs past EOF. Without the
+# bound this reads as "no PT_INTERP", which for delphi-drop is the PASSING answer — a
+# truncated file accepted as a static helper.
+perturb_pht_past_eof() {
+    head -c 200 "$NATIVE_STATIC" > "$1/delphi-drop"
+    chmod 0755 "$1/delphi-drop"
+}
 
 echo
 echo "D0A-R10-11 — staged-binary ELF identity:"
@@ -288,6 +310,10 @@ binary_refuse_case "staged binary is a truncated header" \
                    perturb_truncated "shorter than an ELF identification header"
 binary_refuse_case "the helper is DYNAMIC (no loader inside the jail)" \
                    perturb_dynamic_helper "must be statically linked"
+binary_refuse_case "absurd e_phnum is refused (cause not isolated)" \
+                   perturb_absurd_phnum "will not walk"
+binary_refuse_case "program-header table runs past EOF" \
+                   perturb_pht_past_eof "will not walk"
 
 # ── The happy path + the replace/no-clobber discipline ────────────────────────────────
 echo

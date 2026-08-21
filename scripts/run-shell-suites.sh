@@ -10,13 +10,12 @@
 # EVIDENCE for the tree-replace invariant (CLAUDE.md §6). Nobody noticed because nothing
 # looked. This is the something that looks.
 #
-# DISCOVERED, NOT ENUMERATED (class 17): a list here would be the fourth copy of a list this
-# repo has already let drift. Zero discoveries REFUSES — a runner that finds nothing must
-# not report success.
-#
-# RESIDUAL, stated rather than left implicit: a suite that is DELETED is invisible to this —
-# the discovered count is printed, not asserted against a baseline. The printed list is what
-# makes a disappearance visible in a CI log or a diff.
+# DISCOVERED, AND CHECKED AGAINST A RECORDED MANIFEST (D0A-R11-03). Discovery alone refused
+# only at ZERO, so deleting `tree-install.test.sh` while eight others survived stayed green —
+# the exact disappearance this runner was built for, in the runner itself. The manifest is
+# `scripts/shell-suites.manifest`, one path per line; a suite present-but-unlisted or
+# listed-but-absent REFUSES. It is a list, which class 17 warns about — but a list whose
+# drift is itself detected, which is the difference between a manifest and a copy.
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
@@ -24,6 +23,23 @@ cd "$(dirname "$0")/.." || exit 2
 mapfile -t SUITES < <(find . -name '*.test.sh' -not -path './target/*' | sort)
 if [ "${#SUITES[@]}" -eq 0 ]; then
     echo "REFUSING: found no *.test.sh — a discovery that finds nothing is not a pass." >&2
+    exit 2
+fi
+
+MANIFEST="${DELPHI_SHELL_SUITES_MANIFEST:-scripts/shell-suites.manifest}"
+if [ ! -r "$MANIFEST" ]; then
+    echo "REFUSING: no manifest at $MANIFEST — a deleted suite would be invisible." >&2
+    printf '%s\n' "${SUITES[@]}" | sed 's/^/  /' >&2
+    exit 2
+fi
+expected=$(grep -vE '^\s*(#|$)' "$MANIFEST" | sort -u)
+found=$(printf '%s\n' "${SUITES[@]}" | sort -u)
+if [ "$expected" != "$found" ]; then
+    echo "REFUSING: the discovered suites differ from $MANIFEST." >&2
+    echo "  MISSING (listed, not found — deleted?):" >&2
+    comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$found") | sed 's/^/    /' >&2
+    echo "  UNLISTED (found, not listed — add it):" >&2
+    comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$found") | sed 's/^/    /' >&2
     exit 2
 fi
 

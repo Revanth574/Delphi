@@ -123,15 +123,19 @@ else fail=$((fail+1)); echo "    ^ expected STALE-BYTES in staging; the weaken p
 # has never staged before. A fixture with a hard-coded list fails with MISSING BUILD PRODUCT
 # (this suite's state since cdc3418); a derived one just works.
 echo
-echo "  --- a fifth staged artifact needs no edit here ---"
+echo "  --- one more staged artifact needs no edit here ---"
 sed 's#^stage "\$TARGET/release/delphi-drop" delphi-drop$#&\nstage "$TARGET/release/delphi-future" delphi-future#' \
     "$REAL" > "$work/build-five.sh"
 chmod +x "$work/build-five.sh"
-if [ "$(products_of "$work/build-five.sh" | wc -l)" -ne 5 ]; then
-    echo "  SETUP DID NOT APPLY — the next result would not be about a fifth artifact"; fail=$((fail+1))
+# DERIVED, not hard-coded (D0A-R11-04): asserting "5" bakes in today's count, so the leg
+# breaks the day production genuinely stages a fifth artifact — a test failing because the
+# product grew, which trains the reader to edit the test.
+want_n=$(( ${#PRODUCTS[@]} + 1 ))
+if [ "$(products_of "$work/build-five.sh" | wc -l)" -ne "$want_n" ]; then
+    echo "  SETUP DID NOT APPLY — expected $want_n products in the copy"; fail=$((fail+1))
 else
     R=$(mkrepo "$work/build-five.sh")
-    run "build.sh gains a 5th product -> fixture follows it" 0 "$R"
+    run "build.sh gains one MORE product -> fixture follows" 0 "$R"
     [ -f "$R/installer/staging/delphi-future" ] && { pass=$((pass+1)); echo "    ...and it reached staging ✓"; } \
         || { fail=$((fail+1)); echo "    ...but it never reached staging"; }
 fi

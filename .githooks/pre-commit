@@ -84,41 +84,73 @@ if git diff --cached --name-only | grep -qE '^runtime/'; then
     printf '%s\n' "$counts" | grep -E '^EXECUTED' | sed 's/^/[pre-commit]   /' || true
     echo "[pre-commit]   result lines: $result_lines   FAILED across all targets: $total_failed"
 
-    # ── DISAPPEARANCE GATE (2026-08-20) ────────────────────────────────────────────
-    # Counting FAILURES cannot see a test that is no longer there. `f380085` deleted two
-    # tests in a commit that described neither, and the loss surfaced five commits later
-    # as a property nothing covered. Equality on BOTH numbers, per the baseline file.
-    baseline="${DELPHI_TEST_COUNT_BASELINE:-.githooks/runtime-test-count-baseline}"
-    if [ -r "$baseline" ]; then
-        want_exec=$(sed -n 's/^EXECUTED=\([0-9]\+\)$/\1/p' "$baseline")
-        want_skip=$(sed -n 's/^SKIPPED=\([0-9]\+\)$/\1/p' "$baseline")
-        got_exec=$(printf '%s\n' "$counts" | grep -oE '^EXECUTED [0-9]+' | grep -oE '[0-9]+' || true)
-        got_skip=$(printf '%s\n' "$counts" | grep -oE 'SKIPPED [0-9]+' | grep -oE '[0-9]+' | head -1 || true)
-        if [ -z "$got_exec" ] || [ -z "$got_skip" ]; then
-            echo "REFUSING: could not measure the test counts — the count is UNKNOWN, not unchanged." >&2
-            exit 1
-        fi
-        if [ "$got_exec" != "$want_exec" ] || [ "$got_skip" != "$want_skip" ]; then
-            echo "REFUSING: test counts differ from $baseline." >&2
-            echo "  recorded: EXECUTED=$want_exec SKIPPED=$want_skip" >&2
-            echo "  measured: EXECUTED=$got_exec SKIPPED=$got_skip" >&2
-            echo "  If this is intended, update the baseline IN THIS COMMIT and say why." >&2
-            echo "  A DROP in EXECUTED needs the test named: removed on purpose, or started skipping?" >&2
-            exit 1
-        fi
-        echo "[pre-commit]   counts match $baseline (EXECUTED=$want_exec SKIPPED=$want_skip)"
-    else
-        echo "[pre-commit]   NO BASELINE at $baseline — disappearance is UNGATED for this commit."
-    fi
+    # A run that produced NO result line did not run at all — a compile error yields zero
+    # `test result:` lines and therefore a failure count of zero, which would otherwise pass
+    # every check below. This is first because everything after it reads those results.
     if [ "$result_lines" -eq 0 ]; then
         echo "REFUSING: no 'test result:' line — the suite did not RUN (compile error?)." >&2
         printf '%s\n' "$out" | tail -15 >&2
         exit 1
     fi
-    # The two intentional D0A-R9-02 REDs are expected; a THIRD blocks.
-    if [ "$total_failed" -gt 2 ]; then
-        echo "REFUSING: $total_failed failures; only the 2 intentional D0A-R9-02 REDs are allowed." >&2
-        printf '%s\n' "$out" | grep -E '^    (execute|sandbox)::' >&2
+
+    # IDENTITY **AND** COUNT (D0A-R11-02, and its own first fix). Counting alone allowed a
+    # red/green identity SWAP. Identity alone allowed a THIRD failure whenever the failures
+    # block and the result line disagreed — measured against this hook's own test suite. The
+    # expected set is data, in the baseline file, so there is ONE place to update and a green
+    # suite is expressible (no RED= lines means no failure is tolerated).
+    baseline="${DELPHI_TEST_COUNT_BASELINE:-.githooks/runtime-test-count-baseline}"
+    if [ ! -r "$baseline" ]; then
+        echo "REFUSING: no baseline at $baseline — the expected failures and counts would be UNGATED." >&2
+        echo "  An absent guard that exits 0 is the shape this gate exists to catch." >&2
         exit 1
     fi
+    expected_reds=$(sed -n 's/^RED=\(.*\)$/\1/p' "$baseline" | sort -u)
+    expected_n=$(printf '%s' "$expected_reds" | grep -c . || true)
+    actual_reds=$(awk '
+        /^failures:$/ { inblock = 1; next }
+        inblock && /^    [A-Za-z0-9_:]+$/ { gsub(/^ +/, ""); print; next }
+        inblock { inblock = 0 }
+    ' <<< "$out" | sort -u)
+    if [ "$actual_reds" != "$expected_reds" ]; then
+        echo "REFUSING: the failing tests are not the ones $baseline records." >&2
+        echo "  expected:" >&2; printf '%s\n' "${expected_reds:-<none>}" | sed 's/^/    /' >&2
+        echo "  actual:" >&2;   printf '%s\n' "${actual_reds:-<none>}" | sed 's/^/    /' >&2
+        echo "  A count alone would have passed a red/green identity swap." >&2
+        exit 1
+    fi
+    if [ "$total_failed" -ne "$expected_n" ]; then
+        echo "REFUSING: $total_failed failure(s) reported but $expected_n recorded in $baseline." >&2
+        echo "  The failures block and the result lines disagree — identity alone would have" >&2
+        echo "  passed this, which is how a third failure hid behind two expected names." >&2
+        exit 1
+    fi
+
+    # ── DISAPPEARANCE GATE (2026-08-20; fail-closed per D0A-R11-02) ────────────────
+    # Counting FAILURES cannot see a test that is no longer there. `f380085` deleted two
+    # tests in a commit that described neither, and the loss surfaced five commits later as
+    # a property nothing covered. Equality on BOTH numbers, per the baseline file — and a
+    # MISSING baseline REFUSES, because an absent guard that exits 0 is the exact shape
+    # this gate exists to catch.
+    got_exec=$(printf '%s\n' "$counts" | grep -oE '^EXECUTED [0-9]+' | grep -oE '[0-9]+' || true)
+    got_skip=$(printf '%s\n' "$counts" | grep -oE 'SKIPPED [0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+    if [ -z "$got_exec" ] || [ -z "$got_skip" ]; then
+        echo "REFUSING: could not measure the test counts — the count is UNKNOWN, not unchanged." >&2
+        exit 1
+    fi
+    want_exec=$(sed -n 's/^EXECUTED=\([0-9]\+\)$/\1/p' "$baseline")
+    want_skip=$(sed -n 's/^SKIPPED=\([0-9]\+\)$/\1/p' "$baseline")
+    if [ -z "$want_exec" ] || [ -z "$want_skip" ]; then
+        echo "REFUSING: $baseline carries no EXECUTED=/SKIPPED= pair to compare against." >&2
+        exit 1
+    fi
+    if [ "$got_exec" != "$want_exec" ] || [ "$got_skip" != "$want_skip" ]; then
+        echo "REFUSING: test counts differ from $baseline." >&2
+        echo "  recorded: EXECUTED=$want_exec SKIPPED=$want_skip" >&2
+        echo "  measured: EXECUTED=$got_exec SKIPPED=$got_skip" >&2
+        echo "  If this is intended, update the baseline IN THIS COMMIT and say why." >&2
+        echo "  A DROP in EXECUTED needs the test named: removed on purpose, or started skipping?" >&2
+        exit 1
+    fi
+    echo "[pre-commit]   counts match $baseline (EXECUTED=$want_exec SKIPPED=$want_skip)"
+    echo "[pre-commit]   failures match the $expected_n recorded in $baseline, by name"
 fi

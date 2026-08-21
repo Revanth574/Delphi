@@ -1,0 +1,13 @@
+# The shell suites that must exist and pass. Checked by scripts/run-shell-suites.sh.
+# D0A-R11-03: discovery alone refused only at ZERO, so deleting one while others
+# survived stayed green — the disappearance the runner exists to catch, in the runner.
+# Any change here belongs in the same commit as the suite it adds or removes.
+./.githooks/tests/pre-commit.test.sh
+./installer/tests/apparmor-profile.test.sh
+./installer/tests/build-staging.test.sh
+./installer/tests/p3-preflight.test.sh
+./installer/tests/tree-install.test.sh
+./runtime/tests/pidfd-barrier.test.sh
+./scripts/check-stale-test-sessions.test.sh
+./scripts/ci-test-count-gate.test.sh
+./scripts/test-count.test.sh

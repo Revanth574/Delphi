@@ -28,6 +28,17 @@
 # EXECUTES, so the pair there is EXECUTED=115 SKIPPED=0 — point the hook at another file via
 # DELPHI_TEST_COUNT_BASELINE rather than editing these values for one run.
 #
+# THE EXPECTED FAILURES LIVE HERE TOO (D0A-R11-02), one `RED=` line each, because the hook
+# must check WHICH tests fail and not merely how many. Counting two allowed a red/green
+# identity swap: fix an R9-02 test, break a security test, total still two. Both are checked
+# — the set must match exactly AND the total failure count must equal the number of RED
+# lines, since a failures block and a result line can disagree.
+#
+# NO `RED=` LINES MEANS A FULLY GREEN SUITE IS REQUIRED. When D0A-R9-02 is fixed, delete
+# them in that commit; the hook then refuses any failure at all.
+#
 # Scope: `-p delphi-runtime --lib --bins`, which is what the hook runs.
 EXECUTED=114
 SKIPPED=1
+RED=execute::tests::nested_interpreter_substitution_executes_unapproved_content
+RED=execute::tests::same_inode_overwrite_executes_unapproved_content

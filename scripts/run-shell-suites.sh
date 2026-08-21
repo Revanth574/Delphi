@@ -56,6 +56,16 @@ failed=0
 for t in "${SUITES[@]}"; do
     out=$(bash "$t" 2>&1); rc=$?
     tail_line=$(printf '%s\n' "$out" | grep -iE 'passed=|passed,|ALL PASS|FAILURES|SUITE FAILED' | tail -1)
+    # D0A-R12-09, AS A CLASS: a suite that exits 0 having reported no result did not run its
+    # subject, and "ok" for it is a green about nothing. tree-install did exactly that on CI
+    # for every run. Requiring the summary line makes the same mistake in any other suite
+    # loud, rather than closing only the instance.
+    if [ "$rc" -eq 0 ] && [ -z "$tail_line" ]; then
+        failed=$((failed + 1))
+        printf '  FAIL  %-44s exited 0 but reported NO result — it did not run\n' "$t"
+        printf '%s\n' "$out" | tail -10 | sed 's/^/        | /'
+        continue
+    fi
     if [ "$rc" -eq 0 ]; then
         printf '  ok    %-44s %s\n' "$t" "$tail_line"
     else

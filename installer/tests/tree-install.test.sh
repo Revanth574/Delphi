@@ -76,8 +76,8 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 #   * delphi-drop        -> a STATIC binary, because install.sh requires the helper to have
 #                           no PT_INTERP (it is exec'd inside a jail that binds nothing).
 # The repo's own built helper is the honest choice for the static one. If it has not been
-# built, the suite says so and skips rather than fabricating a header that would exercise a
-# different path than production.
+# built the suite REFUSES (D0A-R12-09) — it neither fabricates a header that would exercise
+# a different path than production, nor exits 0, which is what made it report green on CI.
 NATIVE_DYN=/bin/true
 NATIVE_STATIC=""
 for c in target/debug/delphi-drop target/release/delphi-drop \
@@ -87,9 +87,18 @@ for c in target/debug/delphi-drop target/release/delphi-drop \
     [ -n "$c" ] && [ -f "$c" ] && { NATIVE_STATIC="$c"; break; }
 done
 if [ -z "$NATIVE_STATIC" ]; then
-    echo "SKIP tree-install: measured blocker: no built delphi-drop to use as the STATIC stub."
-    echo "  (cargo build -p delphi-runtime --bin delphi-runtimed produces target/debug/delphi-drop)"
-    exit 0
+    # D0A-R12-09: REFUSE, not skip. This exited 0 and the runner reported it as passing —
+    # and CI has no Rust toolchain in that job, so the helper NEVER existed there: this
+    # suite skipped on every CI run while the pipeline showed green. It is the file
+    # CLAUDE.md §6 names as the tier-1 SOLE EVIDENCE for the tree-replace invariant, so
+    # that invariant had no live evidence in CI at all.
+    #
+    # Worse than the 15-commit red it replaced: red-and-unrun is discoverable,
+    # green-by-skip is not. A required fixture that is absent is a REFUSAL.
+    echo "REFUSING: no built delphi-drop to use as the STATIC stub — this suite cannot run," >&2
+    echo "  and a suite that cannot run must not report success." >&2
+    echo "  Build it first:  cargo build -p delphi-runtime --bin delphi-runtimed" >&2
+    exit 2
 fi
 
 make_sandbox() {

@@ -93,6 +93,16 @@ jobs:
       - name: Install the tools the suites invoke
         run: sudo apt-get update && sudo apt-get install -y apparmor strace
 
+      # D0A-R12-09: installer/tests/tree-install.test.sh needs a real STATIC binary to stage
+      # as delphi-drop. This job had no toolchain, so that fixture never existed and the
+      # suite skipped — reporting green — on every CI run since it was wired in. It now
+      # REFUSES when the fixture is missing, which makes this step load-bearing rather than
+      # convenient.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the drop helper the installer suites stage
+        run: cargo build -p delphi-runtime --bin delphi-runtimed
+
       # D0A-R10-10: nothing ran these before — not cargo, not this workflow, not the
       # pre-commit hook — so installer/tests/{build-staging,tree-install} sat RED for 12
       # commits, the second being the tier-1 sole evidence for the tree-replace invariant.

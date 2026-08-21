@@ -19,8 +19,7 @@ and noticed that two bwrap tests failed **ambiently** in their sandbox. Both mat
 
 ## Target
 
-`git diff 5b6e83a..61a6410` — **12 commits, 17 files changed, 1199 insertions(+), 222
-deletions(-).**
+`git diff 5b6e83a..1902fdc` — **14 commits, 18 files changed, 1414 insertions(+), 222 deletions(-).**
 
 The ending SHA is **PINNED, not `HEAD`**. **If your diff stat disagrees with the line above,
 report that as a finding before reviewing anything.**
@@ -106,6 +105,15 @@ cannot leave the tree mutated.
 **Re-measured, 25 mutants: CAUGHT 23 / NOT CAUGHT 2 / UNEXPLAINED 0.** The two: the denylist
 equality leg (a semantic no-op — `starts_with` is reflexive) and `tool_credentials() -> None`
 (root-only, recorded).
+
+**AND IT HAD ONE MORE, FOUND WHILE PREPARING THIS PROMPT.** The harness shared the tree's
+`CARGO_TARGET_DIR`, so a mutant's build landed in the cache the repo reads: afterwards
+`cargo test` reported EXECUTED **112** against a recorded 114, with two `system_account_guard`
+tests failing — which reads exactly like a regression and was not one. The binary still
+contained the audit's LAST mutant. Class 30, injected by the instrument built to detect
+defects. It is now isolated (its own target dir, and it REFUSES if that dir is the tree's).
+**Two mechanisms made it visible and neither was care**: the count baseline disagreed, and
+every figure in this prompt was re-derived before it was written.
 
 **Attack the instrument, not the number.** Specifically:
 

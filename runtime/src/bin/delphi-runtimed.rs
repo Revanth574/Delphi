@@ -160,6 +160,13 @@ fn login_defs_raw<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// | `"50"00"` | **50** |
 /// | `""` | no value → default |
 fn login_defs_interpret(raw: &str) -> Option<u32> {
+    // LEADING BLANKS COME OFF BEFORE THE QUOTE SCAN (D0A-R12-07). Without this,
+    // `UID_MIN   "5000"` scans a value that starts with spaces: no quote is skipped, the
+    // scan then takes everything up to the FIRST quote — which is the blanks — and the
+    // parse fails into the default. Measured: shadow allocates 5000; we allocated 1000.
+    // The quote handling and the blank handling interact, and the probe that found the
+    // other 38 forms never generated one with both.
+    let raw = raw.trim_start_matches([' ', '\t']);
     let scanned = raw.trim_start_matches('"');
     let scanned = scanned.split('"').next().unwrap_or(scanned);
     // `strtoul` skips leading whitespace of its own accord; trailing whitespace INSIDE the
@@ -717,6 +724,12 @@ mod system_account_guard {
             ("last raw wins even UNPARSEABLE", "UID_MIN 5000\nUID_MIN garbage\n", 1000),
             ("unparseable then good", "UID_MIN garbage\nUID_MIN 5000\n", 5000),
             ("a valueless line does not define", "UID_MIN 5000\nUID_MIN \n", 5000),
+            // D0A-R12-07: blanks AND quotes together — the interaction neither the 28-form
+            // nor the 38-form probe generated.
+            ("blanks then a quoted value", "UID_MIN   \"5000\"\n", 5000),
+            ("a tab then a quoted value", "UID_MIN \t\"5000\"\n", 5000),
+            ("blanks then two quotes", "UID_MIN  \"\"5000\n", 5000),
+            ("blanks, quoted, then a comment", "UID_MIN  \"5000\" # x\n", 5000),
         ];
         let mut disagreed = Vec::new();
         for (form, body, shadow) in measured {

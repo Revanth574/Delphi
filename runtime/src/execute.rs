@@ -138,20 +138,39 @@ pub fn preopen_drop_helper() -> Result<(), RuntimeError> {
     drop_helper().map(|_| ())
 }
 
+/// The one tuple the daemon resolved AND validated, recorded once (D0A-R11-06).
+static TOOL_CREDENTIALS: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+
+/// Record the credentials the daemon validated against the session it is serving.
+///
+/// # Errors
+///
+/// [`RuntimeError::CredentialsNotPlanned`] if called twice — a second plan would mean two
+/// answers exist and the later caller decides which, which is the divergence this closes.
+pub fn set_tool_credentials(creds: Option<(u32, u32)>) -> Result<(), RuntimeError> {
+    TOOL_CREDENTIALS.set(creds).map_err(|_| RuntimeError::CredentialsNotPlanned)
+}
+
 /// Credentials to drop to, or `None` when there is no privilege to drop.
 ///
-/// Unprivileged callers cannot acquire another identity and the action already runs as
-/// a non-root uid, so `None` is the honest answer, not a bypass. Running privileged
-/// with the account absent is a hard error.
+/// **READ, never resolved (D0A-R11-06).** This used to call `User::from_name` itself, and
+/// so did `preopen_drop_helper`, and so did the daemon's startup validation — three
+/// independent lookups, of which only one was checked against the session. An NSS change
+/// between them, or a transient first failure, meant the action dropped to a tuple nothing
+/// had validated. Now there is exactly one resolution and it is the validated one.
+///
+/// Unprivileged callers cannot acquire another identity, so `None` is the honest answer,
+/// not a bypass — and that case needs no plan, which keeps the unprivileged test suite
+/// working without a seam that could weaken the privileged path.
 fn tool_credentials() -> Result<Option<(u32, u32)>, RuntimeError> {
+    if let Some(planned) = TOOL_CREDENTIALS.get() {
+        return Ok(*planned);
+    }
     if nix::unistd::geteuid().as_raw() != 0 {
         return Ok(None);
     }
-    let user = nix::unistd::User::from_name(TOOL_ACCOUNT)
-        .ok()
-        .flatten()
-        .ok_or_else(|| RuntimeError::MissingToolAccount { account: TOOL_ACCOUNT.to_string() })?;
-    Ok(Some((user.uid.as_raw(), user.gid.as_raw())))
+    // Privileged with no plan: refuse. Resolving here is exactly what created the gap.
+    Err(RuntimeError::CredentialsNotPlanned)
 }
 
 /// R4-02: a pinned script's content fd MUST carry the FULL immutability seal set

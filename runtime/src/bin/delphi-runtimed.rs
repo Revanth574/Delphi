@@ -292,6 +292,42 @@ fn refuse_unsafe_tool_account(
     Ok(())
 }
 
+/// D0A-R11-06 — resolve the tool identity ONCE, validate THAT tuple, and hand back the
+/// exact tuple execution will use.
+///
+/// The previous shape had three independent resolutions (startup validation,
+/// `preopen_drop_helper`, and every action) and validated only the first, so an NSS change
+/// or a transient failure landed execution on credentials nothing checked. Worse, the
+/// startup check was written `if let Ok(Some(tool)) = …`, which silently skipped validation
+/// on a lookup ERROR — the one case where skipping is least defensible.
+///
+/// `lookup` is injected so the decision and its wiring are provable unprivileged. What
+/// still needs a root lane is that the drop TAKES; that is
+/// `an_approved_action_runs_with_the_tool_account_credentials`.
+fn plan_tool_credentials<E: std::fmt::Display>(
+    euid: u32,
+    lookup: impl FnOnce(&str) -> std::result::Result<Option<(u32, u32)>, E>,
+    session: (u32, u32),
+    range: (u32, u32),
+) -> Result<Option<(u32, u32)>> {
+    if euid != 0 {
+        // Nothing to drop: an unprivileged daemon cannot acquire another identity, and the
+        // action already runs as a non-root uid.
+        return Ok(None);
+    }
+    let tool = lookup(delphi_runtime::execute::TOOL_ACCOUNT)
+        .map_err(|e| anyhow::anyhow!("resolving the tool account `{}`: {e}", delphi_runtime::execute::TOOL_ACCOUNT))?
+        .with_context(|| {
+            format!(
+                "the tool account `{}` does not exist; approved actions have no \
+                 unprivileged identity to drop to",
+                delphi_runtime::execute::TOOL_ACCOUNT
+            )
+        })?;
+    refuse_unsafe_tool_account(tool, session, range)?;
+    Ok(Some(tool))
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -309,17 +345,20 @@ fn main() -> Result<()> {
     // BEFORE the anchor: a refusal here must precede any system-state change.
     refuse_system_account(&session, user.uid.as_raw(), uid_range)?;
 
-    // D0A-R10-06: the tool identity is validated against the session being served,
-    // before anything is pinned or anchored.
-    if nix::unistd::geteuid().as_raw() == 0
-        && let Ok(Some(tool)) = User::from_name(delphi_runtime::execute::TOOL_ACCOUNT)
-    {
-        refuse_unsafe_tool_account(
-            (tool.uid.as_raw(), tool.gid.as_raw()),
-            (user.uid.as_raw(), user.gid.as_raw()),
-            uid_range,
-        )?;
-    }
+    // D0A-R10-06 / R11-06: the tool identity is resolved ONCE, validated against the
+    // session being served, and RECORDED — so the tuple that was checked is the tuple the
+    // action drops to. Errors propagate; the previous `if let Ok(Some(…))` skipped
+    // validation entirely when the lookup failed.
+    let planned = plan_tool_credentials(
+        nix::unistd::geteuid().as_raw(),
+        |name| {
+            User::from_name(name).map(|u| u.map(|u| (u.uid.as_raw(), u.gid.as_raw())))
+        },
+        (user.uid.as_raw(), user.gid.as_raw()),
+        uid_range,
+    )?;
+    delphi_runtime::execute::set_tool_credentials(planned)
+        .context("recording the validated tool identity")?;
 
     // D0A-R9-01: pin the credential-drop helper BEFORE any action runs, so the
     // substitution window is process start rather than per-action, and a missing
@@ -579,6 +618,41 @@ mod system_account_guard {
     #[test]
     fn a_distinct_system_tool_account_is_admitted() {
         assert!(refuse_unsafe_tool_account((997, 972), (1000, 1000), (1000, 60000)).is_ok());
+    }
+
+    /// D0A-R11-06 — the planner's decisions, provable without root because the resolver
+    /// is injected. Each leg is a distinct way the old shape went wrong.
+    #[test]
+    fn the_credential_plan_is_resolved_once_validated_and_propagates_errors() {
+        let session = (1000, 1000);
+        let range = (1000, 60000);
+        let ok = |_: &str| Ok::<_, String>(Some((997, 972)));
+
+        // Unprivileged: nothing to drop, and the resolver is never consulted.
+        let never = |_: &str| -> std::result::Result<Option<(u32, u32)>, String> {
+            panic!("the resolver must not be called when euid != 0")
+        };
+        assert_eq!(plan_tool_credentials(1000, never, session, range).unwrap(), None);
+
+        // Privileged and healthy: the validated tuple comes back, and it is the SAME tuple
+        // the caller will hand to execution.
+        assert_eq!(plan_tool_credentials(0, ok, session, range).unwrap(), Some((997, 972)));
+
+        // A lookup ERROR must propagate. The old code was `if let Ok(Some(tool)) = …`,
+        // which skipped validation entirely in exactly this case.
+        let err = plan_tool_credentials(0, |_: &str| Err::<Option<(u32, u32)>, _>("nss is down"), session, range)
+            .expect_err("a lookup error must not be silently skipped");
+        assert!(err.to_string().contains("resolving the tool account"), "got: {err}");
+
+        // Account absent: refuse, naming it.
+        let err = plan_tool_credentials(0, |_: &str| Ok::<_, String>(None), session, range)
+            .expect_err("an absent tool account must refuse");
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+
+        // And the validation still runs on the resolved tuple — a shared uid is refused.
+        let err = plan_tool_credentials(0, |_: &str| Ok::<_, String>(Some((1000, 972))), session, range)
+            .expect_err("a tool account sharing the session uid must refuse");
+        assert!(err.to_string().contains("shares the served session"), "got: {err}");
     }
 
     /// A `UID_MIN` of 0 must not disable the guard for root.

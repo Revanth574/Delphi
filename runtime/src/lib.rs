@@ -176,6 +176,16 @@ pub enum RuntimeError {
         path: String,
     },
 
+    /// Running privileged, but no VALIDATED tool identity was recorded (D0A-R11-06).
+    ///
+    /// The daemon resolves `delphi-tool` once, checks it against the session it is
+    /// serving, and records that exact tuple. Re-resolving at execution time would mean
+    /// the credentials that were checked and the credentials that are used could differ —
+    /// an NSS change between the two, or a transient first failure, lands execution on a
+    /// tuple nothing validated. So execution refuses rather than resolving for itself.
+    #[error("execution denied: no validated tool identity was recorded before this action. The daemon must resolve and validate `delphi-tool` at startup and record it; re-resolving here would use credentials nothing checked (D0A-R11-06)")]
+    CredentialsNotPlanned,
+
     /// A bind would make bwrap CREATE a destination ancestor, and that creation would
     /// land in the **host** filesystem through an enclosing bind (D0A-R10-01).
     ///

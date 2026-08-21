@@ -214,8 +214,10 @@ run_case "binds: ro-bind TRANSLATED to rw (R10-05's shape)" "$SANDBOX" \
 run_case "binds: parent-first ordering removed" "$SANDBOX" \
   '        ordered.sort_by_key(|b| lexical_normalize(&b.0));' '        '
 run_case "binds: env_delta never emitted" "$SANDBOX" \
-  '        for (k, v) in &action.env_delta {' \
-  '        for (k, v) in std::iter::empty::<&(String, String)>() {'
+  '        for (k, v) in &action.env_delta {
+            args.push("--setenv".to_string());' \
+  '        for (k, v) in std::iter::empty::<&(String, String)>() {
+            args.push("--setenv".to_string());'
 
 # ── class 40, the ancestors ───────────────────────────────────────────────────────────
 run_case "ancestors: 0755 -> 0700 (class 40's own value)" "$SANDBOX" \
@@ -274,7 +276,8 @@ run_case "drop: --argv0 emitted even with a helper" "$EXECUTE" \
 
 # ── the daemon binary: proves --bins is IN SCOPE for this harness ─────────────────────
 run_case "login.defs: first definition wins, not last" "$DAEMON" \
-  '        .next_back()' '        .next()'
+  '        found = Some(value);' \
+  '        if found.is_none() { found = Some(value); }'
 run_case "login.defs: leading blanks not skipped" "$DAEMON" \
   "    let line = line.trim_start_matches([' ', '\\t']);" '    let line = line;'
 run_case "guards: the tool-account uid check removed" "$DAEMON" \

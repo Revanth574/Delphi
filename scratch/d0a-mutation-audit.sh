@@ -48,10 +48,28 @@ trap cleanup EXIT INT TERM
 git -C "$REPO" worktree add --detach "$TREE" HEAD >/dev/null 2>&1 || {
     echo "REFUSING: could not create an isolated worktree" >&2; exit 2; }
 
-# Share the main target dir: registry dependencies are reused, only this crate rebuilds —
-# which every mutant does anyway. The worktree is the isolation that matters (source), not
-# the artifact cache.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+# ITS OWN TARGET DIR — the first version shared the main tree's, and that was WRONG in a way
+# that took a disagreeing figure to notice.
+#
+# WHAT HAPPENED (2026-08-21). Sharing `$REPO/target` let a mutant's build land in the cache
+# the main tree reads. After a run, `cargo test` in the repo reported 112 executed against a
+# recorded 114, with two `system_account_guard` tests failing — which reads exactly like a
+# real regression and is not one: the binary still contained the LAST mutant
+# (`if tuid == suid || tgid == sgid` neutered). `touch` + rebuild restored 114. That is
+# `docs/DEFECT_CLASSES.md` class 30, introduced by the instrument built to detect defects,
+# and it would have mis-attributed the next commit's measurement.
+#
+# The isolation that matters is BOTH source and artifacts. Kept outside the repo so it
+# survives between runs (a cold dependency build otherwise costs minutes every time), and
+# never equal to the caller's CARGO_TARGET_DIR.
+AUDIT_TARGET="${DELPHI_AUDIT_TARGET:-${TMPDIR:-/tmp}/delphi-mutation-audit-target}"
+if [ "$AUDIT_TARGET" = "${CARGO_TARGET_DIR:-}" ] || [ "$AUDIT_TARGET" = "$REPO/target" ]; then
+    echo "REFUSING: the audit's target dir must not be the tree's — a mutant build would" >&2
+    echo "poison the cache the repo reads (class 30). Set DELPHI_AUDIT_TARGET elsewhere." >&2
+    exit 2
+fi
+mkdir -p "$AUDIT_TARGET"
+export CARGO_TARGET_DIR="$AUDIT_TARGET"
 
 SANDBOX="$TREE/runtime/src/sandbox.rs"
 EXECUTE="$TREE/runtime/src/execute.rs"
@@ -119,7 +137,8 @@ revert() { git -C "$TREE" checkout -- runtime/src >/dev/null 2>&1; }
 
 # ── baseline ───────────────────────────────────────────────────────────────────────────
 echo "=== D0-A mutation audit (rebuilt for D0A-R11-01) ==="
-echo "worktree: $TREE   target: $CARGO_TARGET_DIR"
+echo "worktree: $TREE"
+echo "target:   $CARGO_TARGET_DIR   (isolated — never the tree's, see the header)"
 echo
 echo "measuring the BASELINE (no mutation) …"
 measure

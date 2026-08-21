@@ -63,11 +63,25 @@ git -C "$REPO" worktree add --detach "$TREE" HEAD >/dev/null 2>&1 || {
 # survives between runs (a cold dependency build otherwise costs minutes every time), and
 # never equal to the caller's CARGO_TARGET_DIR.
 AUDIT_TARGET="${DELPHI_AUDIT_TARGET:-${TMPDIR:-/tmp}/delphi-mutation-audit-target}"
-if [ "$AUDIT_TARGET" = "${CARGO_TARGET_DIR:-}" ] || [ "$AUDIT_TARGET" = "$REPO/target" ]; then
-    echo "REFUSING: the audit's target dir must not be the tree's — a mutant build would" >&2
-    echo "poison the cache the repo reads (class 30). Set DELPHI_AUDIT_TARGET elsewhere." >&2
-    exit 2
-fi
+# CANONICALIZED, not string-compared (D0A-R12-10). A lexical test accepts every alias of the
+# forbidden path — `target/../target`, a symlink, a trailing slash, a relative spelling — so
+# the guard against poisoning the tree's cache could be walked straight past by a path that
+# is the same directory under a different name. `realpath -m` resolves without requiring the
+# path to exist yet, which it may not on the first run.
+canon() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+audit_canon=$(canon "$AUDIT_TARGET")
+for forbidden in "${CARGO_TARGET_DIR:-}" "$REPO/target"; do
+    [ -n "$forbidden" ] || continue
+    if [ "$audit_canon" = "$(canon "$forbidden")" ]; then
+        echo "REFUSING: the audit's target dir resolves to the tree's — a mutant build would" >&2
+        echo "poison the cache the repo reads (class 30, D0A-R12-10)." >&2
+        echo "  requested: $AUDIT_TARGET" >&2
+        echo "  resolves to: $audit_canon" >&2
+        echo "  which is:  $forbidden" >&2
+        echo "Set DELPHI_AUDIT_TARGET somewhere else." >&2
+        exit 2
+    fi
+done
 mkdir -p "$AUDIT_TARGET"
 export CARGO_TARGET_DIR="$AUDIT_TARGET"
 

@@ -142,8 +142,9 @@ elf_u() {   # fd offset width -> value on stdout, or exit 1
     # a negative offset, `od` produces nothing, and the SHORT-READ check above rejects it.
     # Every negative value reachable here is caught downstream by some other bound today.
     # Kept because that redundancy depends on `od` failing rather than on anything this
-    # script asserts — the second bound in this file whose isolation could not be
-    # constructed, alongside MAX_PHNUM.
+    # script asserts. It is now the ONLY unisolable bound left in this file: MAX_PHNUM was
+    # deleted outright in R12-05 — the reviewer's answer to "break it or delete it" was that
+    # 257 program headers is a valid executable ELF, so the cap refused good binaries.
     [ "$v" -ge 0 ] || return 1
     printf '%s' "$v"
 }
@@ -154,7 +155,8 @@ elf_ident() {   # fd -> "b0 b1 … b15"
 }
 
 # The layout this parser can read at all. Checked on the REFERENCE once; every subject is
-# then required to have a byte-identical identification header, so this covers them too.
+# then required to match on the fields that DECIDE loadability, which is not the whole
+# header (D0A-R12-06).
 elf_layout_supported() {   # fd -> 0 if ELF64 little-endian version 1
     local -a b
     read -r -a b < <(elf_ident "$1") || true
@@ -165,58 +167,108 @@ elf_layout_supported() {   # fd -> 0 if ELF64 little-endian version 1
     [ "${b[6]}" = "1" ] || return 1   # EI_VERSION
 }
 
+# The fields of `e_ident` a mismatch in which means the file will not load HERE — magic,
+# class, data, version — plus EI_OSABI constrained to what Linux actually runs.
+#
+# D0A-R12-06: this compared all SIXTEEN bytes against the reference, which is both too
+# strict and partly meaningless. EI_OSABI 3 (GNU) and 0 (SYSV) are BOTH runnable on Linux
+# and toolchains emit either, so requiring equality with bash's byte would refuse a
+# perfectly good binary — a false refusal in the installer, which is a real defect and not
+# a conservative one. Bytes 9-15 are PADDING: spec-reserved, ignored by every loader, and
+# comparing them is noise that can only produce false refusals.
+elf_ident_key() {   # fd -> "magic class data version" on stdout; refuses an unusable OSABI
+    local -a b
+    read -r -a b < <(elf_ident "$1") || true
+    [ "${#b[@]}" -eq 16 ] || return 1
+    # EI_OSABI (7): 0 = SYSV, 3 = GNU/Linux. Anything else (Solaris, FreeBSD, …) names a
+    # loader this system does not have.
+    [ "${b[7]}" = "0" ] || [ "${b[7]}" = "3" ] || return 1
+    # EI_ABIVERSION (8) is 0 for every Linux binary in practice; a nonzero value is a
+    # convention this installer does not know how to check, so it refuses rather than guess.
+    [ "${b[8]}" = "0" ] || return 1
+    printf '%s %s %s %s %s %s %s' "${b[0]}" "${b[1]}" "${b[2]}" "${b[3]}" "${b[4]}" "${b[5]}" "${b[6]}"
+}
+
 # THE LIMITS OF THIS PARSER, DECLARED RATHER THAN DISCOVERED. It handles **ELF64,
 # little-endian, ELF version 1** and REFUSES anything else instead of misreading it: the
 # offsets are hard-coded for that layout (`e_phoff` at 32, `e_phentsize` at 54, `e_phnum` at
 # 56), and a 32-bit or big-endian file parsed with them yields garbage.
 #
-# BOUNDED, because this walks attacker-influenced numbers in a root script:
-#   * `e_phnum` is capped. NOT INDEPENDENTLY PROVEN: two attempts to construct an input
-#     where only this bound decides both failed — the other bounds refuse those files first.
-#     It bounds WORK, not the verdict, and the test leg says so rather than claiming a cause;
-#   * the program-header TABLE must lie inside the file, so a truncated binary cannot read
-#     as "no PT_INTERP" (which for delphi-drop is the PASSING answer);
-#   * the interpreter string is length-bounded, must be exactly as long as the header says,
-#     and is used ONLY as an argument to `[ -e ]` — never evaluated.
-MAX_PHNUM=256
+# BOUNDED BY CONSTRUCTION, NOT BY A COUNT (D0A-R12-05). The previous version spawned an `od`
+# per program header and capped `e_phnum` at 256 to stop that becoming 65535 processes. The
+# cap was the wrong instrument: **257 program headers is a valid, executable ELF**, so the
+# bound refused good binaries to protect against slow ones — a false refusal in an installer
+# is a real defect, and "I could not isolate it in a test" was the smaller problem with it.
+#
+# The table is now read in ONE `od` and scanned in ONE `awk`, so the cost is a single pass
+# regardless of `e_phnum` and no count bound is needed. What remains bounded is what should
+# be: the table must lie inside the file, and the interpreter string must too.
 elf_interp() {   # fd -> sets INTERP (empty if none); exit 1 on a header it will not walk
     #
-    # SETS A VARIABLE, does not print (D0A-R12-03, second half). The sentinel below defeats
-    # `$(…)` inside this function — and then the CALLER's own `interp=$(elf_interp …)` ate
-    # the newline all over again, so the first fix passed its own unit and failed the test.
-    # A value that must survive command substitution should not travel through one.
-    local phoff phentsize phnum size i off p_type p_offset p_filesz raw
+    # SETS A VARIABLE, does not print (D0A-R12-03). The sentinel below defeats `$(…)` inside
+    # this function — and then the CALLER's own `interp=$(elf_interp …)` ate the newline all
+    # over again, so the first fix passed its own reasoning and failed the test. A value that
+    # must survive command substitution should not travel through one.
+    local phoff phentsize phnum size found p_offset p_filesz raw
     INTERP=""
     phoff=$(elf_u "$1" 32 8)      || return 1
     phentsize=$(elf_u "$1" 54 2)  || return 1
     phnum=$(elf_u "$1" 56 2)      || return 1
     [ "$phentsize" -ge 56 ] || return 0        # no usable program headers
-    [ "$phnum" -le "$MAX_PHNUM" ] || return 1
     size=$(stat -L -c '%s' "/proc/self/fd/$1") || return 1
     [ "$phoff" -le "$size" ] || return 1
     [ $(( phoff + phnum * phentsize )) -le "$size" ] || return 1
-    for (( i = 0; i < phnum; i++ )); do
-        off=$(( phoff + i * phentsize ))
-        p_type=$(elf_u "$1" "$off" 4) || return 1
-        [ "$p_type" = "3" ] || continue          # PT_INTERP
-        p_offset=$(elf_u "$1" $(( off + 8 )) 8)  || return 1
-        p_filesz=$(elf_u "$1" $(( off + 32 )) 8) || return 1
-        [ "$p_filesz" -gt 1 ] && [ "$p_filesz" -lt 4096 ] || return 1
-        [ $(( p_offset + p_filesz )) -le "$size" ] || return 1
-        # A SENTINEL, because `$(…)` strips trailing newlines: a PT_INTERP of "\n" would
-        # otherwise read as EMPTY, which for delphi-drop is the answer that PASSES
-        # (D0A-R12-03). The sentinel preserves the bytes; the length check then confirms
-        # the string is exactly what the header claims, so a short read cannot pass either.
-        raw=$(dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null; printf 'X')
-        raw=${raw%X}
-        [ "${#raw}" -eq $(( p_filesz - 1 )) ] || return 1
-        INTERP="$raw"
-        return 0
-    done
+    [ "$phnum" -gt 0 ] || return 0
+
+    # One read, one scan. awk groups the byte stream into `esz`-sized records and reports the
+    # first whose p_type is PT_INTERP (3), emitting its p_offset and p_filesz.
+    found=$(od -An -tu1 -j"$phoff" -N$(( phnum * phentsize )) "/proc/self/fd/$1" \
+        | tr -s ' ' '\n' | grep -E '^[0-9]+$' \
+        | awk -v esz="$phentsize" '
+            { b[n++] = $1 }
+            END {
+                recs = int(n / esz)
+                for (i = 0; i < recs; i++) {
+                    o = i * esz
+                    ptype = b[o] + b[o+1]*256 + b[o+2]*65536 + b[o+3]*16777216
+                    if (ptype != 3) continue
+                    off = 0; for (k = 7; k >= 0; k--) off = off * 256 + b[o+8+k]
+                    fsz = 0; for (k = 7; k >= 0; k--) fsz = fsz * 256 + b[o+32+k]
+                    printf "%d %d\n", off, fsz
+                    exit
+                }
+            }') || return 1
+    [ -n "$found" ] || return 0                # no PT_INTERP: statically linked
+    p_offset=${found% *}
+    p_filesz=${found#* }
+    [ "$p_filesz" -gt 1 ] && [ "$p_filesz" -lt 4096 ] || return 1
+    [ $(( p_offset + p_filesz )) -le "$size" ] || return 1
+
+    # THE TRAILING NUL IS VERIFIED, NOT ASSUMED (D0A-R12-04) — and verified NUMERICALLY,
+    # because a shell cannot hold one. The previous version read `p_filesz - 1` bytes and
+    # discarded the last byte unseen, so a header claiming a NUL-terminated string that is
+    # not NUL-terminated was accepted and the path checked was a truncation of what the
+    # loader would actually use.
+    #
+    # The obvious fix — read the whole field and compare the last byte — DOES NOT WORK, and
+    # measured rather than reasoned: `raw=$(dd …)` emits
+    # `warning: command substitution: ignored null byte in input` and silently drops it, so
+    # the terminator can never be seen that way. `od` reports it as a NUMBER instead.
+    local last
+    last=$(od -An -tu1 -j $(( p_offset + p_filesz - 1 )) -N1 "/proc/self/fd/$1" | tr -d ' \n')
+    [ "$last" = "0" ] || return 1
+    raw=$(dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null; printf 'X')
+    raw=${raw%X}
+    # Length equality also rejects an EMBEDDED NUL: bash drops those in the substitution too,
+    # so a short result means the string is not what the header describes.
+    [ "${#raw}" -eq $(( p_filesz - 1 )) ] || return 1
+    INTERP="$raw"
+    return 0
 }
 
 exec {REF_FD}< /proc/self/exe || refuse "cannot open /proc/self/exe as a native ELF reference"
 REF_IDENT=$(elf_ident "$REF_FD")
+REF_KEY=$(elf_ident_key "$REF_FD") || refuse "/proc/self/exe has an e_ident this installer cannot interpret ($REF_IDENT)"
 REF_MACHINE=$(elf_u "$REF_FD" 18 2)
 elf_layout_supported "$REF_FD" || refuse "this installer's ELF checks support ELF64 little-endian only,
   and /proc/self/exe on this host is not that (ident: $REF_IDENT). Refusing rather than
@@ -225,12 +277,20 @@ elf_layout_supported "$REF_FD" || refuse "this installer's ELF checks support EL
 for bin in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
     fd="${FD[$bin]}"
     ident=$(elf_ident "$fd")
-    # A 16-byte identification header must be PRESENT and match the reference in every
-    # field: magic, class (32/64), data (endianness), ELF version, OSABI, ABI version, pad.
     [ "$(printf '%s' "$ident" | wc -w)" -eq 16 ] || refuse "$bin is shorter than an ELF identification header"
-    [ "$ident" = "$REF_IDENT" ] || refuse "$bin's ELF identification header differs from this machine's
-  reference (/proc/self/exe): $REF_IDENT
-  $bin: $ident
+    # The fields that decide loadability, not all sixteen bytes (D0A-R12-06): magic, class,
+    # data and version must match this machine; OSABI must be one Linux runs; ABIVERSION
+    # must be 0; the padding is not compared at all.
+    # THE MAGIC FIRST, so a non-ELF refuses for being a non-ELF (class 11 — refuse for the
+    # reason that is true). Without this the OSABI check fires first on arbitrary bytes and
+    # reports a byte-7 complaint about a file that is not an ELF at all.
+    [ "${ident%% *}" = "127" ] && [ "${ident#127 69 76 70}" != "$ident" ] || \
+        refuse "$bin does not start with the ELF magic — it is not an executable this installer may place in /usr/libexec"
+    key=$(elf_ident_key "$fd") || refuse "$bin has an e_ident this installer will not accept
+  (EI_OSABI must be 0 (SYSV) or 3 (GNU) and EI_ABIVERSION must be 0): $ident"
+    [ "$key" = "$REF_KEY" ] || refuse "$bin's ELF class/encoding differs from this machine's
+  reference (/proc/self/exe): $REF_KEY
+  $bin: $key
   Rebuild everything for one target (installer/build.sh) and re-run."
     machine=$(elf_u "$fd" 18 2)
     [ "$machine" = "$REF_MACHINE" ] || refuse "$bin was built for machine $machine; this system runs $REF_MACHINE (e_machine). It would install and then fail at exec."

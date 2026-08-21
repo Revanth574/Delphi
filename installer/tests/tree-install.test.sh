@@ -289,13 +289,16 @@ perturb_truncated() { printf '\177ELF\002\001' > "$1/delphi-drop"; chmod 0755 "$
 # D0A-R12 pre-emptive: e_phnum is a 16-bit field, so an unbounded walk is up to 65535
 # iterations each spawning `od` — a stall the installer would present as a hang.
 #
-# THIS LEG DOES NOT ISOLATE `MAX_PHNUM`, AND SAYS SO. Removing that bound leaves the case
-# still refusing: walking 4096 entries of a real binary reaches a garbage entry whose
-# p_type happens to be 3 and whose p_filesz then fails its own bound. Two attempts to
-# isolate it failed (65535 first, then 4096), so the claim is narrowed to what the leg
-# actually shows — an absurd e_phnum is REFUSED, by one of three bounds — rather than
-# naming a cause it cannot establish. `MAX_PHNUM` bounds WORK, not the verdict; its effect
-# is time, and nothing here measures time.
+# MAX_PHNUM IS GONE (D0A-R12-05), so this leg no longer claims anything about a count. The
+# reviewer's answer to "break it or delete it" was that **257 program headers is a valid,
+# executable ELF** — a count cap refuses good binaries to protect against slow ones, which
+# in an installer is a defect. The walk is now a single `od` + `awk` pass, so a large
+# e_phnum costs one read regardless and needs no cap.
+#
+# What this leg shows is that a large e_phnum whose entries are GARBAGE is still refused —
+# by the field bounds (p_filesz, table-within-file), which is where the refusal belongs.
+# NOT SHOWN, and not constructible as a fixture: that a genuinely valid 257-header
+# executable is ACCEPTED. Building one is beyond what this suite can fabricate honestly.
 perturb_absurd_phnum() {
     cp "$NATIVE_STATIC" "$1/delphi-drop"
     printf '\000\020' | dd of="$1/delphi-drop" bs=1 seek=56 count=2 conv=notrunc status=none
@@ -329,6 +332,33 @@ perturb_negative_phoff() {
 }
 # A PT_INTERP whose string is a single newline. `$(dd …)` strips trailing newlines, so the
 # path read back as EMPTY — i.e. "statically linked", which is what delphi-drop must be.
+# D0A-R12-04: a PT_INTERP whose final byte is NOT the NUL the header promises. Applied to
+# delphi-runtimed (a DYNAMIC binary) rather than the helper, because that is where the
+# difference is visible: with the terminator verified the header is rejected outright, while
+# discarding it unseen yields a TRUNCATED path that then fails a `[ -e ]` test — both refuse,
+# but only one of them refuses for the true reason, so the leg asserts the reason.
+perturb_unterminated_interp() {
+    cp "$NATIVE_DYN" "$1/delphi-runtimed"
+    python3 - "$1/delphi-runtimed" <<'PYEOF'
+import sys, struct
+p = sys.argv[1]
+b = bytearray(open(p, 'rb').read())
+phoff = struct.unpack_from('<Q', b, 32)[0]
+phesz = struct.unpack_from('<H', b, 54)[0]
+phnum = struct.unpack_from('<H', b, 56)[0]
+for i in range(phnum):
+    off = phoff + i * phesz
+    if struct.unpack_from('<I', b, off)[0] == 3:          # PT_INTERP
+        p_offset = struct.unpack_from('<Q', b, off + 8)[0]
+        p_filesz = struct.unpack_from('<Q', b, off + 32)[0]
+        b[p_offset + p_filesz - 1] = ord('X')             # terminator is not NUL
+        break
+else:
+    sys.exit("fixture: no PT_INTERP in the dynamic stub")
+open(p, 'wb').write(bytes(b))
+PYEOF
+    chmod 0755 "$1/delphi-runtimed"
+}
 perturb_newline_interp() {
     cp "$NATIVE_DYN" "$1/delphi-drop"
     python3 - "$1/delphi-drop" <<'PYEOF'
@@ -352,17 +382,47 @@ PYEOF
     chmod 0755 "$1/delphi-drop"
 }
 
+# D0A-R12-06's POSITIVE control: a binary the installer must ACCEPT. Full 16-byte e_ident
+# equality refused these — EI_OSABI 3 (GNU) is emitted by real toolchains and runs on Linux
+# exactly as 0 (SYSV) does, so requiring equality with bash's byte was a FALSE REFUSAL, which
+# in an installer is a defect and not a conservative choice.
+binary_accept_case() {   # description  perturb-fn
+    local desc="$1" perturb="$2" tmp
+    tmp="$(make_sandbox)"
+    stage_valid_tree "$tmp/installer/staging"
+    tighten_tree "$tmp/installer/staging/shell"
+    "$perturb" "$tmp/installer/staging"
+    run_installer "$tmp" >/dev/null 2>&1
+    local rc=$?
+    local log; log="$(cat "$tmp/out.log" 2>/dev/null)"
+    local libexec; libexec="$(cat "$tmp/libexec.txt" 2>/dev/null)"
+    if [ "$rc" -ne 0 ]; then
+        bad "$desc — REFUSED a binary it must accept (rc=$rc). log: ${log:0:200}"
+    elif [[ "$libexec" != *"delphi-drop"* ]]; then
+        bad "$desc — exited 0 but delphi-drop is not installed: $libexec"
+    else
+        ok "$desc — accepted and installed"
+    fi
+    rm -rf "$tmp"
+}
+perturb_gnu_osabi() {
+    cp "$NATIVE_STATIC" "$1/delphi-drop"
+    printf '\003' | dd of="$1/delphi-drop" bs=1 seek=7 count=1 conv=notrunc status=none
+    chmod 0755 "$1/delphi-drop"
+}
+
 echo
 echo "D0A-R10-11 — staged-binary ELF identity:"
+binary_accept_case "EI_OSABI 3 (GNU) is ACCEPTED, not refused" perturb_gnu_osabi
 binary_refuse_case "helper built for another machine (aarch64 vs x86-64)" \
                    perturb_foreign_helper "this system runs"
 binary_refuse_case "staged binary is not an ELF at all" \
-                   perturb_not_elf "identification header differs"
+                   perturb_not_elf "does not start with the ELF magic"
 binary_refuse_case "staged binary is a truncated header" \
                    perturb_truncated "shorter than an ELF identification header"
 binary_refuse_case "the helper is DYNAMIC (no loader inside the jail)" \
                    perturb_dynamic_helper "must be statically linked"
-binary_refuse_case "absurd e_phnum is refused (cause not isolated)" \
+binary_refuse_case "a large e_phnum with garbage entries is refused" \
                    perturb_absurd_phnum "will not walk"
 binary_refuse_case "program-header table runs past EOF" \
                    perturb_pht_past_eof "will not walk"
@@ -372,6 +432,8 @@ binary_refuse_case "e_phoff has the top bit set (negative in bash)" \
                    perturb_negative_phoff "will not walk"
 binary_refuse_case "PT_INTERP is a single newline (eaten by \$( ))" \
                    perturb_newline_interp "must be statically linked"
+binary_refuse_case "PT_INTERP is not NUL-terminated — refused for THAT" \
+                   perturb_unterminated_interp "will not walk"
 
 # ── The happy path + the replace/no-clobber discipline ────────────────────────────────
 echo

@@ -308,6 +308,49 @@ perturb_pht_past_eof() {
     head -c 200 "$NATIVE_STATIC" > "$1/delphi-drop"
     chmod 0755 "$1/delphi-drop"
 }
+# ── D0A-R12-01/02/03: absence coerced into a value ───────────────────────────────────
+# Each of these was ACCEPTED before the helpers started returning a failure status, and
+# each passed for the same reason: a field that is not there read as 0, which every caller
+# takes to mean "no PT_INTERP" — the answer that PASSES for delphi-drop.
+#
+# 36 bytes: a full 16-byte identification header (so the ident comparison is satisfied) and
+# e_type/e_machine present, but e_phoff at offset 32 is a SHORT READ of 4 bytes.
+perturb_short_phoff() {
+    head -c 36 "$NATIVE_STATIC" > "$1/delphi-drop"
+    chmod 0755 "$1/delphi-drop"
+}
+# e_phoff with the top bit set. Bash arithmetic is 64-bit SIGNED, so it became NEGATIVE —
+# and a negative offset satisfies every `<= size` bound in the walk.
+perturb_negative_phoff() {
+    cp "$NATIVE_STATIC" "$1/delphi-drop"
+    printf '\377\377\377\377\377\377\377\377' \
+        | dd of="$1/delphi-drop" bs=1 seek=32 count=8 conv=notrunc status=none
+    chmod 0755 "$1/delphi-drop"
+}
+# A PT_INTERP whose string is a single newline. `$(dd …)` strips trailing newlines, so the
+# path read back as EMPTY — i.e. "statically linked", which is what delphi-drop must be.
+perturb_newline_interp() {
+    cp "$NATIVE_DYN" "$1/delphi-drop"
+    python3 - "$1/delphi-drop" <<'PYEOF'
+import sys, struct
+p = sys.argv[1]
+b = bytearray(open(p, 'rb').read())
+phoff  = struct.unpack_from('<Q', b, 32)[0]
+phesz  = struct.unpack_from('<H', b, 54)[0]
+phnum  = struct.unpack_from('<H', b, 56)[0]
+for i in range(phnum):
+    off = phoff + i * phesz
+    if struct.unpack_from('<I', b, off)[0] == 3:          # PT_INTERP
+        p_offset = struct.unpack_from('<Q', b, off + 8)[0]
+        struct.pack_into('<Q', b, off + 32, 2)            # p_filesz = 2
+        b[p_offset:p_offset + 2] = b'\n\x00'              # the string is just "\n"
+        break
+else:
+    sys.exit("fixture: no PT_INTERP in the dynamic stub")
+open(p, 'wb').write(bytes(b))
+PYEOF
+    chmod 0755 "$1/delphi-drop"
+}
 
 echo
 echo "D0A-R10-11 — staged-binary ELF identity:"
@@ -323,6 +366,12 @@ binary_refuse_case "absurd e_phnum is refused (cause not isolated)" \
                    perturb_absurd_phnum "will not walk"
 binary_refuse_case "program-header table runs past EOF" \
                    perturb_pht_past_eof "will not walk"
+binary_refuse_case "e_phoff is a SHORT READ (absence read as 0)" \
+                   perturb_short_phoff "will not walk"
+binary_refuse_case "e_phoff has the top bit set (negative in bash)" \
+                   perturb_negative_phoff "will not walk"
+binary_refuse_case "PT_INTERP is a single newline (eaten by \$( ))" \
+                   perturb_newline_interp "must be statically linked"
 
 # ── The happy path + the replace/no-clobber discipline ────────────────────────────────
 echo

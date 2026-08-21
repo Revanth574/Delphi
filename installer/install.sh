@@ -115,12 +115,36 @@ done
 # one. The reference is /proc/self/exe, so on a host this installer does not support, the
 # refusal names the host rather than the artifact.
 
-# Read a little-endian unsigned integer of <width> bytes at <offset> from an open fd.
-# Empty (offset past EOF) reads as 0; every caller treats 0 as "absent", never as valid.
-elf_u() {   # fd offset width -> value on stdout
-    local bytes v=0 i=0
+# ONE ROOT DEFECT, THREE SYMPTOMS (D0A-R12-01/02/03): **absence coerced into a value.**
+# The shell turns nothing into "", "" into 0 in arithmetic, and a command substitution eats
+# trailing newlines — so a field that is not there reads as zero, an 8-byte field overflows
+# into a negative, and a PT_INTERP of "\n" reads as absent. Every caller then treats those
+# as legitimate answers. Each helper below returns a FAILURE STATUS rather than a value it
+# had to invent, and every call site checks it.
+
+# Read a little-endian unsigned integer of <width> bytes at <offset>.
+# REFUSES (exit 1) on a short read — od yielding fewer than <width> bytes means the field is
+# not in the file, and "0" is not what that means (D0A-R12-01).
+elf_u() {   # fd offset width -> value on stdout, or exit 1
+    local bytes v=0 i=0 n=0
     bytes=$(od -An -tu1 -j"$2" -N"$3" "/proc/self/fd/$1" | tr -s ' ' '\n' | grep -E '^[0-9]+$')
-    for b in $bytes; do v=$(( v + b * (1 << (8 * i)) )); i=$((i+1)); done
+    for b in $bytes; do
+        v=$(( v + b * (1 << (8 * i)) ))
+        i=$((i+1)); n=$((n+1))
+    done
+    [ "$n" -eq "$3" ] || return 1
+    # Bash arithmetic is 64-bit SIGNED, so an 8-byte field with the top bit set becomes
+    # NEGATIVE — and a negative offset passes every `<= size` bound (D0A-R12-02). Refuse the
+    # value rather than propagate a number that compares as small.
+    #
+    # NOT INDEPENDENTLY PROVEN, and that is stated rather than left to be discovered: with
+    # this guard removed, the top-bit-set case still refuses, because the walk then reads at
+    # a negative offset, `od` produces nothing, and the SHORT-READ check above rejects it.
+    # Every negative value reachable here is caught downstream by some other bound today.
+    # Kept because that redundancy depends on `od` failing rather than on anything this
+    # script asserts — the second bound in this file whose isolation could not be
+    # constructed, alongside MAX_PHNUM.
+    [ "$v" -ge 0 ] || return 1
     printf '%s' "$v"
 }
 
@@ -141,35 +165,52 @@ elf_layout_supported() {   # fd -> 0 if ELF64 little-endian version 1
     [ "${b[6]}" = "1" ] || return 1   # EI_VERSION
 }
 
-# The PT_INTERP path, or empty if the program has none (statically linked).
+# THE LIMITS OF THIS PARSER, DECLARED RATHER THAN DISCOVERED. It handles **ELF64,
+# little-endian, ELF version 1** and REFUSES anything else instead of misreading it: the
+# offsets are hard-coded for that layout (`e_phoff` at 32, `e_phentsize` at 54, `e_phnum` at
+# 56), and a 32-bit or big-endian file parsed with them yields garbage.
 #
-# BOUNDED IN THREE WAYS, because this walks attacker-influenced numbers in a root script:
-#   * `e_phnum` is capped — the field is 16-bit, so an unbounded loop is up to 65535
-#     iterations each spawning `od`, which is a stall the installer would present as a hang.
-#     NOT INDEPENDENTLY PROVEN: two attempts to construct an input where only this bound
-#     decides both failed — the other bounds refuse the same files first. It bounds WORK,
-#     not the verdict, and the test leg says so rather than claiming a cause;
+# BOUNDED, because this walks attacker-influenced numbers in a root script:
+#   * `e_phnum` is capped. NOT INDEPENDENTLY PROVEN: two attempts to construct an input
+#     where only this bound decides both failed — the other bounds refuse those files first.
+#     It bounds WORK, not the verdict, and the test leg says so rather than claiming a cause;
 #   * the program-header TABLE must lie inside the file, so a truncated binary cannot read
 #     as "no PT_INTERP" (which for delphi-drop is the PASSING answer);
-#   * the interpreter string is length-bounded and used ONLY as an argument to `[ -e ]` —
-#     never evaluated, never expanded into a command.
+#   * the interpreter string is length-bounded, must be exactly as long as the header says,
+#     and is used ONLY as an argument to `[ -e ]` — never evaluated.
 MAX_PHNUM=256
-elf_interp() {   # fd -> path or ""; refuses (exit 1) on a header it will not walk
-    local phoff phentsize phnum size i off p_type p_offset p_filesz
-    phoff=$(elf_u "$1" 32 8); phentsize=$(elf_u "$1" 54 2); phnum=$(elf_u "$1" 56 2)
+elf_interp() {   # fd -> sets INTERP (empty if none); exit 1 on a header it will not walk
+    #
+    # SETS A VARIABLE, does not print (D0A-R12-03, second half). The sentinel below defeats
+    # `$(…)` inside this function — and then the CALLER's own `interp=$(elf_interp …)` ate
+    # the newline all over again, so the first fix passed its own unit and failed the test.
+    # A value that must survive command substitution should not travel through one.
+    local phoff phentsize phnum size i off p_type p_offset p_filesz raw
+    INTERP=""
+    phoff=$(elf_u "$1" 32 8)      || return 1
+    phentsize=$(elf_u "$1" 54 2)  || return 1
+    phnum=$(elf_u "$1" 56 2)      || return 1
     [ "$phentsize" -ge 56 ] || return 0        # no usable program headers
     [ "$phnum" -le "$MAX_PHNUM" ] || return 1
-    size=$(stat -L -c '%s' "/proc/self/fd/$1")
+    size=$(stat -L -c '%s' "/proc/self/fd/$1") || return 1
+    [ "$phoff" -le "$size" ] || return 1
     [ $(( phoff + phnum * phentsize )) -le "$size" ] || return 1
     for (( i = 0; i < phnum; i++ )); do
         off=$(( phoff + i * phentsize ))
-        p_type=$(elf_u "$1" "$off" 4)
+        p_type=$(elf_u "$1" "$off" 4) || return 1
         [ "$p_type" = "3" ] || continue          # PT_INTERP
-        p_offset=$(elf_u "$1" $(( off + 8 )) 8)
-        p_filesz=$(elf_u "$1" $(( off + 32 )) 8)
+        p_offset=$(elf_u "$1" $(( off + 8 )) 8)  || return 1
+        p_filesz=$(elf_u "$1" $(( off + 32 )) 8) || return 1
         [ "$p_filesz" -gt 1 ] && [ "$p_filesz" -lt 4096 ] || return 1
         [ $(( p_offset + p_filesz )) -le "$size" ] || return 1
-        dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null
+        # A SENTINEL, because `$(…)` strips trailing newlines: a PT_INTERP of "\n" would
+        # otherwise read as EMPTY, which for delphi-drop is the answer that PASSES
+        # (D0A-R12-03). The sentinel preserves the bytes; the length check then confirms
+        # the string is exactly what the header claims, so a short read cannot pass either.
+        raw=$(dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null; printf 'X')
+        raw=${raw%X}
+        [ "${#raw}" -eq $(( p_filesz - 1 )) ] || return 1
+        INTERP="$raw"
         return 0
     done
 }
@@ -198,14 +239,14 @@ for bin in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
         2|3) ;;   # ET_EXEC, ET_DYN
         *) refuse "$bin has ELF type $etype — not an executable or PIE, so it is not a program this installer may place in /usr/libexec" ;;
     esac
-    interp=$(elf_interp "$fd") || refuse "$bin has a program-header table this installer will not walk
+    elf_interp "$fd" || refuse "$bin has a program-header table this installer will not walk
   (absurd e_phnum, or a table/interpreter string extending past the end of the file).
   A binary whose headers do not describe itself is not one to install at /usr/libexec."
     if [ "$bin" = "delphi-drop" ]; then
         # The helper enters a jail that binds NOTHING; a dynamic loader would be absent there.
-        [ -z "$interp" ] || refuse "delphi-drop names a dynamic loader ($interp), but it is exec'd inside a jail that binds nothing — it must be statically linked (crt-static). See runtime/helper/delphi-drop.rs."
-    elif [ -n "$interp" ]; then
-        [ -e "$interp" ] || refuse "$bin needs the dynamic loader $interp, which does not exist on this system — it would install and fail at exec."
+        [ -z "$INTERP" ] || refuse "delphi-drop names a dynamic loader (${INTERP@Q}), but it is exec'd inside a jail that binds nothing — it must be statically linked (crt-static). See runtime/helper/delphi-drop.rs."
+    elif [ -n "$INTERP" ]; then
+        [ -e "$INTERP" ] || refuse "$bin needs the dynamic loader ${INTERP@Q}, which does not exist on this system — it would install and fail at exec."
     fi
 done
 

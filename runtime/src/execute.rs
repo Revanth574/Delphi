@@ -163,10 +163,22 @@ pub fn set_tool_credentials(creds: Option<(u32, u32)>) -> Result<(), RuntimeErro
 /// not a bypass — and that case needs no plan, which keeps the unprivileged test suite
 /// working without a seam that could weaken the privileged path.
 fn tool_credentials() -> Result<Option<(u32, u32)>, RuntimeError> {
-    if let Some(planned) = TOOL_CREDENTIALS.get() {
+    decide_credentials(nix::unistd::geteuid().as_raw(), TOOL_CREDENTIALS.get())
+}
+
+/// The decision, separated from the two global reads so it is provable unprivileged
+/// (D0A-R12-08). Its root branch is the one that mattered and the one no unprivileged test
+/// could reach: with euid 0 and no plan recorded, execution REFUSES — correct for
+/// production, and the reason every root-lane execution test failed before reaching the
+/// drop it exists to test until `build_action` began planning.
+fn decide_credentials(
+    euid: u32,
+    planned: Option<&Option<(u32, u32)>>,
+) -> Result<Option<(u32, u32)>, RuntimeError> {
+    if let Some(planned) = planned {
         return Ok(*planned);
     }
-    if nix::unistd::geteuid().as_raw() != 0 {
+    if euid != 0 {
         return Ok(None);
     }
     // Privileged with no plan: refuse. Resolving here is exactly what created the gap.
@@ -417,7 +429,39 @@ mod tests {
         fs::rename(&tmp, path).unwrap();
     }
 
+    /// D0A-R12-08 — plan the credentials the way the DAEMON does, once per test process.
+    ///
+    /// R11-06 made `tool_credentials()` READ a recorded plan and refuse when running
+    /// privileged with none, which is right for production: re-resolving is exactly how the
+    /// validated tuple and the used tuple diverged. But every root-lane execution test then
+    /// failed with `CredentialsNotPlanned` BEFORE reaching the drop it exists to test — a
+    /// test that dies before its subject proves nothing about the subject, and on the lane
+    /// it would have read as the drop being broken.
+    ///
+    /// Called from `build_action`, which every execution test already goes through, so no
+    /// test can forget it. Unprivileged this is a no-op: `tool_credentials()` answers `None`
+    /// without a plan, exactly as production does for an unprivileged daemon.
+    fn plan_credentials_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if nix::unistd::geteuid().as_raw() != 0 {
+                return;
+            }
+            let planned = nix::unistd::User::from_name(TOOL_ACCOUNT)
+                .ok()
+                .flatten()
+                .map(|u| (u.uid.as_raw(), u.gid.as_raw()));
+            // A missing account at root is a real condition the root test asserts on
+            // separately; recording `None` here would MASK it by making the drop silently
+            // not happen, so it is left unplanned and `tool_credentials()` refuses.
+            if let Some(creds) = planned {
+                let _ = set_tool_credentials(Some(creds));
+            }
+        });
+    }
+
     fn build_action(exe: &Path, exe_bytes: &[u8], out_dir: &Path) -> PendingAction {
+        plan_credentials_once();
         PendingAction {
             pending_id: "act-exec".into(),
             preview_version: 1,
@@ -438,6 +482,30 @@ mod tests {
             required_tier: RequiredTier::Biometric,
             script: None,
         }
+    }
+
+    /// D0A-R12-08 — the credential DECISION, all four combinations, without root.
+    ///
+    /// The root branch is what broke the lane: R11-06 made execution refuse when running
+    /// privileged with no recorded plan, which is right, and then every root execution test
+    /// hit it BEFORE reaching the drop — a test that dies before its subject proves nothing
+    /// about the subject. Nothing unprivileged could observe that, because the branch needs
+    /// euid 0. Reading the two globals in the caller and deciding here makes it observable.
+    #[test]
+    fn the_credential_decision_covers_the_root_branch_no_unprivileged_run_can_reach() {
+        // Unprivileged, unplanned: nothing to drop. Production's honest answer.
+        assert_eq!(decide_credentials(1000, None).unwrap(), None);
+        // Unprivileged with a plan recorded: the plan wins — the daemon's answer, not a
+        // second resolution.
+        assert_eq!(decide_credentials(1000, Some(&Some((997, 972)))).unwrap(), Some((997, 972)));
+        // ROOT with a plan: exactly the planned tuple, never a re-resolution.
+        assert_eq!(decide_credentials(0, Some(&Some((997, 972)))).unwrap(), Some((997, 972)));
+        // ROOT, unplanned: REFUSE. This is the branch the lane hit.
+        let err = decide_credentials(0, None).expect_err("root with no plan must refuse");
+        assert!(matches!(err, RuntimeError::CredentialsNotPlanned), "got: {err:?}");
+        // And a plan of None at root is a RECORDED decision (no privilege to drop), which
+        // is different from no plan at all — the distinction the OnceLock exists to carry.
+        assert_eq!(decide_credentials(0, Some(&None)).unwrap(), None);
     }
 
     /// D0A-R10 — THE INTERPOSITION, PROVEN WITHOUT ROOT.

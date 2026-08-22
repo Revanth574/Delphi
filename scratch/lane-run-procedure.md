@@ -276,3 +276,96 @@ state executed-vs-skipped rather than a total.
 
 **If anything fails, the failure is the result. Do not re-run to green** — and if a red looks
 like a harness problem, it is one only when *shown* to be (Iron Law #15 clause 5).
+
+---
+
+# ROOT RUN — D0A-R12-08 and D0A-R9-01 (added 2026-08-21)
+
+Two properties on this branch have **no live evidence** because they need euid 0, and `sudo`
+in the Claude Code session has no terminal. Both are the same run.
+
+* **R12-08** — R11-06 made execution READ a recorded credential plan and refuse when
+  privileged with none. Every root execution test then died at `CredentialsNotPlanned`
+  *before* the drop it exists to test. `build_action` now plans once per process. **That the
+  root tests reach their subject again is REASONED, not measured.**
+* **R9-01** — `an_approved_action_runs_with_the_tool_account_credentials` is the credential
+  proof itself: the action's own `/proc/self/status` read from inside the jail. It SKIPs
+  unprivileged, and a skip proves nothing.
+
+## 0. Preconditions — verify, do not assume
+
+```bash
+getent passwd delphi-tool                      # expect: delphi-tool:x:997:972:…
+sha256sum /usr/libexec/delphi-drop installer/staging/delphi-drop   # the two must MATCH
+bwrap --version                                # expect: bubblewrap 0.11.x
+md5sum /etc/pam.d/delphi-runtime > /tmp/pam-before.md5   # class 16 external check
+```
+
+Measured 2026-08-21 on this box: `997:972`, both helpers `d9ce49055ddddb85`, bwrap 0.11.1.
+The helper is profile-independent — `build.rs` compiles it with `-O` in every profile — so
+debug, release and installed bytes agree, and a mismatch means a stale install, not a
+profile difference.
+
+## 1. Build UNPRIVILEGED, then check the binary is the one you think
+
+`sudo -E cargo` does not work here (sudoers drops `-E`; root has no rustup toolchain), so
+build as yourself and run the produced binary under `sudo`.
+
+```bash
+cd ~/Delphi && export CARGO_TARGET_DIR=$PWD/target
+cargo test -p delphi-runtime --lib --no-run 2>&1 | tail -3
+BIN=$(ls -t target/debug/deps/delphi_runtime-* | grep -v '\.d$' | head -1); echo "$BIN"
+stat -c '%n mtime=%y' "$BIN"; git log -1 --format='HEAD  %h %cd' --date=iso
+```
+
+**The mtime must be LATER than the commit.** An unchanged hash looks identical whether it
+rebuilt or not, and that has produced three false readings in this arc.
+
+## 2. The run
+
+```bash
+sudo "$BIN" execute::tests:: --nocapture --test-threads=1
+```
+
+Serial deliberately: these fork and open PAM/jails, and CLAUDE.md §6's carve-out makes the
+serial run the authoritative one for that shape.
+
+## 3. What the outcomes MEAN — so the run is diagnostic, not pass/fail
+
+| what you see | what it means |
+|---|---|
+| `an_approved_action_runs_with_the_tool_account_credentials … ok` with a printed `/proc/self/status` block showing `Uid: 997 997 997 997`, `Gid: 972 …`, empty `Groups:`, `CapEff: 0000000000000000` | **R9-01's mechanism is proven at root.** This is the first live evidence for it. |
+| that test prints `SKIP …` | the gate did not fire — a skip proves nothing. Report the SKIP line verbatim; it names its own blocker. |
+| any test fails with `no validated tool identity was recorded` | **R12-08 is NOT fixed.** The planning call is not reaching that path; the fix is wrong, not the test. |
+| `the_tool_receives_its_approved_argv0 … ok` | the restored test (deleted by `f380085`) holds at root as well as unprivileged. |
+| a failure mentioning `bwrap: … RTM_NEWADDR` | environment, not product — but say so rather than assuming it. |
+| anything else | the failure IS the result. Do not re-run to green (Iron Law #15). |
+
+## 4. The count, with the root baseline
+
+The recorded pair is unprivileged (`EXECUTED=115 SKIPPED=1`). At root the credential test
+EXECUTES, so the pair is **`EXECUTED=116 SKIPPED=0`** — point the gate at a different file
+rather than editing the committed one for one run:
+
+```bash
+printf 'EXECUTED=116\nSKIPPED=0\nRED=execute::tests::nested_interpreter_substitution_executes_unapproved_content\nRED=execute::tests::same_inode_overwrite_executes_unapproved_content\n' > /tmp/root-baseline
+DELPHI_TEST_COUNT_BASELINE=/tmp/root-baseline scripts/test-count.sh -p delphi-runtime --lib --bins
+```
+
+## 5. After — prove the run did not mutate what it does not own
+
+```bash
+md5sum -c /tmp/pam-before.md5          # the PAM stack must be UNCHANGED
+scripts/check-stale-test-sessions.sh   # no leaked logind sessions
+```
+
+The PAM check is not ceremony: test fixtures deleting the operator's installed
+`/etc/pam.d/delphi-runtime` is a defect this project has already paid for
+(`docs/DEFECT_CLASSES.md` class 16), and it surfaced far away as unrelated tests reporting
+"not installed".
+
+## 6. Report
+
+Paste the literal output. Per §13.5, executed-vs-skipped rather than a total, and the
+`/proc/self/status` block from R9-01's test if it ran — that block IS the evidence, and
+without it the pass is decorative (class 38).

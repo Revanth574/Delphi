@@ -2370,6 +2370,47 @@ than one supported by one real case, because the reader learns the wrong boundar
 
 ---
 
+## 43. One error string, two processes — diagnose from the CHILD's own output  *(new — D0A-R9-02; second occurrence of a class that had already cost a false RED)*
+
+**`execvp: No such file or directory` has two causes in two different processes**, and the
+string cannot tell them apart:
+
+| reading | whose state | how it happens |
+|---|---|---|
+| "the program fd did not survive" | the **parent's** fd table | a keep-list miss, a CLOEXEC left set, a wrong fd number |
+| "the dynamic loader is not there" | the **child's** mount namespace | the jail binds nothing, or binds the wrong set |
+
+**Both occurrences cost real time, and the second happened with the first already written
+down** in `runtime/helper/delphi-drop.rs`:
+
+* the drop helper's first RED was **false** — it failed with this string and was read as
+  proving a static-linking requirement, when it was a missing loader (the helper was
+  dynamically linked at the time);
+* `canonicalize_for_test` passed `fs_binds: vec![]`, so a dynamically linked ELF ran in a
+  jail binding nothing. The same string appeared, and the working hypothesis became "the
+  sealed memfd is not executable on this kernel" — a conclusion that would have been wrong
+  in a specific and expensive way, since the next step was to redesign around fs-verity.
+
+**What broke the tie both times was the same, and it is not cleverness:** print the
+**subprocess's own stderr** instead of reasoning about the parent's fd table. `bwrap` says
+which path it could not exec; the parent can only be inferred about. A second measurement —
+a direct `memfd_create` + `F_ADD_SEALS` + `execv` probe returning `F_GET_SEALS = 0x3f` and
+child exit 0 — killed the wrong hypothesis in under a minute.
+
+**Foreclosing discipline:** an assertion about a spawned process must **carry that process's
+stderr in its failure message**. Not as a courtesy — as the thing that makes the failure
+attributable at all. Grounded: `same_inode_overwrite_…`'s assertion printed only the exit
+code, so the first reading was "exit 1 is gnufalse's" — the substituted binary — when exit 1
+was **bwrap's own** and the tool had never run. One line of `String::from_utf8_lossy(&out.stderr)`
+turned an hour's misattribution into one read.
+
+**Distinct from class 33** (the diagnostic path is the least-executed code): there the
+diagnostic is *wrong when it finally runs*. Here the diagnostic is *absent*, and the string
+that remains is ambiguous by construction — no amount of care reading it distinguishes the
+two processes.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2416,4 +2457,5 @@ than one supported by one real case, because the reader learns the wrong boundar
 | 39. First-ordered check that never fires in time | discipline — **the mechanism already exists** (`scripts/check-free-space.sh`): run it at block START and before any bulk write; on an unexplained tool failure suspect the SUBSTRATE before the harness | Discipline (nothing to extract) |
 | 40. Sandbox scaffolding blocks the measurement | bwrap auto-creates intermediates `0700` owned by the sandbox uid: emit `--perms 0755 --dir` per ancestor when the payload's uid differs, and pair every such probe with a positive control | Discipline + production constraint |
 | 41. Assertion at the wrong altitude | discipline: **does the assertion observe the layer where the property would be violated?** Assert there, even when it costs a real run, a before/after snapshot, or a second discriminating leg | Discipline |
+| 43. One error string, two processes | discipline: an assertion about a spawned process CARRIES that process's stderr in its failure message; suspect the CHILD's namespace before the PARENT's fd table when the string is `No such file or directory` | Discipline |
 | 42. Negative assertion resting on a removed default | assert the POSITIVE wherever one exists ("the narrowing is applied", not only "the widening is absent"); when an umbrella default is removed, find the assertions that relied on it by DELETING the new explicit thing and seeing what fails — `scratch/d0a-mutation-audit.sh` is that search, mechanised | Discipline + a mutation harness |

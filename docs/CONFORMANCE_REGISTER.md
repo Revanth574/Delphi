@@ -27,6 +27,26 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | **CLOSED 2026-08-15** — `sandbox::refuse_denied_bind` refuses every spelling (lexical fold + canonicalize), wired at the `run_fd_pinned` choke point, with a positive control. Both weakens bite: removing the call site lets execution reach bwrap (`bwrap: Can't find source path /run/delphi/alice` — it would have BOUND it where the path exists); removing traversal folding fails `/tmp/../run/delphi/alice` |
 
+## PROVEN WITH ROOT EVIDENCE vs DECLARED — read this before citing anything below (2026-08-22)
+
+The distinction this file exists to keep. Both columns are honest; only one is a measurement.
+
+| property | standing |
+|---|---|
+| the action runs as `delphi-tool` — all four uids/gids, empty `Groups:`, `CapEff` zero | **ROOT-MEASURED** (`Uid: 997 997 997 997`, lane run 2026-08-22) |
+| bytes written behind a pinned inode do not execute | **ROOT-MEASURED** — `same_inode_overwrite_…` green at root, through production canonicalization with a real ELF |
+| the drop helper is the one this daemon was built against | **ROOT-MEASURED** — the digest binding fires at root; helper hashes matched across built/installed/staged |
+| a nested shebang never reaches execution | **PROVEN AT CANONICALIZATION** — refused before any exec, so there is no root-only half to measure |
+| the credential plan reaches execution (R12-08) | **ROOT-MEASURED** (18 passed / 0 failed, no `CredentialsNotPlanned`) |
+| **the loader and system libraries are immutable** (§3 named limit 2) | **DECLARED, NOT ENFORCED.** A sealed dynamic ELF still resolves `PT_INTERP` and its DSOs **by path**. Nothing in this tree verifies them. It is a statement about who we trust, in the same class as `bwrap` — and it is written down precisely so it is not mistaken for a mechanism |
+| **the pre-drop window is bounded** (D0A-R10-12) | **NEITHER.** The mitigation (restrict the helper to `CAP_SETUID`/`CAP_SETGID`) is named and unimplemented; the window's duration is unmeasured. An intuition, recorded as an obligation |
+| the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
+
+**The lane run's hygiene, since a root run that mutates what it does not own is worse than
+no run:** PAM stack unchanged (`md5sum -c` OK), no stale sessions, 0 leaked daemons, and the
+test binary proven current by a forced rebuild with an unchanged sha (`fb8c6c123685…`) rather
+than by mtime — the rule that was systematically wrong for hook-built binaries.
+
 **CLOSED — D0A-R9-02 (2026-08-22), and the row is removed per this file's own rule.**
 §3's clause now holds because the contract changed to match what a mechanism can actually
 deliver: **TRUST_MODEL v7** binds an **immutable content snapshot**, not a filesystem object.

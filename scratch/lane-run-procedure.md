@@ -318,8 +318,24 @@ BIN=$(ls -t target/debug/deps/delphi_runtime-* | grep -v '\.d$' | head -1); echo
 stat -c '%n mtime=%y' "$BIN"; git log -1 --format='HEAD  %h %cd' --date=iso
 ```
 
-**The mtime must be LATER than the commit.** An unchanged hash looks identical whether it
-rebuilt or not, and that has produced three false readings in this arc.
+**Check freshness — but NOT against the commit timestamp.** That rule mis-fires, and it did
+on 2026-08-22: binary mtime `15:03:24`, `HEAD` committed `15:04:31`, so the binary read as
+67 seconds STALE while in fact containing the fix. The **pre-commit hook builds and tests
+before the commit object exists**, so a binary built by the hook is always older than the
+commit it belongs to.
+
+Compare against the SOURCE instead, or force the question:
+
+```bash
+sha256sum "$BIN"                                   # note it
+touch runtime/src/execute.rs
+cargo test -p delphi-runtime --lib --no-run >/dev/null 2>&1
+sha256sum "$BIN"                                   # same hash => the run used this code
+```
+
+An unchanged hash after a forced rebuild is the proof the earlier rule was reaching for; an
+unchanged hash *without* one proves nothing, which is the trap that produced three false
+readings in this arc.
 
 ## 2. The run
 
@@ -334,7 +350,8 @@ serial run the authoritative one for that shape.
 
 | what you see | what it means |
 |---|---|
-| `an_approved_action_runs_with_the_tool_account_credentials … ok` with a printed `/proc/self/status` block showing `Uid: 997 997 997 997`, `Gid: 972 …`, empty `Groups:`, `CapEff: 0000000000000000` | **R9-01's mechanism is proven at root.** This is the first live evidence for it. |
+| `an_approved_action_runs_with_the_tool_account_credentials … ok` with a printed `/proc/self/status` block showing `Uid: 997 997 997 997`, `Gid: 972 …`, empty `Groups:`, `CapEff: 0000000000000000` | **R9-01's mechanism is proven at root.** Observed 2026-08-22. |
+| `test result: FAILED. 15 passed; 2 failed` for `execute::tests::` | **THE EXPECTED ROOT RESULT**, not a problem: the two are the intentional D0A-R9-02 REDs, by name. A prediction of "17 passed, 0 failed" was written once in this arc and was wrong — the R9-02 pair lives in this same module. Check the NAMES against the `RED=` lines in `.githooks/runtime-test-count-baseline`, never the count alone. |
 | that test prints `SKIP …` | the gate did not fire — a skip proves nothing. Report the SKIP line verbatim; it names its own blocker. |
 | any test fails with `no validated tool identity was recorded` | **R12-08 is NOT fixed.** The planning call is not reaching that path; the fix is wrong, not the test. |
 | `the_tool_receives_its_approved_argv0 … ok` | the restored test (deleted by `f380085`) holds at root as well as unprivileged. |

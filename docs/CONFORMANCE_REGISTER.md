@@ -361,6 +361,23 @@ FIXTURE: `Env::new` chowns the out dir to the **planned tuple** (never a fresh l
 R11-06's discipline), in the one place that creates it. One test passed at root only because
 it chowned by hand; that line is now the fixture's job.
 
+**RE-RUN 2026-08-22 — THE FIXTURE FIX IS MEASURED.** `sudo … execute::tests::` at root:
+**15 passed, 2 failed**, and the two are the intentional D0A-R9-02 REDs by name
+(`same_inode_overwrite_…`, `nested_interpreter_substitution_…`). Every `Permission denied`
+is gone, so the chown-to-the-planned-tuple in `Env::new` is confirmed at the only privilege
+level that can execute that code. `an_approved_action_runs_with_the_tool_account_credentials`
+printed its `/proc/self/status` block again, and `the_helper_is_interposed_…`,
+`the_tool_receives_its_approved_argv0` and `a_second_kept_fd_survives_a_second_exec_…` all
+pass at root as well as unprivileged.
+
+**Two corrections to what was written before that run, both mine.** "Expected: 17 passed, 0
+failed" was wrong — the R9-02 pair lives in `execute::tests::`, so 15/2 IS the clean result;
+the check is the failing NAMES against the recorded `RED=` lines, never the count. And the
+binary-freshness rule "mtime must be later than the commit" mis-fires: the pre-commit hook
+builds before the commit object exists, so the binary read as 67 seconds stale while
+containing the fix (confirmed by a forced rebuild producing the identical hash,
+`a6faef1cea8d74be`). Both fixed in `scratch/lane-run-procedure.md`.
+
 **Why nothing caught it, and this is the part worth keeping:** the drop only happens when
 `tool_credentials()` returns `Some`, which needs euid 0 — so the unprivileged run of every
 execution test takes the **no-helper branch**. It ran, it passed, and it exercised a

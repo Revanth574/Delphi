@@ -130,6 +130,86 @@ action_digest = delphi_hardening::canonical_hash(PendingAction)   // injective; 
      kernel object, not a file an attacker can replace. Executable-TOCTOU is thereby extended
      **to the interpreter**: neither the interpreter binary (exec'd fd) nor the script content
      (sealed memfd) is swappable between hash and exec.
+### AMENDMENT v7 (2026-08-22, D0A-R9-02) — the contract binds an immutable CONTENT SNAPSHOT, not a filesystem object
+
+**This is a deliberate contract version, ratified by the operator, not a document edited to
+match code.** It is recorded here because the sentence above it was one step past what the
+mechanism delivered, and because the register's rule — normative text is never softened to
+match drift — applies to weakening, not to a decided change of contract.
+
+**What v6 implied and could not deliver.** "Executable pinning" above pins an **inode**:
+`executable_fd` fixes *which object* runs; nothing fixed *what is in it*. Two reproductions
+(D0A-R9-02) execute unapproved bytes through a correct, unmodified pin — a same-inode
+overwrite, and a shebang chain whose next interpreter the kernel re-resolves by path.
+Re-hashing before `execve` does **not** close this: `fexecve` does not prevent same-inode
+modification, so a hash-then-exec still races.
+
+**What v7 specifies instead.** The arbiter takes an **immutable snapshot** at canonicalize
+time and executes *that*:
+
+1. copy the source bytes into `memfd_create(MFD_EXEC | MFD_ALLOW_SEALING | MFD_CLOEXEC)`;
+2. `F_ADD_SEALS` the full set — `F_SEAL_SEAL | F_SEAL_EXEC | F_SEAL_WRITE |
+   F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` — and **verify** them with
+   `F_GET_SEALS` before use;
+3. hash the **sealed** fd; that digest is `executable_digest`;
+4. store only the snapshot in the `PendingAction` and close the mutable source fd;
+5. **fail closed** if executable memfds are unavailable (`vm.memfd_noexec`).
+
+The seals are **kernel-enforced against the fd that is exec'd**, so there is no window
+between hash and `execve`. (An earlier version of this reasoning claimed only fs-verity
+gives kernel enforcement. That was wrong — memfd seals are equally kernel-enforced, and the
+asymmetry it implied was the reason verity looked necessary.)
+
+**THE BEHAVIOURAL CHANGE, NAMED RATHER THAN DISCOVERED.** What executes is a memfd, so:
+
+| observable | effect |
+|---|---|
+| `argv[0]` | **unchanged** — the arbiter supplies it explicitly (via `delphi-drop`) |
+| audit identity | **improved** — the recorded digest is of the bytes that ran |
+| `/proc/self/exe` | **CHANGES** to `/memfd:… (deleted)` |
+| glibc `$ORIGIN` | **CHANGES** — it is derived from `/proc/self/exe` |
+
+A tool that resolves its own installation directory at runtime will see the memfd instead.
+That is accepted deliberately: **the action never bound a source path, so the contract could
+not claim path identity even before this amendment** — v7 names the property that was
+already true and stops implying one that never was. A path-identity design (an immutable
+object mounted at a bound, approved path) is the alternative, and is deferred to a later
+increment *with a measured need behind it* rather than an anticipated one, because it adds a
+second binding to the surface that has produced findings in six consecutive rounds.
+
+### NAMED LIMIT 1 — a nested shebang is REFUSED at canonicalization
+
+If the snapshot of an interpreter itself begins `#!`, canonicalization **fails**. It is a
+refusal, not a silent narrowing, and it happens **before anything executes**.
+
+The kernel opens *every* interpreter in a shebang chain **by path**, recursively
+(`fs/binfmt_script.c`), so "pin the interpreter" was too narrow: the chain's length is
+attacker-influenced and each element is a place the pin does not reach. The alternative —
+recursively snapshotting the whole chain — fails **silently at exec** if it misses an
+element, which is precisely the shape of R9-02. Refusing fails **closed and loudly**, at the
+one point where a human can be told why.
+
+**Cost, stated:** a tool whose interpreter is itself a script stops working. That is a real
+capability reduction and it is the reason this limit is written in the normative text rather
+than left in an implementation comment — someone who hits it deserves an explanation, not a
+puzzle.
+
+### NAMED LIMIT 2 — the loader and system libraries are a DECLARED platform TCB member
+
+A sealed **dynamic** ELF still names `PT_INTERP`, and that loader resolves its DSOs **by
+path** at runtime. Sealing the executable does not seal them.
+
+So the contract does **not** claim that every transitive code dependency is pinned. It
+claims: the dynamic loader and the system libraries it resolves are an **immutable platform
+TCB member** — installer-placed, root-owned, and in the same trust class as `bwrap` and
+`delphi-drop`, both of which the action already never names. Anything outside that class
+that a tool loads at runtime is **outside the digest binding**, and this document says so
+rather than leaving the boundary to be inferred.
+
+**Declared, because an undeclared TCB member is how D0A-R10-12 started** — the pre-drop
+window's capability enlargement was real, unremarkable in itself, and dangerous precisely
+because nothing had written down who occupied it.
+
 - **The digest is the binding** for preview = approval = sandbox = audit. The no-`..`
   `canonical_hash` discipline means a new `PendingAction`/`ScriptPin` field cannot be
   silently unhashed (DEFECT_CLASSES §1, both-halves).

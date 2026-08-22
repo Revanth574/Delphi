@@ -292,6 +292,67 @@ discoveries, so deleting one suite while eight survived stayed green; the fixtur
 "5" for a fifth artifact. All fixed — and the hook's first fix had the same bug backwards
 (identity without count let a third failure through), caught by the hook's own test suite.
 
+## Round 12 (2026-08-21) — the fix for green-by-skip arrived as green-by-skip
+
+Ten findings. **D0A-R12-09 outranks the six parser findings** and is recorded first because
+it is the arc's recurring class landing inside the fix for that class.
+
+**D0A-R12-09 — the tier-1 suite reported GREEN by skipping, in CI, on every run.**
+`installer/tests/tree-install.test.sh` exits when it cannot find a built `delphi-drop` to
+stage as its static stub, and the R11-07 fixture rewrite made that an `exit 0`. The
+shell-suites CI job had **no Rust toolchain**, so on a clean checkout the fixture never
+existed: the suite skipped every time and the runner reported it `ok`. It is the file
+CLAUDE.md §6 names as the tier-1 **SOLE EVIDENCE** for the tree-replace invariant, so in CI
+that invariant had no live evidence at all while the pipeline was green.
+
+**Worse than the 15-commit red it replaced** (recorded above): red-and-unrun is
+discoverable; green-by-skip is not. Closed at three levels — the suite REFUSES; the runner
+FAILS any suite that exits 0 having printed no result line (the class, for all nine); and CI
+builds the fixture, which makes that step load-bearing. Both weakens bite under CI's exact
+condition.
+
+**D0A-R12-01/02/03 — absence coerced into a value, three symptoms of one cause.** A field
+not in the file read as **0**; an 8-byte field with the top bit set read as **negative**
+(and a negative offset passes every `<= size` bound); a `PT_INTERP` of `"\n"` read as
+**absent**. For `delphi-drop`, "no PT_INTERP" is the answer that PASSES. Each helper now
+returns a failure status rather than a value it invented. Two of three weakens bite; the
+negative guard is **not independently isolable** — every negative value reachable is caught
+downstream by the short-read check, because `od` produces nothing at a negative offset — and
+that is recorded in the script rather than claimed.
+
+**D0A-R12-04/05/06 — a discarded terminator, a wrong bound, a too-strict header.**
+The `PT_INTERP` NUL was dropped unseen (weaken: a binary whose terminator is overwritten
+INSTALLS, because the old code read the original path and never saw the header lie); the NUL
+is now verified **numerically**, since bash cannot hold one — `$(dd …)` warns
+`ignored null byte in input` and drops it. `MAX_PHNUM` is **deleted**: 257 program headers
+is a valid executable ELF, so a count cap refused good binaries; the table is now one `od` +
+one `awk`, bounded by construction. Full `e_ident` equality is replaced by the fields that
+decide loadability — EI_OSABI 3 (GNU) is accepted, padding is not compared, and the magic is
+checked first so a non-ELF refuses for being a non-ELF.
+
+**D0A-R12-07 — the parser's third round, and the first INTERACTION.** `UID_MIN   "5000"`:
+shadow 5000, Delphi 1000. Blanks and quotes were each measured and each correct in
+isolation; 28 forms then 38, and not one had **both**. Enumerating a grammar feature at a
+time misses the products.
+
+**D0A-R12-08 — the root execution tests died before their subject.** R11-06's refusal is
+right for production and broke the lane. `build_action` now plans once per process, and
+`decide_credentials(euid, planned)` is split out so the ROOT BRANCH is a unit fact.
+**STILL UNMEASURED:** that the root tests now reach the drop. `sudo` needs a terminal this
+session does not have; the procedure is `scratch/lane-run-procedure.md` §"ROOT RUN".
+
+**D0A-R12-10 — the poisoning guard compared strings**, so `target/../target`, a symlink, or
+a trailing slash walked past it. Canonicalized. Demonstrated at the comparison, because the
+audit refuses on a dirty tree and weakening the audit dirties it — the two guards conflict,
+so a harness-level weaken cannot run.
+
+**Two process defects of my own, both recorded in commits rather than smoothed over:**
+`git checkout --` used as a restore on a file with UNCOMMITTED work discarded the fix along
+with the weaken (copy-based restore is the rule while uncommitted); and a claim —
+"the alias was ACCEPTED" — was printed beneath a run that had been blocked and did not show
+it. The second is this session's own recurring mechanism: a sentence written next to output
+that does not support it.
+
 ## Claims whose scope was believed wider than their proof
 
 A different kind of row from the table above. Nothing here is a violated clause — each is a

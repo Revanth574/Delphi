@@ -25,7 +25,7 @@
 #
 # ENVIRONMENT-SPECIFIC, like its workspace sibling. Measured UNPRIVILEGED, where
 # `an_approved_action_runs_with_the_tool_account_credentials` skips. On a root lane it
-# EXECUTES, so the pair there is EXECUTED=119 SKIPPED=0 — point the hook at another file via
+# EXECUTES, so the pair there is EXECUTED=137 SKIPPED=0 — point the hook at another file via
 # DELPHI_TEST_COUNT_BASELINE rather than editing these values for one run.
 #
 # THE EXPECTED FAILURES LIVE HERE TOO (D0A-R11-02), one `RED=` line each, because the hook
@@ -40,6 +40,8 @@
 # canonicalization instead of substituted at exec. The two deliberate REDs that stood here
 # since 2026-08-12 are gone, and the hook now refuses ANY failure.
 #
-# Scope: `-p delphi-runtime --lib --bins`, which is what the hook runs.
-EXECUTED=118
-SKIPPED=1
+# Scope: `-p delphi-runtime --tests`, which is what the hook runs — ALL test targets,
+# integration included. It was `--lib --bins` until 2026-08-23, and that scope let two red
+# integration suites sit behind a green gate (D0A-R14-03). The full run costs ~3 seconds.
+EXECUTED=137
+SKIPPED=23

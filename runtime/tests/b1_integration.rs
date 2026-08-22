@@ -1444,14 +1444,21 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
     let dir = _dir_tmp.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let result = dir.join("res");
-    // The "interpreter" records its FIRST arg — so if our exec passes the shebang arg,
-    // its $1 is the arg; if dropped, its $1 would be the script fd-path instead.
-    let recorder = dir.join("recorder.sh");
-    std::fs::write(&recorder, format!("#!/bin/sh\necho \"$1\" > {}\n", result.display())).unwrap();
-    std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // The action's script: shebang names the recorder + the arg ARGPROOF.
+    // D0A-R14-03: A NATIVE INTERPRETER, ONE LEVEL. This used a `#!/bin/sh` recorder as the
+    // interpreter of another script — a NESTED chain, which TRUST_MODEL v7 named limit 1 now
+    // refuses at canonicalization. The property under test is unchanged (does the shebang's
+    // interpreter ARG reach exec?); only the way it is observed had to stop depending on a
+    // chain the contract no longer allows.
+    //
+    // `$-` carries the shell's active option flags, so a body that writes only when `e` is
+    // present observes the ARG ITSELF rather than a recorder's `$1`. Drop the arg and the
+    // file stays empty — the same discrimination, one hop shorter.
     let exe = dir.join("act.sh");
-    std::fs::write(&exe, format!("#!{} ARGPROOF\n:\n", recorder.display())).unwrap();
+    std::fs::write(
+        &exe,
+        format!("#!/bin/sh -e\ncase $- in *e*) printf ARGPROOF > {} ;; esac\n", result.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let key = MintingKey::from_bytes(KEY);

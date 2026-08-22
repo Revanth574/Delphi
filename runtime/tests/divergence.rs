@@ -22,14 +22,13 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
-use delphi_runtime::action::{
-    canonical_action_digest, preview, BindMode, NetPolicy, PendingAction, RequiredTier,
-};
+use delphi_runtime::action::{canonical_action_digest, preview, PendingAction};
 use delphi_runtime::audit::RuntimeAuditEntry;
+use delphi_runtime::canonicalize::canonicalize;
+use delphi_runtime::wire::pb;
 use delphi_runtime::execute::{execute_approved, ConsumptionLedger};
 use delphi_runtime::sandbox::SandboxProfile;
 use delphi_runtime::token::{mint, MintingKey};
@@ -73,27 +72,36 @@ impl Drop for Env {
     }
 }
 
+/// D0A-R14-03: built through PRODUCTION canonicalization.
+///
+/// This hand-constructed a `PendingAction` with a `#!` executable and `script: None` — a
+/// shape `canonicalize` never produces (it builds a sealed `ScriptPin` for a shebang) and a
+/// FAKE `executable_digest` of `[0x22; 32]`. Under TRUST_MODEL v7 the exec path refuses an
+/// unsealed fd, so the test failed; but the deeper problem is the one R13-01 named — a
+/// fixture that can construct what production cannot is testing a shape production never
+/// has, and this file's whole claim is that FOUR DERIVATIONS AGREE. They can only be shown
+/// to agree on an object the daemon would actually build.
 fn action_with_marker(env: &Env, marker: &str) -> PendingAction {
-    PendingAction {
-        pending_id: "act-div".into(),
-        preview_version: 1,
-        executable_fd: fs::File::open(&env.exe).unwrap().into(),
-        executable_digest: [0x22; 32],
+    let proposal = pb::Propose {
         argv: vec!["tool".into(), marker.into()],
-        cwd: PathBuf::from("/"),
+        cwd: "/".into(),
         env_delta: vec![],
         fs_binds: vec![
-            (PathBuf::from("/usr"), BindMode::ReadOnly),
-            (PathBuf::from("/bin"), BindMode::ReadOnly),
-            (PathBuf::from("/lib"), BindMode::ReadOnly),
-            (PathBuf::from("/lib64"), BindMode::ReadOnly),
-            (env.out_dir.clone(), BindMode::ReadWrite),
+            pb::Bind { path: "/usr".into(), mode: pb::BindMode::BindReadOnly as i32 },
+            pb::Bind { path: "/bin".into(), mode: pb::BindMode::BindReadOnly as i32 },
+            pb::Bind { path: "/lib".into(), mode: pb::BindMode::BindReadOnly as i32 },
+            pb::Bind { path: "/lib64".into(), mode: pb::BindMode::BindReadOnly as i32 },
+            pb::Bind {
+                path: env.out_dir.to_string_lossy().into_owned(),
+                mode: pb::BindMode::BindReadWrite as i32,
+            },
         ],
-        net_policy: NetPolicy::None,
-        timeout: Duration::from_secs(30),
-        required_tier: RequiredTier::Biometric,
-        script: None,
-    }
+        exe_path: env.exe.to_string_lossy().into_owned(),
+        net_policy: pb::NetPolicy::NetNone as i32,
+        timeout_secs: 30,
+        required_tier: pb::RequiredTier::TierBiometric as i32,
+    };
+    canonicalize(&proposal, "act-div".into()).expect("canonicalize the proposal")
 }
 
 /// RED helper: exec the action's executable with an argv sourced INDEPENDENTLY of

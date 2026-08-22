@@ -335,6 +335,39 @@ shadow 5000, Delphi 1000. Blanks and quotes were each measured and each correct 
 isolation; 28 forms then 38, and not one had **both**. Enumerating a grammar feature at a
 time misses the products.
 
+**ROOT LANE RUN, 2026-08-21 — R9-01 IS PROVEN LIVE.** The operator ran the procedure. The
+credential proof produced its evidence for the first time on this branch:
+
+```
+[R9-01] Uid: 997 997 997 997 / Gid: 972 972 972 972 / Groups: (empty) / CapEff: 0000000000000000
+with helper: ["--", "/proc/self/fd/9", "997", "972", "/proc/self/fd/7", "approved-name", "--flag"]
+```
+
+So §6's "the tool runs under a uid that cannot reach daemon IPC" now has its **credential
+half measured at root**, not reasoned: all four uids and gids are `delphi-tool`'s, the
+supplementary set is empty, and `CapEff` is zero. **R12-08 is measured too** — the root path
+plans credentials, the helper is interposed with `997 972`, and no
+`no validated tool identity was recorded` appeared. The socket-refusal half remains measured
+against a probe fixture (R9-01's open remainder), and the PAM stack was verified unchanged
+before and after (`439c1d1521d86e4eb011a927aff659db`), 0 leaked daemons, class 16 clean.
+
+**AND THE RUN FOUND SEVEN FAILURES THAT HAD BEEN THERE SINCE SHAPE E — D0A-R12-11.** All one
+cause: `cannot create /tmp/delphi-exec-*/out/result: Permission denied`. The tool at uid 997
+cannot write an `out/` created by the root test process. **This is the predicted behavioural
+change, arriving exactly as recorded twice before E shipped** — dropping the tool off root
+removes its access to root-owned paths, a test failing for that reason is CORRECT, and
+widening the uid's access to turn it green would be the forbidden weaken. The fix is the
+FIXTURE: `Env::new` chowns the out dir to the **planned tuple** (never a fresh lookup —
+R11-06's discipline), in the one place that creates it. One test passed at root only because
+it chowned by hand; that line is now the fixture's job.
+
+**Why nothing caught it, and this is the part worth keeping:** the drop only happens when
+`tool_credentials()` returns `Some`, which needs euid 0 — so the unprivileged run of every
+execution test takes the **no-helper branch**. It ran, it passed, and it exercised a
+different mechanism than production does at root. Not "absent, not passing" in the earlier
+sense (a suite nothing ran) but its sharper relative: a suite that runs, reports green, and
+is about the other branch. Recorded as an instance under `docs/DEFECT_CLASSES.md` class 20.
+
 **D0A-R12-08 — the root execution tests died before their subject.** R11-06's refusal is
 right for production and broke the lane. `build_action` now plans once per process, and
 `decide_credentials(euid, planned)` is split out so the ROOT BRANCH is a unit fact.

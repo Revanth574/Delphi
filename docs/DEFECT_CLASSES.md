@@ -1009,6 +1009,41 @@ thing for one that sees nothing, **and the second is harder to notice because it
 infrastructure trouble.** Not a figure of speech: `Died(6)` was read as a build problem across
 two rounds of diagnosis before a profiled/unprofiled A/B settled it.
 
+### Instance, 2026-08-21 (D0A-R12-11) — when the environment selects a BRANCH, the green is about the other one
+
+The sharpest instance this project has produced, because nothing about the test was wrong
+and the suite was not skipping.
+
+Shape E drops an approved action to `delphi-tool`. The drop only happens when
+`tool_credentials()` returns `Some`, which needs euid 0 — so the **unprivileged** run of
+every execution test takes the **no-helper branch**, and its green describes a code path
+production never takes at root. Seven tests had been failing at root since E landed
+(`cannot create …/out/result: Permission denied` — the tool at uid 997 cannot write an
+`out/` the root test process created), and nothing noticed for as long as the only runs were
+unprivileged.
+
+**This is not "the suite skipped".** It ran, it passed, and it exercised a different
+mechanism than the one under review. A skip is at least legible in the output; a branch
+divergence is invisible — the test names, the count, and the result line are all identical
+between the two environments.
+
+**Two consequences worth carrying:**
+
+* An `euid`-gated code path makes its unprivileged suite non-representative for **every**
+  test that touches it, not only for the tests that name it. The seven failures were spread
+  across tests about tokens, seals and one-shot consumption — none of them "about" the drop.
+* The failures were **the predicted behavioural change arriving on schedule**: the register
+  recorded twice, before E shipped, that dropping the tool off root removes its access to
+  root-owned paths, that any test failing for that reason is CORRECT, and that widening the
+  new uid's access to turn those reds green would be the forbidden weaken. The fix was the
+  FIXTURE (chown the out dir to the planned tuple, in the one place that creates it), not
+  the uid.
+
+**Foreclosing discipline, beyond class 20's general form:** when a privilege gate selects a
+branch, the unprivileged suite cannot report on the privileged branch at all — so the
+privileged run is not a *confirmation* step to be scheduled later, it is the only run that
+has ever executed that code. Name it as owed work at the moment the gate is introduced.
+
 ## 21. A warning banner is not an enforcement mechanism  *(new — B2a composition)*
 
 **Description.** A test harness, probe, or demo renders something that **looks

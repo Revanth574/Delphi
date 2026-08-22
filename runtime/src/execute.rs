@@ -716,10 +716,27 @@ mod tests {
     }
     impl Env {
         fn new(tag: &str) -> Self {
+            // The credential plan must exist before the chown below can know what to chown
+            // TO — and every execution test comes through here or through `build_action`.
+            plan_credentials_once();
             let dir = PathBuf::from(format!("/tmp/delphi-exec-{}-{tag}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             let out_dir = dir.join("out");
             fs::create_dir_all(&out_dir).unwrap();
+            // AT ROOT THE TOOL IS NOT ROOT (D0A-R12-11). Shape E drops the action to
+            // `delphi-tool`, so an `out/` created by the test process — root — is not
+            // writable by the thing under test, and seven tests failed at root with
+            // `cannot create …/out/result: Permission denied`. That is the predicted
+            // consequence of the drop, recorded twice before E shipped: a test that fails
+            // because the tool lost root is CORRECT, and the fixture is what must change.
+            //
+            // Chowned to the PLANNED tuple, never a fresh lookup — the same discipline
+            // R11-06 imposed on production, for the same reason: two resolutions can
+            // disagree. Unprivileged there is no plan and this is a no-op.
+            if let Ok(Some((uid, gid))) = tool_credentials() {
+                std::os::unix::fs::chown(&out_dir, Some(uid), Some(gid))
+                    .expect("chown the out dir to the tool account");
+            }
             Self { exe: dir.join("tool.sh"), result: out_dir.join("result"), out_dir, dir }
         }
     }
@@ -809,8 +826,10 @@ mod tests {
             eprintln!("SKIP an_approved_action_runs_with_the_tool_account_credentials: measured blocker: {DROP_HELPER} does not exist — installer/install.sh installs it");
             return;
         }
+        // `Env::new` chowns the out dir to the planned tuple; this test used to do it
+        // itself, which is why it was the ONE root test that passed while seven others
+        // failed for want of the same line (D0A-R12-11).
         let env = Env::new("tool-uid");
-        std::os::unix::fs::chown(&env.out_dir, Some(tool.uid.as_raw()), None).unwrap();
         let content = format!(
             "#!/bin/sh\ngrep -E '^(Uid|Gid|Groups|CapEff):' /proc/self/status > {}\n",
             env.result.display()

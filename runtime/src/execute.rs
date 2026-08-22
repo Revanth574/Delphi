@@ -460,6 +460,29 @@ mod tests {
         });
     }
 
+    /// D0A-R13-01 — build the action the way PRODUCTION does.
+    ///
+    /// `build_action` below hand-constructs a `PendingAction` with `script: None`, which
+    /// is right for most tests and WRONG for the R9-02 reproductions: a shebang executable
+    /// canonicalizes to a sealed `ScriptPin`, so a hand-built action with `script: None`
+    /// tests a configuration the daemon never creates. Anything asserting a property of
+    /// the exec path against a shebang must come through here.
+    fn canonicalize_for_test(exe: &Path) -> PendingAction {
+        plan_credentials_once();
+        let proposal = crate::wire::pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            fs_binds: vec![],
+            exe_path: exe.to_string_lossy().into_owned(),
+            net_policy: crate::wire::pb::NetPolicy::NetNone as i32,
+            timeout_secs: 30,
+            required_tier: crate::wire::pb::RequiredTier::TierBiometric as i32,
+        };
+        crate::canonicalize::canonicalize(&proposal, "act-exec".into())
+            .expect("canonicalize the proposal")
+    }
+
     fn build_action(exe: &Path, exe_bytes: &[u8], out_dir: &Path) -> PendingAction {
         plan_credentials_once();
         PendingAction {
@@ -907,13 +930,44 @@ mod tests {
             eprintln!("SKIP same_inode_overwrite_executes_unapproved_content: requires bwrap + unprivileged userns");
             return;
         }
+        // D0A-R13-01: THROUGH PRODUCTION CANONICALIZATION, and with a REAL ELF.
+        //
+        // This used a `#!/bin/sh` fixture and a hand-built `PendingAction` with
+        // `script: None` — a configuration `canonicalize` never produces, because a
+        // shebang there becomes a SEALED ScriptPin. So the reproduction attacked a shape
+        // production does not have, and a correct fix could have left it red: unsafe as
+        // an acceptance criterion, which is what R9-02 was being held to.
+        //
+        // An ELF has no ScriptPin either way, so the binary path is the one under test.
+        // gnutrue/gnufalse are two real 35KB ELFs on this box differing in EXIT STATUS,
+        // which is the observable that survives an in-place byte swap.
+        let (approved_elf, substituted_elf) = ("/usr/bin/gnutrue", "/usr/bin/gnufalse");
+        for p in [approved_elf, substituted_elf] {
+            if !std::path::Path::new(p).exists() {
+                eprintln!("SKIP same_inode_overwrite_executes_unapproved_content: measured blocker: {p} does not exist");
+                return;
+            }
+        }
         let env = Env::new("same-inode");
-        let bytes = write_script(&env.exe, "APPROVED", &env.result);
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        fs::copy(approved_elf, &env.exe).unwrap();
+        fs::set_permissions(&env.exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let action = canonicalize_for_test(&env.exe);
+        assert!(action.script.is_none(), "harness: an ELF must canonicalize WITHOUT a ScriptPin");
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
-        let (ino_before, ino_after) = overwrite_in_place(&env.exe, "SUBSTITUTED", &env.result);
+        // Overwrite the SAME inode with the other ELF's bytes.
+        use std::os::unix::fs::MetadataExt;
+        let ino_before = fs::metadata(&env.exe).unwrap().ino();
+        let sub_bytes = fs::read(substituted_elf).unwrap();
+        {
+            use std::io::{Seek, Write};
+            let mut f = fs::OpenOptions::new().write(true).truncate(true).open(&env.exe).unwrap();
+            f.seek(std::io::SeekFrom::Start(0)).unwrap();
+            f.write_all(&sub_bytes).unwrap();
+        }
+        let ino_after = fs::metadata(&env.exe).unwrap().ino();
         assert_eq!(
             ino_before, ino_after,
             "harness: the overwrite must keep the SAME inode, else this silently \
@@ -922,12 +976,13 @@ mod tests {
 
         let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
             .expect("approved exec");
-        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(
-            fs::read_to_string(&env.result).unwrap().trim(),
-            "APPROVED",
+        // The APPROVED bytes exit 0; the SUBSTITUTED bytes exit 1. The pinned fd resolves
+        // to the same inode either way — which is the whole point.
+        assert!(
+            out.status.success(),
             "D0A-R9-02: bytes written behind the pinned inode execute — the digest bound \
-             content that is no longer there"
+             content that is no longer there (exit {:?} is gnufalse's, not gnutrue's)",
+            out.status.code()
         );
     }
 

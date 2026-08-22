@@ -388,8 +388,10 @@ is about the other branch. Recorded as an instance under `docs/DEFECT_CLASSES.md
 **D0A-R12-08 — the root execution tests died before their subject.** R11-06's refusal is
 right for production and broke the lane. `build_action` now plans once per process, and
 `decide_credentials(euid, planned)` is split out so the ROOT BRANCH is a unit fact.
-**STILL UNMEASURED:** that the root tests now reach the drop. `sudo` needs a terminal this
-session does not have; the procedure is `scratch/lane-run-procedure.md` §"ROOT RUN".
+**MEASURED 2026-08-22** — the root lane ran it; see the RE-RUN paragraph above. (This
+sentence previously said "STILL UNMEASURED", contradicting the run recorded 40 lines later —
+D0A-R13-05. A register that disagrees with itself about whether something was measured is
+worse than one that says nothing.)
 
 **D0A-R12-10 — the poisoning guard compared strings**, so `target/../target`, a symlink, or
 a trailing slash walked past it. Canonicalized. Demonstrated at the comparison, because the

@@ -410,10 +410,22 @@ perturb_gnu_osabi() {
     printf '\003' | dd of="$1/delphi-drop" bs=1 seek=7 count=1 conv=notrunc status=none
     chmod 0755 "$1/delphi-drop"
 }
+# D0A-R13-03: EI_OSABI 9, EI_ABIVERSION 7 and EI_VERSION 255 are NOT load-determining on
+# Linux — the reviewer modified the real built delphi-drop to each in turn and every one
+# still reached `main`. R12-06 replaced a full-header equality with a smaller hand allowlist
+# that still refused these, which is the same false-refusal defect one size down.
+perturb_exotic_ident() {
+    cp "$NATIVE_STATIC" "$1/delphi-drop"
+    printf '\377' | dd of="$1/delphi-drop" bs=1 seek=6 count=1 conv=notrunc status=none   # EI_VERSION=255
+    printf '\011' | dd of="$1/delphi-drop" bs=1 seek=7 count=1 conv=notrunc status=none   # EI_OSABI=9
+    printf '\007' | dd of="$1/delphi-drop" bs=1 seek=8 count=1 conv=notrunc status=none   # EI_ABIVERSION=7
+    chmod 0755 "$1/delphi-drop"
+}
 
 echo
 echo "D0A-R10-11 — staged-binary ELF identity:"
 binary_accept_case "EI_OSABI 3 (GNU) is ACCEPTED, not refused" perturb_gnu_osabi
+binary_accept_case "EI_VERSION/OSABI/ABIVERSION exotic but RUNNABLE -> ACCEPTED" perturb_exotic_ident
 binary_refuse_case "helper built for another machine (aarch64 vs x86-64)" \
                    perturb_foreign_helper "this system runs"
 binary_refuse_case "staged binary is not an ELF at all" \

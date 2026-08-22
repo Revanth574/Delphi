@@ -176,17 +176,21 @@ elf_layout_supported() {   # fd -> 0 if ELF64 little-endian version 1
 # perfectly good binary — a false refusal in the installer, which is a real defect and not
 # a conservative one. Bytes 9-15 are PADDING: spec-reserved, ignored by every loader, and
 # comparing them is noise that can only produce false refusals.
-elf_ident_key() {   # fd -> "magic class data version" on stdout; refuses an unusable OSABI
+elf_ident_key() {   # fd -> "magic class data" on stdout
     local -a b
     read -r -a b < <(elf_ident "$1") || true
     [ "${#b[@]}" -eq 16 ] || return 1
-    # EI_OSABI (7): 0 = SYSV, 3 = GNU/Linux. Anything else (Solaris, FreeBSD, …) names a
-    # loader this system does not have.
-    [ "${b[7]}" = "0" ] || [ "${b[7]}" = "3" ] || return 1
-    # EI_ABIVERSION (8) is 0 for every Linux binary in practice; a nonzero value is a
-    # convention this installer does not know how to check, so it refuses rather than guess.
-    [ "${b[8]}" = "0" ] || return 1
-    printf '%s %s %s %s %s %s %s' "${b[0]}" "${b[1]}" "${b[2]}" "${b[3]}" "${b[4]}" "${b[5]}" "${b[6]}"
+    # BYTES 0-5 ONLY (D0A-R13-03): magic, EI_CLASS, EI_DATA. Those decide whether this
+    # machine can load the file at all.
+    #
+    # EI_VERSION (6), EI_OSABI (7) and EI_ABIVERSION (8) are NOT load-determining on Linux,
+    # and that is measured rather than assumed: the reviewer modified the real built
+    # delphi-drop to EI_OSABI=9, EI_ABIVERSION=7 and EI_VERSION=255 in turn, and each one
+    # still reached `main`. R12-06 replaced a full-header equality with a smaller hand
+    # allowlist that still refused runnable artifacts — the same false-refusal defect, one
+    # size down. A guard that refuses what the loader accepts is wrong even when it is
+    # "conservative".
+    printf '%s %s %s %s %s %s' "${b[0]}" "${b[1]}" "${b[2]}" "${b[3]}" "${b[4]}" "${b[5]}"
 }
 
 # THE LIMITS OF THIS PARSER, DECLARED RATHER THAN DISCOVERED. It handles **ELF64,
@@ -214,15 +218,25 @@ elf_interp() {   # fd -> sets INTERP (empty if none); exit 1 on a header it will
     phoff=$(elf_u "$1" 32 8)      || return 1
     phentsize=$(elf_u "$1" 54 2)  || return 1
     phnum=$(elf_u "$1" 56 2)      || return 1
-    [ "$phentsize" -ge 56 ] || return 0        # no usable program headers
-    size=$(stat -L -c '%s' "/proc/self/fd/$1") || return 1
-    [ "$phoff" -le "$size" ] || return 1
-    [ $(( phoff + phnum * phentsize )) -le "$size" ] || return 1
+    # THE KERNEL'S OWN BOUNDS, not ours (D0A-R13-02). `>= 56` admitted any 16-bit
+    # e_phentsize, and `phnum * phentsize` with two 16-bit fields reaches ~4.29 GB — on a
+    # sparse staged file that is an enormous `od` and a larger `awk` array, in the root
+    # installer. Linux requires e_phentsize == sizeof(Elf64_Phdr) EXACTLY and caps the whole
+    # program-header table at 65536 bytes (fs/binfmt_elf.c), so a file outside those bounds
+    # is one the kernel would refuse to load anyway. Bounding by what the loader accepts
+    # admits 257 headers — R12-05's point — without an arbitrary count of our own.
+    [ "$phentsize" -eq 56 ] || return 1
     [ "$phnum" -gt 0 ] || return 0
+    [ $(( phnum * 56 )) -le 65536 ] || return 1
+    size=$(stat -L -c '%s' "/proc/self/fd/$1") || return 1
+    # SUBTRACTION, not addition: `phoff + table` can overflow bash's signed arithmetic into
+    # a negative that satisfies `<= size`. Comparing the remaining space cannot.
+    [ "$phoff" -le "$size" ] || return 1
+    [ $(( size - phoff )) -ge $(( phnum * 56 )) ] || return 1
 
     # One read, one scan. awk groups the byte stream into `esz`-sized records and reports the
     # first whose p_type is PT_INTERP (3), emitting its p_offset and p_filesz.
-    found=$(od -An -tu1 -j"$phoff" -N$(( phnum * phentsize )) "/proc/self/fd/$1" \
+    found=$(od -An -tu1 -j"$phoff" -N$(( phnum * 56 )) "/proc/self/fd/$1" \
         | tr -s ' ' '\n' | grep -E '^[0-9]+$' \
         | awk -v esz="$phentsize" '
             { b[n++] = $1 }
@@ -259,9 +273,11 @@ elf_interp() {   # fd -> sets INTERP (empty if none); exit 1 on a header it will
     [ "$last" = "0" ] || return 1
     raw=$(dd if="/proc/self/fd/$1" bs=1 skip="$p_offset" count=$(( p_filesz - 1 )) 2>/dev/null; printf 'X')
     raw=${raw%X}
-    # Length equality also rejects an EMBEDDED NUL: bash drops those in the substitution too,
-    # so a short result means the string is not what the header describes.
-    [ "${#raw}" -eq $(( p_filesz - 1 )) ] || return 1
+    # BYTES, NOT CHARACTERS (D0A-R13-04). `${#raw}` counts CHARACTERS under a UTF-8 locale,
+    # so `/tmp/é/ld.so` — 13 bytes — measured 12 and was refused as though it carried an
+    # embedded NUL. A valid non-ASCII interpreter path is not a defect to refuse. `wc -c`
+    # counts bytes regardless of locale, which is the quantity the ELF header describes.
+    [ "$(printf '%s' "$raw" | wc -c)" -eq $(( p_filesz - 1 )) ] || return 1
     INTERP="$raw"
     return 0
 }
@@ -286,8 +302,7 @@ for bin in delphi-runtimed delphi-drop delphi-shell delphi-minimal-ai; do
     # reports a byte-7 complaint about a file that is not an ELF at all.
     [ "${ident%% *}" = "127" ] && [ "${ident#127 69 76 70}" != "$ident" ] || \
         refuse "$bin does not start with the ELF magic — it is not an executable this installer may place in /usr/libexec"
-    key=$(elf_ident_key "$fd") || refuse "$bin has an e_ident this installer will not accept
-  (EI_OSABI must be 0 (SYSV) or 3 (GNU) and EI_ABIVERSION must be 0): $ident"
+    key=$(elf_ident_key "$fd") || refuse "$bin has no readable ELF identification header: $ident"
     [ "$key" = "$REF_KEY" ] || refuse "$bin's ELF class/encoding differs from this machine's
   reference (/proc/self/exe): $REF_KEY
   $bin: $key

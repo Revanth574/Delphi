@@ -22,12 +22,36 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §6 | "**seccomp default-deny**" | **ABSENT** — no `--seccomp` anywhere in `sandbox.rs` | D0A-R9-05 | a policy is attached and a denied syscall is proven denied |
 | §6 | "**cgroup v2 mem/pids/CPU caps**" | **ABSENT** | D0A-R9-04 | caps applied and a breach proven contained |
 | §6 | "**timeout + kill-on-expiry**" | **ABSENT** — `action.timeout` is unenforced | D0A-R9-04 | an over-running action is killed, RED-proven |
-| §3 | **CLOSED 2026-08-22 — TRUST_MODEL v7.** The action binds a **sealed executable snapshot**: `seal_executable_snapshot` copies the bytes into `memfd_create(MFD_EXEC \| MFD_ALLOW_SEALING \| MFD_CLOEXEC)`, applies and **verifies** `F_SEAL_SEAL \| F_SEAL_EXEC \| F_SEAL_WRITE \| F_SEAL_FUTURE_WRITE \| F_SEAL_SHRINK \| F_SEAL_GROW`, and `execute` re-checks the seals at the choke point. Both reviewer reproductions are green: the same-inode overwrite no longer reaches execution (through PRODUCTION canonicalization, with a real ELF), and a nested shebang is REFUSED at canonicalization (v7 named limit 1) rather than substituted at exec. **The helper is covered**, which the row required: `build.rs` embeds its SHA-256 and the daemon refuses a `/usr/libexec/delphi-drop` that is not those bytes, then executes a sealed snapshot of them — so path substitution is irrelevant. Weaken-proven (comparison neutered → the modified helper is accepted). **Residual, in §3 as named limit 2:** a sealed dynamic ELF still resolves its loader and DSOs by path; those are a DECLARED immutable platform TCB member, not a pinned dependency. **Root-lane confirmation is owed** — the helper path executes only at euid 0 (class 20). <br><br> SUPERSEDED ROW: | (superseded) |
-| §3 | "**the digest is the binding** for preview = approval = sandbox = audit" | **PARTIAL, AND NARROWER THAN FIRST RECORDED (corrected 2026-08-13, before the tests were written).** The **script body IS content-pinned** — `execute.rs:138` enforces `ScriptPin::FULL_SEALS` on `script_memfd`, so its bytes and length cannot change after the digest. The gap is the **binary and interpreter** side: `executable_fd` and `interpreter_fd` are plain `File::open` fds — **inode-pinned, never sealed, and `executable_digest` is not re-verified at exec**. Same-inode overwrite and nested-shebang swap execute unapproved bytes **there** (both reproduced by the reviewer) | D0A-R9-02 | the binary/interpreter side is content-pinned, with both substitutions as failing-then-passing tests — **AND the drop helper is covered by it.** `execute.rs` opens `/usr/libexec/delphi-drop` by PATH, so it carries this same inode-vs-content gap for itself; opening once per process shrinks the window to process start but does not close it. The helper is the one component whose substitution grants **uid control**, so it is the worst candidate for an exemption: **R9-02 may not be closed without answering it** |
 | §6 | "mount exactly `fs_binds`" | **PARTIAL** — bind sources are **path-resolved at launch**, so a symlink swap substitutes scope | D0A-R9-03 | binds resolve to what was approved, TOCTOU-proven |
 | §6 | "env is scrubbed to `env_delta`" | **LEAKS** — `env_delta` is passed in **bwrap's argv**, world-readable via `/proc/<pid>/cmdline` | D0A-R9-06 | secrets never transit argv |
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | **CLOSED 2026-08-15** — `sandbox::refuse_denied_bind` refuses every spelling (lexical fold + canonicalize), wired at the `run_fd_pinned` choke point, with a positive control. Both weakens bite: removing the call site lets execution reach bwrap (`bwrap: Can't find source path /run/delphi/alice` — it would have BOUND it where the path exists); removing traversal folding fails `/tmp/../run/delphi/alice` |
+
+**CLOSED — D0A-R9-02 (2026-08-22), and the row is removed per this file's own rule.**
+§3's clause now holds because the contract changed to match what a mechanism can actually
+deliver: **TRUST_MODEL v7** binds an **immutable content snapshot**, not a filesystem object.
+`seal_executable_snapshot` copies the bytes into `memfd_create(MFD_EXEC | MFD_ALLOW_SEALING
+| MFD_CLOEXEC)`, applies **and verifies** `F_SEAL_SEAL | F_SEAL_EXEC | F_SEAL_WRITE |
+F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW`, and `execute` re-checks the seals at the
+choke point every execution passes rather than trusting the constructor.
+
+Both reviewer reproductions are green, and both were REBUILT before they were fixed
+(D0A-R13-01): the same-inode case now runs through **production canonicalization** with a
+real ELF, because the shebang fixture it used tested a shape `canonicalize` never
+produces — it would have been an unsafe acceptance criterion. The nested case became a
+**rejection** test: a nested shebang is refused at canonicalization (v7 named limit 1)
+rather than substituted at exec.
+
+**The helper is covered, which this row required before it could close.** `build.rs` hashes
+the helper it just built and embeds `DELPHI_DROP_DIGEST`; the daemon refuses a
+`/usr/libexec/delphi-drop` whose bytes are not that digest, then executes a sealed snapshot
+of them. Weaken-proven: with the comparison neutered, a one-bit-modified helper is accepted.
+
+**Two residuals, both named rather than implied.** A sealed **dynamic** ELF still resolves
+its loader and DSOs by path — declared in §3 as an immutable platform TCB member, **not** a
+pinned dependency. And the helper path and credential drop execute **only at euid 0**, so
+everything above is the unprivileged half; the root lane is owed (class 20 — the gap that
+made seven tests silently non-representative for 15 commits).
 
 **CLOSED — D0A-R9-11 (2026-08-15).** The daemon now refuses to serve a **system account**
 before the anchor: `uid == 0`, or outside the system's own `UID_MIN..=UID_MAX` from

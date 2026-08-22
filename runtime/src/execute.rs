@@ -34,7 +34,7 @@
 //!    into bwrap or the jailed tool; only the pinned program fd(s) survive.
 
 use std::collections::HashSet;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
 
@@ -115,13 +115,63 @@ pub const DROP_HELPER: &str = "/usr/libexec/delphi-drop";
 /// content-pinned) for itself. Opening once shrinks the substitution window from
 /// every action to process start; closing it fully is recorded as an obligation on
 /// R9-02 in `docs/CONFORMANCE_REGISTER.md`.
-static DROP_HELPER_FD: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+static DROP_HELPER_FD: std::sync::OnceLock<Option<std::os::fd::OwnedFd>> = std::sync::OnceLock::new();
 
-fn drop_helper() -> Result<&'static std::fs::File, RuntimeError> {
-    DROP_HELPER_FD
-        .get_or_init(|| std::fs::File::open(DROP_HELPER).ok())
-        .as_ref()
-        .ok_or_else(|| RuntimeError::MissingDropHelper { path: DROP_HELPER.to_string() })
+/// The helper's SHA-256, fixed when this daemon was built (`build.rs`).
+///
+/// D0A-R9-02 step 6. The helper was opened by PATH, so it carried the same inode-vs-content
+/// gap v7 closed for the tool — and it is the one component whose substitution grants **uid
+/// control**, because it is what calls `setresuid`. A build-time constant is what lets the
+/// daemon tell "the helper I was built against" from "whatever is at that path now".
+pub const DROP_HELPER_DIGEST: &str = env!("DELPHI_DROP_DIGEST");
+
+/// Compare a candidate helper's bytes against the compiled-in digest.
+///
+/// Pure, so the refusal is provable without root or an installed helper.
+///
+/// # Errors
+///
+/// [`RuntimeError::MissingDropHelper`] naming the mismatch — a helper that is not the one
+/// this daemon was built against is refused, not run.
+fn verify_helper_digest(bytes: &[u8], expected_hex: &str) -> Result<(), RuntimeError> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if got != expected_hex {
+        return Err(RuntimeError::MissingDropHelper {
+            path: format!(
+                "{DROP_HELPER} is not the helper this daemon was built against \
+                 (built {expected_hex}, installed {got}) — re-run installer/install.sh"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The helper, read once, **verified against the compiled digest**, and held as a sealed
+/// executable snapshot.
+///
+/// After this, path substitution is irrelevant: what executes is a sealed memfd whose bytes
+/// were checked against a constant fixed at build time.
+fn drop_helper() -> Result<std::os::fd::BorrowedFd<'static>, RuntimeError> {
+    let cell = DROP_HELPER_FD.get_or_init(|| {
+        let bytes = std::fs::read(DROP_HELPER).ok()?;
+        verify_helper_digest(&bytes, DROP_HELPER_DIGEST).ok()?;
+        crate::action::seal_executable_snapshot(&bytes).ok()
+    });
+    match cell {
+        Some(fd) => Ok(fd.as_fd()),
+        None => {
+            // Distinguish "absent" from "wrong bytes" for the operator, at the cost of one
+            // extra read on a path that is already failing.
+            match std::fs::read(DROP_HELPER) {
+                Ok(bytes) => verify_helper_digest(&bytes, DROP_HELPER_DIGEST)
+                    .and(Err(RuntimeError::MissingDropHelper { path: DROP_HELPER.to_string() })),
+                Err(_) => Err(RuntimeError::MissingDropHelper { path: DROP_HELPER.to_string() }),
+            }
+        }
+    }
 }
 
 /// Open the drop helper at daemon startup, so the pin is taken before any action runs.
@@ -555,6 +605,38 @@ mod tests {
             required_tier: RequiredTier::Biometric,
             script: None,
         }
+    }
+
+    /// D0A-R9-02 step 6 — the helper is bound to a BUILD-TIME digest, provable without
+    /// root and without an installed helper.
+    ///
+    /// The helper opened by PATH was the last piece of R9-02: sealing the tool's snapshot
+    /// while leaving the component that calls `setresuid` substitutable fixes the smaller
+    /// half. The daemon now refuses a helper that is not the one it was built against.
+    #[test]
+    fn the_drop_helper_is_bound_to_the_digest_this_daemon_was_built_with() {
+        // The constant exists and is a SHA-256 — a build script that silently emitted
+        // nothing would otherwise make every comparison below vacuous.
+        assert_eq!(DROP_HELPER_DIGEST.len(), 64, "digest: {DROP_HELPER_DIGEST}");
+        assert!(DROP_HELPER_DIGEST.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // The bytes it was built from verify against it. Read from the build's own copy,
+        // so this also proves the constant matches the artifact rather than itself.
+        let built = std::path::Path::new(env!("OUT_DIR")).join("delphi-drop");
+        let bytes = fs::read(&built).expect("the build script's helper");
+        verify_helper_digest(&bytes, DROP_HELPER_DIGEST).expect("built bytes must verify");
+
+        // ONE BYTE CHANGED IS REFUSED, and the refusal names both digests.
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let err = verify_helper_digest(&tampered, DROP_HELPER_DIGEST)
+            .expect_err("a modified helper must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("built") && msg.contains("installed") && msg.contains(DROP_HELPER_DIGEST),
+            "the refusal must name what was expected and what was found: {msg}"
+        );
     }
 
     /// D0A-R12-08 — the credential DECISION, all four combinations, without root.

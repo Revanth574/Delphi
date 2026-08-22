@@ -104,6 +104,26 @@ fn main() {
     std::fs::rename(&tmp, &staged)
         .unwrap_or_else(|e| panic!("renaming the drop helper {} -> {}: {e}", tmp.display(), staged.display()));
 
+    // D0A-R9-02 step 6: EMBED THE HELPER'S DIGEST IN THE DAEMON.
+    //
+    // `execute.rs` opens /usr/libexec/delphi-drop by PATH, so the helper carried the same
+    // inode-vs-content gap v7 closed for the tool — and it is the ONE component whose
+    // substitution grants uid control, since it is what calls setresuid. Sealing its
+    // snapshot at startup binds the bytes; comparing them to a digest fixed AT BUILD TIME
+    // is what makes a substituted installation refuse rather than run.
+    //
+    // Hashed from the bytes just built, so the constant and the artifact cannot disagree.
+    let helper_bytes = std::fs::read(&helper)
+        .unwrap_or_else(|e| panic!("reading the built drop helper {}: {e}", helper.display()));
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&helper_bytes);
+        h.finalize()
+    };
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    println!("cargo:rustc-env=DELPHI_DROP_DIGEST={hex}");
+
     // B1: compile the AI↔daemon general-socket wire schema (protobuf, prost).
     println!("cargo:rerun-if-changed=proto/runtime_wire.proto");
     prost_build::compile_protos(&["proto/runtime_wire.proto"], &["proto"])

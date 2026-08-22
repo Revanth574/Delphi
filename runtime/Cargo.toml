@@ -79,6 +79,10 @@ tempfile = { workspace = true, optional = true }
 [build-dependencies]
 # B1: compile runtime/proto/runtime_wire.proto into Rust types.
 prost-build = "0.13"
+# D0A-R9-02 step 6: hash the drop helper AT BUILD TIME so the daemon can require the
+# installed one to be those exact bytes. Already a runtime dependency of this crate
+# (workspace-pinned); using it here adds no new supply-chain surface.
+sha2 = { workspace = true }
 
 [features]
 # B1 test-only: a logind-verdict override the binary-flow test uses (WSL2 sessions

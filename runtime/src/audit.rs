@@ -157,7 +157,10 @@ mod tests {
         PendingAction {
             pending_id: "act-audit".into(),
             preview_version: 1,
-            executable_fd: fs::File::open("/dev/null").unwrap().into(),
+            // TRUST_MODEL v7: a sealed snapshot, as canonicalize builds. This action is
+            // never executed (the test only digests it), but constructing one production
+            // cannot is how a fixture drifts from its subject.
+            executable_fd: crate::action::seal_executable_snapshot(b"").unwrap(),
             executable_digest: [0xAB; 32],
             argv: vec!["tool".into()],
             cwd: PathBuf::from("/"),
@@ -257,7 +260,7 @@ mod tests {
         PendingAction {
             pending_id: "act-exit7".into(),
             preview_version: 1,
-            executable_fd: fs::File::open(exe).unwrap().into(),
+            executable_fd: crate::action::seal_executable_snapshot(&fs::read(exe).unwrap()).unwrap(),
             executable_digest: [0x11; 32],
             argv: vec!["tool".into()],
             cwd: PathBuf::from("/"),

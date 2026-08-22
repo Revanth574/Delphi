@@ -266,6 +266,24 @@ fn exec_tail(
     args
 }
 
+/// TRUST_MODEL v7: refuse a program fd that is not a fully sealed executable snapshot.
+///
+/// # Errors
+///
+/// [`RuntimeError::Syscall`] if `F_GET_SEALS` fails; [`RuntimeError::UnsealedScript`] if any
+/// seal in [`crate::action::EXEC_SEALS`] is missing.
+fn require_exec_sealed(fd: RawFd) -> Result<(), RuntimeError> {
+    // SAFETY: F_GET_SEALS reads the memfd's seal bitmask; it touches no caller memory.
+    let seals = unsafe { nix::libc::fcntl(fd, nix::libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(RuntimeError::Syscall { op: "fcntl F_GET_SEALS (program fd)", source: Errno::last() });
+    }
+    if seals & crate::action::EXEC_SEALS != crate::action::EXEC_SEALS {
+        return Err(RuntimeError::UnsealedScript);
+    }
+    Ok(())
+}
+
 /// Build the bwrap invocation and execute the **fd-pinned** program inside it
 /// (`/proc/self/fd/N` — the swap-proof inode).
 ///
@@ -280,6 +298,15 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // seal set defeats script-CONTENT/LENGTH-mutation. Refuse before any exec path.
     if let Some(sp) = &action.script {
         require_fully_sealed(sp.script_memfd.as_raw_fd())?;
+    }
+    // TRUST_MODEL v7 (D0A-R9-02): the program fd must be a fully sealed SNAPSHOT. Verified
+    // HERE, at the one choke point every execution passes, rather than trusting the
+    // constructor — the same reason the script's seals are re-checked here despite
+    // `ScriptPin::sealed` having applied them. A fd that arrived by any other path, or a
+    // future constructor that forgets, is refused instead of exec'd.
+    require_exec_sealed(action.executable_fd.as_raw_fd())?;
+    if let Some(sp) = &action.script {
+        require_exec_sealed(sp.interpreter_fd.as_raw_fd())?;
     }
     // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
     // is defence in depth on top of the uid drop rather than the barrier itself.
@@ -403,17 +430,6 @@ mod tests {
     /// opens the existing file `O_TRUNC`, so an fd already open on it observes the
     /// new bytes. Returns (inode before, inode after) so a caller can PROVE the pin
     /// was intact and simply did not apply (D0A-R9-02).
-    fn overwrite_in_place(path: &Path, marker: &str, out: &Path) -> (u64, u64) {
-        use std::os::unix::fs::MetadataExt;
-        let before = fs::metadata(path).unwrap().ino();
-        let content = format!("#!/bin/sh\necho {marker} > {}\n", out.display());
-        fs::write(path, &content).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        (before, fs::metadata(path).unwrap().ino())
-    }
-
-    /// A script whose shebang names `interp` — the interpreter the KERNEL resolves
-    /// by path *after* the fd-pin has already fixed this file's inode.
     fn write_script_with_interp(path: &Path, interp: &Path) -> Vec<u8> {
         let content = format!("#!{}\n", interp.display());
         fs::write(path, &content).unwrap();
@@ -467,28 +483,62 @@ mod tests {
     /// canonicalizes to a sealed `ScriptPin`, so a hand-built action with `script: None`
     /// tests a configuration the daemon never creates. Anything asserting a property of
     /// the exec path against a shebang must come through here.
-    fn canonicalize_for_test(exe: &Path) -> PendingAction {
+    /// The fallible form, for tests asserting that canonicalization REFUSES.
+    fn canonicalize_for_test_err(exe: &Path) -> Result<PendingAction, RuntimeError> {
         plan_credentials_once();
-        let proposal = crate::wire::pb::Propose {
+        use crate::wire::pb;
+        let proposal = pb::Propose {
             argv: vec!["tool".into()],
             cwd: "/".into(),
             env_delta: vec![],
             fs_binds: vec![],
             exe_path: exe.to_string_lossy().into_owned(),
-            net_policy: crate::wire::pb::NetPolicy::NetNone as i32,
+            net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 30,
-            required_tier: crate::wire::pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        crate::canonicalize::canonicalize(&proposal, "act-exec".into())
+    }
+
+    fn canonicalize_for_test(exe: &Path) -> PendingAction {
+        plan_credentials_once();
+        use crate::wire::pb;
+        let proposal = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            // THE SAME BINDS `build_action` USES. Empty binds gave
+            // `bwrap: execvp /proc/self/fd/4: No such file or directory` — which reads as
+            // "the fd did not survive" and is in fact "the dynamic loader is not in the
+            // jail", the exact ambiguity `runtime/helper/delphi-drop.rs` documents for its
+            // own first false RED. gnutrue is dynamically linked; the snapshot is fine.
+            fs_binds: vec![
+                pb::Bind { path: "/usr".into(), mode: pb::BindMode::BindReadOnly as i32 },
+                pb::Bind { path: "/bin".into(), mode: pb::BindMode::BindReadOnly as i32 },
+                pb::Bind { path: "/lib".into(), mode: pb::BindMode::BindReadOnly as i32 },
+                pb::Bind { path: "/lib64".into(), mode: pb::BindMode::BindReadOnly as i32 },
+            ],
+            exe_path: exe.to_string_lossy().into_owned(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 30,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
         };
         crate::canonicalize::canonicalize(&proposal, "act-exec".into())
             .expect("canonicalize the proposal")
     }
 
-    fn build_action(exe: &Path, exe_bytes: &[u8], out_dir: &Path) -> PendingAction {
+    /// TRUST_MODEL v7: builds from BYTES, not a path — the action binds content, so the
+    /// fixture no longer needs to know where the content came from.
+    fn build_action(exe_bytes: &[u8], out_dir: &Path) -> PendingAction {
         plan_credentials_once();
         PendingAction {
             pending_id: "act-exec".into(),
             preview_version: 1,
-            executable_fd: fs::File::open(exe).unwrap().into(),
+            // TRUST_MODEL v7: a SEALED SNAPSHOT, as canonicalize builds. A plain
+            // `File::open` fd is refused at the exec choke point now, which is the point —
+            // a fixture that can construct an action production cannot is a fixture that
+            // tests a shape production never has (D0A-R13-01, generalized).
+            executable_fd: crate::action::seal_executable_snapshot(exe_bytes).unwrap(),
             executable_digest: sha256(exe_bytes),
             argv: vec!["tool".into()],
             cwd: PathBuf::from("/"),
@@ -546,7 +596,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("t");
         fs::write(&exe, b"x").unwrap();
-        let mut action = build_action(&exe, b"x", &dir);
+        let mut action = build_action(b"x", &dir);
         action.argv = vec!["approved-name".into(), "--flag".into()];
 
         let with = exec_tail(&action, Some(9), Some((997, 972)), 7, None);
@@ -581,10 +631,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("t");
         fs::write(&exe, b"x").unwrap();
-        let mut action = build_action(&exe, b"x", &dir);
+        let mut action = build_action(b"x", &dir);
         action.argv = vec!["approved-name".into(), "rest".into()];
         action.script = Some(ScriptPin {
-            interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_fd: crate::action::seal_executable_snapshot(&fs::read("/bin/sh").unwrap()).unwrap(),
             interpreter_digest: [0u8; 32],
             interpreter_arg: Some("-e".into()),
             script_memfd: write_sealed_only_memfd(b"#!/bin/sh\n"),
@@ -637,7 +687,7 @@ mod tests {
             eprintln!("SKIP the_tool_receives_its_approved_argv0: measured blocker: cannot read /bin/sh");
             return;
         };
-        let mut action = build_action(&shell, &bytes, &env.out_dir);
+        let mut action = build_action(&bytes, &env.out_dir);
         // `sh -c CMD` with no operand leaves `$0` as the shell's own argv[0] — which
         // is exactly what `--argv0` (or the helper) sets, so it is observable.
         action.argv = vec![
@@ -694,7 +744,7 @@ mod tests {
         let pf = fs::File::open(&env.exe).unwrap();
         let (h, p) = (hf.as_raw_fd(), pf.as_raw_fd());
 
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let action = build_action(&bytes, &env.out_dir);
         let mut args = SandboxProfile::derive(&action).args().to_vec();
         args.push("--".into());
         args.push(format!("/proc/self/fd/{h}"));
@@ -779,7 +829,7 @@ mod tests {
         }
         let env = Env::new("ok");
         let bytes = write_script(&env.exe, "APPROVED", &env.result);
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let action = build_action(&bytes, &env.out_dir);
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
         // Swap the PATH (new inode) after approval; the fd keeps the original.
@@ -805,7 +855,7 @@ mod tests {
         }
         let env = Env::new("swap");
         let bytes = write_script(&env.exe, "APPROVED", &env.result);
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let action = build_action(&bytes, &env.out_dir);
         swap_script(&env.exe, "SWAPPED", &env.result);
 
         let out = execute_via_path(&action, &env.exe);
@@ -859,7 +909,7 @@ mod tests {
         );
         fs::write(&env.exe, &content).unwrap();
         fs::set_permissions(&env.exe, fs::Permissions::from_mode(0o755)).unwrap();
-        let action = build_action(&env.exe, content.as_bytes(), &env.out_dir);
+        let action = build_action(content.as_bytes(), &env.out_dir);
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
@@ -900,7 +950,7 @@ mod tests {
     fn an_action_binding_the_daemon_runtime_directory_is_refused() {
         let env = Env::new("denied-bind");
         let bytes = write_script(&env.exe, "SHOULD-NOT-RUN", &env.result);
-        let mut action = build_action(&env.exe, &bytes, &env.out_dir);
+        let mut action = build_action(&bytes, &env.out_dir);
         action
             .fs_binds
             .push((PathBuf::from("/run/delphi/alice"), BindMode::ReadWrite));
@@ -981,48 +1031,54 @@ mod tests {
         assert!(
             out.status.success(),
             "D0A-R9-02: bytes written behind the pinned inode execute — the digest bound \
-             content that is no longer there (exit {:?} is gnufalse's, not gnutrue's)",
-            out.status.code()
+             content that is no longer there (exit {:?} is gnufalse's, not gnutrue's).\n\
+             bwrap stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
-    /// D0A-R9-02, reviewer reproduction 2 — **NESTED-INTERPRETER substitution**.
+    /// D0A-R9-02, reviewer reproduction 2 — **NESTED-INTERPRETER substitution**, now a
+    /// REJECTION test (TRUST_MODEL v7, named limit 1).
     ///
-    /// The pinned file is never modified: it still hashes to `executable_digest`, and
-    /// the test asserts that. What runs is the interpreter its shebang names, which the
-    /// kernel resolves **by path, after the pin**, and which nothing pins or seals.
-    /// (Nested shebang honoured through `/proc/self/fd/N` — measured on this kernel.)
+    /// It reproduced a substitution: the pinned interpreter was itself a `#!` script, so
+    /// the kernel re-resolved ITS interpreter by path after the pin, and unapproved bytes
+    /// ran. v7 refuses the shape at canonicalization instead of trying to pin a chain —
+    /// the kernel opens every element by path recursively (`fs/binfmt_script.c`), the
+    /// chain's length is attacker-influenced, and a recursive snapshot that misses one
+    /// element fails SILENTLY at exec, which is this finding's own shape.
+    ///
+    /// So the assertion changes from "unapproved bytes ran" to "the action is never built",
+    /// which is a stronger claim about an earlier moment. The substitution it used to
+    /// perform is unreachable: there is no action to execute.
     #[test]
-    fn nested_interpreter_substitution_executes_unapproved_content() {
-        if !bwrap_available() {
-            eprintln!("SKIP nested_interpreter_substitution_executes_unapproved_content: requires bwrap + unprivileged userns");
-            return;
-        }
+    fn a_nested_shebang_interpreter_is_refused_at_canonicalization() {
         let env = Env::new("nested");
+        // interpreter → itself a script. This is the chain v7 refuses.
         let interp = env.out_dir.join("interp");
-        write_script(&interp, "APPROVED-INTERP", &env.result);
+        write_script(&interp, "SUBSTITUTABLE-INTERP", &env.result);
         let bytes = write_script_with_interp(&env.exe, &interp);
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
-        let key = MintingKey::from_bytes(KEY);
-        let token = mint(&key, &canonical_action_digest(&action), NOW);
+        assert!(bytes.starts_with(b"#!"), "harness: the outer file must be a script");
 
-        let (ino_before, ino_after) = overwrite_in_place(&interp, "SUBSTITUTED-INTERP", &env.result);
-        assert_eq!(ino_before, ino_after, "harness: the interpreter swap must be in place");
-        assert_eq!(
-            fs::read(&env.exe).unwrap(),
-            bytes,
-            "harness: the PINNED file must stay byte-identical, or this proves the wrong thing"
+        // `expect_err` needs Debug on the Ok type, which PendingAction deliberately lacks
+        // (it holds fds and a digest that must not be casually printed).
+        let msg = match canonicalize_for_test_err(&env.exe) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a nested shebang must be REFUSED at canonicalization"),
+        };
+        assert!(
+            msg.contains("itself a `#!` script") && msg.contains("named limit 1"),
+            "must refuse for the NESTED-SHEBANG reason, naming the limit: {msg}"
         );
 
-        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
-            .expect("approved exec");
-        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(
-            fs::read_to_string(&env.result).unwrap().trim(),
-            "APPROVED-INTERP",
-            "D0A-R9-02: the pinned inode is correct AND unmodified, yet the code that ran \
-             was resolved by path after the pin"
-        );
+        // POSITIVE CONTROL: the same shape with a REAL interpreter canonicalizes fine, so
+        // "nested is refused" cannot be confused with "scripts are refused".
+        let ok_interp = env.out_dir.join("sh-copy");
+        fs::copy("/bin/sh", &ok_interp).unwrap();
+        fs::set_permissions(&ok_interp, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = write_script_with_interp(&env.exe, &ok_interp);
+        let action = canonicalize_for_test(&env.exe);
+        assert!(action.script.is_some(), "a single-level script must still canonicalize");
     }
 
     /// The gate: an invalid token is rejected (no execution); the ungated path runs
@@ -1035,7 +1091,7 @@ mod tests {
         }
         let env = Env::new("gate");
         let bytes = write_script(&env.exe, "UNAPPROVED", &env.result);
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let action = build_action(&bytes, &env.out_dir);
         let key = MintingKey::from_bytes(KEY);
         // A token minted for a DIFFERENT digest — does not verify against this action.
         let wrong = mint(&key, &[0xFF; 32], NOW);
@@ -1064,7 +1120,7 @@ mod tests {
         }
         let env = Env::new("oneshot");
         let bytes = write_script(&env.exe, "ONCE", &env.result);
-        let action = build_action(&env.exe, &bytes, &env.out_dir);
+        let action = build_action(&bytes, &env.out_dir);
         let key = MintingKey::from_bytes(KEY);
         let token = mint(&key, &canonical_action_digest(&action), NOW);
         let mut ledger = ConsumptionLedger::new();
@@ -1134,9 +1190,9 @@ mod tests {
         let env = Env::new("unsealed");
         let script_src = b"#!/bin/sh\n:\n";
         let mut action =
-            build_action(&env.exe, &write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
+            build_action(&write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
         action.script = Some(crate::action::ScriptPin {
-            interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_fd: crate::action::seal_executable_snapshot(&fs::read("/bin/sh").unwrap()).unwrap(),
             interpreter_digest: sha256(b"interp"),
             interpreter_arg: None,
             script_memfd: unsealed_memfd(script_src), // NOT sealed
@@ -1168,9 +1224,9 @@ mod tests {
         let env = Env::new("partialseal");
         let script_src = b"#!/bin/sh\n:\n";
         let mut action =
-            build_action(&env.exe, &write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
+            build_action(&write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
         action.script = Some(crate::action::ScriptPin {
-            interpreter_fd: fs::File::open("/bin/sh").unwrap().into(),
+            interpreter_fd: crate::action::seal_executable_snapshot(&fs::read("/bin/sh").unwrap()).unwrap(),
             interpreter_digest: sha256(b"interp"),
             interpreter_arg: None,
             script_memfd: write_sealed_only_memfd(script_src), // ONLY F_SEAL_WRITE
@@ -1207,11 +1263,15 @@ mod tests {
             fs::rename(&tmp, &interp).unwrap(); // new inode each time (so the fd pins v1)
         };
         write_interp("INTERP-V1");
-        let interp_fd: std::os::fd::OwnedFd = fs::File::open(&interp).unwrap().into();
+        // TRUST_MODEL v7: the interpreter is a SEALED SNAPSHOT, as canonicalize builds it.
+        // A plain open is refused at the exec choke point now — which is what makes this
+        // test's own subject (the pin defeating a PATH swap) still meaningful: the snapshot
+        // is taken from v1's bytes, so v2 appearing at the path afterwards changes nothing.
+        let interp_fd = crate::action::seal_executable_snapshot(&fs::read(&interp).unwrap()).unwrap();
         // The script: shebang points at the interpreter PATH (the RED re-resolves it).
         let script_src = format!("#!{}\n:\n", interp.display());
 
-        let mut action = build_action(&env.exe, &write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
+        let mut action = build_action(&write_script(&env.exe, "UNUSED", &env.result), &env.out_dir);
         // Bind the dir holding the interpreter (so the RED's shebang path resolves).
         action.fs_binds.push((env.dir.clone(), BindMode::ReadWrite));
         // The sanctioned constructor: a FULLY-sealed script memfd (so the exec-time

@@ -19,7 +19,6 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -61,8 +60,12 @@ pub fn canonicalize(
         path: PathBuf::from(&proposal.exe_path),
         source,
     })?;
+    // TRUST_MODEL v7 (D0A-R9-02): bind an IMMUTABLE SNAPSHOT, not the filesystem object.
+    // The mutable source fd is dropped here — after this line nothing in the action can be
+    // changed by whoever owns the path.
+    let executable_fd = crate::action::seal_executable_snapshot(&bytes)?;
     let executable_digest = sha256(&bytes);
-    let executable_fd: OwnedFd = file.into();
+    drop(file);
 
     // Shebang → pin the interpreter object + seal the script content (R3-04).
     let script = if bytes.starts_with(b"#!") {
@@ -144,8 +147,23 @@ fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
         path: PathBuf::from(interp_path),
         source,
     })?;
+    // TRUST_MODEL v7 NAMED LIMIT 1: a nested shebang is REFUSED, here, before anything
+    // executes. The kernel opens every interpreter in a chain BY PATH, recursively
+    // (fs/binfmt_script.c), so pinning one interpreter leaves the rest unpinned; and
+    // recursively snapshotting a chain fails SILENTLY at exec if it misses an element,
+    // which is R9-02's own shape. Refusing fails closed, loudly, where a human can be told.
+    if interp_bytes.starts_with(b"#!") {
+        return Err(RuntimeError::Protocol(format!(
+            "the script's interpreter `{interp_path}` is itself a `#!` script. The kernel \
+             resolves each interpreter in the chain by PATH, so only the first can be \
+             pinned — a nested chain is refused rather than partially bound \
+             (TRUST_MODEL.md §3 v7, named limit 1)."
+        )));
+    }
     let interpreter_digest = sha256(&interp_bytes);
-    let interpreter_fd: OwnedFd = interp.into();
+    // Snapshotted too: for a script it is the interpreter that actually executes.
+    let interpreter_fd = crate::action::seal_executable_snapshot(&interp_bytes)?;
+    drop(interp);
 
     ScriptPin::sealed(interpreter_fd, interpreter_digest, interpreter_arg, script_bytes)
 }

@@ -131,6 +131,82 @@ impl ScriptPin {
     }
 }
 
+/// `MFD_EXEC` — memfd_create(2)'s "this memfd may be exec'd" flag.
+///
+/// Defined here because this `libc` release does not export it; the value is the kernel's
+/// own, from `/usr/include/linux/memfd.h:14` (`#define MFD_EXEC 0x0010U`). Without it a
+/// memfd created while `vm.memfd_noexec` is 1 or 2 is non-executable, and the exec fails —
+/// which is the fail-closed direction, but for a reason nobody would recognise.
+const MFD_EXEC: nix::libc::c_uint = 0x0010;
+
+/// The seal set an executable snapshot must carry (TRUST_MODEL v7, D0A-R9-02).
+///
+/// Beyond [`ScriptPin::FULL_SEALS`]: `F_SEAL_EXEC` (the exec bits cannot change) and
+/// `F_SEAL_FUTURE_WRITE` (no new writable mapping, even from a fd opened before sealing).
+/// The set is **verified after being applied** — `F_ADD_SEALS` reporting success is not the
+/// same as the seals being present, and the whole property rests on them being present.
+pub(crate) const EXEC_SEALS: i32 = nix::libc::F_SEAL_SEAL
+    | nix::libc::F_SEAL_EXEC
+    | nix::libc::F_SEAL_WRITE
+    | nix::libc::F_SEAL_FUTURE_WRITE
+    | nix::libc::F_SEAL_SHRINK
+    | nix::libc::F_SEAL_GROW;
+
+/// TRUST_MODEL v7 (D0A-R9-02): the immutable snapshot the action binds and the sandbox
+/// executes — **not** the filesystem object it was copied from.
+///
+/// The inode pin this replaces fixed WHICH object ran and never fixed WHAT WAS IN IT: two
+/// reproductions executed unapproved bytes through a correct, unmodified pin. Re-hashing
+/// before `execve` does not close that — `fexecve` does not prevent same-inode modification.
+/// Sealing does, and the kernel enforces it against the exact fd that is exec'd.
+///
+/// # Errors
+///
+/// [`RuntimeError::Syscall`] if `memfd_create` / `write` / `fcntl` fails, or if the seals
+/// are not present after being added.
+pub(crate) fn seal_executable_snapshot(content: &[u8]) -> Result<OwnedFd, RuntimeError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: memfd_create returns a fresh owned fd, wrapped once so RAII closes it on
+    // every error path; the writes are bounded by `content.len()`.
+    let owned = unsafe {
+        let fd = nix::libc::memfd_create(
+            c"delphi-exec".as_ptr(),
+            nix::libc::MFD_CLOEXEC as nix::libc::c_uint
+                | nix::libc::MFD_ALLOW_SEALING as nix::libc::c_uint
+                | MFD_EXEC,
+        );
+        if fd < 0 {
+            return Err(RuntimeError::Syscall { op: "memfd_create (executable snapshot)", source: Errno::last() });
+        }
+        let owned = OwnedFd::from_raw_fd(fd);
+        let mut written = 0usize;
+        while written < content.len() {
+            let n = nix::libc::write(fd, content[written..].as_ptr().cast(), content.len() - written);
+            if n < 0 {
+                return Err(RuntimeError::Syscall { op: "write executable snapshot", source: Errno::last() });
+            }
+            written += n as usize;
+        }
+        owned
+    };
+    // SAFETY: fcntl on an fd this function owns; no caller memory is touched.
+    unsafe {
+        if nix::libc::fcntl(owned.as_raw_fd(), nix::libc::F_ADD_SEALS, EXEC_SEALS) < 0 {
+            return Err(RuntimeError::Syscall { op: "fcntl F_ADD_SEALS (executable snapshot)", source: Errno::last() });
+        }
+        // VERIFIED, not assumed. A successful F_ADD_SEALS is not evidence the seals are
+        // present, and every claim v7 makes rests on their presence.
+        let seals = nix::libc::fcntl(owned.as_raw_fd(), nix::libc::F_GET_SEALS);
+        if seals < 0 {
+            return Err(RuntimeError::Syscall { op: "fcntl F_GET_SEALS (executable snapshot)", source: Errno::last() });
+        }
+        if seals & EXEC_SEALS != EXEC_SEALS {
+            return Err(RuntimeError::Syscall { op: "executable snapshot is not fully sealed", source: Errno::EPERM });
+        }
+    }
+    Ok(owned)
+}
+
 /// Create a memfd holding `content` and seal it fully immutable
 /// ([`ScriptPin::FULL_SEALS`]).
 fn seal_immutable_memfd(content: &[u8]) -> Result<OwnedFd, RuntimeError> {

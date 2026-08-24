@@ -202,7 +202,6 @@ impl SandboxProfile {
             "--unshare-cgroup-try".to_string(),
             "--die-with-parent".to_string(),
             "--new-session".to_string(),
-            "--clearenv".to_string(),
             // Jail infrastructure (not scope): a private /proc is REQUIRED for the
             // `/proc/self/fd/N` swap-proof exec (R3-04); a minimal /dev for basic
             // device access. Neither exposes a path back to the daemon.
@@ -242,11 +241,18 @@ impl SandboxProfile {
             args.push(p.clone());
             args.push(p);
         }
-        for (k, v) in &action.env_delta {
-            args.push("--setenv".to_string());
-            args.push(k.clone());
-            args.push(v.clone());
-        }
+        // D0A-R9-06: THE ENVIRONMENT IS NOT IN ARGV, AND NEITHER IS THE FLAG THAT CLEARED IT.
+        //
+        // `--setenv K V` put every approved value in bwrap's command line, world-readable via
+        // /proc/<pid>/cmdline for as long as bwrap lives — §6 says the env is scrubbed TO
+        // `env_delta`, and it was, in public. `execute` now sets the child environment on the
+        // `Command` itself (`env_clear` + `envs`), so bwrap inherits exactly `env_delta` and
+        // passes it on; `--clearenv` is dropped with it, because it would wipe precisely what
+        // we are handing over.
+        //
+        // Measured before writing: `Command::env_clear()` does NOT break bwrap's own PATH
+        // lookup (the program is resolved against the parent's environment), and a payload
+        // under this shape sees exactly the delta — nothing inherited from the daemon.
         args.push("--chdir".to_string());
         args.push(action.cwd.to_string_lossy().into_owned());
         Self { args }
@@ -680,26 +686,16 @@ mod tests {
             NetPolicy::Full if !has_share_net || has_unshare_net => return false,
             _ => {}
         }
-        // §6 "env is scrubbed to `env_delta`" starts with dropping the daemon's own
-        // environment. Nothing asserted this: removing `--clearenv` passed the whole
-        // suite (D0A-R9-08 recorded the gap; the mutation audit measured it).
-        if !args.iter().any(|a| a == "--clearenv") {
-            return false;
-        }
-        // …and the OTHER half of that clause: exactly `env_delta`, nothing more and
-        // nothing less. Dropping the emission entirely also passed the whole suite
-        // (D0A-R11-01's rebuilt audit) — `--clearenv` alone leaves the approved variables
-        // missing, which is a different failure from leaking the daemon's.
-        let setenv: Vec<(&String, &String)> = args
-            .windows(3)
-            .filter(|w| w[0] == "--setenv")
-            .map(|w| (&w[1], &w[2]))
-            .collect();
-        if setenv.len() != action.env_delta.len() {
+        // §6 "env is scrubbed to `env_delta`" — and D0A-R9-06 changed WHERE that is done.
+        // The values must not appear in argv at all: `/proc/<pid>/cmdline` is world-readable,
+        // so `--setenv SECRET value` published every approved secret for bwrap's lifetime.
+        // The environment now travels on the `Command`, so the assertion here is that argv
+        // carries NEITHER the flag nor any value.
+        if args.iter().any(|a| a == "--setenv" || a == "--clearenv") {
             return false;
         }
         for (k, v) in &action.env_delta {
-            if !setenv.iter().any(|(sk, sv)| *sk == k && *sv == v) {
+            if args.iter().any(|a| a == k || a == v) {
                 return false;
             }
         }
@@ -744,25 +740,72 @@ mod tests {
             "the real derivation must enforce exactly the approved scope"
         );
 
-        // …and the check must FAIL on env divergence in either direction, or the leg above
-        // proves only that it agrees with itself.
-        let mut extra = SandboxProfile::derive(&action).args().to_vec();
-        extra.extend(["--setenv".into(), "SECRET".into(), "leaked".into()]);
+        // …and the check must FAIL if any approved value appears in argv. D0A-R9-06 moved
+        // the environment onto the `Command`, so the property changed from "the right
+        // --setenv pairs are present" to "no value is on the command line at all" — which
+        // is what /proc/<pid>/cmdline exposes.
+        let mut leaked = SandboxProfile::derive(&action).args().to_vec();
+        leaked.extend(["--setenv".into(), "TZ".into(), "UTC".into()]);
         assert!(
-            !args_enforce_scope(&extra, &action),
-            "an env var beyond the approved delta must not pass as the approved scope"
+            !args_enforce_scope(&leaked, &action),
+            "an approved value re-appearing in argv must fail the scope check — that is the leak"
         );
-        let dropped: Vec<String> = {
-            let args = SandboxProfile::derive(&action).args().to_vec();
-            let at = args.iter().position(|a| a == "--setenv").expect("a --setenv is emitted");
-            let mut v = args.clone();
-            v.drain(at..at + 3);
-            v
-        };
+    }
+
+    /// D0A-R9-06 — the approved environment reaches the tool, and is NOT in argv.
+    ///
+    /// Two halves that used to be one `--setenv`: the values must ARRIVE (env fidelity) and
+    /// must not be PUBLISHED (`/proc/<pid>/cmdline` is world-readable for bwrap's lifetime).
+    /// Asserting only the first would pass with the leak restored; asserting only the second
+    /// would pass if the environment never arrived at all.
+    #[test]
+    fn the_approved_env_reaches_the_tool_and_never_appears_in_argv() {
+        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
+            eprintln!("SKIP the_approved_env_reaches_the_tool…: measured blocker: bwrap not executable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("delphi-r906-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_file = dir.join("env.txt");
+
+        let mut action = action_with(vec![(dir.clone(), BindMode::ReadWrite)], NetPolicy::None);
+        action.env_delta = vec![("DELPHI_SECRET".into(), "s3cret-value".into())];
+
+        let mut args = SandboxProfile::derive(&action).args().to_vec();
+        // NOT IN ARGV — the property the finding was about.
         assert!(
-            !args_enforce_scope(&dropped, &action),
-            "a MISSING approved env var must not pass either"
+            !args.iter().any(|a| a == "s3cret-value" || a == "--setenv" || a == "--clearenv"),
+            "the approved value must not be on bwrap's command line: {args:?}"
         );
+
+        args.extend(["--ro-bind".into(), "/usr".into(), "/usr".into()]);
+        for (link, at) in [("usr/bin", "/bin"), ("usr/lib", "/lib"), ("usr/lib64", "/lib64")] {
+            args.extend(["--symlink".into(), link.into(), at.into()]);
+        }
+        args.extend([
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("env > {}", out_file.display()),
+        ]);
+        // The env travels the way production sends it: on the Command, not in the args.
+        let out = std::process::Command::new("bwrap")
+            .args(&args)
+            .env_clear()
+            .envs(action.env_delta.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+
+        // AND IT ARRIVED — with nothing of the daemon's alongside it.
+        let seen = std::fs::read_to_string(&out_file).unwrap();
+        println!("  the tool's environment:\n{seen}");
+        assert!(seen.contains("DELPHI_SECRET=s3cret-value"), "the approved value must arrive: {seen}");
+        for leaked_var in ["CARGO", "HOME", "PATH=/usr/local/sbin"] {
+            assert!(!seen.contains(leaked_var), "the daemon's environment leaked: {seen}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// RED-proof (same check, derivation the only variable): a broadening

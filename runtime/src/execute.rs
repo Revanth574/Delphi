@@ -462,6 +462,12 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
 
     let mut cmd = Command::new("bwrap");
     cmd.args(&args);
+    // D0A-R9-06: the approved environment travels HERE, not in argv. bwrap inherits exactly
+    // `env_delta` and passes it to the payload; nothing of the daemon's own environment
+    // survives `env_clear`, which is what `--clearenv` used to do at the cost of publishing
+    // every value in /proc/<pid>/cmdline.
+    cmd.env_clear();
+    cmd.envs(action.env_delta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     // 1D-03 / §6: extend the 1b fd-discipline to execute. In the child, before
     // bwrap's exec, mark every inherited fd >= 3 close-on-exec and un-mark only the
     // program fd(s). No daemon fd (the approval channel, the anchor socket, ...)

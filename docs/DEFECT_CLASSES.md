@@ -2411,6 +2411,49 @@ two processes.
 
 ---
 
+## 44. A restore whose PRECONDITION is absent looks exactly like a successful one  *(new — D0A-R14 remediation; the mechanism existed and was not used)*
+
+**What happened.** After weakening a check to prove it bites, the restore was
+`cp "$W/exA.keep" runtime/src/execute.rs`. The backup had never been written — the scratchpad
+directory did not exist, so the earlier `cp` had failed too. The restore `cp` then failed
+identically. **The next two commands measured the WEAKENED tree and reported clean:**
+`EXECUTED 137 / SKIPPED 23` and `clippy rc=0`, both of code that no longer existed as
+committed.
+
+**What caught it was the ABSENCE of a line.** Not an error, not a failing test, not a diff —
+the `&& echo "restored byte-identical"` never printed, and only reading for a line that
+wasn't there separated a clean measurement from a fictional one. Nothing else in the pipeline
+disagreed.
+
+**Why "verify the restore" is the wrong remedy, and this is the point of the entry:** the
+rule already existed (`CLAUDE.md` §6, and class 18's "verify a RESTORE by diff, never by
+green"), and it was broken anyway by someone who had written it down twice that week. This is
+the same shape as class 42's `--unshare-net`: **a mechanism present and not used.**
+
+**The remedy is that a restore step must FAIL LOUDLY WHEN ITS OWN PRECONDITION IS ABSENT.**
+At the exit-code level being watched, `cp` from a nonexistent path and `cp` from a valid one
+are indistinguishable — the failure is on stderr, in a pipeline whose next command overwrites
+attention with a green. So:
+
+```bash
+cp "$FILE" "$BACKUP" || { echo "BACKUP FAILED — do not weaken"; exit 2; }   # before touching anything
+… weaken, measure …
+cp "$BACKUP" "$FILE" || { echo "RESTORE FAILED — the tree is WEAKENED"; exit 2; }
+diff -q "$BACKUP" "$FILE" || { echo "RESTORE INCOMPLETE"; exit 2; }
+```
+
+**The ordering matters more than the checks:** the backup's success is a precondition of the
+weaken, not a step beside it. A weaken performed without a proven backup is a change with no
+way home, and the moment to discover that is before the tree is modified — not after two
+measurements have been published from it.
+
+**Distinct from class 18** (the verification loop mutates its subject): there the *subject*
+is destroyed and the discipline is a tracked-ness pre-flight. Here the *restore* silently
+does nothing, the subject survives in a modified state, and every downstream measurement is
+of the wrong tree while reporting success.
+
+---
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |
@@ -2457,5 +2500,6 @@ two processes.
 | 39. First-ordered check that never fires in time | discipline — **the mechanism already exists** (`scripts/check-free-space.sh`): run it at block START and before any bulk write; on an unexplained tool failure suspect the SUBSTRATE before the harness | Discipline (nothing to extract) |
 | 40. Sandbox scaffolding blocks the measurement | bwrap auto-creates intermediates `0700` owned by the sandbox uid: emit `--perms 0755 --dir` per ancestor when the payload's uid differs, and pair every such probe with a positive control | Discipline + production constraint |
 | 41. Assertion at the wrong altitude | discipline: **does the assertion observe the layer where the property would be violated?** Assert there, even when it costs a real run, a before/after snapshot, or a second discriminating leg | Discipline |
+| 44. Restore with an absent precondition | discipline + shape: the BACKUP's success is a precondition of the weaken (`cp … || exit`), the restore fails loudly (`cp … || exit`), and the diff confirms it — because at the exit-code level being watched, a `cp` from a nonexistent path is indistinguishable from a successful one | Discipline (mechanizable in every weaken script) |
 | 43. One error string, two processes | discipline: an assertion about a spawned process CARRIES that process's stderr in its failure message; suspect the CHILD's namespace before the PARENT's fd table when the string is `No such file or directory` | Discipline |
 | 42. Negative assertion resting on a removed default | assert the POSITIVE wherever one exists ("the narrowing is applied", not only "the widening is absent"); when an umbrella default is removed, find the assertions that relied on it by DELETING the new explicit thing and seeing what fails — `scratch/d0a-mutation-audit.sh` is that search, mechanised | Discipline + a mutation harness |

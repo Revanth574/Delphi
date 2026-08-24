@@ -23,7 +23,6 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §6 | "**cgroup v2 mem/pids/CPU caps**" | **ABSENT** | D0A-R9-04 | caps applied and a breach proven contained |
 | §6 | "**timeout + kill-on-expiry**" | **ABSENT** — `action.timeout` is unenforced | D0A-R9-04 | an over-running action is killed, RED-proven |
 | §6 | "mount exactly `fs_binds`" | **PARTIAL** — bind sources are **path-resolved at launch**, so a symlink swap substitutes scope | D0A-R9-03 | binds resolve to what was approved, TOCTOU-proven |
-| §6 | "env is scrubbed to `env_delta`" | **LEAKS** — `env_delta` is passed in **bwrap's argv**, world-readable via `/proc/<pid>/cmdline` | D0A-R9-06 | secrets never transit argv |
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | **CLOSED 2026-08-15** — `sandbox::refuse_denied_bind` refuses every spelling (lexical fold + canonicalize), wired at the `run_fd_pinned` choke point, with a positive control. Both weakens bite: removing the call site lets execution reach bwrap (`bwrap: Can't find source path /run/delphi/alice` — it would have BOUND it where the path exists); removing traversal folding fails `/tmp/../run/delphi/alice` |
 
@@ -62,6 +61,24 @@ deployment has needed. Refused deliberately.
 no run:** PAM stack unchanged (`md5sum -c` OK), no stale sessions, 0 leaked daemons, and the
 test binary proven current by a forced rebuild with an unchanged sha (`fb8c6c123685…`) rather
 than by mtime — the rule that was systematically wrong for hook-built binaries.
+
+**CLOSED — D0A-R9-06 (2026-08-23).** `env_delta` no longer transits argv. `--setenv K V`
+published every approved value in `/proc/<pid>/cmdline` — world-readable for as long as bwrap
+lived — while satisfying §6's "scrubbed to `env_delta`" in public. The environment now travels
+on the `Command` (`env_clear` + `envs`), so bwrap inherits exactly the delta and passes it on;
+`--clearenv` went with it, since it would wipe what we are handing over.
+
+**Measured before it was written** (`Command::env_clear()` does not break bwrap's own PATH
+lookup, and a payload under this shape sees exactly the delta). **Both halves are asserted,
+because one alone passes with the defect:** the value must ARRIVE (a real bwrap run reads the
+tool's environment and finds `DELPHI_SECRET=s3cret-value`, with none of the daemon's) and must
+NOT be in argv. Weaken — restore the `--setenv` loop — and the second fails, printing the
+command line with `s3cret-value` in it.
+
+**Fixed rather than excepted.** This file committed to recording an "explicit dated exception
+to Iron Law #2" if R9-06 were still open at the next merge to `main`. An exception is a dated
+admission that a known defect ships; taking one for something fixable inside the same review
+window is the worse trade, so **no exception is recorded and none is owed**.
 
 **CLOSED — D0A-R9-02 (2026-08-22), and the row is removed per this file's own rule.**
 §3's clause now holds because the contract changed to match what a mechanism can actually

@@ -260,8 +260,16 @@ mod tests {
         PendingAction {
             pending_id: "act-exit7".into(),
             preview_version: 1,
+            // D0A-R14-03: the REAL digest. `[0x11; 32]` described nothing the action held;
+            // it survived only because nothing verified the snapshot against it until the
+            // choke-point check landed.
             executable_fd: crate::action::seal_executable_snapshot(&fs::read(exe).unwrap()).unwrap(),
-            executable_digest: [0x11; 32],
+            executable_digest: {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(fs::read(exe).unwrap());
+                h.finalize().into()
+            },
             argv: vec!["tool".into()],
             cwd: PathBuf::from("/"),
             env_delta: vec![],

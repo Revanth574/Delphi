@@ -334,6 +334,50 @@ fn require_exec_sealed(fd: RawFd) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// TRUST_MODEL v7 + D0A-R14-03: the sealed fd's CONTENTS must be what the action's digest
+/// says, checked at the choke point rather than trusted from canonicalization.
+///
+/// # Errors
+///
+/// [`RuntimeError::Unapproved`] if the snapshot does not hash to the recorded digest — the
+/// same error an unverifiable token gets, because it is the same failure: what is about to
+/// run is not what was approved.
+fn require_digest_matches(fd: RawFd, expected: &[u8; 32], what: &str) -> Result<(), RuntimeError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    // SAFETY: borrow the fd for the read without taking ownership — the action still owns it
+    // and must keep it open for the exec.
+    let mut f = std::mem::ManuallyDrop::new(unsafe {
+        <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    });
+    // The snapshot is sealed, so its length cannot change under us; a fresh read from offset
+    // 0 sees exactly the bytes the digest covered.
+    use std::io::Seek;
+    f.rewind().map_err(|source| RuntimeError::Filesystem {
+        op: "rewind the sealed snapshot",
+        path: std::path::PathBuf::from(format!("<{what} snapshot>")),
+        source,
+    })?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|source| RuntimeError::Filesystem {
+            op: "read the sealed snapshot",
+            path: std::path::PathBuf::from(format!("<{what} snapshot>")),
+            source,
+        })?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let got: [u8; 32] = h.finalize().into();
+    if got != *expected {
+        return Err(RuntimeError::Unapproved);
+    }
+    Ok(())
+}
+
 /// Build the bwrap invocation and execute the **fd-pinned** program inside it
 /// (`/proc/self/fd/N` — the swap-proof inode).
 ///
@@ -355,8 +399,20 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     // `ScriptPin::sealed` having applied them. A fd that arrived by any other path, or a
     // future constructor that forgets, is refused instead of exec'd.
     require_exec_sealed(action.executable_fd.as_raw_fd())?;
+    // D0A-R14-03: SEALS ARE NOT IDENTITY. The check above proves the bytes cannot change;
+    // it says nothing about WHICH bytes. An action could carry a perfectly sealed snapshot
+    // of something other than what was approved — and the digest binding, which §3 calls
+    // "the binding for preview = approval = sandbox = audit", was established at
+    // canonicalization and never checked again at the point of use.
+    //
+    // Hashing here is race-free ONLY BECAUSE the fd is sealed: that is what re-hashing
+    // before `execve` could not achieve on a plain file (fexecve does not prevent same-inode
+    // modification), and it is the property v7 bought. Cost is one pass over the snapshot.
+    require_digest_matches(action.executable_fd.as_raw_fd(), &action.executable_digest, "executable")?;
     if let Some(sp) = &action.script {
         require_exec_sealed(sp.interpreter_fd.as_raw_fd())?;
+        require_digest_matches(sp.interpreter_fd.as_raw_fd(), &sp.interpreter_digest, "interpreter")?;
+        require_digest_matches(sp.script_memfd.as_raw_fd(), &sp.script_digest, "script")?;
     }
     // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
     // is defence in depth on top of the uid drop rather than the barrier itself.
@@ -605,6 +661,48 @@ mod tests {
             required_tier: RequiredTier::Biometric,
             script: None,
         }
+    }
+
+    /// D0A-R14-03 — a SEALED snapshot that is not the APPROVED one is refused.
+    ///
+    /// Seals prove the bytes cannot change; they say nothing about WHICH bytes. The digest
+    /// binding §3 calls "the binding for preview = approval = sandbox = audit" was
+    /// established at canonicalization and never checked again at the point of use — so an
+    /// action carrying a perfectly sealed snapshot of something else would have executed it.
+    ///
+    /// Hashing at exec is race-free ONLY BECAUSE the fd is sealed. That is exactly what
+    /// re-hashing a plain file could not achieve (`fexecve` does not prevent same-inode
+    /// modification), and it is the property v7 bought.
+    #[test]
+    fn a_sealed_snapshot_that_is_not_the_approved_one_is_refused() {
+        if !bwrap_available() {
+            eprintln!("SKIP a_sealed_snapshot_that_is_not_the_approved_one_is_refused: requires bwrap + unprivileged userns");
+            return;
+        }
+        let env = Env::new("digest-mismatch");
+        let approved = write_script(&env.exe, "APPROVED", &env.result);
+        let mut action = build_action(&approved, &env.out_dir);
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        // POSITIVE CONTROL FIRST: the honest action runs, so the refusal below cannot be
+        // "everything is refused".
+        let ok = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("the approved action must run");
+        assert!(ok.status.success(), "bwrap: {}", String::from_utf8_lossy(&ok.stderr));
+
+        // Now swap the SNAPSHOT for a sealed one holding different bytes, leaving the
+        // digest — and the token minted over it — untouched. Seals are intact; identity is
+        // not. This is the case seal-checking alone admits.
+        let other = format!("#!/bin/sh\necho SUBSTITUTED > {}\n", env.result.display());
+        action.executable_fd = crate::action::seal_executable_snapshot(other.as_bytes()).unwrap();
+        let token2 = mint(&key, &canonical_action_digest(&action), NOW);
+        let err = execute_approved(&action, &token2, &key, NOW, &mut ConsumptionLedger::new())
+            .expect_err("a sealed snapshot that is not the approved one must be refused");
+        assert!(
+            matches!(err, RuntimeError::Unapproved),
+            "must be refused as UNAPPROVED — what is about to run is not what was approved: {err:?}"
+        );
     }
 
     /// D0A-R9-02 step 6 — the helper is bound to a BUILD-TIME digest, provable without
@@ -1349,7 +1447,8 @@ mod tests {
         // A plain open is refused at the exec choke point now — which is what makes this
         // test's own subject (the pin defeating a PATH swap) still meaningful: the snapshot
         // is taken from v1's bytes, so v2 appearing at the path afterwards changes nothing.
-        let interp_fd = crate::action::seal_executable_snapshot(&fs::read(&interp).unwrap()).unwrap();
+        let interp_v1_bytes = fs::read(&interp).unwrap();
+        let interp_fd = crate::action::seal_executable_snapshot(&interp_v1_bytes).unwrap();
         // The script: shebang points at the interpreter PATH (the RED re-resolves it).
         let script_src = format!("#!{}\n:\n", interp.display());
 
@@ -1359,7 +1458,11 @@ mod tests {
         // The sanctioned constructor: a FULLY-sealed script memfd (so the exec-time
         // require_fully_sealed check passes on the legitimate path).
         action.script = Some(
-            ScriptPin::sealed(interp_fd, sha256(b"INTERP-V1"), None, script_src.as_bytes())
+            // D0A-R14-03: the REAL digest of the interpreter bytes. This was
+            // `sha256(b"INTERP-V1")` — the marker string, not the interpreter — so the
+            // action carried a digest describing nothing it held. Harmless while nothing
+            // checked it; the choke-point check found it immediately.
+            ScriptPin::sealed(interp_fd, sha256(&interp_v1_bytes), None, script_src.as_bytes())
                 .expect("seal script memfd"),
         );
         let key = MintingKey::from_bytes(KEY);

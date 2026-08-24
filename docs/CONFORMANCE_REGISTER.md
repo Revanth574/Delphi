@@ -84,8 +84,10 @@ the helper it just built and embeds `DELPHI_DROP_DIGEST`; the daemon refuses a
 of them. Weaken-proven: with the comparison neutered, a one-bit-modified helper is accepted.
 
 **Two residuals, both named rather than implied.** A sealed **dynamic** ELF still resolves
-its loader and DSOs by path — declared in §3 as an immutable platform TCB member, **not** a
-pinned dependency. And the helper path and credential drop execute **only at euid 0**, so
+its loader and DSOs by path. This paragraph originally called that "a DECLARED immutable
+platform TCB member"; **D0A-R14-01 falsified the declaration the next day** and it is struck
+from §3 — see the standing table above. What remains is an **accepted gap** with three named
+hops, not a boundary. And the helper path and credential drop execute **only at euid 0**, so
 everything above is the unprivileged half; the root lane is owed (class 20 — the gap that
 made seven tests silently non-representative for 15 commits).
 

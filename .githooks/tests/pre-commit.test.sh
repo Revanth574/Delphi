@@ -151,7 +151,12 @@ run "no baseline present -> REFUSE (was: allowed with a note)" 1 "$(mkrepo "$REA
 echo
 echo "  --- weakens: each must let a defect through ---"
 # G1: restore the `set -e`-killing form (the command substitution without `|| true`).
-sed 's#counts=\$(scripts/test-count.sh -p delphi-runtime --lib --bins 2>/dev/null || true)#counts=$(scripts/test-count.sh -p delphi-runtime --lib --bins 2>/dev/null)#' \
+# DERIVED, not hard-coded (2026-08-23). This sed named the hook's exact arguments, so
+# widening the gate's scope from `--lib --bins` to `--tests` left the weaken matching
+# nothing — and the suite correctly refused to report a result about the SHIPPED hook,
+# which counted as a failure for three commits. A weaken that hard-codes its subject's
+# text is the fixture-follows-subject problem (class 17) inside a weaken.
+sed -E 's#(counts=\$\(scripts/test-count\.sh .*) \|\| true\)#\1)#' \
     "$REAL" > "$work/hook-g1"; chmod +x "$work/hook-g1"
 if diff -q "$REAL" "$work/hook-g1" >/dev/null; then
     echo "  WEAKEN G1 DID NOT APPLY — the next line would be about the SHIPPED hook"; fail=$((fail+1))

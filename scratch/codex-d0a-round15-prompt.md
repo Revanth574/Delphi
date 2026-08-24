@@ -15,8 +15,7 @@ lines; all 17 test targets pass. Any failure you see is real.
 
 ## Target
 
-`git diff b4e38e2..ce6687e` — **5 commits, 11 files changed, 530 insertions(+), 98
-deletions(-).** PINNED. **If your stat disagrees, report that first.**
+`git diff b4e38e2..1931dc2` — **6 commits, 13 files changed, 678 insertions(+), 99 deletions(-).** PINNED. **If your stat disagrees, report that first.**
 
 **The scope is deliberately narrow — it is exactly what changed since round 14.** After a
 FAIL the temptation is to widen the prompt to demonstrate thoroughness; the honest scope is
@@ -137,6 +136,18 @@ fix sketch.
 **The two answers worth more than findings:** does the current §3 overclaim anywhere else,
 and does the struck-text record belong in the normative document or the register?
 
-**Current state:** clippy `-D warnings` rc=0; **17 targets, 0 failures**; `EXECUTED 139 /
-SKIPPED 23 / reported 162`; `ALL 9 SHELL SUITES PASS`; root lane (2026-08-22, pre-dating
-changes 1 and 3) `18 passed / 0 failed`.
+**Current state:** clippy `-D warnings` rc=0; **17 cargo targets, 0 failures**;
+`EXECUTED 139 / SKIPPED 23 / reported 162`; **ALL 9 SHELL SUITES PASS**; root lane
+(2026-08-22, **pre-dating changes 1 and 3** — neither has run at euid 0) `18 passed / 0
+failed`.
+
+**One figure in this prompt was wrong until it was re-derived, and the correction is part of
+the evidence.** It claimed all 9 shell suites passed; the run said 1 of 9 FAILED. Widening the
+gate to `--tests` had left the hook-test's G1 weaken matching nothing, so that suite refused
+to report a result about the shipped hook — correct behaviour, counted as a failure, unnoticed
+for three commits because **nothing local runs the shell suites** (the pre-commit gate runs
+cargo tests; only CI invokes `run-shell-suites.sh`). Fixed in `1931dc2`: the weaken now derives
+its target. **A change to the hook broke the hook's own suite and the hook could not notice —
+D0A-R14-03's shape, one layer out.** Worth your view on whether that should be closed by
+mechanism or left recorded, given a gate running every shell suite per commit is one that gets
+`--no-verify`'d.

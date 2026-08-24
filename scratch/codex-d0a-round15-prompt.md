@@ -3,6 +3,21 @@
 <!-- Invocation: codex review - < scratch/codex-d0a-round15-prompt.md
      Every range-selection flag rejects a PROMPT positional; the scope is carried here. -->
 
+## PROMPT VERSION 2 — CHECK THIS FIRST, THE FILE HAS BEEN REISSUED
+
+**If the three finding labels `[static]` / `[probe]` / `[suite]` do not appear a few lines
+below, you are reading VERSION 1 — a stale copy — and should stop and say so.**
+
+Version 1 told you to stop if you could not run the sandbox lanes. It was withdrawn on
+2026-08-23. **A review has already been run twice against version 1**, the second time after
+this file had been corrected in the tree — the verdict quoted an instruction that no longer
+exists here. The prompt pinned the DIFF RANGE and never pinned ITSELF, which is
+`docs/DEFECT_CLASSES.md` class 19 (runs compared under different instruments) applied to the
+instrument that directs the review.
+
+**The invocation reads this file at run time (`codex review - < …`), so re-run it rather than
+reusing an earlier session.**
+
 ## BEFORE ANYTHING — READ THIS, IT REPLACES A WORSE INSTRUCTION
 
 **Round 15's first issue told you to stop if you could not run the sandbox lanes, and you

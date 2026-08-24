@@ -942,6 +942,28 @@ the comparison is auditable after the fact rather than reconstructed from memory
 
 ---
 
+### Instance, 2026-08-23 — class 19 applied to THE PROMPT (the instrument that directs the review)
+
+Every review prompt in this project pins its **diff range** to an explicit SHA, because
+D0A-R10-02 established that a moving endpoint cannot be checked against a fixed manifest.
+**No prompt pinned ITSELF.**
+
+Round 15 was reissued after its stop-instruction was withdrawn, and the next review still
+quoted the withdrawn instruction verbatim — a run against a stale copy of the file, made
+after the file had changed in the tree. Nothing in the prompt let either party notice: the
+reviewer had no way to tell which version they held, and the operator had no reason to
+suspect a mismatch, because the range still matched.
+
+**Foreclosing shape:** a prompt carries a **VERSION line and a self-check the reader can
+perform without external state** — "if section X does not appear below, you hold an older
+copy; stop and say so." Content-addressed rather than date-addressed, because a date in a
+stale file is as stale as the rest of it.
+
+**Why it belongs under class 19 rather than as a new class:** it is exactly "runs compared
+under different instruments" — the review ran under a different instrument than the one in
+the tree, and the difference was invisible in the output. The instrument here happens to be
+prose rather than a script, which changes nothing about the failure.
+
 ## 20. A correctly-biting test in a NON-REPRESENTATIVE environment  *(new — B2a composition)*
 
 **Description.** A test is written well: it is RED-proven, its weaken/restore

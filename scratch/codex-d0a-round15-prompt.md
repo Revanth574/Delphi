@@ -3,20 +3,17 @@
 <!-- Invocation: codex review - < scratch/codex-d0a-round15-prompt.md
      Every range-selection flag rejects a PROMPT positional; the scope is carried here. -->
 
-## PROMPT VERSION 2 — CHECK THIS FIRST, THE FILE HAS BEEN REISSUED
+## ROUND 15, VERSION 2 — THERE IS NO INSTRUCTION TO STOP IN THIS PROMPT
 
-**If the three finding labels `[static]` / `[probe]` / `[suite]` do not appear a few lines
-below, you are reading VERSION 1 — a stale copy — and should stop and say so.**
+**First, check you are holding this file and not an earlier round's.** The prompts for rounds
+12, 13, 14 and round 15 version 1 ALL carried a "say so and stop" instruction. It is
+withdrawn. If the labels `[static]` / `[probe]` / `[suite]` do not appear below, you have an
+older prompt: **say which one as your first line, then review whatever you can read.**
 
-Version 1 told you to stop if you could not run the sandbox lanes. It was withdrawn on
-2026-08-23. **A review has already been run twice against version 1**, the second time after
-this file had been corrected in the tree — the verdict quoted an instruction that no longer
-exists here. The prompt pinned the DIFF RANGE and never pinned ITSELF, which is
-`docs/DEFECT_CLASSES.md` class 19 (runs compared under different instruments) applied to the
-instrument that directs the review.
-
-**The invocation reads this file at run time (`codex review - < …`), so re-run it rather than
-reusing an earlier session.**
+Three consecutive runs have returned no verdict, each quoting that withdrawn instruction —
+the last two after it had been removed here. No copy of it survives in this file; the other
+four files that contain it are the archived prompts for earlier rounds. The invocation reads
+this file at run time, so start a FRESH run rather than continuing an earlier session.
 
 ## BEFORE ANYTHING — READ THIS, IT REPLACES A WORSE INSTRUCTION
 
@@ -26,8 +23,7 @@ produced their most valuable findings — R13-01, R14-01, R14-02 — from **read
 running targeted probes**, not from the test suite. "Stop" discarded the capability that has
 actually found things.
 
-**So: stop ONLY if you cannot READ the tree.** Otherwise review, and label each finding with
-what it rests on:
+**Review with whatever you can read, and label each finding by what it rests on:**
 
 - **[static]** — code reading, contract-vs-implementation, no execution needed.
 - **[probe]** — a controlled experiment you constructed (your `PT_INTERP` and `env`

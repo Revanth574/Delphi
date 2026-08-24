@@ -194,21 +194,71 @@ capability reduction and it is the reason this limit is written in the normative
 than left in an implementation comment — someone who hits it deserves an explanation, not a
 puzzle.
 
-### NAMED LIMIT 2 — the loader and system libraries are a DECLARED platform TCB member
+### NAMED LIMIT 2 — **WITHDRAWN AS FALSE (2026-08-23, D0A-R14-01)**
 
-A sealed **dynamic** ELF still names `PT_INTERP`, and that loader resolves its DSOs **by
-path** at runtime. Sealing the executable does not seal them.
+**The previous text declared the dynamic loader and system libraries an immutable platform
+TCB member.** That declaration is withdrawn, not softened, because measurement removed it: an
+approved binary **names its own `PT_INTERP`**, so it can select a loader the operator never
+placed — and a controlled probe confirmed that replacing that loader after sealing changes
+the code that executes.
 
-So the contract does **not** claim that every transitive code dependency is pinned. It
-claims: the dynamic loader and the system libraries it resolves are an **immutable platform
-TCB member** — installer-placed, root-owned, and in the same trust class as `bwrap` and
-`delphi-drop`, both of which the action already never names. Anything outside that class
-that a tool loads at runtime is **outside the digest binding**, and this document says so
-rather than leaving the boundary to be inferred.
+**A declaration the attacker can invalidate is not a weaker boundary. It is not a boundary.**
+It is struck from the normative text rather than qualified, and this paragraph stays as the
+record that it was asserted for one day and falsified by the next round.
 
-**Declared, because an undeclared TCB member is how D0A-R10-12 started** — the pre-drop
-window's capability enlargement was real, unremarkable in itself, and dangerous precisely
-because nothing had written down who occupied it.
+### WHAT v7 BINDS, STATED AT ITS ACTUAL EXTENT (2026-08-23, D0A-R14-01/02)
+
+**v7 binds THE FIRST OBJECT.** The bytes that `execve` receives are a sealed snapshot, the
+seals are kernel-enforced, and the digest covers exactly those bytes. That is a real property
+and it is more than existed before this increment.
+
+**v7 does NOT bind the execution chain.** Three hops are known and reachable; each was
+demonstrated by probe, not argued:
+
+| hop | how it escapes the binding |
+|---|---|
+| **`PT_INTERP`** | a sealed *dynamic* ELF names its loader by path; the loader then resolves DSOs by path. Neither is sealed. |
+| **`#!/usr/bin/env python3`** | `env` is snapshotted faithfully — and then resolves `python3` through `PATH` at runtime. The binding stops at `env`. |
+| **`binfmt_misc`** | a registered handler introduces the same unbound interpreter hop, chosen by the kernel from the file's magic. |
+
+**This is an ACCEPTED GAP, recorded rather than closed**, and the reasoning for accepting it
+is the reasoning that produced v7: say what is true rather than build toward what was
+claimed. Computing and binding a dependency closure would add a new mechanism to the surface
+that has produced findings in **seven consecutive review rounds** — and a closure that misses
+one element fails **silently at exec**, which is precisely D0A-R9-02's shape. Reintroducing
+that failure mode to support a claim no deployment has yet needed is the wrong trade.
+
+**THE CONFIGURATION WHERE FIRST-OBJECT BINDING IS TOTAL — offered, not imposed.** A
+**statically linked native ELF** has no downstream hops: no `PT_INTERP`, no interpreter, no
+handler. For such a program "the first object is bound" and "everything that executes is
+bound" are the same statement. A deployment that needs closure obtains it **by construction**
+— by shipping static tools — rather than by trusting a computation of ours. `delphi-drop` is
+already built this way for an unrelated reason (§6's mount discipline), which is evidence the
+constraint is livable where it matters most.
+
+### NAMED LIMIT 1 — NARROWED to what it does (2026-08-23, D0A-R14-02)
+
+It refuses an interpreter whose snapshot **begins with a literal `#!`**. That is what the
+mechanism does and all it does. It was written as though it closed the interpreter chain; it
+does not — `env`-style dispatch and `binfmt_misc` handlers pass it untouched. The refusal is
+kept because a literal nested chain is the one hop we can refuse at canonicalization, where
+failure is loud; the claim around it is corrected.
+
+### THE SNAPSHOT'S EXECUTE POLICY — ADOPTED EXPLICITLY (2026-08-23, D0A-R14-04)
+
+A source **without** execute permission becomes an **executable** snapshot: the bytes are
+copied into an `MFD_EXEC` memfd regardless of the source's mode, and a mode-0644 file yields
+a runnable object.
+
+**Adopted as policy rather than fixed**, because the alternative contradicts v7 itself:
+inheriting the source's mode — or refusing on it — would assert that the snapshot carries the
+source's *identity*, which is exactly the path/inode claim v7 stopped making. The approval
+gate, not the filesystem's execute bit, is what authorises execution here.
+
+**Stated in the normative text because it is a real change** in what an operator can expect:
+a file they left non-executable, and a `noexec` mount they relied on, do not prevent an
+**approved** action from running those bytes. That belongs in a document, not in a reader's
+eventual surprise.
 
 - **The digest is the binding** for preview = approval = sandbox = audit. The no-`..`
   `canonical_hash` discipline means a new `PendingAction`/`ScriptPin` field cannot be

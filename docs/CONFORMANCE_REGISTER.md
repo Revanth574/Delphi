@@ -27,20 +27,36 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | **CLOSED 2026-08-15** — `sandbox::refuse_denied_bind` refuses every spelling (lexical fold + canonicalize), wired at the `run_fd_pinned` choke point, with a positive control. Both weakens bite: removing the call site lets execution reach bwrap (`bwrap: Can't find source path /run/delphi/alice` — it would have BOUND it where the path exists); removing traversal folding fails `/tmp/../run/delphi/alice` |
 
-## PROVEN WITH ROOT EVIDENCE vs DECLARED — read this before citing anything below (2026-08-22)
+## STANDING — PROVEN / DECLARED / **FALSIFIED** (three states, 2026-08-23)
 
-The distinction this file exists to keep. Both columns are honest; only one is a measurement.
+The distinction this file exists to keep, and it needed a **third** state the day after it
+was written: D0A-R14-01 produced the first **falsification** — a property this document had
+listed as *declared* and which measurement then removed. A two-state table would have
+absorbed that as a quiet edit to a "declared" row. It gets its own column so the next one
+cannot.
+
+**The three states are not degrees of confidence. They are different kinds of claim:**
+*proven* is a measurement, *declared* is a trust decision we are making openly, and
+*falsified* is a statement that was made and is now known to be untrue.
 
 | property | standing |
 |---|---|
-| the action runs as `delphi-tool` — all four uids/gids, empty `Groups:`, `CapEff` zero | **ROOT-MEASURED** (`Uid: 997 997 997 997`, lane run 2026-08-22) |
-| bytes written behind a pinned inode do not execute | **ROOT-MEASURED** — `same_inode_overwrite_…` green at root, through production canonicalization with a real ELF |
-| the drop helper is the one this daemon was built against | **ROOT-MEASURED** — the digest binding fires at root; helper hashes matched across built/installed/staged |
-| a nested shebang never reaches execution | **PROVEN AT CANONICALIZATION** — refused before any exec, so there is no root-only half to measure |
-| the credential plan reaches execution (R12-08) | **ROOT-MEASURED** (18 passed / 0 failed, no `CredentialsNotPlanned`) |
-| **the loader and system libraries are immutable** (§3 named limit 2) | **DECLARED, NOT ENFORCED.** A sealed dynamic ELF still resolves `PT_INTERP` and its DSOs **by path**. Nothing in this tree verifies them. It is a statement about who we trust, in the same class as `bwrap` — and it is written down precisely so it is not mistaken for a mechanism |
-| **the pre-drop window is bounded** (D0A-R10-12) | **NEITHER.** The mitigation (restrict the helper to `CAP_SETUID`/`CAP_SETGID`) is named and unimplemented; the window's duration is unmeasured. An intuition, recorded as an obligation |
+| the action runs as `delphi-tool` — all four uids/gids, empty `Groups:`, `CapEff` zero | **PROVEN** (root lane 2026-08-22: `Uid: 997 997 997 997`) |
+| bytes written behind a pinned inode do not execute | **PROVEN** at root, through production canonicalization with a real ELF |
+| the drop helper is the one this daemon was built against | **PROVEN** at root — the digest binding fires; built/installed/staged hashes matched |
+| the credential plan reaches execution (R12-08) | **PROVEN** at root (18 passed / 0 failed) |
+| a **literal** nested `#!` interpreter never reaches execution | **PROVEN** at canonicalization — refused before any exec |
+| the snapshot is executable regardless of the source's mode (R14-04) | **DECLARED POLICY** — adopted deliberately; a 0644 source yields a runnable object, and `noexec` on the source mount does not stop an approved action |
+| **the loader and system libraries are immutable** | ~~DECLARED~~ → **FALSIFIED 2026-08-23 (D0A-R14-01).** An approved binary names its own `PT_INTERP`; a probe replaced the loader after sealing and changed executed code. **Struck from §3**, not qualified — a declaration the attacker can invalidate is not a boundary |
+| the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3** — v7 binds the FIRST OBJECT only. Closure is available **by construction** (a statically linked native ELF has no downstream hops), not by a computation of ours |
+| the pre-drop window is bounded (D0A-R10-12) | **NEITHER** — mitigation named and unimplemented; duration unmeasured |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
+
+**Why the gap is accepted rather than closed** (the decision, so it is not relitigated as an
+oversight): computing a dependency closure adds a mechanism to the surface that has produced
+findings in **seven consecutive rounds**, and a closure that misses an element fails
+**silently at exec** — D0A-R9-02's own shape, reintroduced in service of a claim no
+deployment has needed. Refused deliberately.
 
 **The lane run's hygiene, since a root run that mutates what it does not own is worse than
 no run:** PAM stack unchanged (`md5sum -c` OK), no stale sessions, 0 leaked daemons, and the

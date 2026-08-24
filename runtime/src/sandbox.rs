@@ -385,8 +385,8 @@ mod tests {
     /// either way; the mount topology is where the property lives (class 41).
     #[test]
     fn a_read_only_child_stays_read_only_when_its_parent_is_bound_after_it() {
-        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
-            eprintln!("SKIP a_read_only_child_stays_read_only_when_its_parent_is_bound_after_it: measured blocker: bwrap not executable");
+        if let Err(why) = crate::bwrap_can_build_a_jail() {
+            eprintln!("SKIP a_read_only_child_stays_read_only_when_its_parent_is_bound_after_it: measured blocker: {why}");
             return;
         }
         let root = std::env::temp_dir().join(format!("delphi-r1005-{}", std::process::id()));
@@ -440,8 +440,8 @@ mod tests {
     /// This asserts the host is unchanged after a real bwrap run.
     #[test]
     fn a_nested_bind_does_not_create_anything_in_the_host() {
-        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
-            eprintln!("SKIP a_nested_bind_does_not_create_anything_in_the_host: measured blocker: bwrap not executable");
+        if let Err(why) = crate::bwrap_can_build_a_jail() {
+            eprintln!("SKIP a_nested_bind_does_not_create_anything_in_the_host: measured blocker: {why}");
             return;
         }
         let root = std::env::temp_dir().join(format!("delphi-r1001-{}", std::process::id()));
@@ -488,8 +488,8 @@ mod tests {
     /// profile. `0700` is bwrap's own default and therefore the value this must exclude.
     #[test]
     fn a_created_ancestor_is_0755_inside_a_real_jail() {
-        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
-            eprintln!("SKIP a_created_ancestor_is_0755_inside_a_real_jail: measured blocker: bwrap not executable");
+        if let Err(why) = crate::bwrap_can_build_a_jail() {
+            eprintln!("SKIP a_created_ancestor_is_0755_inside_a_real_jail: measured blocker: {why}");
             return;
         }
         let root = std::env::temp_dir().join(format!("delphi-r10perm-{}", std::process::id()));
@@ -760,8 +760,8 @@ mod tests {
     /// would pass if the environment never arrived at all.
     #[test]
     fn the_approved_env_reaches_the_tool_and_never_appears_in_argv() {
-        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
-            eprintln!("SKIP the_approved_env_reaches_the_tool…: measured blocker: bwrap not executable");
+        if let Err(why) = crate::bwrap_can_build_a_jail() {
+            eprintln!("SKIP the_approved_env_reaches_the_tool_and_never_appears_in_argv: measured blocker: {why}");
             return;
         }
         let dir = std::env::temp_dir().join(format!("delphi-r906-{}", std::process::id()));

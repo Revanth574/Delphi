@@ -274,3 +274,32 @@ pub enum RuntimeError {
         secs: u64,
     },
 }
+
+/// Can bwrap actually BUILD A JAIL here — not merely "is the binary present" (2026-08-23).
+///
+/// `bwrap --version` answers a different question, and the difference is not academic: in a
+/// restricted container bwrap EXISTS and then fails at `RTM_NEWADDR` configuring loopback,
+/// so tests gated on existence RUN and FAIL where they should have SKIPPED. An external
+/// reviewer reported exactly that — four failures they then had to attribute by hand.
+///
+/// Existence is not capability. This attempts the minimal jail the tests need and reports
+/// what actually happened, so a gated test's SKIP carries a measured blocker rather than a
+/// guess.
+#[cfg(test)]
+pub(crate) fn bwrap_can_build_a_jail() -> Result<(), String> {
+    match std::process::Command::new("bwrap")
+        .args([
+            "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64",
+            "/lib64", "--unshare-all", "--die-with-parent", "--", "/usr/bin/true",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "bwrap present but cannot build a jail (exit {:?}): {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("bwrap not executable: {e}")),
+    }
+}

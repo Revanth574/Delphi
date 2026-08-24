@@ -3,15 +3,40 @@
 <!-- Invocation: codex review - < scratch/codex-d0a-round15-prompt.md
      Every range-selection flag rejects a PROMPT positional; the scope is carried here. -->
 
-## BEFORE ANYTHING: if you cannot RUN the repository, say so and stop
+## BEFORE ANYTHING — READ THIS, IT REPLACES A WORSE INSTRUCTION
 
-Round 14 reported its boundary precisely — `unshare` and bwrap's loopback setup were refused,
-so three sandbox-dependent tests failed in your sandbox and the root lane could not be
-validated. **Say the same again if it holds.** Several claims below are bwrap-dependent, and
-a finding derived without them should announce itself.
+**Round 15's first issue told you to stop if you could not run the sandbox lanes, and you
+did exactly that. The instruction was wrong and it is mine to fix.** Rounds 13 and 14
+produced their most valuable findings — R13-01, R14-01, R14-02 — from **reading the tree and
+running targeted probes**, not from the test suite. "Stop" discarded the capability that has
+actually found things.
+
+**So: stop ONLY if you cannot READ the tree.** Otherwise review, and label each finding with
+what it rests on:
+
+- **[static]** — code reading, contract-vs-implementation, no execution needed.
+- **[probe]** — a controlled experiment you constructed (your `PT_INTERP` and `env`
+  substitutions were this, and they were the best findings of round 14).
+- **[suite]** — depends on this repo's tests running, which your environment may prevent.
+
+**A [static] or [probe] finding is fully valid from a restricted sandbox.** Only [suite]
+conclusions need the boundary, and for those, say what you could not run rather than
+inferring.
+
+**AND YOUR FOUR TEST FAILURES WERE MY DEFECT, NOW FIXED.** They came from tests gated on
+`bwrap --version` — **existence, not capability**. In your environment bwrap exists and then
+fails at `RTM_NEWADDR`, so those tests RAN and FAILED where they should have SKIPPED. There
+is now one shared probe (`bwrap_can_build_a_jail`) that attempts a minimal jail and reports
+the real reason; four call sites use it. Re-running here: **17 targets, 0 failures**, and in
+a restricted environment they should now skip with a measured blocker rather than fail.
+
+`unshare -rm` is a separate matter: `installer/tests/tree-install.test.sh` genuinely cannot
+run without it and REFUSES rather than skipping (D0A-R12-09 — that suite reporting green by
+skipping is a defect this arc already paid for). Three shell suites failing in your sandbox is
+expected and is not a finding.
 
 **There are no deliberate REDs.** `.githooks/runtime-test-count-baseline` carries no `RED=`
-lines; all 17 test targets pass. Any failure you see is real.
+lines. Any failure beyond the environment-dependent ones is real.
 
 ## Target
 

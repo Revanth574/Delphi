@@ -169,6 +169,18 @@ pub enum RuntimeError {
 
     /// The credential-drop helper is not installed (D0A-R9-01). bwrap cannot drop
     /// the payload itself (`--uid` needs a user namespace and is namespace-internal
+    /// D0A-R15-03: the sealed snapshot does not hold the approved bytes.
+    ///
+    /// Distinct from [`RuntimeError::Unapproved`] because it is decided AFTER the token
+    /// verified and the ledger consumed. Reusing `Unapproved` told the caller "verification
+    /// failed, nothing consumed" — so the store stayed `Granted` while the ledger had
+    /// consumed, the only place those two ever disagreed.
+    #[error("the sealed {what} snapshot does not match the approved digest")]
+    SnapshotMismatch {
+        /// Which snapshot: `executable`, `interpreter`, or `script`.
+        what: String,
+    },
+
     /// D0A-R15-01: no trusted absolute `bwrap` was found. The daemon will NOT fall back to
     /// a `PATH` lookup — that is how an approved `env_delta` got to choose its own jail.
     #[error("no trusted bwrap found (tried {tried}) — install bubblewrap")]

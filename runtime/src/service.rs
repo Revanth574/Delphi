@@ -351,6 +351,12 @@ pub fn present_and_execute(
     // (Unapproved) leaves the ledger untouched and the approval Granted (re-presentable
     // with the right token — the 1c "failed-verify doesn't consume" precedent). Store
     // and ledger never disagree.
+    //
+    // D0A-R15-03 is why that last sentence needs a guard rather than trust: the R14-03
+    // digest check runs after the consume and returned `Unapproved`, so a valid token over a
+    // mismatched snapshot consumed the ledger and left the store Granted. Any future
+    // post-verification refusal MUST NOT reuse `Unapproved` — the variant is the signal that
+    // nothing was consumed.
     if !matches!(result, Err(RuntimeError::Unapproved))
         && let Some(e) = store.get_mut(pending_id)
     {
@@ -359,6 +365,12 @@ pub fn present_and_execute(
     match result {
         Ok(output) => Outcome::Completed { pending_id: pending_id.to_string(), exit_code: output.status.code() },
         Err(RuntimeError::Unapproved) => denied("token does not verify against the stored action's digest"),
+        // D0A-R15-03: post-verification, so the ledger HAS consumed and the store advanced
+        // with it above. Named separately because blaming the token sends the operator to a
+        // mechanism that worked.
+        Err(RuntimeError::SnapshotMismatch { what }) => denied(&format!(
+            "the sealed {what} snapshot does not match the approved digest (approval consumed — one-shot)"
+        )),
         Err(RuntimeError::AlreadyConsumed) => denied("approval already consumed (one-shot)"),
         Err(e) => denied(&format!("execution failed (approval consumed — one-shot): {e}")),
     }

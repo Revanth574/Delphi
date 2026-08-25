@@ -1337,6 +1337,76 @@ fn b1_swap_after_canonicalize_runs_the_pinned_content() {
 
 // ── B1-04 / B1-R2-03: store and ledger AGREE — a wrong token doesn't burn it ──
 
+/// D0A-R15-03: a VALID token whose sealed snapshot does not hold the approved bytes.
+///
+/// The R14-03 digest check runs AFTER the ledger consume and returned `Unapproved` — the one
+/// variant `present_and_execute` reads as "failed verification, ledger untouched". So the
+/// ledger consumed, the store stayed Granted, and the two disagreed for the first time; the
+/// denial also blamed the token, which had verified perfectly.
+///
+/// Both halves are asserted because either alone passes with the defect half-fixed: the STATE
+/// (store agrees with the ledger) and the REASON (it names the snapshot, not the token).
+#[test]
+fn b1_a_snapshot_mismatch_consumes_the_approval_and_blames_the_snapshot() {
+    if !bwrap_available() {
+        eprintln!("SKIP b1_a_snapshot_mismatch: requires bwrap + unprivileged userns");
+        return;
+    }
+    let _dir_tmp = tempfile::Builder::new().prefix("delphi-b1-mismatch-")
+        .tempdir_in(std::env::temp_dir()).expect("tempdir");
+    let dir = _dir_tmp.path().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = dir.join("res");
+    let exe = write_marker_exe(&dir, &result);
+
+    let key = MintingKey::from_bytes(KEY);
+    let mut store = PendingStore::new();
+    let id = store.next_id();
+    let mut action = canonicalize(&marker_proposal(&exe, "MISMATCH", &dir), id.clone()).unwrap();
+    // The recorded digest no longer describes the sealed snapshot. The token is minted over
+    // the action AFTER this, so the token VERIFIES — only the content identity is wrong,
+    // which is exactly the case R14-03 added the check for.
+    action.executable_digest = [0x11; 32];
+    let digest = canonical_action_digest(&action);
+    store.insert(action);
+    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    let good = mint(&key, &digest, NOW).to_wire();
+    let mut ledger = ConsumptionLedger::new();
+
+    let d = present_and_execute(&mut store, &mut ledger, &key, &id, &good, NOW);
+    println!("  outcome: {d:?}");
+    let Outcome::Denied { reason, .. } = &d else {
+        panic!("a snapshot mismatch must be denied, got {d:?}");
+    };
+    assert!(!result.exists(), "denied → nothing executed");
+    assert_eq!(
+        store.get(&id).unwrap().state,
+        PendingState::Consumed,
+        "D0A-R15-03: the ledger consumed when the token verified, so the store MUST advance \
+         too. Leaving it Granted breaks the stated store/ledger agreement and leaves an \
+         approval that reads as re-presentable while the ledger will refuse it."
+    );
+    assert!(
+        reason.contains("snapshot"),
+        "D0A-R15-03: the denial must name the SNAPSHOT. The token verified; blaming it sends \
+         the operator to the wrong mechanism. reason: {reason}"
+    );
+    assert!(
+        !reason.contains("token does not verify"),
+        "D0A-R15-03: the token DID verify. reason: {reason}"
+    );
+    // Found by weaken (b): with the variant added but no explicit arm in `present_and_execute`,
+    // the generic handler produced "execution failed (approval consumed — one-shot): …", which
+    // contains "snapshot" and passed every assertion above. NOTHING EXECUTED — this is a
+    // refusal BEFORE the run, and telling the operator the tool ran and failed sends them to
+    // the tool's logs for an event that never happened.
+    assert!(
+        !reason.contains("execution failed"),
+        "D0A-R15-03: nothing executed — this is a refusal, not a failed run. reason: {reason}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn b1_wrong_token_does_not_burn_the_approval() {
     if !bwrap_available() {

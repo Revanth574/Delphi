@@ -443,7 +443,7 @@ fn require_digest_matches(fd: RawFd, expected: &[u8; 32], what: &str) -> Result<
     }
     let got: [u8; 32] = h.finalize().into();
     if got != *expected {
-        return Err(RuntimeError::Unapproved);
+        return Err(RuntimeError::SnapshotMismatch { what: what.to_string() });
     }
     Ok(())
 }
@@ -800,9 +800,19 @@ mod tests {
         let token2 = mint(&key, &canonical_action_digest(&action), NOW);
         let err = execute_approved(&action, &token2, &key, NOW, &mut ConsumptionLedger::new())
             .expect_err("a sealed snapshot that is not the approved one must be refused");
+        // D0A-R15-03: a STRICTER variant than the `Unapproved` this originally asserted.
+        // `Unapproved` means "the token failed to verify, so nothing was consumed" — and this
+        // refusal happens AFTER the consume, so reusing it made the store and the ledger
+        // disagree. Narrowing, not relaxing: every `SnapshotMismatch` is a refusal, and now
+        // only a genuine verification failure can claim the ledger is untouched.
         assert!(
-            matches!(err, RuntimeError::Unapproved),
-            "must be refused as UNAPPROVED — what is about to run is not what was approved: {err:?}"
+            matches!(err, RuntimeError::SnapshotMismatch { .. }),
+            "must be refused — what is about to run is not what was approved: {err:?}"
+        );
+        assert!(
+            !matches!(err, RuntimeError::Unapproved),
+            "must NOT be Unapproved: that variant tells the caller the ledger is untouched, \
+             and by this point it has consumed: {err:?}"
         );
     }
 

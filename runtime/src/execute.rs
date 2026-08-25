@@ -1173,6 +1173,68 @@ mod tests {
     /// `/proc/self/status` is the right altitude (class 41): `Uid:`/`Gid:` carry
     /// real/effective/**saved**/fs, so a partial drop that left a saved id is visible —
     /// which `id -u` could never show.
+    /// D0A-R15-01 at euid 0 — the branch the unprivileged suite cannot reach.
+    ///
+    /// Unprivileged there is no gradient, so the delta travels through bwrap's `--setenv`.
+    /// The branch this arc actually changed is the other one: a sealed memfd the helper reads
+    /// and applies with `execve` AFTER `setresuid`. Nothing has ever executed it.
+    ///
+    /// One artifact carries both facts on purpose. The delta ARRIVING proves the transport
+    /// works; the recording process running as `delphi-tool` proves it arrived on the far
+    /// side of the drop. Either alone is satisfiable with the defect present — the pre-fix
+    /// code also delivered the value, just to root first.
+    #[test]
+    fn the_approved_env_reaches_the_tool_through_the_helper_after_the_drop() {
+        if !bwrap_available() {
+            eprintln!("SKIP the_approved_env_reaches_the_tool_through_the_helper_after_the_drop: requires bwrap + unprivileged userns");
+            return;
+        }
+        if nix::unistd::geteuid().as_raw() != 0 {
+            eprintln!("SKIP the_approved_env_reaches_the_tool_through_the_helper_after_the_drop: requires root — measured blocker: geteuid() != 0, so there is no gradient and the helper is not interposed");
+            return;
+        }
+        let Ok(Some(tool)) = nix::unistd::User::from_name(TOOL_ACCOUNT) else {
+            eprintln!("SKIP the_approved_env_reaches_the_tool_through_the_helper_after_the_drop: measured blocker: getpwnam(\"{TOOL_ACCOUNT}\") returned no entry — installer/install.sh creates it");
+            return;
+        };
+        if !std::path::Path::new(DROP_HELPER).exists() {
+            eprintln!("SKIP the_approved_env_reaches_the_tool_through_the_helper_after_the_drop: measured blocker: {DROP_HELPER} does not exist — installer/install.sh installs it");
+            return;
+        }
+        let env = Env::new("tool-env");
+        let content = format!(
+            "#!/bin/sh\n{{ grep -E '^Uid:' /proc/self/status; env; }} > {}\n",
+            env.result.display()
+        );
+        fs::write(&env.exe, &content).unwrap();
+        fs::set_permissions(&env.exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut action = build_action(content.as_bytes(), &env.out_dir);
+        action.env_delta = vec![("DELPHI_SECRET".into(), "s3cret-value".into())];
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        let out = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new())
+            .expect("approved exec");
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+        let seen = fs::read_to_string(&env.result).unwrap();
+        eprintln!("[R15-01] the tool's uid line and environment:\n{seen}");
+
+        let uid = tool.uid.as_raw().to_string();
+        let uids: Vec<String> = seen
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .expect("no Uid: line")
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(uids, vec![uid; 4], "the environment must arrive on the far side of the drop");
+        assert!(seen.contains("DELPHI_SECRET=s3cret-value"), "the approved value must arrive: {seen}");
+        for leaked in ["CARGO", "HOME=", "PATH=/usr/local/sbin"] {
+            assert!(!seen.contains(leaked), "the daemon's environment leaked past the helper: {seen}");
+        }
+    }
+
     #[test]
     fn an_approved_action_runs_with_the_tool_account_credentials() {
         if !bwrap_available() {

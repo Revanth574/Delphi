@@ -25,8 +25,12 @@
 #
 # ENVIRONMENT-SPECIFIC, like its workspace sibling. Measured UNPRIVILEGED, where
 # `an_approved_action_runs_with_the_tool_account_credentials` skips. On a root lane it
-# EXECUTES, so the pair there is EXECUTED=141 SKIPPED=0 — point the hook at another file via
-# DELPHI_TEST_COUNT_BASELINE rather than editing these values for one run.
+# EXECUTES. The root pair once recorded here as EXECUTED=141 SKIPPED=0 was an EXPECTATION that
+# was never measured, and it cannot be right: the two PAM-auth skips, the --features skip and
+# the DEFER do not depend on euid, so SKIPPED=0 is unreachable. It is withdrawn rather than
+# replaced with a second guess — lane run 3 measures it into
+# `.githooks/runtime-test-count-baseline.root`, which the hook reads via
+# DELPHI_TEST_COUNT_BASELINE. Do not edit THESE values for a root run.
 #
 # AND ENVIRONMENT-SPECIFIC IS A SHARPER CONSTRAINT THAN IT READS (D0A-R15-04). A reviewer in
 # a restricted container measured EXECUTED=115 SKIPPED=46 against this same tree: bwrap and
@@ -50,4 +54,4 @@
 # integration included. It was `--lib --bins` until 2026-08-23, and that scope let two red
 # integration suites sit behind a green gate (D0A-R14-03). The full run costs ~3 seconds.
 EXECUTED=142
-SKIPPED=23
+SKIPPED=24

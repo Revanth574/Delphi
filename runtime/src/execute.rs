@@ -652,6 +652,62 @@ pub(crate) mod tests {
         fs::rename(&tmp, path).unwrap();
     }
 
+    /// **The guard that replaces the sentence that was wrong seven times.**
+    ///
+    /// A doc comment claimed every execution fixture goes through `build_action`, "so no test
+    /// can forget it". Lane run 3 found `audit.rs` had. The whole-suite root run then found
+    /// SEVEN more — five `b1_integration` fixtures, `end_to_end`, `divergence` — all failing
+    /// with "no validated tool identity was recorded before this action", and `end_to_end`
+    /// and `divergence` reporting it as an EMPTY result string, two inferences from the cause.
+    ///
+    /// A rule cannot enforce this; enumeration can. Every source that BUILDS an action and
+    /// EXECUTES one must also plan credentials, or it silently never runs at root — and a
+    /// test that never runs is the failure this whole arc exists to prevent.
+    #[test]
+    fn every_fixture_that_executes_an_action_plans_its_credentials() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        walk(&root.join("tests"), &mut files);
+        files.sort();
+
+        let mut checked = 0usize;
+        let mut missing = Vec::new();
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            let builds = text.contains("PendingAction {");
+            let executes = text.contains("execute_approved(") || text.contains("present_and_execute(");
+            if !(builds && executes) {
+                continue;
+            }
+            checked += 1;
+            if !(text.contains("plan_credentials_once") || text.contains("set_tool_credentials")) {
+                missing.push(f.strip_prefix(root).unwrap_or(f).display().to_string());
+            }
+        }
+        // POSITIVE CONTROL: a guard that matched nothing would pass forever. It must have
+        // found the files it is about.
+        assert!(checked >= 4, "the guard matched only {checked} files — its pattern has drifted \
+                               off the fixtures it exists to check");
+        assert!(
+            missing.is_empty(),
+            "these build an action AND execute one, but never plan credentials, so at euid 0 \
+             they are refused before running (D0A-R11-06) and assert on nothing: {missing:?}"
+        );
+        println!("  {checked} files build-and-execute; all plan credentials");
+    }
+
     /// D0A-R12-08 — plan the credentials the way the DAEMON does, once per test process.
     ///
     /// R11-06 made `tool_credentials()` READ a recorded plan and refuse when running

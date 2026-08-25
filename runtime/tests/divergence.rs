@@ -17,6 +17,9 @@
 //!
 //! No root (bwrap unprivileged); gated on bwrap + userns.
 
+#[path = "common/credentials.rs"]
+mod credentials;
+
 use std::fs;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -82,6 +85,7 @@ impl Drop for Env {
 /// has, and this file's whole claim is that FOUR DERIVATIONS AGREE. They can only be shown
 /// to agree on an object the daemon would actually build.
 fn action_with_marker(env: &Env, marker: &str) -> PendingAction {
+    credentials::plan_credentials_once();
     let proposal = pb::Propose {
         argv: vec!["tool".into(), marker.into()],
         cwd: "/".into(),

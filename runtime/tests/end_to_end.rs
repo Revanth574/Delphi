@@ -23,6 +23,9 @@
 //!   -- --test-threads=1 --nocapture
 //! ```
 
+#[path = "common/credentials.rs"]
+mod credentials;
+
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -148,6 +151,7 @@ fn one_biometric_action_through_1a_to_1d() {
     let result = work.join("result");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$1\" > {}\n", result.display())).unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    credentials::plan_credentials_once();
     let action = PendingAction {
         pending_id: "act-e2e".into(),
         preview_version: 1,

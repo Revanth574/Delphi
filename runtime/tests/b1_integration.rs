@@ -46,6 +46,9 @@ use delphi_runtime::token::{mint, MintingKey, TOKEN_TTL_SECS};
 use delphi_runtime::wire::{pb, write_frame};
 use delphi_runtime::{approval_socketpair, bind_approval_socket, ensure_runtime_dir};
 
+#[path = "common/credentials.rs"]
+mod credentials;
+
 #[path = "common/shell_fixtures.rs"]
 mod shell_fixtures;
 
@@ -253,15 +256,40 @@ fn unsealed_memfd(content: &[u8]) -> std::os::fd::OwnedFd {
 }
 
 /// Copy a built bin into `dir` (mode 0755) so the dropped session user can exec it
-/// — the build target lives under `/home/raven`, which other uids cannot traverse.
+/// — the build target lives under the developer's home, which other uids cannot traverse.
+/// (It said `/home/raven` until lane run 3: a machine-specific path left over from the
+/// `build.target-dir` pin CLAUDE.md reversed on 2026-08-15 for being exactly that.)
+/// The `insecure-test-seams` gate, in ONE place (D0A lane run 3, whole-suite).
+///
+/// `delphi-surface-shell` carries `required-features = ["insecure-test-seams"]`, so
+/// `CARGO_BIN_EXE_delphi-surface-shell` names a path that does not exist in a plain build.
+/// `b1_daemon_binary` checked the feature and skipped; `the_daemon_binary_runs_the_real_gate`
+/// did not, and failed with `copy minimal-side bin: NotFound` — the same gate written twice
+/// with two behaviours, which is how `bwrap --version` produced four unattributable failures
+/// one increment ago.
+fn surface_shell_or_skip(test: &str) -> Option<&'static str> {
+    let p = env!("CARGO_BIN_EXE_delphi-surface-shell");
+    if std::path::Path::new(p).exists() {
+        return Some(p);
+    }
+    eprintln!(
+        "SKIP {test}: measured blocker: {p} does not exist — delphi-surface-shell carries \
+         required-features = [\"insecure-test-seams\"]. Re-run with `cargo test -p \
+         delphi-runtime --features insecure-test-seams --test b1_integration`."
+    );
+    None
+}
+
 fn stage_bin(src: &str, dir: &Path, name: &str) -> PathBuf {
     let dst = dir.join(name);
-    std::fs::copy(src, &dst).expect("copy minimal-side bin");
+    std::fs::copy(src, &dst)
+        .unwrap_or_else(|e| panic!("copy staged bin {src} -> {}: {e}", dst.display()));
     std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
     dst
 }
 
 fn marker_proposal(exe: &Path, marker: &str, out_dir: &Path) -> pb::Propose {
+    credentials::plan_credentials_once();
     let ro = |p: &str| pb::Bind { path: p.into(), mode: pb::BindMode::BindReadOnly as i32 };
     pb::Propose {
         argv: vec!["tool".into(), marker.into()],
@@ -889,7 +917,8 @@ fn the_daemon_binary_runs_the_real_gate_d0a_r4_03() {
     // SurfaceLive, so a scaffold-marker shell makes `launch()` refuse BEFORE the gate is ever
     // consulted — which is what leg 1 was doing for two rounds while its old assertion
     // accepted the pre-gate startup line.
-    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-surface-shell"), &work, "sshell");
+    let Some(surface) = surface_shell_or_skip("r4_03_daemon_real_gate") else { return };
+    let shell_bin = stage_bin(surface, &work, "sshell");
     let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-ai"), &work, "mai");
     let result = work.join("result");
     let exe_str = write_marker_exe(&work, &result).display().to_string();

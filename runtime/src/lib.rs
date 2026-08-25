@@ -169,6 +169,13 @@ pub enum RuntimeError {
 
     /// The credential-drop helper is not installed (D0A-R9-01). bwrap cannot drop
     /// the payload itself (`--uid` needs a user namespace and is namespace-internal
+    /// D0A-R15-01: no trusted absolute `bwrap` was found. The daemon will NOT fall back to
+    /// a `PATH` lookup — that is how an approved `env_delta` got to choose its own jail.
+    #[error("no trusted bwrap found (tried {tried}) — install bubblewrap")]
+    MissingSandboxBinary {
+        /// The absolute candidates that were checked.
+        tried: String,
+    },
     /// anyway), so without this binary the action would run as root.
     #[error("execution denied: the drop helper `{path}` is missing, so the action cannot be dropped off root. Re-run `installer/install.sh` (TRUST_MODEL.md §6, D0A-R9-01)")]
     MissingDropHelper {
@@ -285,8 +292,7 @@ pub enum RuntimeError {
 /// Existence is not capability. This attempts the minimal jail the tests need and reports
 /// what actually happened, so a gated test's SKIP carries a measured blocker rather than a
 /// guess.
-#[cfg(test)]
-pub(crate) fn bwrap_can_build_a_jail() -> Result<(), String> {
+pub fn bwrap_can_build_a_jail() -> Result<(), String> {
     match std::process::Command::new("bwrap")
         .args([
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64",

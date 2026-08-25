@@ -26,21 +26,17 @@ use std::process::Command;
 /// exists to stop that.
 const HELPER: &str = concat!(env!("OUT_DIR"), "/delphi-drop");
 
-fn bwrap_available() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-all", "--die-with-parent", "--proc", "/proc", "--", "/proc/self/fd/0"])
-        .output()
-        .map(|o| o.status.code().is_some())
-        .unwrap_or(false)
-}
+// D0A-R15-04: this used to accept ANY exit code, so a lane where bwrap EXISTS but cannot
+// build a jail ran the test and FAILED it instead of skipping. The shared probe is the one
+// production-adjacent definition of "can build a jail", and it reports the real blocker.
 
 /// The helper, handed to bwrap by fd, in a jail with **no binds at all** — not even
 /// `/usr`. Exercised via its own argument validation so the leg needs no second binary:
 /// a helper that could not start could not report `2` for a bad argument count.
 #[test]
 fn the_shipped_helper_runs_in_a_jail_binding_nothing() {
-    if !bwrap_available() {
-        eprintln!("SKIP the_shipped_helper_runs_in_a_jail_binding_nothing: requires bwrap + unprivileged userns");
+    if let Err(why) = delphi_runtime::bwrap_can_build_a_jail() {
+        eprintln!("SKIP the_shipped_helper_runs_in_a_jail_binding_nothing: measured blocker: {why}");
         return;
     }
     let f = std::fs::File::open(HELPER).expect("open the shipped helper");
@@ -95,7 +91,7 @@ fn the_shipped_helper_runs_in_a_jail_binding_nothing() {
 fn dropping_to_root_is_refused_for_either_id() {
     for (uid, gid) in [("0", "0"), ("0", "997"), ("997", "0")] {
         let out = Command::new(HELPER)
-            .args([uid, gid, "/bin/true", "true"])
+            .args([uid, gid, "-", "/bin/true", "true"])
             .output()
             .expect("spawn helper");
         let err = String::from_utf8_lossy(&out.stderr);
@@ -107,9 +103,10 @@ fn dropping_to_root_is_refused_for_either_id() {
 #[test]
 fn dropping_to_root_is_refused() {
     let out = Command::new(HELPER)
-        // FOUR args: the helper takes argv0 explicitly. With three it exits through
-        // USAGE and never reaches the root check this test names (D0A-R10-09).
-        .args(["0", "0", "/bin/true", "true"])
+        // FIVE args: uid, gid, the env fd (`-` = none), the program, and argv0 — which the
+        // helper takes explicitly. With fewer it exits through USAGE and never reaches the
+        // root check this test names (D0A-R10-09).
+        .args(["0", "0", "-", "/bin/true", "true"])
         .output()
         .expect("spawn helper");
     assert_eq!(out.status.code(), Some(2));

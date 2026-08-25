@@ -259,6 +259,72 @@ fn require_fully_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Absolute candidates for the sandbox binary, in order.
+///
+/// D0A-R15-01: `Command::new("bwrap")` resolves through `PATH`, and the approved
+/// `env_delta` used to be on that `Command` — so the caller could name the binary that
+/// would build its jail. The list is absolute and fixed at compile time; nothing an action
+/// carries can extend or reorder it.
+const BWRAP_CANDIDATES: [&str; 3] = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
+
+/// The first trusted candidate: a regular file, owned by root, not group- or world-writable.
+///
+/// # Errors
+///
+/// [`RuntimeError::MissingSandboxBinary`] naming every path tried, rather than falling back
+/// to a `PATH` lookup.
+pub(crate) fn bwrap_path() -> Result<&'static str, RuntimeError> {
+    use std::os::unix::fs::MetadataExt;
+    for cand in BWRAP_CANDIDATES {
+        let Ok(md) = std::fs::metadata(cand) else { continue };
+        if md.is_file() && md.uid() == 0 && md.mode() & 0o022 == 0 {
+            return Ok(cand);
+        }
+    }
+    Err(RuntimeError::MissingSandboxBinary { tried: BWRAP_CANDIDATES.join(", ") })
+}
+
+/// How the approved environment travels to the tool (D0A-R15-01).
+///
+/// **There is deliberately no field for the parent `Command`'s environment.** That is the
+/// property, encoded where it cannot be forgotten: the delta is untrusted, and applying it
+/// to the process that IS bwrap gave it `LD_PRELOAD` and `PATH` over a root process running
+/// before the sandbox existed and before `delphi-drop` lowered credentials.
+pub(crate) struct EnvTransport {
+    /// `--setenv K V` tokens for bwrap, carried on an fd via `--args` so no approved value
+    /// reaches `/proc/<pid>/cmdline` (D0A-R9-06). Used only where there is no gradient.
+    pub(crate) setenv_tokens: Vec<String>,
+    /// NUL-separated `KEY=VALUE`, read by `delphi-drop` and applied with `execve` AFTER
+    /// `setresuid`. Used wherever a drop happens.
+    pub(crate) helper_blob: Option<Vec<u8>>,
+}
+
+/// Choose the transport from whether a privilege gradient exists.
+///
+/// With credentials to drop, bwrap and `delphi-drop` both run as root, so the delta must
+/// reach neither: it stays inert bytes until the helper `execve`s the tool. Without them,
+/// bwrap and the tool run as the same uid — there is no more-privileged process for the
+/// delta to influence — so bwrap sets it, still off argv.
+pub(crate) fn plan_env_transport(delta: &[(String, String)], creds: Option<(u32, u32)>) -> EnvTransport {
+    if creds.is_some() {
+        let mut blob = Vec::new();
+        for (k, v) in delta {
+            blob.extend_from_slice(k.as_bytes());
+            blob.push(b'=');
+            blob.extend_from_slice(v.as_bytes());
+            blob.push(0);
+        }
+        return EnvTransport { setenv_tokens: Vec::new(), helper_blob: Some(blob) };
+    }
+    let mut setenv_tokens = Vec::new();
+    for (k, v) in delta {
+        setenv_tokens.push("--setenv".to_string());
+        setenv_tokens.push(k.clone());
+        setenv_tokens.push(v.clone());
+    }
+    EnvTransport { setenv_tokens, helper_blob: None }
+}
+
 /// The bwrap tail: the `--argv0` flag when nothing is interposed, `--`, and the payload.
 ///
 /// **Extracted to be provable without root (D0A-R10).** The interposition only happens
@@ -268,7 +334,7 @@ fn require_fully_sealed(script_fd: RawFd) -> Result<(), RuntimeError> {
 /// argument-assembly properties, and a pure function makes them testable with injected
 /// credentials rather than only on a root lane.
 ///
-/// Layout with the helper: `<helper> <uid> <gid> <program> <argv0> [interp_arg] [script] [args…]`
+/// Layout with the helper: `<helper> <uid> <gid> <envfd> <program> <argv0> [interp_arg] [script] [args…]`
 /// Without it: `--argv0 <argv0> -- <program> [interp_arg] [script] [args…]`
 fn exec_tail(
     action: &PendingAction,
@@ -276,6 +342,7 @@ fn exec_tail(
     creds: Option<(u32, u32)>,
     program_fd: RawFd,
     script_arg_fd: Option<RawFd>,
+    env_fd: Option<RawFd>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     // `--argv0` names whatever bwrap execs. With the helper interposed that is the
@@ -294,6 +361,9 @@ fn exec_tail(
         args.push(format!("/proc/self/fd/{h}"));
         args.push(uid.to_string());
         args.push(gid.to_string());
+        // The approved environment, as a sealed fd the helper reads and applies at `execve`
+        // AFTER the drop (D0A-R15-01). The NUMBER is on the command line; no value is.
+        args.push(env_fd.map_or_else(|| "-".to_string(), |fd| fd.to_string()));
     }
     args.push(format!("/proc/self/fd/{program_fd}"));
     // The approved argv[0], passed through the helper rather than via `--argv0`.
@@ -457,17 +527,42 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
         keep.push(h);
     }
 
-    let mut args = SandboxProfile::derive(action).args().to_vec();
-    args.extend(exec_tail(action, helper_fd, creds, program_fd, script_arg_fd));
+    // D0A-R15-01. The delta is UNTRUSTED and never becomes anyone's environment before the
+    // tool's: with a gradient it stays sealed bytes until `delphi-drop` execve's past the
+    // drop; without one bwrap sets it, carried on an fd so argv stays clean (D0A-R9-06).
+    let transport = plan_env_transport(&action.env_delta, creds);
+    let env_snapshot = match &transport.helper_blob {
+        Some(blob) => Some(crate::action::seal_data_snapshot(blob)?),
+        None => None,
+    };
+    let env_fd = env_snapshot.as_ref().map(|fd| fd.as_raw_fd());
+    if let Some(fd) = env_fd {
+        keep.push(fd);
+    }
+    let args_snapshot = if transport.setenv_tokens.is_empty() {
+        None
+    } else {
+        let mut blob = Vec::new();
+        for tok in &transport.setenv_tokens {
+            blob.extend_from_slice(tok.as_bytes());
+            blob.push(0);
+        }
+        Some(crate::action::seal_data_snapshot(&blob)?)
+    };
 
-    let mut cmd = Command::new("bwrap");
+    let mut args = SandboxProfile::derive(action).args().to_vec();
+    if let Some(fd) = args_snapshot.as_ref().map(|fd| fd.as_raw_fd()) {
+        keep.push(fd);
+        args.push("--args".to_string());
+        args.push(fd.to_string());
+    }
+    args.extend(exec_tail(action, helper_fd, creds, program_fd, script_arg_fd, env_fd));
+
+    // An absolute, verified binary — NOT a PATH lookup, which the delta could steer.
+    let mut cmd = Command::new(bwrap_path()?);
     cmd.args(&args);
-    // D0A-R9-06: the approved environment travels HERE, not in argv. bwrap inherits exactly
-    // `env_delta` and passes it to the payload; nothing of the daemon's own environment
-    // survives `env_clear`, which is what `--clearenv` used to do at the cost of publishing
-    // every value in /proc/<pid>/cmdline.
+    // Sterile, and nothing is added back. The parent of the sandbox carries no approved byte.
     cmd.env_clear();
-    cmd.envs(action.env_delta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     // 1D-03 / §6: extend the 1b fd-discipline to execute. In the child, before
     // bwrap's exec, mark every inherited fd >= 3 close-on-exec and un-mark only the
     // program fd(s). No daemon fd (the approval channel, the anchor socket, ...)
@@ -785,19 +880,20 @@ mod tests {
         let mut action = build_action(b"x", &dir);
         action.argv = vec!["approved-name".into(), "--flag".into()];
 
-        let with = exec_tail(&action, Some(9), Some((997, 972)), 7, None);
+        let with = exec_tail(&action, Some(9), Some((997, 972)), 7, None, Some(11));
         println!("  with helper:    {with:?}");
         assert_eq!(
             with,
-            vec!["--", "/proc/self/fd/9", "997", "972", "/proc/self/fd/7", "approved-name", "--flag"],
-            "the helper must be exec'd with uid, gid, the pinned program, and the APPROVED argv[0]"
+            vec!["--", "/proc/self/fd/9", "997", "972", "11", "/proc/self/fd/7", "approved-name", "--flag"],
+            "the helper must be exec'd with uid, gid, the ENV FD, the pinned program, and the \
+             APPROVED argv[0]"
         );
         // `--argv0` would name the HELPER, not the tool, so it must not be emitted here.
         assert!(!with.iter().any(|a| a == "--argv0"), "--argv0 names the helper when one is interposed");
 
         // Without credentials nothing is interposed and the flag carries argv0 instead —
         // the POSITIVE CONTROL, so "the helper is present" cannot be satisfied vacuously.
-        let without = exec_tail(&action, None, None, 7, None);
+        let without = exec_tail(&action, None, None, 7, None, None);
         println!("  without helper: {without:?}");
         assert_eq!(
             without,
@@ -826,12 +922,12 @@ mod tests {
             script_memfd: write_sealed_only_memfd(b"#!/bin/sh\n"),
             script_digest: [0u8; 32],
         });
-        let tail = exec_tail(&action, Some(9), Some((997, 972)), 7, Some(8));
+        let tail = exec_tail(&action, Some(9), Some((997, 972)), 7, Some(8), Some(11));
         println!("  script tail: {tail:?}");
         assert_eq!(
             tail,
             vec![
-                "--", "/proc/self/fd/9", "997", "972", "/proc/self/fd/7", "approved-name",
+                "--", "/proc/self/fd/9", "997", "972", "11", "/proc/self/fd/7", "approved-name",
                 "-e", "/proc/self/fd/8", "rest"
             ]
         );

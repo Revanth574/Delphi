@@ -8,7 +8,16 @@
 //! cannot build its own sandbox (leg C — `loopback: Failed RTM_NEWADDR`). So the drop
 //! belongs to bwrap's **payload**, which is this.
 //!
-//! Usage: `delphi-drop <uid> <gid> <program> <argv0> [args...]`
+//! Usage: `delphi-drop <uid> <gid> <envfd> <program> <argv0> [args...]`
+//!
+//! # Why the environment arrives on a FILE DESCRIPTOR (D0A-R15-01)
+//!
+//! The approved `env_delta` is untrusted. It used to be applied to the `Command` that is
+//! bwrap — a root process, running before the sandbox existed and before this helper lowered
+//! credentials — where `LD_PRELOAD` is arbitrary root code execution and `PATH` chooses which
+//! binary builds the jail. It now travels as sealed bytes nobody's loader reads, and this
+//! helper applies it with `execve` AFTER `setresuid`. The first process it can influence is
+//! the unprivileged tool, which is the one it was approved for.
 //!
 //! `argv0` is passed SEPARATELY from `program`: bwrap's `--argv0` would apply to
 //! this helper, not to the tool, so without it the tool would see `argv[0]` as
@@ -40,7 +49,8 @@ unsafe extern "C" {
     fn setgroups(size: usize, list: *const u32) -> i32;
     fn setresgid(r: u32, e: u32, s: u32) -> i32;
     fn setresuid(r: u32, e: u32, s: u32) -> i32;
-    fn execv(path: *const Char, argv: *const *const Char) -> i32;
+    fn execve(path: *const Char, argv: *const *const Char, envp: *const *const Char) -> i32;
+    fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
     fn getuid() -> u32;
     fn geteuid() -> u32;
     fn getgid() -> u32;
@@ -53,8 +63,8 @@ fn fail(what: &str) -> ! {
 
 fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if args.len() < 5 {
-        eprintln!("usage: delphi-drop <uid> <gid> <program> <argv0> [args...]");
+    if args.len() < 6 {
+        eprintln!("usage: delphi-drop <uid> <gid> <envfd> <program> <argv0> [args...]");
         std::process::exit(2);
     }
     let uid: u32 = args[1].to_string_lossy().parse().unwrap_or_else(|_| {
@@ -92,20 +102,55 @@ fn main() {
         }
     }
 
-    let prog = std::ffi::CString::new(args[3].as_bytes()).unwrap_or_else(|_| {
+    // Read the approved environment BEFORE exec, from the sealed fd named in argv. `-` means
+    // none: the tool gets an empty environment, never the daemon's.
+    let envp_owned: Vec<std::ffi::CString> = if args[3] == "-" {
+        Vec::new()
+    } else {
+        let fd: i32 = args[3].to_string_lossy().parse().unwrap_or_else(|_| {
+            eprintln!("delphi-drop: envfd must be numeric or '-'");
+            std::process::exit(2);
+        });
+        let mut blob = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            // SAFETY: reading into a stack buffer whose length is passed exactly.
+            let n = unsafe { read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                fail("read environment fd");
+            }
+            if n == 0 {
+                break;
+            }
+            blob.extend_from_slice(&chunk[..n as usize]);
+        }
+        blob.split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                std::ffi::CString::new(e).unwrap_or_else(|_| {
+                    eprintln!("delphi-drop: environment entry contains NUL");
+                    std::process::exit(2);
+                })
+            })
+            .collect()
+    };
+
+    let prog = std::ffi::CString::new(args[4].as_bytes()).unwrap_or_else(|_| {
         eprintln!("delphi-drop: program path contains NUL");
         std::process::exit(2);
     });
-    // argv[0] is the APPROVED name (args[4]), not the program path (args[3]).
-    let argv: Vec<std::ffi::CString> = args[4..]
+    // argv[0] is the APPROVED name (args[5]), not the program path (args[4]).
+    let argv: Vec<std::ffi::CString> = args[5..]
         .iter()
         .map(|a| std::ffi::CString::new(a.as_bytes()).unwrap_or_default())
         .collect();
     let mut raw: Vec<*const Char> = argv.iter().map(|a| a.as_ptr()).collect();
     raw.push(std::ptr::null());
-    // SAFETY: `prog` and `raw` outlive the call; `raw` is NULL-terminated.
+    let mut envp: Vec<*const Char> = envp_owned.iter().map(|e| e.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    // SAFETY: `prog`, `raw` and `envp` outlive the call; both vectors are NULL-terminated.
     unsafe {
-        execv(prog.as_ptr(), raw.as_ptr());
+        execve(prog.as_ptr(), raw.as_ptr(), envp.as_ptr());
     }
-    fail("execv");
+    fail("execve");
 }

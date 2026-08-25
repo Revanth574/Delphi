@@ -772,30 +772,17 @@ mod tests {
         let mut action = action_with(vec![(dir.clone(), BindMode::ReadWrite)], NetPolicy::None);
         action.env_delta = vec![("DELPHI_SECRET".into(), "s3cret-value".into())];
 
-        let mut args = SandboxProfile::derive(&action).args().to_vec();
-        // NOT IN ARGV — the property the finding was about.
+        let args = SandboxProfile::derive(&action).args().to_vec();
+        // NOT IN ARGV — the property D0A-R9-06 was about.
         assert!(
             !args.iter().any(|a| a == "s3cret-value" || a == "--setenv" || a == "--clearenv"),
             "the approved value must not be on bwrap's command line: {args:?}"
         );
 
-        args.extend(["--ro-bind".into(), "/usr".into(), "/usr".into()]);
-        for (link, at) in [("usr/bin", "/bin"), ("usr/lib", "/lib"), ("usr/lib64", "/lib64")] {
-            args.extend(["--symlink".into(), link.into(), at.into()]);
-        }
-        args.extend([
-            "--".into(),
-            "/bin/sh".into(),
-            "-c".into(),
-            format!("env > {}", out_file.display()),
-        ]);
-        // The env travels the way production sends it: on the Command, not in the args.
-        let out = std::process::Command::new("bwrap")
-            .args(&args)
-            .env_clear()
-            .envs(action.env_delta.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .output()
-            .unwrap();
+        // POSITIVE CONTROL for D0A-R15-01, and it is load-bearing: a fix that made the delta
+        // STERILE by dropping it entirely would pass both negative legs and break every
+        // approved action that sets a variable. This is what distinguishes the two.
+        let out = spawn_like_production(&action, &dir, &out_file);
         assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
 
         // AND IT ARRIVED — with nothing of the daemon's alongside it.
@@ -805,6 +792,169 @@ mod tests {
         for leaked_var in ["CARGO", "HOME", "PATH=/usr/local/sbin"] {
             assert!(!seen.contains(leaked_var), "the daemon's environment leaked: {seen}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Spawn bwrap the way `execute.rs` does, so these tests bind PRODUCTION's environment
+    /// transport rather than a replica of it that could drift away from the defect.
+    #[cfg(test)]
+    fn spawn_like_production(
+        action: &PendingAction,
+        _dir: &std::path::Path,
+        out_file: &std::path::Path,
+    ) -> std::process::Output {
+        use std::os::fd::AsRawFd;
+        // PRODUCTION's transport, not a replica: the same planner the daemon calls.
+        let transport = crate::execute::plan_env_transport(&action.env_delta, None);
+        let mut blob = Vec::new();
+        for tok in &transport.setenv_tokens {
+            blob.extend_from_slice(tok.as_bytes());
+            blob.push(0);
+        }
+        let snapshot = crate::action::seal_data_snapshot(&blob).unwrap();
+        // SAFETY: clearing FD_CLOEXEC on an fd this function owns, so bwrap inherits it —
+        // production does the same through its pre_exec keep-list.
+        unsafe { nix::libc::fcntl(snapshot.as_raw_fd(), nix::libc::F_SETFD, 0) };
+
+        let mut args = SandboxProfile::derive(action).args().to_vec();
+        args.push("--args".to_string());
+        args.push(snapshot.as_raw_fd().to_string());
+        args.extend(["--ro-bind".to_string(), "/usr".to_string(), "/usr".to_string()]);
+        for (link, at) in [("usr/bin", "/bin"), ("usr/lib", "/lib"), ("usr/lib64", "/lib64")] {
+            args.extend(["--symlink".to_string(), link.to_string(), at.to_string()]);
+        }
+        args.extend([
+            "--".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("env > {}", out_file.display()),
+        ]);
+        let mut cmd = std::process::Command::new(crate::execute::bwrap_path().unwrap());
+        cmd.args(&args);
+        // Sterile. Nothing added back — that is the property under test.
+        cmd.env_clear();
+        cmd.output().unwrap()
+    }
+
+    /// Compile a tiny cdylib whose ELF constructor appends the LOADING process's
+    /// `comm` to a marker file. Any dynamically linked process that receives it in
+    /// `LD_PRELOAD` names itself; that is the discriminator, because the TOOL is
+    /// supposed to receive the delta and bwrap is not.
+    #[cfg(test)]
+    fn build_preload_marker(dir: &std::path::Path, marker: &std::path::Path) -> Result<PathBuf, String> {
+        let src = dir.join("marker.rs");
+        let so = dir.join("libmarker.so");
+        std::fs::write(
+            &src,
+            format!(
+                r#"
+#[used]
+#[link_section = ".init_array"]
+static CTOR: extern "C" fn() = ctor;
+extern "C" fn ctor() {{
+    use std::io::Write;
+    let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("{}") {{
+        let _ = writeln!(f, "{{}}", comm.trim());
+    }}
+}}
+"#,
+                marker.display()
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "--crate-type", "cdylib", "-o"])
+            .arg(&so)
+            .arg(&src)
+            .output()
+            .map_err(|e| format!("rustc not runnable: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("rustc failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(so)
+    }
+
+    /// D0A-R15-01 LEG 1 of 2 — `LD_PRELOAD`.
+    ///
+    /// The approved `env_delta` is UNTRUSTED. Applying it to the `Command` that IS bwrap
+    /// hands it to a process running as root, before the sandbox exists and before
+    /// `delphi-drop` lowers credentials — so `LD_PRELOAD` there is arbitrary code
+    /// execution as root. The tool receiving it is correct and expected; bwrap receiving
+    /// it is the defect. The marker records WHO loaded the library, which is what
+    /// separates those two.
+    ///
+    /// Kept separate from the `PATH` leg on purpose: a fix that closes one and not the
+    /// other passes a combined assertion.
+    #[test]
+    fn the_approved_env_never_reaches_bwrap_itself_via_ld_preload() {
+        if let Err(why) = crate::bwrap_can_build_a_jail() {
+            eprintln!("SKIP the_approved_env_never_reaches_bwrap_itself_via_ld_preload: measured blocker: {why}");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("delphi-r1501-preload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("loaded-by.txt");
+        let so = match build_preload_marker(&dir, &marker) {
+            Ok(so) => so,
+            Err(why) => {
+                eprintln!("SKIP the_approved_env_never_reaches_bwrap_itself_via_ld_preload: measured blocker: {why}");
+                return;
+            }
+        };
+
+        let out_file = dir.join("env.txt");
+        let mut action = action_with(vec![(dir.clone(), BindMode::ReadWrite)], NetPolicy::None);
+        action.env_delta = vec![("LD_PRELOAD".into(), so.display().to_string())];
+
+        let out = spawn_like_production(&action, &dir, &out_file);
+        assert!(out.status.success(), "bwrap: {}", String::from_utf8_lossy(&out.stderr));
+
+        let loaded_by = std::fs::read_to_string(&marker).unwrap_or_default();
+        println!("  processes that loaded the preloaded library:\n{loaded_by}");
+        assert!(
+            !loaded_by.lines().any(|l| l.trim() == "bwrap"),
+            "D0A-R15-01: the approved env_delta reached BWRAP — a root process, pre-sandbox \
+             and pre-drop. LD_PRELOAD there is root code execution. Loaded by:\n{loaded_by}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// D0A-R15-01 LEG 2 of 2 — `PATH`.
+    ///
+    /// Independent of the `LD_PRELOAD` leg and a different exploitation path: if the
+    /// untrusted delta is on the `Command`, `PATH` in it decides WHICH BINARY the daemon
+    /// runs as the sandbox. The jail is then whatever the caller supplied.
+    #[test]
+    fn the_approved_env_cannot_choose_which_bwrap_binary_runs() {
+        if let Err(why) = crate::bwrap_can_build_a_jail() {
+            eprintln!("SKIP the_approved_env_cannot_choose_which_bwrap_binary_runs: measured blocker: {why}");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("delphi-r1501-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake_dir = dir.join("fake");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let impostor_ran = dir.join("impostor-ran.txt");
+        let fake = fake_dir.join("bwrap");
+        std::fs::write(&fake, format!("#!/bin/sh\necho ran > {}\nexit 0\n", impostor_ran.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out_file = dir.join("env.txt");
+        let mut action = action_with(vec![(dir.clone(), BindMode::ReadWrite)], NetPolicy::None);
+        action.env_delta = vec![("PATH".into(), fake_dir.display().to_string())];
+
+        let _ = spawn_like_production(&action, &dir, &out_file);
+
+        assert!(
+            !impostor_ran.exists(),
+            "D0A-R15-01: PATH from the approved env_delta selected the sandbox binary — the \
+             caller chose its own jail. An impostor at {} ran instead of the real bwrap.",
+            fake.display()
+        );
+        assert!(out_file.exists(), "the real bwrap must still have run the tool");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

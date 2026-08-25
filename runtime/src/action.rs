@@ -207,6 +207,21 @@ pub(crate) fn seal_executable_snapshot(content: &[u8]) -> Result<OwnedFd, Runtim
     Ok(owned)
 }
 
+/// A sealed, NON-executable snapshot of `content`, rewound to offset 0.
+///
+/// D0A-R15-01. Same immutability as a script pin, but it is DATA that a reader consumes with
+/// `read(2)` — bwrap's `--args` and `delphi-drop`'s environment blob — so the offset is part
+/// of the contract; a snapshot left at EOF reads as empty and would silently carry nothing.
+pub(crate) fn seal_data_snapshot(content: &[u8]) -> Result<OwnedFd, RuntimeError> {
+    use std::os::fd::AsRawFd;
+    let fd = seal_immutable_memfd(content)?;
+    // SAFETY: lseek on an fd this function owns; seals forbid writes, not seeks.
+    if unsafe { nix::libc::lseek(fd.as_raw_fd(), 0, nix::libc::SEEK_SET) } < 0 {
+        return Err(RuntimeError::Syscall { op: "lseek (data snapshot)", source: Errno::last() });
+    }
+    Ok(fd)
+}
+
 /// Create a memfd holding `content` and seal it fully immutable
 /// ([`ScriptPin::FULL_SEALS`]).
 fn seal_immutable_memfd(content: &[u8]) -> Result<OwnedFd, RuntimeError> {

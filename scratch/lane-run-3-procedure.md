@@ -1,4 +1,8 @@
-# Lane run 3 — procedure (branch `phase-3b/d0-readiness-contract`)
+# Lane runs 3–4 — procedure (branch `phase-3b/d0-readiness-contract`)
+
+> **RUN 4 is the re-run.** Sections 0–6 below are unchanged and still apply. What run 4 adds
+> is §7, which exists because **run 3's fixes are unproven in exactly the way this arc keeps
+> getting caught by.**
 
 **Why this run exists.** Round 15 changed the execute path's environment transport at the
 privilege boundary, and **the branch it changed has never executed.** Unprivileged there is no
@@ -175,3 +179,60 @@ Two failure shapes, and they are not the same:
   pre-`execve` — → suspect the harness, but only as far as the evidence goes. That error means
   a missing fd **or** a missing loader (class 43), and it was misdiagnosed twice by assuming
   the first. Print the subprocess's stderr before concluding anything.
+
+---
+
+## 7. RUN 4 — what it must settle, and what it must NOT be allowed to conclude
+
+### 7.1 The guard proves they PLAN, not that they PASS
+
+`every_fixture_that_executes_an_action_plans_its_credentials` asserts that seven fixtures now
+call the credential API. **It cannot assert that the actions then execute.** Planning was the
+necessary condition for the eight root failures; it is not obviously the sufficient one, and
+treating "the guard is green" as "the failures are fixed" would be the same substitution —
+evidence about a mechanism standing in for evidence about the property — that this run exists
+to correct.
+
+So the eight are OPEN until this run closes them by name:
+
+```bash
+grep -E 'test result:|^test .+ \.\.\. (FAILED|SKIP|DEFER)' /tmp/lane4.log
+```
+
+Each of the eight must appear as `ok`, or as a SKIP whose **measured blocker names something
+other than credentials**. A SKIP is not a pass, and `r4_03_daemon_real_gate` will legitimately
+skip without `--features insecure-test-seams` — which is a different statement from the
+`NotFound` crash it produced before, and must be read as such.
+
+### 7.2 The leaks were never leaks — confirm the warning is gone
+
+The errno was `ENOENT`: both directories were already removed, and the guard reported its own
+success path as a failure. `leak_report` now returns `None` for `NotFound`. **Confirm no
+warning fires**, and that the mechanism has not been disabled wholesale:
+
+```bash
+grep -c 'has LEAKED' /tmp/lane4.log      # expect 0
+ls -d /run/delphi-* 2>/dev/null || echo "no /run/delphi-* remains"
+```
+
+Both lines are needed. `0` warnings with directories still present would mean the fix silenced
+a real leak rather than a false one — the failure mode of every "make the warning go away"
+change, and the reason the fix was made in `leak_report` with both directions asserted rather
+than by dropping the report.
+
+### 7.3 Two numbers to record, neither to predict
+
+- **the whole-suite root pair.** Run 3's first measurement was `159 passed / 8 failed` across
+  17 targets. Run 4's is the one that says whether the eight closed.
+- **the skip set at root.** Not the count — the NAMES. A test that stops failing by starting
+  to skip has not been fixed, and a bare count cannot tell those apart (`DEFECT_CLASSES` 10).
+
+```bash
+grep -oE '^test [a-z_0-9:]+ \.\.\. SKIP' /tmp/lane4.log | sort
+```
+
+### 7.4 Unchanged from run 3, and still the point
+
+Build every target (§4), `installer/build.sh` before `install.sh` (§3), PAM checksum both
+sides (§1, §6). Run 3 found three procedure defects and one of them — running one target of
+seventeen — hid sixteen targets' worth of failures behind a green summary.

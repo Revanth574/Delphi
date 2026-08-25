@@ -28,9 +28,12 @@
 # EXECUTES. The root pair once recorded here as EXECUTED=141 SKIPPED=0 was an EXPECTATION that
 # was never measured, and it cannot be right: the two PAM-auth skips, the --features skip and
 # the DEFER do not depend on euid, so SKIPPED=0 is unreachable. It is withdrawn rather than
-# replaced with a second guess — lane run 3 measures it into
-# `.githooks/runtime-test-count-baseline.root`, which the hook reads via
-# DELPHI_TEST_COUNT_BASELINE. Do not edit THESE values for a root run.
+# replaced with a second guess. As of lane run 6 the root SHAPE is measured — 17 targets, 0
+# failures, 0 SKIPS — but the root EXECUTED figure STILL is not: deriving it as 169 from this
+# file's `reported` minus zero skips is arithmetic, and arithmetic is what put the withdrawn
+# expectation here in the first place. It gets written to
+# `.githooks/runtime-test-count-baseline.root` when scripts/test-count.sh prints it AT ROOT.
+# Do not edit THESE values for a root run.
 #
 # AND ENVIRONMENT-SPECIFIC IS A SHARPER CONSTRAINT THAN IT READS (D0A-R15-04). A reviewer in
 # a restricted container measured EXECUTED=115 SKIPPED=46 against this same tree: bwrap and

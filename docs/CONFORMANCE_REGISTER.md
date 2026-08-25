@@ -26,6 +26,49 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | **CLOSED 2026-08-15** — `sandbox::refuse_denied_bind` refuses every spelling (lexical fold + canonicalize), wired at the `run_fd_pinned` choke point, with a positive control. Both weakens bite: removing the call site lets execution reach bwrap (`bwrap: Can't find source path /run/delphi/alice` — it would have BOUND it where the path exists); removing traversal folding fails `/tmp/../run/delphi/alice` |
 
+## THE ROOT LANE — WHAT IT PROVED, AND WHAT IT COST TO FIND OUT (runs 3–6, 2026-08-24/25)
+
+**Standing after run 6: 17 targets, 0 failures, 0 skips, 0 leaks, PAM stack intact.** Sixteen
+of those seventeen targets had never executed at root before run 3.
+
+| property | standing |
+|---|---|
+| the approved environment reaches the tool **on the far side of the drop** (D0A-R15-01's gradient branch) | **PROVEN** at root — one artifact carrying `Uid: 997 997 997 997` **and** `DELPHI_SECRET=s3cret-value`, fd 11 carrying the sealed env |
+| the drop helper the daemon runs is the one it was built against | **PROVEN** at root — built and installed agree at `aba0f0ea14b751aa…`, and the first time the digest binding refused a *legitimate* change rather than an attack |
+| every `b1_integration` / `end_to_end` / `divergence` root path | **PROVEN** — 0 failures, and **0 skips**, so nothing closed by ceasing to run |
+
+### The root EXECUTED figure is still NOT recorded, deliberately
+
+`0 skips` and `169 reported` unprivileged would give `EXECUTED=169` at root by arithmetic.
+**That is two measurements and a subtraction, not a measurement**, and it is the move that put
+`EXECUTED=141 SKIPPED=0` in the baseline as an expectation nobody had run. The figure gets
+recorded when `scripts/test-count.sh` runs at root and prints it. Until then this file records
+the shape (17 targets, 0 failures, 0 skips) and not the number.
+
+Superseded and not to be cited: run 3's `159 passed / 8 failed` (17 targets, first whole-suite
+measurement) and its lib-only predecessor `112 passed / 1 failed`, which covered one target of
+seventeen because the procedure said `head -1`.
+
+### EIGHT FAILURES, FOUR CAUSES, ONE SIGNATURE — the record, because the shape recurs
+
+`8 → 5 → 2 → 0`. Each run shed one cause and exposed the next, and **three of the four
+presented identically** as `left: ""` — an empty marker, no error, no denial:
+
+| run | cause | why it was invisible until then |
+|---|---|---|
+| 3 | fixtures never planned credentials | `#[cfg(test)]` helper cannot exist for an integration test, so the lib fix could not generalise |
+| 4 | out dirs not chowned to the planned tuple | the action runs as `delphi-tool` and fails INSIDE the jail, so it never surfaces as a permission error |
+| 5 | a second chown instance in a funnel run 4's fix did not reach | the file-granular guard asked whether the FILE chowns, not whether THIS fixture does |
+| 5 | a fixture building an action production cannot (plain fd, fake digest) | `unwrap_or_default()` collapsed a correct refusal into an empty string |
+
+**All four were latent, none regressed.** Every one had been present since its code landed and
+was waiting for an environment nobody had used — the class-20 shape, four times in one arc.
+
+**The durable fix is not any of the four.** It is that the fixtures now assert the **result
+before the marker**, so a fifth cause names itself instead of costing three inferences. And
+the enumerating guard, whose record is now decisive: seal check found 9 fixtures, digest check
+2, credential guard 7, chown guard 5 — **reading found 0.**
+
 ## SUPERSEDED CLAIMS FROM `docs/TRUST_MODEL.md` §3 (relocated here 2026-08-23, D0A-R15-02)
 
 **Why they live here.** A normative document's one job is to let a reader tell what is

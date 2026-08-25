@@ -196,15 +196,35 @@ puzzle.
 
 ### NAMED LIMIT 2 — **WITHDRAWN AS FALSE (2026-08-23, D0A-R14-01)**
 
-**The previous text declared the dynamic loader and system libraries an immutable platform
-TCB member.** That declaration is withdrawn, not softened, because measurement removed it: an
-approved binary **names its own `PT_INTERP`**, so it can select a loader the operator never
-placed — and a controlled probe confirmed that replacing that loader after sealing changes
-the code that executes.
+It declared the dynamic loader and system libraries an immutable platform TCB member.
+Measurement removed it. **The narrative — what was claimed, how it was falsified, and why it
+was struck rather than qualified — lives in `docs/CONFORMANCE_REGISTER.md`,** which is where
+superseded claims belong.
 
-**A declaration the attacker can invalidate is not a weaker boundary. It is not a boundary.**
-It is struck from the normative text rather than qualified, and this paragraph stays as the
-record that it was asserted for one day and falsified by the next round.
+That relocation is itself a correction (D0A-R15-02). The withdrawal was originally left
+standing here, struck through, as an honest record. It made a reader of a NORMATIVE document
+distinguish preserved-falsified text from active requirement, which is the one job this
+document has. The trail survives through the pointer; the requirement text does not carry it.
+
+### THE RULE THIS SECTION IS NOW WRITTEN UNDER (2026-08-23, after three amendments in three rounds)
+
+**§3 states what is BOUND. It does not state what is UNREACHABLE.**
+
+Three rounds, three sentences in this section that measurement contradicted: v7's contract
+version, named limit 2, and the static-ELF "no handler" claim. The pattern across all three is
+not carelessness in a particular sentence — it is the KIND of sentence. **The narrowing claims
+have survived and the totality claims have not.** "v7 binds the first object" has held under
+every probe. "Immutable platform TCB member", "no handler", "everything downstream is pinned"
+each failed within a round of being written.
+
+The reason is structural, which is why it is a rule and not a resolution to be careful: a
+claim that some path is absent is a claim about the entire kernel and every configuration it
+can be in. We cannot measure that, and an unmeasurable claim in a normative document is a
+declaration wearing a proof's clothes. A claim about what is bound is checkable against the
+mechanism in front of us.
+
+Where an absence really is load-bearing, it is written as a **precondition the deployment
+enforces and verifies** — not as a property this system provides.
 
 ### WHAT v7 BINDS, STATED AT ITS ACTUAL EXTENT (2026-08-23, D0A-R14-01/02)
 
@@ -228,13 +248,26 @@ that has produced findings in **seven consecutive review rounds** — and a clos
 one element fails **silently at exec**, which is precisely D0A-R9-02's shape. Reintroducing
 that failure mode to support a claim no deployment has yet needed is the wrong trade.
 
-**THE CONFIGURATION WHERE FIRST-OBJECT BINDING IS TOTAL — offered, not imposed.** A
-**statically linked native ELF** has no downstream hops: no `PT_INTERP`, no interpreter, no
-handler. For such a program "the first object is bound" and "everything that executes is
-bound" are the same statement. A deployment that needs closure obtains it **by construction**
-— by shipping static tools — rather than by trusting a computation of ours. `delphi-drop` is
-already built this way for an unrelated reason (§6's mount discipline), which is evidence the
-constraint is livable where it matters most.
+**THE CONFIGURATION WHERE FIRST-OBJECT BINDING IS CLOSEST TO TOTAL — offered, not imposed,
+and NOT total (corrected 2026-08-23, D0A-R15-02).** A **statically linked native ELF** removes
+the two hops that live in the FILE: no `PT_INTERP`, so no loader and no path-resolved DSOs;
+no interpreter. A deployment that wants that obtains it **by construction** — by shipping
+static tools — rather than by trusting a computation of ours. `delphi-drop` is already built
+this way for an unrelated reason (§6's mount discipline), which is evidence the constraint is
+livable where it matters most.
+
+**It does NOT remove the third hop, and the previous text said it did.** That text claimed
+"no handler", and therefore that first-object binding and total binding coincide. They do not:
+`binfmt_misc` dispatch is a property of the KERNEL, not of the file. A registered handler can
+match on `\x7fELF` magic and be selected **before** the native ELF handler in the kernel's
+`search_binary_handler` walk, introducing exactly the unbound interpreter hop static linkage
+was supposed to have removed; an `F`-flagged handler additionally holds its interpreter open
+across mount changes. Static linkage is a statement about the file. The claim it was made to
+support was a statement about the whole kernel.
+
+**So the honest form is conditional:** for a static native ELF, first-object binding is total
+**on a system with no matching `binfmt_misc` handler** — a precondition a deployment can
+enforce and verify, and which this runtime does not currently check.
 
 ### NAMED LIMIT 1 — NARROWED to what it does (2026-08-23, D0A-R14-02)
 

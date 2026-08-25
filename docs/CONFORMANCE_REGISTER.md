@@ -26,6 +26,52 @@ merged at `f5b823d`); D0-A did not introduce them, it found them. Measured at `0
 | §7 | audit "carries … result" | **CORRUPTIBLE** — a bwrap SETUP failure exits nonzero and is recorded as the action having run and failed, when it never ran. **Not a bypass**: `execute.rs:175` is the only production spawn (everything else is after `#[cfg(test)]`), and a missing bwrap is a hard error | D0A-R9-07 | setup failure and tool exit are distinguished in the audit entry |
 | §6 | "the daemon's socket is a root-owned filesystem socket **outside the jail's mount set**" | **UNENFORCED** — `sandbox.rs:60` binds exactly what was approved with **no path denylist**, so an action may name `/run/delphi/…` and place the socket *inside* the mount set. Distinct from R9-03: that is TOCTOU on *resolution*; this is that nothing forbids naming the target at all | **D0A-R9-10** (found while verifying, not in the review) | **CLOSED 2026-08-15** — `sandbox::refuse_denied_bind` refuses every spelling (lexical fold + canonicalize), wired at the `run_fd_pinned` choke point, with a positive control. Both weakens bite: removing the call site lets execution reach bwrap (`bwrap: Can't find source path /run/delphi/alice` — it would have BOUND it where the path exists); removing traversal folding fails `/tmp/../run/delphi/alice` |
 
+## SUPERSEDED CLAIMS FROM `docs/TRUST_MODEL.md` §3 (relocated here 2026-08-23, D0A-R15-02)
+
+**Why they live here.** A normative document's one job is to let a reader tell what is
+required. Struck-through history in §3 made the reader distinguish preserved-falsified text
+from active requirement, so the narratives moved and §3 keeps a pointer. The trail survives;
+the requirement text does not carry it.
+
+### NAMED LIMIT 2 — the dynamic loader as an immutable platform TCB member
+
+**Claimed** (2026-08-22, v7): the dynamic loader and system libraries are an immutable
+platform TCB member, so the chain past the first object needs no binding.
+
+**Falsified** (2026-08-23, D0A-R14-01): an approved binary **names its own `PT_INTERP`**, so
+it selects a loader the operator never placed. A controlled probe replaced that loader after
+sealing and changed the code that executed.
+
+**Struck, not softened.** A declaration the attacker can invalidate is not a weaker boundary;
+it is not a boundary. It stood for one day.
+
+### THE STATIC-ELF CLOSURE CLAIM — "no downstream hops: no `PT_INTERP`, no interpreter, no handler"
+
+**Claimed** (2026-08-23, in the same amendment that struck limit 2): for a statically linked
+native ELF, first-object binding and total binding are the same statement.
+
+**Falsified** (2026-08-23, D0A-R15-02): `binfmt_misc` dispatch is a property of the KERNEL,
+not the file. A handler can match `\x7fELF` magic and be selected before the native ELF
+handler, reintroducing the unbound interpreter hop; an `F`-flagged handler holds its
+interpreter open across mount changes. Static linkage removes the two hops that live in the
+file and cannot remove the one that lives in the kernel.
+
+**Narrowed, not struck** — the configuration is still the best available, stated with the
+precondition it actually needs: no matching handler registered, which a deployment can enforce
+and this runtime does not check.
+
+### THE PATTERN, WHICH IS THE POINT OF LISTING THEM TOGETHER
+
+**Three §3 amendments in three consecutive rounds, every one found by MEASUREMENT and none by
+rereading.** The author's model of the mechanism is the model that produced the sentence, so
+rereading cannot catch it — this is structural blindness, not inattention.
+
+**The narrowing claims survived; the totality claims did not.** "v7 binds the first object"
+has held under every probe. "Immutable platform TCB member", "no handler", "everything
+downstream is pinned" each failed within a round. §3 is now written under the rule that
+follows from that: **it states what is bound, never what is unreachable** — because a claim
+about the absence of a path is a claim about the whole kernel, which nothing here can measure.
+
 ## STANDING — PROVEN / DECLARED / **FALSIFIED** (three states, 2026-08-23)
 
 The distinction this file exists to keep, and it needed a **third** state the day after it

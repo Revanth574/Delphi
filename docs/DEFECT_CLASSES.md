@@ -2248,6 +2248,18 @@ output), never offered as a guess to explain an inconvenient red.
 
 ---
 
+### Instance, 2026-08-23 — a COMMENT that executes (class 39, loud end)
+
+A comment written into an **unquoted** heredoc quoted two flags in backticks. Backticks are
+command substitution, so bash ran them: `--tests: command not found`, twice per fixture built.
+
+Same mechanism as the Rust-continuation-through-Python instance above — **the tool writing the
+text and the shell reading it disagree about escapes, and the artifact exists and looks
+plausible** — but at the opposite volume. That one wrote a silently wrong literal; this one
+shouted. The volume is luck, not a property of the class: a comment is exactly where nobody
+looks for executable content, and had the substitution succeeded quietly it would have been
+the silent form.
+
 ## 40. The sandbox's own scaffolding blocks the measurement  *(new — D0A-R9-01; THREE instances before it was named)*
 
 **Measured, unprivileged, in one command:**

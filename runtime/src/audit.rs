@@ -255,6 +255,10 @@ mod tests {
     /// Build an action whose executable is the script at `exe` (which really
     /// `exit 7`s), with the toolset bound so `/bin/sh` runs.
     fn exit7_action(exe: &Path) -> PendingAction {
+        // At euid 0 with no plan recorded, `decide_credentials` REFUSES by design
+        // (D0A-R11-06/R12-08, demonstrated at execute.rs:868). Without this the action
+        // never runs at root and the audit records no exit code — lane run 3's failure.
+        crate::execute::tests::plan_credentials_once();
         fs::write(exe, "#!/bin/sh\nexit 7\n").unwrap();
         fs::set_permissions(exe, fs::Permissions::from_mode(0o755)).unwrap();
         PendingAction {
@@ -307,6 +311,13 @@ mod tests {
         let token = mint(&key, &canonical_action_digest(&action), NOW);
 
         let real = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+        // NAME THE CAUSE FIRST. This assertion is here because its absence cost a diagnosis:
+        // at root the run failed with `CredentialsNotPlanned` and the suite reported
+        // `left: None, right: Some(7)` — true, and three inferences away from the reason.
+        // An assertion one step removed from its cause is a diagnostic the operator pays for.
+        if let Err(e) = &real {
+            panic!("execute_approved failed before any exit code could exist: {e}");
+        }
         let audit = RuntimeAuditEntry::record(&action, &profile, &real, NOW);
         assert_eq!(
             audit.exit_code,

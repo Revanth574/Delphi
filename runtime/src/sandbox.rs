@@ -863,16 +863,30 @@ extern "C" fn ctor() {{
             ),
         )
         .map_err(|e| e.to_string())?;
-        let out = std::process::Command::new("rustc")
+        let out = std::process::Command::new(env!("DELPHI_RUSTC"))
             .args(["--edition", "2021", "--crate-type", "cdylib", "-o"])
             .arg(&so)
             .arg(&src)
             .output()
-            .map_err(|e| format!("rustc not runnable: {e}"))?;
+            .map_err(|e| format!("rustc not runnable at {}: {e}", env!("DELPHI_RUSTC")))?;
         if !out.status.success() {
             return Err(format!("rustc failed: {}", String::from_utf8_lossy(&out.stderr)));
         }
         Ok(so)
+    }
+
+    /// The baked rustc path must be ABSOLUTE, because that is the entire mechanism.
+    ///
+    /// Lane run 3 skipped the `LD_PRELOAD` leg — the one leg the run existed to prove — with
+    /// "rustc not runnable": under `sudo`, rustup is not on root's `PATH`. A relative path
+    /// here reproduces that silently, and a SKIP is invisible in a green summary.
+    #[test]
+    fn the_baked_rustc_path_is_absolute_so_the_root_lane_can_use_it() {
+        let p = env!("DELPHI_RUSTC");
+        assert!(
+            p.starts_with('/'),
+            "DELPHI_RUSTC must be absolute or the root lane skips the leg it came for: {p}"
+        );
     }
 
     /// D0A-R15-01 LEG 1 of 2 — `LD_PRELOAD`.

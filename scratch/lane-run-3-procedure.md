@@ -61,29 +61,54 @@ touch runtime/src/execute.rs && cargo test -p delphi-runtime --tests --no-run >/
 sha256sum "$BIN"          # MUST equal /tmp/bin-before.sha — a forced rebuild changed nothing
 ```
 
-## 3. Install — before the run, not after
+## 3. BUILD the staging tree, then install
 
-The helper's argv gained the env fd, so the compiled-in digest no longer matches whatever is
-at `/usr/libexec/delphi-drop`.
+**Corrected after run 3, where this step was wrong twice.**
+
+`install.sh` installs whatever is in `installer/staging/` and does not build it. On run 3 the
+staging helper was the PRE-ABI binary, unchanged since that morning, while the daemon had been
+compiled against the new one — so the install produced a digest mismatch that the run then had
+to diagnose. Build first:
 
 ```bash
+installer/build.sh
 sudo installer/install.sh
 sha256sum /usr/libexec/delphi-drop
 ```
 
-Then confirm built and installed agree — this is item **B**, and it is a one-line check
-because the daemon does it by construction:
+**And the digest check named in run 3's procedure does not work.** `DELPHI_DROP_DIGEST` is a
+`cargo:rustc-env` emitted by `runtime/build.rs`; it is compiled INTO the daemon and never
+appears in build output, so `grep DELPHI_DROP_DIGEST /tmp/build.log` returns nothing — silently,
+which is worse than failing. Read it out of the binary instead:
 
 ```bash
-grep -oE 'DELPHI_DROP_DIGEST=[a-f0-9]+' /tmp/build.log | tail -1
+INSTALLED=$(sha256sum /usr/libexec/delphi-drop | cut -c1-64)
+strings "$BIN" | grep -q "$INSTALLED" && echo "BUILT == INSTALLED ($INSTALLED)" \
+    || echo "MISMATCH — the run would measure a refusal, not the property"
 ```
 
-If they disagree, **stop**: the run would measure a refusal, not the property.
+If they disagree, **stop**.
 
 ## 4. The run
 
+**RUN EVERY TARGET, NOT ONE.** Run 3 executed a single binary and reported `112 passed / 1
+failed / 2 skips` — that is the LIB target alone (113 tests), and the other sixteen targets,
+including every `b1_integration` root test, never ran. The procedure said `head -1`. This is
+D0A-R14-03's shape — a scope narrower than the claim drawn from it — reintroduced by me in the
+document written to avoid it, one increment after fixing it in the gate.
+
 ```bash
-sudo "$BIN" --test-threads=1 --nocapture 2>&1 | tee /tmp/lane3.log
+mapfile -t BINS < <(cargo test -p delphi-runtime --tests --no-run --message-format=json 2>/dev/null \
+    | python3 -c 'import sys,json
+for l in sys.stdin:
+    try: m=json.loads(l)
+    except ValueError: continue
+    if m.get("profile",{}).get("test") and m.get("executable"): print(m["executable"])')
+printf '%s targets to run:\n' "${#BINS[@]}"; printf '  %s\n' "${BINS[@]}"
+for b in "${BINS[@]}"; do
+    echo "=== $b ==="
+    sudo "$b" --test-threads=1 --nocapture
+done 2>&1 | tee /tmp/lane3.log
 ```
 
 `--test-threads=1` is required, not a preference: every `fork`+PAM test on this branch is
@@ -101,6 +126,16 @@ Item **A** passes only if the single artifact carries **both** facts: `Uid:` fou
 `997`, **and** `DELPHI_SECRET=s3cret-value`. Either alone is satisfiable with the defect
 present — the pre-fix code also delivered the value, just to root first.
 
+### The rustc-under-sudo skip is closed by mechanism, not by a PATH reminder
+
+Run 3 skipped `the_approved_env_never_reaches_bwrap_itself_via_ld_preload` — R15-01's own RED
+leg, in the run that existed to prove R15-01 — because it compiles its `LD_PRELOAD` fixture with
+`rustc`, and `sudo` does not carry rustup's `PATH`. `runtime/build.rs` now bakes cargo's own
+absolute rustc into `DELPHI_RUSTC`, and a test asserts it is absolute, so the leg no longer
+depends on the invoking environment. **`sudo env "PATH=$PATH"` would also have worked and is
+the wrong fix** — it is a rule the operator must remember, on a run whose failure mode is a
+silent skip inside a green summary.
+
 ## 5. Record the pair — do not predict it
 
 The unprivileged pair is measured: **`EXECUTED 142 / SKIPPED 24 / reported 166`**, of which 20
@@ -115,8 +150,9 @@ measured.
 I am deliberately not replacing it with another prediction. Some of the 20 root-gated tests
 carry *further* gates — a real seat, systemd, a same-uid sibling — that this box may not
 satisfy, so the arithmetic `142 + 20` is exactly the one-step-past-what-was-measured move this
-arc keeps paying for. **Run it, quote it, and the number goes in a separate root baseline
-file** rather than overwriting the unprivileged pair:
+arc keeps paying for. Run 3's `112 / 1 / 2` is **not** that number: it is the lib target alone. The whole-suite root
+pair is still unmeasured. Run it across every target, quote it, and put it in a separate root
+baseline file rather than overwriting the unprivileged pair:
 
 ```bash
 DELPHI_TEST_COUNT_BASELINE=.githooks/runtime-test-count-baseline.root

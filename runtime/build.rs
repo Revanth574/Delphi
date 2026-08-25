@@ -10,6 +10,15 @@
 //! and no dev package required. The symbols are verified present via `nm -D`.
 
 fn main() {
+    // D0A-R15-01's LD_PRELOAD leg compiles its marker library with rustc, and SKIPPED on lane
+    // run 3: under `sudo` rustup is not on root's PATH, so the one leg the run existed to
+    // prove could not build its fixture. Cargo hands build scripts the absolute rustc it is
+    // itself using; baking it makes the test independent of the invoking PATH.
+    println!(
+        "cargo:rustc-env=DELPHI_RUSTC={}",
+        std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
+    );
+
     // Link the exact runtime soname (no unversioned `.so`, so no `libsystemd-dev`).
     //
     // `rustc-link-lib` rather than the former `rustc-link-arg-{bins,tests}` pair: a

@@ -593,7 +593,7 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -661,10 +661,18 @@ mod tests {
     /// test that dies before its subject proves nothing about the subject, and on the lane
     /// it would have read as the drop being broken.
     ///
-    /// Called from `build_action`, which every execution test already goes through, so no
-    /// test can forget it. Unprivileged this is a no-op: `tool_credentials()` answers `None`
-    /// without a plan, exactly as production does for an unprivileged daemon.
-    fn plan_credentials_once() {
+    /// **The previous sentence here claimed "called from `build_action`, which every
+    /// execution test already goes through, so no test can forget it". That was false, and
+    /// saying it is why nobody checked** — `audit.rs`'s `exit7_action` builds its own action,
+    /// never called this, and at root `execute_approved` therefore refused before running. It
+    /// surfaced on lane run 3 as `exit_code: None` where 7 was expected, one step removed from
+    /// its cause. A totality claim about a mechanism, in a doc comment (D0A-R15-02's shape).
+    ///
+    /// The callers are `build_action` and `audit::tests::exit7_action`. Any future fixture
+    /// that constructs a `PendingAction` by hand owes this call; nothing enforces it, which is
+    /// the honest statement of where the mechanism stops. Unprivileged it is a no-op:
+    /// `tool_credentials()` answers `None` without a plan, exactly as production does.
+    pub(crate) fn plan_credentials_once() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             if nix::unistd::geteuid().as_raw() != 0 {

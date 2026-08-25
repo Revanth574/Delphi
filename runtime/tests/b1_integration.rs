@@ -262,10 +262,6 @@ fn unsealed_memfd(content: &[u8]) -> std::os::fd::OwnedFd {
     }
 }
 
-/// Copy a built bin into `dir` (mode 0755) so the dropped session user can exec it
-/// — the build target lives under the developer's home, which other uids cannot traverse.
-/// (It said `/home/raven` until lane run 3: a machine-specific path left over from the
-/// `build.target-dir` pin CLAUDE.md reversed on 2026-08-15 for being exactly that.)
 /// The `insecure-test-seams` gate, in ONE place (D0A lane run 3, whole-suite).
 ///
 /// `delphi-surface-shell` carries `required-features = ["insecure-test-seams"]`, so
@@ -287,6 +283,10 @@ fn surface_shell_or_skip(test: &str) -> Option<&'static str> {
     None
 }
 
+/// Copy a built bin into `dir` (mode 0755) so the dropped session user can exec it
+/// — the build target lives under the developer's home, which other uids cannot traverse.
+/// (It said `/home/raven` until lane run 3: a machine-specific path left over from the
+/// `build.target-dir` pin CLAUDE.md reversed on 2026-08-15 for being exactly that.)
 fn stage_bin(src: &str, dir: &Path, name: &str) -> PathBuf {
     let dst = dir.join(name);
     std::fs::copy(src, &dst)
@@ -297,6 +297,12 @@ fn stage_bin(src: &str, dir: &Path, name: &str) -> PathBuf {
 
 fn marker_proposal(exe: &Path, marker: &str, out_dir: &Path) -> pb::Propose {
     credentials::plan_credentials_once();
+    // The rw bind is where the action writes, so it is chowned HERE and not only in
+    // `write_marker_exe` — `b1_shebang_interpreter_arg_reaches_exec` writes its own executable
+    // and reaches production through `canonicalize`, so it never passed through that helper
+    // and stayed red on lane run 5 with the same empty-marker signature (run 4's cause fixed,
+    // a second instance of it left standing).
+    credentials::chown_to_tool(out_dir);
     let ro = |p: &str| pb::Bind { path: p.into(), mode: pb::BindMode::BindReadOnly as i32 };
     pb::Propose {
         argv: vec!["tool".into(), marker.into()],

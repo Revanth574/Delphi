@@ -717,6 +717,15 @@ pub(crate) mod tests {
              {missing:#?}"
         );
         println!("  {checked} files build-and-execute; all plan credentials and chown");
+        // NAMED LIMIT, because lane run 5 walked through it. This guard is FILE-granular: it
+        // asks whether the file chowns SOMEWHERE, not whether THIS fixture does.
+        // `b1_integration.rs` chowned in `write_marker_exe` and passed, while
+        // `b1_shebang_interpreter_arg_reaches_exec` wrote its own executable, never went
+        // through that helper, and stayed red with the same empty-marker signature. Closing
+        // it needs per-`#[test]` granularity plus a list of helpers that chown on a fixture's
+        // behalf — a predicate with two ways to drift. Left open deliberately, and the
+        // mitigation is elsewhere: the fixtures now assert the RESULT before the marker, so a
+        // fourth cause names itself instead of arriving as `left: ""`.
     }
 
     /// D0A-R12-08 — plan the credentials the way the DAEMON does, once per test process.

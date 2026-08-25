@@ -156,8 +156,20 @@ fn one_biometric_action_through_1a_to_1d() {
     let action = PendingAction {
         pending_id: "act-e2e".into(),
         preview_version: 1,
-        executable_fd: std::fs::File::open(&exe).unwrap().into(),
-        executable_digest: [0x33; 32],
+        // PRODUCTION'S SHAPE (D0A-R13-01). A plain `File::open` fd is refused by v7's
+        // `require_exec_sealed`, and `[0x33; 32]` described nothing the action held — R14-03's
+        // `require_digest_matches` refuses that too. Both refusals are correct; this fixture
+        // predates them and could construct an action production cannot.
+        executable_fd: delphi_runtime::action::seal_executable_snapshot(
+            &std::fs::read(&exe).unwrap(),
+        )
+        .unwrap(),
+        executable_digest: {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(std::fs::read(&exe).unwrap());
+            h.finalize().into()
+        },
         argv: vec!["tool".into(), "DONE-E2E".into()],
         cwd: PathBuf::from("/"),
         env_delta: vec![],
@@ -194,6 +206,11 @@ fn one_biometric_action_through_1a_to_1d() {
 
     // ---- 1d: token-gated execute in the sandbox + audit the real outcome. ----
     let real = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+    // NAME THE CAUSE. `unwrap_or_default()` turns every refusal into an empty string, and an
+    // empty marker has now had THREE distinct causes across lane runs 3-5 — unplanned
+    // credentials, an un-chowned out dir, an unsealed fd — each indistinguishable from the
+    // others at the assertion. Asserting the Result first collapses three inferences to zero.
+    assert!(real.is_ok(), "execute_approved refused before any marker could be written: {real:?}");
     let observed = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
     let entry = RuntimeAuditEntry::record(&action, &SandboxProfile::derive(&action), &real, NOW);
 

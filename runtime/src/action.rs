@@ -164,7 +164,10 @@ pub(crate) const EXEC_SEALS: i32 = nix::libc::F_SEAL_SEAL
 ///
 /// [`RuntimeError::Syscall`] if `memfd_create` / `write` / `fcntl` fails, or if the seals
 /// are not present after being added.
-pub(crate) fn seal_executable_snapshot(content: &[u8]) -> Result<OwnedFd, RuntimeError> {
+/// Public so an INTEGRATION test can build the shape production builds (D0A-R13-01): a
+/// fixture that can construct an action production cannot is a fixture testing a shape
+/// production never has.
+pub fn seal_executable_snapshot(content: &[u8]) -> Result<OwnedFd, RuntimeError> {
     use std::os::fd::{AsRawFd, FromRawFd};
     // SAFETY: memfd_create returns a fresh owned fd, wrapped once so RAII closes it on
     // every error path; the writes are bounded by `content.len()`.

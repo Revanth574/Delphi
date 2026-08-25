@@ -52,6 +52,26 @@ REDS="${reds:-execute::tests::nested_interpreter_substitution_executes_unapprove
 case "\$1" in
   clippy) exit 0 ;;
   test)
+    if [ "$mode" = "integration-red" ]; then
+        # D0A-R15-05: a failure that lives in an INTEGRATION target, so the narrow scope
+        # cannot see it and the wide one can. The only leg where the gate's SCOPE decides
+        # the outcome. (No backticks in this comment: the heredoc is UNQUOTED, so a
+        # backtick here is command substitution and bash runs the flag as a command.)
+        case " \$* " in
+          *" --tests "*)
+            echo "test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.46s"
+            echo "failures:"
+            echo ""
+            echo "failures:"
+            echo "    b1_a_snapshot_mismatch_consumes_the_approval_and_blames_the_snapshot"
+            echo ""
+            echo "test result: FAILED. 14 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s"
+            exit 101 ;;
+          *)
+            echo "test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.46s"
+            exit 0 ;;
+        esac
+    fi
     if [ "$mode" = "compile-error" ]; then
         echo "error[E0004]: non-exhaustive patterns" >&2
         echo "error: could not compile \\\`delphi-runtime\\\` (lib test) due to 1 previous error" >&2
@@ -120,6 +140,27 @@ echo doc > "$R/README.md"; git -C "$R" add README.md
 run "nothing staged under runtime/ -> gate skipped" 0 "$R"
 case "$LAST_OUT" in *"runtime test gate"*) fail=$((fail+1)); echo "       ^ but the gate RAN";;
   *) pass=$((pass+1)); echo "       ...and the gate did not run ✓";; esac
+
+# ── SCOPE: the gate must reach INTEGRATION targets (D0A-R15-05) ───────────────────────
+# The self-test modelled --no-fail-fast and nothing else, so reverting the gate to
+# `--lib --bins` reopened D0A-R14-03 while every leg stayed green. The suite proved the gate
+# EXISTED, not that it catches what it was widened to catch. This stub's red is reachable
+# only through --tests.
+echo
+echo "  --- scope: a red that only --tests can see ---"
+run "integration-only failure -> REFUSE"          1 "$(mkrepo "$REAL" 0 0 integration-red "98 1" "" none)" "not the ones"
+
+# RED PROOF for that leg: the SAME fixture against a hook narrowed back to `--lib --bins`
+# must be ALLOWED — the defect walks through. Derived, never hard-coded (the G1 lesson).
+sed -E 's#(cargo test --no-fail-fast -p delphi-runtime) --tests#\1 --lib --bins#' \
+    "$REAL" > "$work/hook-scope"
+if ! grep -q -- '--lib --bins' "$work/hook-scope"; then
+    echo "  WEAKEN SCOPE DID NOT APPLY — the next line would be about the SHIPPED hook"; fail=$((fail+1))
+else
+    chmod +x "$work/hook-scope"
+    run "scope narrowed: the same red -> ALLOWED"  0 "$(mkrepo "$work/hook-scope" 0 0 integration-red "98 1" "" none)"
+    echo "       ^ so --tests is load-bearing, not decoration"
+fi
 
 # ── IDENTITY, not count (D0A-R11-02) ──────────────────────────────────────────────────
 # The gate counted failures, so a RED/GREEN IDENTITY SWAP passed it: fix an R9-02 test,

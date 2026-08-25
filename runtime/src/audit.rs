@@ -304,6 +304,7 @@ mod tests {
         // hand-rolled version cleaned up only on the success path.
         let tmp = tempfile::Builder::new().prefix("delphi-audit-").tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
+        crate::execute::tests::chown_to_tool(&dir);
         let exe = dir.join("tool.sh");
         let action = exit7_action(&exe);
         let profile = SandboxProfile::derive(&action);

@@ -652,7 +652,8 @@ pub(crate) mod tests {
         fs::rename(&tmp, path).unwrap();
     }
 
-    /// **The guard that replaces the sentence that was wrong seven times.**
+    /// **The guard that replaces the sentence that was wrong seven times — and then the
+    /// assumption that fixing it was enough.**
     ///
     /// A doc comment claimed every execution fixture goes through `build_action`, "so no test
     /// can forget it". Lane run 3 found `audit.rs` had. The whole-suite root run then found
@@ -692,8 +693,16 @@ pub(crate) mod tests {
                 continue;
             }
             checked += 1;
+            let path = f.strip_prefix(root).unwrap_or(f).display().to_string();
             if !(text.contains("plan_credentials_once") || text.contains("set_tool_credentials")) {
-                missing.push(f.strip_prefix(root).unwrap_or(f).display().to_string());
+                missing.push(format!("{path} (never plans credentials)"));
+            }
+            // LANE RUN 4: planning was necessary and not sufficient. Five fixtures then ran
+            // as `delphi-tool` into a directory the TEST process owned, wrote nothing, and
+            // asserted `left: ""`. Applied uniformly — a fixture whose tool writes nothing
+            // loses nothing by chowning, and a per-fixture judgement is what drifts.
+            if !text.contains("chown") {
+                missing.push(format!("{path} (never chowns an out dir to the planned tuple)"));
             }
         }
         // POSITIVE CONTROL: a guard that matched nothing would pass forever. It must have
@@ -702,10 +711,12 @@ pub(crate) mod tests {
                                off the fixtures it exists to check");
         assert!(
             missing.is_empty(),
-            "these build an action AND execute one, but never plan credentials, so at euid 0 \
-             they are refused before running (D0A-R11-06) and assert on nothing: {missing:?}"
+            "these build an action AND execute one, so at euid 0 they must BOTH plan \
+             credentials (or be refused before running, D0A-R11-06) AND chown what the tool \
+             writes to (or run as delphi-tool into a root-owned dir and write nothing): \
+             {missing:#?}"
         );
-        println!("  {checked} files build-and-execute; all plan credentials");
+        println!("  {checked} files build-and-execute; all plan credentials and chown");
     }
 
     /// D0A-R12-08 — plan the credentials the way the DAEMON does, once per test process.
@@ -728,6 +739,21 @@ pub(crate) mod tests {
     /// that constructs a `PendingAction` by hand owes this call; nothing enforces it, which is
     /// the honest statement of where the mechanism stops. Unprivileged it is a no-op:
     /// `tool_credentials()` answers `None` without a plan, exactly as production does.
+    /// Chown a directory the action will WRITE to, to the planned tuple.
+    ///
+    /// At root the tool is not root (D0A-R12-11): a dir created by the test process is not
+    /// writable by `delphi-tool`, and the action then writes nothing — which presents as an
+    /// EMPTY result, not as a permission error, because the failure is inside the jail.
+    /// Applied uniformly, including where the fixture's tool writes nothing, so there is no
+    /// per-fixture judgement to get wrong.
+    pub(crate) fn chown_to_tool(dir: &std::path::Path) {
+        plan_credentials_once();
+        if let Ok(Some((uid, gid))) = tool_credentials() {
+            std::os::unix::fs::chown(dir, Some(uid), Some(gid))
+                .expect("chown the out dir to the tool account");
+        }
+    }
+
     pub(crate) fn plan_credentials_once() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -1162,10 +1188,7 @@ pub(crate) mod tests {
             // Chowned to the PLANNED tuple, never a fresh lookup — the same discipline
             // R11-06 imposed on production, for the same reason: two resolutions can
             // disagree. Unprivileged there is no plan and this is a no-op.
-            if let Ok(Some((uid, gid))) = tool_credentials() {
-                std::os::unix::fs::chown(&out_dir, Some(uid), Some(gid))
-                    .expect("chown the out dir to the tool account");
-            }
+            chown_to_tool(&out_dir);
             Self { exe: dir.join("tool.sh"), result: out_dir.join("result"), out_dir, dir }
         }
     }

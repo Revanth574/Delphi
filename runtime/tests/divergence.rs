@@ -61,6 +61,9 @@ impl Env {
         let _ = fs::remove_dir_all(&dir);
         let out_dir = dir.join("out");
         fs::create_dir_all(&out_dir).unwrap();
+        // The tool is delphi-tool at root; an out/ owned by the test process is not writable
+        // by it, and the action writes nothing (lane run 4: `left: ""`).
+        credentials::chown_to_tool(&out_dir);
         Self { exe: dir.join("echo.sh"), result: out_dir.join("result"), out_dir, dir }
     }
     /// Write the fixed executable: echo `$1` into the bound result path.

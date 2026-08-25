@@ -231,6 +231,13 @@ impl Drop for Setup {
 /// A `#!/bin/sh` action that echoes its `argv[1]` into `result`, with the toolset +
 /// the writable output dir bound. Returns the executable path.
 fn write_marker_exe(dir: &Path, result: &Path) -> PathBuf {
+    // Every marker fixture goes through here, so this is where the result's directory becomes
+    // writable by the dropped tool. Without it the action runs and writes NOTHING, which the
+    // assertions read as `left: ""` or as NotFound on the result file — never as a permission
+    // error, because the failure is inside the jail (lane run 4, five tests).
+    if let Some(parent) = result.parent() {
+        credentials::chown_to_tool(parent);
+    }
     let exe = dir.join("echo.sh");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$1\" > {}\n", result.display())).unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();

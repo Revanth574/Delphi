@@ -147,6 +147,7 @@ fn one_biometric_action_through_1a_to_1d() {
     // ---- 1d: the canonical action (a Biometric action that writes a marker). ----
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();
+    credentials::chown_to_tool(&work);
     let exe = work.join("echo.sh");
     let result = work.join("result");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$1\" > {}\n", result.display())).unwrap();

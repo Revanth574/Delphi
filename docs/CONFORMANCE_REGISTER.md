@@ -322,6 +322,23 @@ reads `CapPrm/CapEff = 0` for bwrap while its payload lives: bwrap drops its own
 after setup. The privileged span is bounded by **setup**, not by the tool's lifetime — a
 materially smaller exposure than this row asserted.
 
+**THE CAP SET IS MINIMAL, MEASURED (2026-08-25, probe leg 7).** 5b established only
+SUFFICIENCY — a set carrying an unneeded capability would pass it identically. Necessity is
+now measured by removing each capability in turn:
+
+| variant | outcome |
+|---|---|
+| only `CAP_SETUID` (no SETGID) | fails — `setgroups failed: Operation not permitted` |
+| only `CAP_SETGID` (no SETUID) | fails — `setresuid failed: Operation not permitted` |
+| neither | fails — `setgroups failed` |
+| **both (positive control)** | **succeeds** |
+
+**Two DISTINCT failing syscalls, not three identical refusals** — `setgroups` when SETGID
+goes, `setresuid` when SETUID goes — so each variant fails for the reason its own removal
+predicts, and the positive control shows the harness can succeed at all. Both capabilities
+are load-bearing; the set is exactly minimal, and a future `--cap-add` has a standing check
+to justify itself against.
+
 **WHAT DID NOT CLOSE.** The tool's bounding set is still full. Split into its own row above.
 
 ### THE GUARD'S EVIDENCE IS A PROBE PAIR, NOT A RED — recorded as a limit (2026-08-25)

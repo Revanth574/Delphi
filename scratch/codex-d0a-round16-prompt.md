@@ -54,23 +54,37 @@ Measured support, all on the privileged path:
 
 ## Attack surfaces to concentrate on
 
-**1. Is the `--cap-add` set MINIMAL, or merely sufficient?** This is the sharpest known gap.
-`delphi-drop` calls `setgroups` → `setresgid` → `setresuid`. It has been shown to work with
-exactly these two capabilities; **nothing has shown that removing either one breaks it.** A
-set carrying an unneeded capability passes every existing check identically. Leg 7 of the
-probe was written for this and is **UNRUN at commit time** — treat the minimality claim as
-unsupported until it is, and say so if the leg's design would not actually establish it.
-
-**2. Is the "not weaken-provable in-tree" limit true, or is it an alibi?** The change grades
+**1. Is the "not weaken-provable in-tree" limit true, or is it an alibi?** The change grades
 its own guard below its name: stable (30/30 default parallel), emission weaken-proven twice,
 but the NNP discrimination **probe-measured rather than weaken-proven**, on the argument that
 the variable making it bite belongs to bwrap. **Try to falsify that.** If a test could
 construct the NNP-absent shape in-tree — the way probe leg 4b does out-of-tree — then the
 limit is overstated and the guard owes a real RED. This is the claim I most want attacked.
 
-**3. The gate on `creds.is_some()`.** With no credential drop the tool runs as root with the
-full capability set and no restriction is emitted. Is that the right boundary, or does the
-change leave the more dangerous configuration untouched while hardening the safer one?
+**2. The gate on `creds.is_some()` hardens the safer path and leaves the more dangerous one
+untouched — is that defensible?** Answer this directly rather than in passing. When
+`tool_credentials()` returns `None` no helper is interposed, bwrap execs the approved tool
+itself, no restriction is emitted, and **the tool runs as root holding
+`000001ffffffffff`**. The change therefore narrows capabilities in the configuration where a
+uid drop already constrains the payload, and does nothing in the configuration where nothing
+else does. Is that boundary right — is the un-dropped path a supported deployment, a
+dev-only path, or an unremarked hole — and should the restriction be unconditional?
+
+**3. Does the minimality design establish minimality, given its results?** MEASURED at root
+on 2026-08-25, after the reviewed commit (probe leg 7 — the file is in `3e4a275`; these
+numbers are not):
+
+```
+only CAP_SETUID (no SETGID)   failed   setgroups failed: Operation not permitted
+only CAP_SETGID (no SETUID)   failed   setresuid failed: Operation not permitted
+neither (control)             failed   setgroups failed: Operation not permitted
+both caps                     SUCCESS  (control holds)
+```
+
+Each removal fails at a **different syscall**, and a positive control shows the harness can
+succeed — so this is not three identical refusals sharing one explanation. The narrow ask:
+**does that design actually establish necessity of both capabilities**, or is there a way
+for a variant to fail for a reason unrelated to the capability removed?
 
 **4. Arg construction and scope enforcement.** The flags land after `--chdir` and before
 `--args <fd>` and the `--` separator. Check the interaction with `--args` fd-carried tokens
@@ -104,7 +118,9 @@ it stands in for.
 - **42** (a negative assertion whose sufficiency rested on a default the change removed) —
   the change is a *self-declared instance*: the restriction rests on bwrap's `no_new_privs`
   default. Judge whether asserting after a further exec is an adequate response, or theatre.
-- **34** (a deferral is an untested claim) — minimality, deferred to an unrun leg.
+- **34** (a deferral is an untested claim) — minimality WAS this, and is now measured
+  (surface 3). It stays listed because the measurement post-dates the commit: judge whether
+  anything else in the change is still carrying a deferral in place of a result.
 - **41** (the assertion is at the wrong altitude) — the guard asserts on `CapPrm` text
   scraped from `/proc/self/status` inside the jail.
 - **25** (the fixture is constructed differently from the thing it stands in for) — surface 6.

@@ -141,18 +141,57 @@ impl ReportingTempDir {
     }
 }
 
+/// Decide whether a failed `TempDir::close` is a LEAK, separated from the `Drop` so it is
+/// provable without arranging a real teardown failure (D0A whole-suite root run).
+///
+/// **`NotFound` is not a leak — it is the desired end state reached by another route.** The
+/// root run reported `/run/delphi-b1-…` and `/run/delphi-e2e-…` as LEAKED with
+/// `No such file or directory`: the directories were already gone. A teardown guard that
+/// warns on its own success path is worse than one that says nothing, because it trains the
+/// reader to skip the warning that matters — the same dynamic as a flaky test.
+#[must_use]
+pub fn leak_report(err: &std::io::Error, path: &std::path::Path) -> Option<String> {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return None;
+    }
+    Some(format!(
+        "WARN: could not remove the temp dir {} — it has LEAKED: {err}. \
+         Left unreported this is DEFECT_CLASSES 31 (a teardown whose failure is \
+         unobservable); reported, it is a fact you can act on.",
+        path.display()
+    ))
+}
+
 impl Drop for ReportingTempDir {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
             let p = inner.path().to_path_buf();
-            if let Err(e) = inner.close() {
-                eprintln!(
-                    "WARN: could not remove the temp dir {} — it has LEAKED: {e}. \
-                     Left unreported this is DEFECT_CLASSES 31 (a teardown whose failure is \
-                     unobservable); reported, it is a fact you can act on.",
-                    p.display()
-                );
+            if let Err(e) = inner.close()
+                && let Some(msg) = leak_report(&e, &p)
+            {
+                eprintln!("{msg}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod leak_report_tests {
+    use super::leak_report;
+    use std::io::{Error, ErrorKind};
+    use std::path::Path;
+
+    /// Both directions, because either alone is satisfiable by a constant.
+    #[test]
+    fn an_already_removed_dir_is_not_a_leak_and_a_busy_one_is() {
+        let p = Path::new("/run/delphi-b1-Yo7srF");
+        assert!(
+            leak_report(&Error::new(ErrorKind::NotFound, "No such file or directory"), p).is_none(),
+            "NotFound means the directory is GONE, which is what teardown is for. The root run \
+             reported exactly this as a LEAK for two directories that had already been removed."
+        );
+        let busy = leak_report(&Error::from_raw_os_error(nix::libc::EBUSY), p)
+            .expect("a genuine removal failure MUST still be reported");
+        assert!(busy.contains("LEAKED") && busy.contains("delphi-b1-Yo7srF"), "{busy}");
     }
 }

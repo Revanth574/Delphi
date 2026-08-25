@@ -53,5 +53,5 @@
 # Scope: `-p delphi-runtime --tests`, which is what the hook runs — ALL test targets,
 # integration included. It was `--lib --bins` until 2026-08-23, and that scope let two red
 # integration suites sit behind a green gate (D0A-R14-03). The full run costs ~3 seconds.
-EXECUTED=144
+EXECUTED=145
 SKIPPED=24

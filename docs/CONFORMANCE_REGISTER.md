@@ -137,7 +137,8 @@ cannot.
 | the snapshot is executable regardless of the source's mode (R14-04) | **DECLARED POLICY** — adopted deliberately; a 0644 source yields a runnable object, and `noexec` on the source mount does not stop an approved action |
 | **the loader and system libraries are immutable** | ~~DECLARED~~ → **FALSIFIED 2026-08-23 (D0A-R14-01).** An approved binary names its own `PT_INTERP`; a probe replaced the loader after sealing and changed executed code. **Struck from §3**, not qualified — a declaration the attacker can invalidate is not a boundary |
 | the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3** — v7 binds the FIRST OBJECT only. Closure is available **by construction** (a statically linked native ELF has no downstream hops), not by a computation of ours |
-| the pre-drop window is bounded (D0A-R10-12) | **NEITHER** — mitigation named and unimplemented; duration unmeasured |
+| the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED + duration MEASURED (2026-08-25).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload; window ~9–11 ms attributable, bind-count-driven, depth-independent. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured (the census samples after it) |
+| the pre-drop payload's BOUNDING set is narrowed | **OPEN — own row, split out of D0A-R10-12 (2026-08-25).** Measured: the R10-12 fix leaves `CapBnd = 000001ffffffffff` at both the payload and the tool. Left inside R10-12 it would let that row close with a named property still standing |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
 
 **Why the gap is accepted rather than closed** (the decision, so it is not relitigated as an
@@ -291,6 +292,73 @@ single-entry map). It was never falsified, only unmeasured.
 
 **Closes when** either the helper runs with the minimal capability set, or the window is measured
 and the trade re-decided against that measurement.
+
+### RESOLVED 2026-08-25 — both conditions met, and the row is narrowed rather than closed
+
+`scratch/d0a-r10-12-window-probe.sh`, six legs, zero skips, on the privileged path.
+
+**DURATION.** ~9–11 ms attributable (window minus the payload's own exec chain), ~17–20 ms
+wall. Driven by **bind count** (~1.7 ms/bind), **not by ancestor-emission depth** — depth 1
+vs 8 does not move it, across three runs. The obligation's specific worry is falsified.
+
+**PLACEMENT, forced by measurement rather than chosen.** Daemon-side is impossible (dropping
+the bounding set before bwrap → `Creating new namespace failed: Operation not permitted`;
+bwrap needs `CAP_SYS_ADMIN`). The permitted/effective lever does not exist in general: a root
+`execve` recomputes `P'(permitted) = F(permitted) & P(bounding)`, and with `F(permitted)`
+all-ones for the root case that restores the full set. bwrap's payload-side
+`--cap-drop`/`--cap-add` is the only seam that both restricts and holds.
+
+**IT BITES, AND ON SOMEONE ELSE'S DEFAULT.** `c0` survives a further root exec under the
+restriction; the control returns `000001ffffffffff` without it. It holds only because bwrap
+sets `no_new_privs=1` — unconditional, ungoverned by any flag, and **theirs, not ours**. If
+that changed, the profile would still emit the flags, the immediate state would still read
+`c0`, and the property would be gone with nothing failing. **Class 42 with a name attached.**
+So the guard asserts the state **after a further exec**, never the immediate state, and
+carries the control that makes it discriminate.
+
+**THE WINDOW'S SHAPE WAS ALSO WRONG HERE.** The census (corrected — the first version sampled
+a bash subshell that, being root, showed an identical cap set and could not discriminate)
+reads `CapPrm/CapEff = 0` for bwrap while its payload lives: bwrap drops its own capabilities
+after setup. The privileged span is bounded by **setup**, not by the tool's lifetime — a
+materially smaller exposure than this row asserted.
+
+**WHAT DID NOT CLOSE.** The tool's bounding set is still full. Split into its own row above.
+
+### THE GUARD'S EVIDENCE IS A PROBE PAIR, NOT A RED — recorded as a limit (2026-08-25)
+
+`the_predrop_payload_cannot_recover_capabilities_across_a_further_exec` is **stable**
+(30/30 under default parallel, suite-wide clean) and **not weaken-proven**, and the second
+half is a property of the subject rather than a gap in the work.
+
+**The available weaken is the wrong weaken.** Removing the flags makes the "restricted" leg
+*become* the control — both are then unflagged bwrap invocations that cannot differ. The
+first attempt returned `WRONG ASSERTION — both legs read alike`, which is a correct
+observation and an uninformative verdict: it cannot separate *the guard is mis-aimed* from
+*the weaken deleted the only thing that made the legs differ*. Reordering the assertions
+makes that weaken report the table's success string, but the result would be hollow —
+it demonstrates the test notices absent flags, which
+`the_credential_drop_restriction_is_emitted_only_when_asked` already demonstrates with two
+weakens of its own. **A green obtained that way would overstate what was proven.**
+
+**The regression this guard exists for is bwrap dropping `no_new_privs`, and that variable
+is not ours to remove** — no flag governs it (measured against `bwrap --help`, 0.11.1).
+
+**So the discrimination is established by measurement rather than by weaken**, which is
+weaker evidence and is named as such:
+
+- **leg 4b** constructs the NNP-absent shape directly — permitted/effective lowered to
+  `c0`, bounding full — and the capabilities come back **`000001ffffffffff`** across the
+  exec. That is precisely the outcome the test asserts must not occur.
+- **6b/6c** show the paired behaviour under bwrap: `c0` persists with the flags, full
+  recovery without them.
+
+**The assertion ORDER was also wrong and is fixed independently of all this.** The paired
+`assert_ne!` fired first, so under the real regression (both legs read full) the reported
+failure was "they read alike" — a message naming no cause. The control is now a
+**precondition checked first**, and the property assertion carries the `no_new_privs`
+suspect. With both specific assertions present the paired comparison was redundant anyway.
+
+**Closes when** a mechanism exists to exercise NNP-absence in-tree. None is known.
 
 **BOUNDED BY EVIDENCE, NOT ASSUMED SHORT (obligation, 2026-08-16).** "The pre-drop window is
 short" is currently an **intuition**. bwrap's setup does mount work, `--dir` creation and now

@@ -258,6 +258,24 @@ impl SandboxProfile {
         Self { args }
     }
 
+    /// Restrict the pre-drop payload to the two capabilities `delphi-drop` needs
+    /// (D0A-R10-12). Applied only when a credential drop is planned.
+    ///
+    /// Holds ONLY because bwrap sets `no_new_privs=1` — without it the payload recovers the
+    /// full set from the bounding set on its next `execve` while still reading `c0` here,
+    /// so the assertion that guards this must be taken AFTER a further exec, never on the
+    /// immediate state. `docs/CONFORMANCE_REGISTER.md` D0A-R10-12.
+    #[must_use]
+    pub fn with_credential_drop(mut self) -> Self {
+        self.args.push("--cap-drop".to_string());
+        self.args.push("ALL".to_string());
+        self.args.push("--cap-add".to_string());
+        self.args.push("CAP_SETUID".to_string());
+        self.args.push("--cap-add".to_string());
+        self.args.push("CAP_SETGID".to_string());
+        self
+    }
+
     /// The derived bwrap arguments (before the trailing `-- <command>`).
     #[must_use]
     pub fn args(&self) -> &[String] {
@@ -271,6 +289,41 @@ mod tests {
     use std::path::Path;
 
     const BASE: &str = "/run/delphi";
+
+    /// D0A-R10-12: the restriction is emitted only for a planned credential drop, and
+    /// `derive` alone must NOT carry it — otherwise this test would pass against a profile
+    /// that restricts unconditionally, which is a different (and unapproved) change.
+    #[test]
+    fn the_credential_drop_restriction_is_emitted_only_when_asked() {
+        let a = action_with(vec![], NetPolicy::None);
+        let plain = SandboxProfile::derive(&a);
+        assert!(
+            !plain.args().iter().any(|x| x == "--cap-drop"),
+            "derive() must not restrict on its own: {:?}",
+            plain.args()
+        );
+
+        let restricted = SandboxProfile::derive(&a).with_credential_drop();
+        let args = restricted.args();
+        let pos = |flag: &str, val: &str| {
+            args.windows(2).any(|w| w[0] == flag && w[1] == val)
+        };
+        assert!(pos("--cap-drop", "ALL"), "missing --cap-drop ALL: {args:?}");
+        assert!(pos("--cap-add", "CAP_SETUID"), "missing --cap-add CAP_SETUID: {args:?}");
+        assert!(pos("--cap-add", "CAP_SETGID"), "missing --cap-add CAP_SETGID: {args:?}");
+        // Nothing beyond the two. A third --cap-add would widen the pre-drop payload
+        // silently, and the count is the only thing that catches it.
+        assert_eq!(
+            args.iter().filter(|x| *x == "--cap-add").count(),
+            2,
+            "exactly two capabilities may survive into the pre-drop payload: {args:?}"
+        );
+        // The flags must precede the `--` separator or bwrap reads them as the command.
+        if let Some(sep) = args.iter().position(|x| x == "--") {
+            let drop_at = args.iter().position(|x| x == "--cap-drop").unwrap();
+            assert!(drop_at < sep, "cap flags landed after the `--` separator: {args:?}");
+        }
+    }
 
     /// Emitted `--perms MODE --dir PATH` triples, in order.
     fn emitted_dirs(args: &[String]) -> Vec<String> {

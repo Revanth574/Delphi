@@ -550,7 +550,13 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
         Some(crate::action::seal_data_snapshot(&blob)?)
     };
 
-    let mut args = SandboxProfile::derive(action).args().to_vec();
+    // D0A-R10-12: the restriction rides the PROFILE, not a loose append, so
+    // `sandbox_profile_digest` covers it once the audit is wired.
+    let mut profile = SandboxProfile::derive(action);
+    if creds.is_some() {
+        profile = profile.with_credential_drop();
+    }
+    let mut args = profile.args().to_vec();
     if let Some(fd) = args_snapshot.as_ref().map(|fd| fd.as_raw_fd()) {
         keep.push(fd);
         args.push("--args".to_string());
@@ -1329,6 +1335,96 @@ pub(crate) mod tests {
         for leaked in ["CARGO", "HOME=", "PATH=/usr/local/sbin"] {
             assert!(!seen.contains(leaked), "the daemon's environment leaked past the helper: {seen}");
         }
+    }
+
+    /// D0A-R10-12: the pre-drop payload holds ONLY `CAP_SETUID`/`CAP_SETGID`, and still
+    /// holds only those AFTER a further `execve`.
+    ///
+    /// THE ASSERTION IS TAKEN AFTER A FURTHER EXEC ON PURPOSE. Measured (leg 4b): a root
+    /// process whose permitted/effective are lowered recovers `P' = bounding` on its next
+    /// exec, and bwrap leaves the bounding set FULL on the privileged path (leg 5a). So the
+    /// immediate state reads `c0` in BOTH the biting and the cosmetic case — an assertion
+    /// on it cannot tell them apart. What makes it bite is bwrap's `no_new_privs=1`, which
+    /// is bwrap's default and not ours; this test exists to fail if that ever changes.
+    ///
+    /// ROOT-GATED DELIBERATELY. Unprivileged, bwrap needs a userns and drops the BOUNDING
+    /// set too (measured `c0`) — under which the assertion passes for the wrong reason,
+    /// via bounding rather than NNP. A green off the privileged path would not cover the
+    /// configuration that ships.
+    ///
+    /// **NOT WEAKEN-PROVABLE IN-TREE, and that is a limit rather than an omission.** The
+    /// only weaken this repo can apply is removing the flags — which exercises emission,
+    /// already covered by `the_credential_drop_restriction_is_emitted_only_when_asked` and
+    /// its two weakens. The variable that makes THIS assertion bite is bwrap's
+    /// `no_new_privs`, which is not ours to remove. Its discrimination is established by
+    /// probe instead: `scratch/d0a-r10-12-window-probe.sh` leg 4b produces exactly the
+    /// NNP-absent shape (p/e lowered, bounding full) and the caps come back FULL — the
+    /// outcome this test asserts must not occur — while 6b/6c show persistence with NNP
+    /// and full recovery without the flags. `docs/CONFORMANCE_REGISTER.md` D0A-R10-12.
+    #[test]
+    fn the_predrop_payload_cannot_recover_capabilities_across_a_further_exec() {
+        const NAME: &str = "the_predrop_payload_cannot_recover_capabilities_across_a_further_exec";
+        if !bwrap_available() {
+            eprintln!("SKIP {NAME}: requires bwrap");
+            return;
+        }
+        if nix::unistd::geteuid().as_raw() != 0 {
+            eprintln!(
+                "SKIP {NAME}: requires root — measured blocker: geteuid() != 0, so bwrap takes \
+                 the userns path, which drops the bounding set as well and makes this pass for \
+                 the wrong reason"
+            );
+            return;
+        }
+        let out = tempfile::tempdir().unwrap();
+        let action = build_action(b"#!/bin/sh\n:\n", out.path());
+
+        // Read CapPrm after replacing the image — the recovery, performed rather than
+        // inferred.
+        const AFTER_EXEC: &str =
+            "exec /bin/sh -c 'grep ^CapPrm: /proc/self/status'";
+
+        let run = |restricted: bool| -> String {
+            let mut p = SandboxProfile::derive(&action);
+            if restricted {
+                p = p.with_credential_drop();
+            }
+            let mut args = p.args().to_vec();
+            args.push("--".to_string());
+            args.push("/bin/sh".to_string());
+            args.push("-c".to_string());
+            args.push(AFTER_EXEC.to_string());
+            let o = Command::new(bwrap_path().unwrap()).args(&args).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        let restricted = run(true);
+        let control = run(false);
+
+        // A PASSING RUN MUST NOT LOOK LIKE A VACUOUS ONE. This test's whole premise is that
+        // the property can stop holding silently (bwrap's `no_new_privs=1` is not ours); a
+        // green with nothing to read would leave a reader nothing to check that against.
+        // Both legs are printed BEFORE the assertions, so a failure carries them too.
+        eprintln!("{NAME}: restricted (--cap-drop ALL --cap-add SETUID,SETGID) -> {restricted}");
+        eprintln!("{NAME}: control    (no cap flags)                          -> {control}");
+
+        // THE CONTROL IS A PRECONDITION, CHECKED FIRST — not a paired comparison.
+        // A paired `assert_ne!` fired BEFORE the specific assertions and therefore stole the
+        // failure from them: under the real regression (bwrap stops setting no_new_privs)
+        // both legs read full, so the reader got "they read alike", which names no cause.
+        // With both specific assertions present, "the legs differ" is implied anyway.
+        assert!(
+            control.contains("000001ffffffffff"),
+            "PRECONDITION FAILED: an unflagged payload did not recover the full set across a \
+             further exec, so this platform cannot demonstrate the property either way. \
+             got={control:?}"
+        );
+        assert!(
+            restricted.contains("00000000000000c0"),
+            "the pre-drop payload recovered capabilities across a further exec — the \
+             restriction is cosmetic. Check whether bwrap still sets no_new_privs=1 \
+             (D0A-R10-12). got={restricted:?}"
+        );
     }
 
     #[test]

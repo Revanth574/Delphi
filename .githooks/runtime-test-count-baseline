@@ -56,5 +56,11 @@
 # Scope: `-p delphi-runtime --tests`, which is what the hook runs — ALL test targets,
 # integration included. It was `--lib --bins` until 2026-08-23, and that scope let two red
 # integration suites sit behind a green gate (D0A-R14-03). The full run costs ~3 seconds.
-EXECUTED=145
-SKIPPED=24
+# 2026-08-25 (D0A-R10-12): 145/24 -> 146/25. Both moves are additions, neither is a
+# disappearance. +1 EXECUTED: `the_credential_drop_restriction_is_emitted_only_when_asked`
+# (unprivileged unit test on the emitted --cap-drop/--cap-add tokens). +1 SKIPPED:
+# `the_predrop_payload_cannot_recover_capabilities_across_a_further_exec`, which is
+# root-gated on purpose — unprivileged, bwrap drops the bounding set too and it would
+# pass for the wrong reason. It EXECUTES on a root lane, like its credential sibling.
+EXECUTED=146
+SKIPPED=25

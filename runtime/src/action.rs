@@ -454,6 +454,23 @@ fn hex32(d: &[u8; 32]) -> String {
 /// // env value is redacted (key shown, value not), timeout at full precision.
 /// assert!(p.contains("echo hi") && p.contains("K=[redacted]") && !p.contains("K=V"));
 /// ```
+/// Env keys whose VALUE selects which code runs. Shown in full; everything else stays
+/// `[redacted]` because the delta may carry secrets.
+///
+/// **This is a DISCLOSURE fix, not a BINDING fix.** `env` still resolves through `PATH` and
+/// the loader still honours these — nothing here binds them. What it removes is a preview
+/// that showed a digest for `/usr/bin/env` beside a name the digest does not cover, while
+/// hiding the field that decides which binary runs. The sentence lives here rather than only
+/// in `docs/TRUST_MODEL.md` §3 because a qualification one document away stops being read
+/// (DEFECT_CLASSES 45, and D0A-R17-01 is the instance).
+///
+/// An allowlist, so a new `env`-shaped finding is one entry rather than a redesign. It is
+/// LOADER-level and deliberately does not reach interpreter-level path variables
+/// (`PYTHONPATH`, `NODE_PATH`, `PERL5LIB`, …): those are unbounded per runtime, and listing
+/// some would imply a completeness this list does not have.
+const CODE_SELECTING_ENV: &[&str] =
+    &["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "GCONV_PATH"];
+
 #[must_use]
 pub fn preview(action: &PendingAction) -> String {
     let binds = action
@@ -471,7 +488,13 @@ pub fn preview(action: &PendingAction) -> String {
     let env = action
         .env_delta
         .iter()
-        .map(|(k, _v)| format!("{k}=[redacted]"))
+        .map(|(k, v)| {
+            if CODE_SELECTING_ENV.contains(&k.as_str()) {
+                format!("{k}={v}")
+            } else {
+                format!("{k}=[redacted]")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let net = match action.net_policy {
@@ -480,12 +503,21 @@ pub fn preview(action: &PendingAction) -> String {
     };
     let script = match &action.script {
         None => "none".to_string(),
-        Some(sp) => format!(
-            "interp:{} arg:{} content:{}",
-            hex32(&sp.interpreter_digest),
-            sp.interpreter_arg.as_deref().unwrap_or("(none)"),
-            hex32(&sp.script_digest)
-        ),
+        Some(sp) => {
+            // The digest binds the interpreter's BYTES and the arg STRING. It does not bind
+            // what the arg NAMES: `#!/usr/bin/env python3` pins `env` and leaves `python3`
+            // to PATH at run time. A flag (`-I`, `-e`) names no program, so it is not marked.
+            let arg = match sp.interpreter_arg.as_deref() {
+                None => "(none)".to_string(),
+                Some(a) if a.starts_with('-') => a.to_string(),
+                Some(a) => format!("{a} (resolved through PATH at run time — NOT bound)"),
+            };
+            format!(
+                "interp:{} arg:{arg} content:{}",
+                hex32(&sp.interpreter_digest),
+                hex32(&sp.script_digest)
+            )
+        }
     };
     format!(
         "Run: {}\n  cwd: {}\n  env: [{env}]\n  net: {net}\n  binds: [{binds}]\n  \
@@ -629,6 +661,71 @@ mod tests {
                 });
             }),
             "script interpreter/content fingerprints rendered"
+        );
+    }
+
+    /// The chain-gap disclosure fix: a value that SELECTS CODE is shown, everything else
+    /// stays redacted. Both halves are asserted in one test because either alone is
+    /// satisfiable by the wrong change — showing everything would pass the first, and
+    /// redacting everything would pass the second.
+    #[test]
+    fn preview_shows_code_selecting_env_and_redacts_the_rest() {
+        let mut a = sample();
+        a.env_delta = vec![
+            ("PATH".into(), "/tmp/evil:/usr/bin".into()),
+            ("LD_PRELOAD".into(), "/tmp/evil/hook.so".into()),
+            ("LD_LIBRARY_PATH".into(), "/tmp/evil/lib".into()),
+            ("LD_AUDIT".into(), "/tmp/evil/audit.so".into()),
+            ("GCONV_PATH".into(), "/tmp/evil/gconv".into()),
+            ("API_TOKEN".into(), "s3cret-value".into()),
+        ];
+        let p = preview(&a);
+
+        for shown in [
+            "/tmp/evil:/usr/bin",
+            "/tmp/evil/hook.so",
+            "/tmp/evil/lib",
+            "/tmp/evil/audit.so",
+            "/tmp/evil/gconv",
+        ] {
+            assert!(p.contains(shown), "a code-selecting value must be VISIBLE: {shown}\n{p}");
+        }
+        assert!(!p.contains("s3cret-value"), "a non-code-selecting value must stay redacted:\n{p}");
+        assert!(p.contains("API_TOKEN=[redacted]"), "the KEY is still disclosed:\n{p}");
+    }
+
+    /// The arg names a program the digest does not cover — the preview must say so. A FLAG
+    /// names no program and must NOT be marked, or the marking means nothing.
+    #[test]
+    fn preview_marks_a_path_resolved_interpreter_arg_as_unbound() {
+        const UNBOUND: &str = "NOT bound";
+
+        let mut env_style = sample();
+        env_style.script = Some(ScriptPin {
+            interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
+            interpreter_digest: [0x11; 32],
+            interpreter_arg: Some("python3".into()),
+            script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
+            script_digest: [0x22; 32],
+        });
+        let p = preview(&env_style);
+        assert!(
+            p.contains("python3") && p.contains(UNBOUND),
+            "`#!/usr/bin/env python3` pins env and leaves python3 to PATH — say so:\n{p}"
+        );
+
+        let mut flag_style = sample();
+        flag_style.script = Some(ScriptPin {
+            interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
+            interpreter_digest: [0x11; 32],
+            interpreter_arg: Some("-I".into()),
+            script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
+            script_digest: [0x22; 32],
+        });
+        let q = preview(&flag_style);
+        assert!(
+            q.contains("-I") && !q.contains(UNBOUND),
+            "a flag names no program; marking it would make the marking meaningless:\n{q}"
         );
     }
 

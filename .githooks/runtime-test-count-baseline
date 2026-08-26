@@ -62,5 +62,16 @@
 # `the_predrop_payload_cannot_recover_capabilities_across_a_further_exec`, which is
 # root-gated on purpose — unprivileged, bwrap drops the bounding set too and it would
 # pass for the wrong reason. It EXECUTES on a root lane, like its credential sibling.
-EXECUTED=146
+# 2026-08-26 (chain-gap preview fix): 146/25 -> 148/25. TWO additions, no disappearance:
+# `preview_shows_code_selecting_env_and_redacts_the_rest` and
+# `preview_marks_a_path_resolved_interpreter_arg_as_unbound`. SKIPPED unchanged — both run
+# unprivileged.
+#
+# This line first read 149, and the 3 was WRONG BECAUSE THE COUNT WAS. A duplicated `#[test]`
+# attribute (an edit that orphaned the previous test's doc comment) inflated the total by one.
+# `cargo test` compiled it and reported green; only `clippy -D warnings` rejected it, as
+# `duplicate-macro-attributes`. The visible symptom — one test name printed TWICE in the run
+# output — was seen and dismissed as cargo noise. Recorded because the baseline exists to
+# catch counts that drift, and here the count drifted from a defect the test run could not see.
+EXECUTED=148
 SKIPPED=25

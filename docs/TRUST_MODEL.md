@@ -257,6 +257,38 @@ that has produced findings in **seven consecutive review rounds** — and a clos
 one element fails **silently at exec**, which is precisely D0A-R9-02's shape. Reintroducing
 that failure mode to support a claim no deployment has yet needed is the wrong trade.
 
+### THE `env`+`PATH` HOP IS AN EXPOSURE, NOT MERELY A GAP (2026-08-26)
+
+The three hops were accepted together on the reasoning above. **Measurement separates them.**
+A gap needs a probe built to reach it; an exposure is reached by what an approved action
+ordinarily does. Only the second hop crosses:
+
+- **The shape is ordinary.** 52 of 412 `/usr/bin` scripts carry an `env`-style shebang, 41 of
+  those `#!/usr/bin/env node` — the developer-tools domain this product targets first.
+- **The mechanism is measured, not argued.** `env -i PATH=<dir> /usr/bin/env python3` runs
+  the impostor. With no `PATH` at all, `env` falls back to confstr `/bin:/usr/bin`, which is
+  root-owned — so the exposure is exactly *"`PATH` is in the approved delta"*, which for a
+  node or venv project is the most ordinary entry there is and points into user-writable
+  space by construction.
+- **The preview could not show the difference.** It rendered `interp:<sha of /usr/bin/env>`
+  beside a bare `arg:python3` and `PATH=[redacted]` — a cryptographic binding next to a name
+  the binding does not cover, with the deciding field withheld.
+
+**What changed is the PREVIEW, and it is a DISCLOSURE fix, not a BINDING fix.** `preview()`
+now shows values for the keys that select code (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+`LD_AUDIT`, `GCONV_PATH` — an allowlist, everything else still redacted because the delta may
+carry secrets), and marks a non-flag interpreter arg as resolved at run time and not bound.
+**The hop is unchanged: `env` still resolves through `PATH`.** The human can now see which
+directories decide; nothing prevents them deciding.
+
+**The gap stays accepted.** Refusing `env`-style shebangs would break 52 of 412 system scripts
+to close a hop the human can now see. Computing a closure remains the wrong trade for the
+reasons above.
+
+**OWED, and this section does not claim it:** the end-to-end demonstration — canonicalize →
+preview → approve → execute producing the impostor through the real runtime. The mechanism is
+measured in isolation and the preview is unit-tested; the composed path is not.
+
 **THE CONFIGURATION WHERE FIRST-OBJECT BINDING IS CLOSEST TO TOTAL — offered, not imposed,
 and NOT total (corrected 2026-08-23, D0A-R15-02).** A **statically linked native ELF** removes
 the two hops that live in the FILE: no `PT_INTERP`, so no loader and no path-resolved DSOs;

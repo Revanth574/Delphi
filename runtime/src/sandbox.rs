@@ -290,20 +290,25 @@ mod tests {
 
     const BASE: &str = "/run/delphi";
 
-    /// D0A-R10-12: the restriction is emitted only for a planned credential drop, and
-    /// `derive` alone must NOT carry it — otherwise this test would pass against a profile
-    /// that restricts unconditionally, which is a different (and unapproved) change.
+    /// D0A-R10-12: the restriction is emitted only for a planned credential drop.
+    ///
+    /// D0A-R16-02: this goes through `assemble_profile`, the function PRODUCTION calls, so
+    /// it tests the `creds.is_some()` DECISION. Calling `with_credential_drop()` directly
+    /// left the test green when the branch was deleted from the caller — the wiring is what
+    /// ships, and the method is only what the wiring reaches for.
     #[test]
     fn the_credential_drop_restriction_is_emitted_only_when_asked() {
+        use crate::execute::assemble_profile;
         let a = action_with(vec![], NetPolicy::None);
-        let plain = SandboxProfile::derive(&a);
+
+        let plain = assemble_profile(&a, None);
         assert!(
             !plain.args().iter().any(|x| x == "--cap-drop"),
-            "derive() must not restrict on its own: {:?}",
+            "no credential drop planned, so nothing may be restricted: {:?}",
             plain.args()
         );
 
-        let restricted = SandboxProfile::derive(&a).with_credential_drop();
+        let restricted = assemble_profile(&a, Some((997, 997)));
         let args = restricted.args();
         let pos = |flag: &str, val: &str| {
             args.windows(2).any(|w| w[0] == flag && w[1] == val)

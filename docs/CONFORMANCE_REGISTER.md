@@ -137,7 +137,7 @@ cannot.
 | the snapshot is executable regardless of the source's mode (R14-04) | **DECLARED POLICY** — adopted deliberately; a 0644 source yields a runnable object, and `noexec` on the source mount does not stop an approved action |
 | **the loader and system libraries are immutable** | ~~DECLARED~~ → **FALSIFIED 2026-08-23 (D0A-R14-01).** An approved binary names its own `PT_INTERP`; a probe replaced the loader after sealing and changed executed code. **Struck from §3**, not qualified — a declaration the attacker can invalidate is not a boundary |
 | the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3** — v7 binds the FIRST OBJECT only. Closure is available **by construction** (a statically linked native ELF has no downstream hops), not by a computation of ours |
-| the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED + duration MEASURED (2026-08-25).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload; window ~9–11 ms attributable, bind-count-driven, depth-independent. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured (the census samples after it) |
+| the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED; duration WITHDRAWN pending re-measurement (2026-08-26).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload, cap set proven MINIMAL by leg 7. The `~9–11 ms` figure is withdrawn — D0A-R16-05/06 showed it timed the path WITHOUT the flags and with duplicated ancestors production dedupes. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured |
 | the pre-drop payload's BOUNDING set is narrowed | **OPEN — own row, split out of D0A-R10-12 (2026-08-25).** Measured: the R10-12 fix leaves `CapBnd = 000001ffffffffff` at both the payload and the tool. Left inside R10-12 it would let that row close with a named property still standing |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
 
@@ -341,7 +341,37 @@ to justify itself against.
 
 **WHAT DID NOT CLOSE.** The tool's bounding set is still full. Split into its own row above.
 
-### THE GUARD'S EVIDENCE IS A PROBE PAIR, NOT A RED — recorded as a limit (2026-08-25)
+### ⚠ THE SECTION BELOW IS SUPERSEDED — the limit was FALSIFIED (2026-08-26, D0A-R16-01)
+
+**"Not weaken-provable in-tree" was wrong, and it was wrong in the direction that flattered
+the work.** The round-16 reviewer was asked to attack that claim and did: bwrap is
+dynamically linked, calls `prctl` through the PLT (`R_X86_64_JUMP_SLOT`,
+`prctl@GLIBC_2.2.5`), is not setuid and carries no file capabilities — so `LD_PRELOAD`
+reaches it even under root. `scratch/nnp-shim/nnp_suppress.c` returns success for
+`PR_SET_NO_NEW_PRIVS` without performing it; measured, bwrap's payload goes from
+`no-new-privs=1` to `no-new-privs=0`.
+
+So the NNP-absent shape **is** constructible in-tree, and the guard has a **real RED**: leg
+A of `scratch/d0a-r10-12-red-proof.sh` runs the guard under the shim, where it must fail on
+the `c0` assertion. The flag-removal weaken is demoted to a secondary leg exercising
+emission only.
+
+**The lesson is about the shape of the claim, not the mechanism.** "No mechanism exists" is
+a claim about every mechanism, which is the same unmeasurable totality shape §3 was
+rewritten to forbid — and it was made about a tool whose linkage takes one `readelf` to
+check. The narrow form ("the only weaken I found removes the flags") would have been true
+and would have invited the fix instead of foreclosing it.
+
+**Also withdrawn on the same round: the timing figures.** `~9–11 ms attributable` and
+`~1.7 ms/bind` were measured on a probe whose helper leg **omitted the capability flags**
+(D0A-R16-05 — it timed the pre-mitigation path) and which **emitted duplicate shared
+ancestors** where production deduplicates through a `BTreeSet` (D0A-R16-06 — inflating the
+per-bind slope that was the headline finding). Both are fixed; the numbers are **withdrawn
+pending re-measurement**, not adjusted. What survives unaffected: depth is not the driver
+(a comparison between cells that shared the defect), and the capability census, which does
+no timing.
+
+### THE SUPERSEDED RECORD (2026-08-25), kept for the trail
 
 `the_predrop_payload_cannot_recover_capabilities_across_a_further_exec` is **stable**
 (30/30 under default parallel, suite-wide clean) and **not weaken-proven**, and the second

@@ -386,6 +386,21 @@ fn exec_tail(
     args
 }
 
+/// The profile as production assembles it, including the credential-drop decision.
+///
+/// D0A-R16-02: this exists so tests exercise the DECISION and not just the method. A test
+/// calling `with_credential_drop()` directly stays green when the `creds.is_some()` branch is
+/// deleted from the caller — the wiring, not the method, is what ships. The restriction rides
+/// the returned `SandboxProfile` so `sandbox_profile_digest` covers it once the audit is wired.
+pub(crate) fn assemble_profile(action: &PendingAction, creds: Option<(u32, u32)>) -> SandboxProfile {
+    let profile = SandboxProfile::derive(action);
+    if creds.is_some() {
+        profile.with_credential_drop()
+    } else {
+        profile
+    }
+}
+
 /// TRUST_MODEL v7: refuse a program fd that is not a fully sealed executable snapshot.
 ///
 /// # Errors
@@ -550,13 +565,7 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
         Some(crate::action::seal_data_snapshot(&blob)?)
     };
 
-    // D0A-R10-12: the restriction rides the PROFILE, not a loose append, so
-    // `sandbox_profile_digest` covers it once the audit is wired.
-    let mut profile = SandboxProfile::derive(action);
-    if creds.is_some() {
-        profile = profile.with_credential_drop();
-    }
-    let mut args = profile.args().to_vec();
+    let mut args = assemble_profile(action, creds).args().to_vec();
     if let Some(fd) = args_snapshot.as_ref().map(|fd| fd.as_raw_fd()) {
         keep.push(fd);
         args.push("--args".to_string());
@@ -1352,15 +1361,14 @@ pub(crate) mod tests {
     /// via bounding rather than NNP. A green off the privileged path would not cover the
     /// configuration that ships.
     ///
-    /// **NOT WEAKEN-PROVABLE IN-TREE, and that is a limit rather than an omission.** The
-    /// only weaken this repo can apply is removing the flags — which exercises emission,
-    /// already covered by `the_credential_drop_restriction_is_emitted_only_when_asked` and
-    /// its two weakens. The variable that makes THIS assertion bite is bwrap's
-    /// `no_new_privs`, which is not ours to remove. Its discrimination is established by
-    /// probe instead: `scratch/d0a-r10-12-window-probe.sh` leg 4b produces exactly the
-    /// NNP-absent shape (p/e lowered, bounding full) and the caps come back FULL — the
-    /// outcome this test asserts must not occur — while 6b/6c show persistence with NNP
-    /// and full recovery without the flags. `docs/CONFORMANCE_REGISTER.md` D0A-R10-12.
+    /// **WEAKEN-PROVABLE AFTER ALL (D0A-R16-01).** This carried a claim that the NNP-absent
+    /// shape could not be built in-tree, so the guard's discrimination rested on a probe
+    /// rather than a RED. The round-16 reviewer falsified it: bwrap is dynamically linked
+    /// and calls `prctl` through the PLT, is not setuid and holds no file capabilities, so
+    /// `LD_PRELOAD` reaches it even as root. `scratch/nnp-shim/nnp_suppress.c` suppresses
+    /// `PR_SET_NO_NEW_PRIVS` (measured: `no-new-privs=1` → `0`), and leg A of
+    /// `scratch/d0a-r10-12-red-proof.sh` runs this guard under it — the real RED.
+    /// The withdrawn claim is recorded in `docs/CONFORMANCE_REGISTER.md` D0A-R10-12.
     #[test]
     fn the_predrop_payload_cannot_recover_capabilities_across_a_further_exec() {
         const NAME: &str = "the_predrop_payload_cannot_recover_capabilities_across_a_further_exec";
@@ -1384,12 +1392,11 @@ pub(crate) mod tests {
         const AFTER_EXEC: &str =
             "exec /bin/sh -c 'grep ^CapPrm: /proc/self/status'";
 
+        // D0A-R16-02: through `assemble_profile` — the production decision — so deleting the
+        // `creds.is_some()` branch turns this test red instead of leaving it green.
         let run = |restricted: bool| -> String {
-            let mut p = SandboxProfile::derive(&action);
-            if restricted {
-                p = p.with_credential_drop();
-            }
-            let mut args = p.args().to_vec();
+            let creds = if restricted { Some((997, 997)) } else { None };
+            let mut args = assemble_profile(&action, creds).args().to_vec();
             args.push("--".to_string());
             args.push("/bin/sh".to_string());
             args.push("-c".to_string());

@@ -47,6 +47,32 @@ skip() { # skip <leg> <reason>
     SKIPPED=$((SKIPPED + 1))
 }
 
+# D0A-R16-07. The capability legs used to pipe bwrap straight into `sed`, so the pipeline's
+# status was sed's and a bwrap that produced NOTHING printed an empty indented block that
+# read as a successful measurement — while EXECUTED was incremented regardless. A leg that
+# cannot produce its measurement is a FAILED leg, not a quiet one.
+PROBE_FAILURES=0
+probe_fail() { printf '    *** MEASUREMENT FAILED: %s\n' "$1"; PROBE_FAILURES=$((PROBE_FAILURES + 1)); }
+
+# cap_read <label> <required-regex> <command...> — run, require rc=0 AND the field, print.
+cap_read() {
+    local label="$1" required="$2"; shift 2
+    local out rc
+    out="$("$@" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '    %s\n' "$out" | head -4
+        probe_fail "$label — command exited $rc"
+        return 1
+    fi
+    if ! printf '%s' "$out" | grep -qE "$required"; then
+        printf '    %s\n' "${out:-（no output）}" | head -4
+        probe_fail "$label — output lacks /$required/, so there is nothing to read"
+        return 1
+    fi
+    printf '%s\n' "$out" | sed 's/^/    /'
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # The profile, transcribed from runtime/src/sandbox.rs SandboxProfile::derive.
 # Ancestor emission (`--perms 0755 --dir <ancestor>`) is emitted BEFORE the binds and
@@ -71,16 +97,25 @@ system_binds() {
     return 0
 }
 
-# ancestors <path> -> each proper ancestor, shallowest first (derive()'s parent-first order)
+# ancestors <path>... -> the DEDUPLICATED proper ancestors of every path, shallowest first.
+#
+# D0A-R16-06: this took one path and was called per bind, so N binds under a shared deep
+# root emitted that root's chain N times. Production's `ancestor_dirs` collects into a
+# BTreeSet, so it emits each ancestor ONCE — the probe was making bwrap do duplicate --dir
+# work that production never does, inflating the per-bind slope it was measuring. It now
+# takes all paths at once and dedupes, matching production's assembly.
 ancestors() {
-    local p="$1" acc="" comp
-    IFS='/' read -ra comps <<< "${p#/}"
-    for comp in "${comps[@]}"; do
-        [ -n "$comp" ] || continue
-        acc="$acc/$comp"
-        [ "$acc" = "$p" ] && break
-        printf '%s\n' "$acc"
-    done
+    local p acc comp
+    for p in "$@"; do
+        acc=""
+        IFS='/' read -ra comps <<< "${p#/}"
+        for comp in "${comps[@]}"; do
+            [ -n "$comp" ] || continue
+            acc="$acc/$comp"
+            [ "$acc" = "$p" ] && break
+            printf '%s\n' "$acc"
+        done
+    done | sort -u
 }
 
 now_ns() { date +%s%N; }
@@ -104,16 +139,24 @@ timed_run() { # timed_run <userns:0|1> <n_binds> <depth> [--with-helper]
     for ((i = 0; i < depth; i++)); do dir="$dir/d$i"; done
     mkdir -p "$dir"
 
+    local -a bind_paths=()
     for ((i = 0; i < n_binds; i++)); do
         mkdir -p "$dir/b$i"
-        while read -r a; do args+=(--perms 0755 --dir "$a"); done < <(ancestors "$dir/b$i")
-        args+=(--bind "$dir/b$i" "$dir/b$i")
+        bind_paths+=("$dir/b$i")
     done
+    # Ancestors ONCE for the whole bind set, deduplicated, before the binds — as
+    # `ancestor_dirs` + `derive` do (D0A-R16-06).
+    while read -r a; do args+=(--perms 0755 --dir "$a"); done < <(ancestors "${bind_paths[@]}")
+    for p in "${bind_paths[@]}"; do args+=(--bind "$p" "$p"); done
 
     args+=(--chdir /)
 
     local t0 t1 out rc
     if [ -n "$with_helper" ]; then
+        # D0A-R16-05: the helper path is what SHIPS, and what ships now carries the
+        # capability restriction. Timing it without the flags measured the pre-mitigation
+        # path and reported the number as the mitigated window's.
+        args+=(--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID)
         t0="$(now_ns)"
         out="$("$BWRAP" "${args[@]}" -- "$DROP_HELPER" "$TOOL_UID" "$TOOL_GID" - \
               /bin/sh sh -c 'date +%s%N' 2>&1)"; rc=$?
@@ -249,15 +292,15 @@ else
     wait "$bw" 2>/dev/null
 
     printf '\n  [point 2] bwrap PAYLOAD, pre-drop (where delphi-drop starts)\n'
-    "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') --chdir / \
-        -- /bin/sh -c 'grep -E "^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status' \
-        2>&1 | sed 's/^/    /'
+    cap_read "point 2 (pre-drop payload)" '^CapPrm:' \
+        "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') --chdir / \
+        -- /bin/sh -c 'grep -E "^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status'
 
     printf '\n  [point 3] the TOOL, post-drop through the real delphi-drop\n'
-    "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') --chdir / \
+    cap_read "point 3 (tool, post-drop)" '^Uid:\s+997' \
+        "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') --chdir / \
         -- "$DROP_HELPER" "$TOOL_UID" "$TOOL_GID" - \
-        /bin/sh sh -c 'grep -E "^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status' \
-        2>&1 | sed 's/^/    /'
+        /bin/sh sh -c 'grep -E "^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status'
     EXECUTED=$((EXECUTED + 1))
 fi
 
@@ -280,17 +323,18 @@ else
     show='grep -E "^Cap(Prm|Eff|Bnd):" /proc/self/status'
 
     printf '\n  [4a] baseline: root exec, nothing restricted\n'
-    /bin/sh -c "$show" | sed 's/^/    /'
+    cap_read "4a (baseline root exec)" '^CapPrm:' /bin/sh -c "$show"
 
     printf '\n  [4b] CapPrm/CapEff lowered to setuid+setgid, BOUNDING left intact\n'
     printf '       If permitted comes back full, lowering p/e alone buys NOTHING.\n'
-    "$CAPSH" --caps="cap_setuid,cap_setgid=eip" -- -c "$show" 2>&1 | sed 's/^/    /'
+    cap_read "4b (p/e lowered, bounding intact)" '^CapPrm:' \
+        "$CAPSH" --caps="cap_setuid,cap_setgid=eip" -- -c "$show"
 
     # Everything the bounding set currently holds, minus the two the helper needs.
     drop_list="$("$CAPSH" --print 2>/dev/null | sed -n 's/^Bounding set =//p' | tr ',' '\n' \
         | grep -vxE 'cap_setuid|cap_setgid' | paste -sd, -)"
     printf '\n  [4c] BOUNDING dropped to setuid+setgid only, then exec\n'
-    "$CAPSH" --drop="$drop_list" -- -c "$show" 2>&1 | sed 's/^/    /'
+    cap_read "4c (bounding dropped)" '^CapPrm:' "$CAPSH" --drop="$drop_list" -- -c "$show"
 
     # RELABELLED after its first run. This drops the bounding set in the DAEMON, before
     # bwrap — the "restrict bwrap" variant, NOT the "restrict the helper" mitigation R10-12
@@ -325,16 +369,17 @@ else
     CAPFLAGS="--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID"
 
     printf '\n  [5a] pre-drop payload under the restriction (expect 00000000000000c0)\n'
-    "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
-        -- /bin/sh -c 'grep -E "^(Uid|CapPrm|CapEff|CapBnd):" /proc/self/status' 2>&1 | sed 's/^/    /'
+    cap_read "5a (restricted pre-drop payload)" '^CapPrm:' \
+        "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
+        -- /bin/sh -c 'grep -E "^(Uid|CapPrm|CapEff|CapBnd):" /proc/self/status'
 
     printf '\n  [5b] FEASIBILITY: the real delphi-drop under the restriction\n'
     printf '       Does it still drop, and does the TOOL inherit the narrowed bounding set?\n'
     if [ -x "$DROP_HELPER" ]; then
-        "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
+        cap_read "5b (tool under the restriction)" '^Uid:\s+997' \
+            "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
             -- "$DROP_HELPER" "$TOOL_UID" "$TOOL_GID" - \
-            /bin/sh sh -c 'grep -E "^(Uid|Gid|Groups|CapPrm|CapEff|CapBnd):" /proc/self/status' \
-            2>&1 | sed 's/^/    /'
+            /bin/sh sh -c 'grep -E "^(Uid|Gid|Groups|CapPrm|CapEff|CapBnd):" /proc/self/status'
         printf '\n       Point 3 without the restriction had CapBnd 000001ffffffffff.\n'
         printf '       If CapBnd is 00000000000000c0 here, ONE change closes both.\n'
     else
@@ -364,17 +409,22 @@ else
     "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
         -- /usr/sbin/capsh --print 2>&1 | grep -iE 'secure|current:|bounding' | sed 's/^/    /'
 
+    tmp6b="$(mktemp)"; tmp6c="$(mktemp)"
     printf '\n  [6b] THE BITE TEST: exec a further root binary under the restriction\n'
     printf '       If CapPrm returns to 000001ffffffffff, the c0 is cosmetic.\n'
     "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
         -- /bin/sh -c 'echo "  [before further exec]"; grep -E "^Cap(Prm|Eff|Bnd):" /proc/self/status; echo "  [after further exec]"; exec /bin/sh -c "grep -E \"^Cap(Prm|Eff|Bnd):\" /proc/self/status"' \
-        2>&1 | sed 's/^/    /'
+        > "$tmp6b" 2>&1 || probe_fail "6b — bwrap exited non-zero"
+    grep -qE '^CapPrm:' "$tmp6b" || probe_fail "6b — no CapPrm line; nothing to read"
+    sed 's/^/    /' "$tmp6b"; rm -f "$tmp6b"
 
     printf '\n  [6c] CONTROL: the same further exec WITHOUT the restriction\n'
     printf '       Both legs must not read alike, or 6b discriminates nothing.\n'
     "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') --chdir / \
         -- /bin/sh -c 'exec /bin/sh -c "grep -E \"^Cap(Prm|Eff|Bnd):\" /proc/self/status"' \
-        2>&1 | sed 's/^/    /'
+        > "$tmp6c" 2>&1 || probe_fail "6c — bwrap exited non-zero"
+    grep -qE '^CapPrm:' "$tmp6c" || probe_fail "6c — no CapPrm line; the CONTROL is absent"
+    sed 's/^/    /' "$tmp6c"; rm -f "$tmp6c"
     EXECUTED=$((EXECUTED + 1))
 fi
 
@@ -431,7 +481,15 @@ EOF
 fi
 
 hr
-printf 'LEGS EXECUTED %s / SKIPPED %s\n' "$EXECUTED" "$SKIPPED"
+printf 'LEGS EXECUTED %s / SKIPPED %s / MEASUREMENTS FAILED %s\n' \
+    "$EXECUTED" "$SKIPPED" "$PROBE_FAILURES"
 printf 'A SKIPPED LEG PROVES NOTHING. Leg 1 alone cannot answer the duration question:\n'
 printf 'it measures a DIFFERENT namespace configuration from the one that ships.\n'
+# D0A-R16-07: a leg that could not produce its measurement must not exit 0. EXECUTED counts
+# legs that RAN, which is not the same as legs that MEASURED.
+if [ "$PROBE_FAILURES" -gt 0 ]; then
+    printf 'EXITING NON-ZERO — %s measurement(s) absent or failed.\n' "$PROBE_FAILURES"
+    hr
+    exit 1
+fi
 hr

@@ -34,11 +34,28 @@ set -u -o pipefail
 BWRAP="${BWRAP:-/usr/bin/bwrap}"
 DROP_HELPER="${DROP_HELPER:-/usr/libexec/delphi-drop}"
 REPS="${REPS:-20}"
-TOOL_UID="${TOOL_UID:-997}"
-TOOL_GID="${TOOL_GID:-997}"
+# D0A-R17-02: RESOLVED, not assumed. These were hard-coded 997:997 while the installer's
+# account is uid 997 / gid 972 — the group is `delphi-tool`, not a same-numbered group — so
+# every leg dropped to a gid production never uses, and the validation regex checked Uid
+# only, so the wrong gid passed silently. Resolve from the system; refuse if absent.
+TOOL_ACCOUNT="${TOOL_ACCOUNT:-delphi-tool}"
+TOOL_UID="${TOOL_UID:-$(getent passwd "$TOOL_ACCOUNT" 2>/dev/null | cut -d: -f3)}"
+TOOL_GID="${TOOL_GID:-$(getent passwd "$TOOL_ACCOUNT" 2>/dev/null | cut -d: -f4)}"
 
 EXECUTED=0
 SKIPPED=0
+
+if [ -z "$TOOL_UID" ] || [ -z "$TOOL_GID" ]; then
+    echo "REFUSING: cannot resolve '$TOOL_ACCOUNT' — installer/install.sh creates it."
+    echo "  Probing a guessed uid/gid measures a configuration production does not have,"
+    echo "  which is how 997:997 stood in for the real 997:972 (D0A-R17-02)."
+    exit 1
+fi
+if [ "$TOOL_UID" = "$TOOL_GID" ]; then
+    echo "NOTE: $TOOL_ACCOUNT resolves to $TOOL_UID:$TOOL_GID — uid and gid coincide here."
+    echo "  Both are still checked independently; this note exists so a reader does not"
+    echo "  mistake the coincidence for the assumption D0A-R17-02 removed."
+fi
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 
@@ -54,21 +71,29 @@ skip() { # skip <leg> <reason>
 PROBE_FAILURES=0
 probe_fail() { printf '    *** MEASUREMENT FAILED: %s\n' "$1"; PROBE_FAILURES=$((PROBE_FAILURES + 1)); }
 
-# cap_read <label> <required-regex> <command...> — run, require rc=0 AND the field, print.
+# cap_read <label> <required-regexes, ';'-separated> <command...>
+#
+# ALL patterns must match. D0A-R17-02: a single pattern let the drop legs assert `Uid:` and
+# say nothing about `Gid:`, so a drop to the wrong group read as a clean measurement. What
+# is being observed is a credential PAIR, and the check has to be the same shape.
 cap_read() {
     local label="$1" required="$2"; shift 2
-    local out rc
+    local out rc pat
     out="$("$@" 2>&1)"; rc=$?
     if [ "$rc" -ne 0 ]; then
         printf '    %s\n' "$out" | head -4
         probe_fail "$label — command exited $rc"
         return 1
     fi
-    if ! printf '%s' "$out" | grep -qE "$required"; then
-        printf '    %s\n' "${out:-（no output）}" | head -4
-        probe_fail "$label — output lacks /$required/, so there is nothing to read"
-        return 1
-    fi
+    local IFS=';'
+    for pat in $required; do
+        [ -n "$pat" ] || continue
+        if ! printf '%s' "$out" | grep -qE "$pat"; then
+            printf '    %s\n' "${out:-（no output）}" | head -6
+            probe_fail "$label — output lacks /$pat/, so there is nothing to read"
+            return 1
+        fi
+    done
     printf '%s\n' "$out" | sed 's/^/    /'
     return 0
 }
@@ -188,15 +213,17 @@ baseline() {
     done
     mapfile -t sorted < <(printf '%s\n' "${samples[@]}" | sort -n)
     local cnt=${#sorted[@]}
-    printf '%-8s %-7s %-10s %-10s %-10s %s\n' \
-        "(none)" "-" "${sorted[0]}" "${sorted[$((cnt / 2))]}" "${sorted[$((cnt - 1))]}" "$cnt"
     BASELINE_MED="${sorted[$((cnt / 2))]}"
+    printf '%-8s %-7s %-10s %-10s %-10s %-12s %s\n' \
+        "(none)" "-" "${sorted[0]}" "${sorted[$((cnt / 2))]}" "${sorted[$((cnt - 1))]}" "-" "$cnt"
 }
 
 sweep() { # sweep <userns> <label> [--with-helper]
     local userns="$1" label="$2" helper="${3:-}"
     printf '\n%s\n' "$label"
-    printf '%-8s %-7s %-10s %-10s %-10s %s\n' binds depth min_us med_us max_us n
+    printf '%-8s %-7s %-10s %-10s %-10s %-12s %s\n' \
+        binds depth min_us med_us max_us med-baseline n
+    BASELINE_MED=""
     baseline
     local n_binds depth
     for spec in "1 1" "1 4" "1 8" "4 4" "8 4" "8 8"; do
@@ -214,12 +241,18 @@ sweep() { # sweep <userns> <label> [--with-helper]
         done
         if [ "${#samples[@]}" -eq 0 ]; then
             printf '%-8s %-7s  (no successful runs)\n' "$n_binds" "$depth"
+            probe_fail "sweep cell binds=$n_binds depth=$depth produced no measurement"
             continue
         fi
         mapfile -t sorted < <(printf '%s\n' "${samples[@]}" | sort -n)
         local cnt=${#sorted[@]}
-        printf '%-8s %-7s %-10s %-10s %-10s %s\n' \
-            "$n_binds" "$depth" "${sorted[0]}" "${sorted[$((cnt / 2))]}" "${sorted[$((cnt - 1))]}" "$cnt"
+        # D0A-R17-04: BASELINE_MED was computed and never read, so the payload's own exec
+        # chain stayed folded into every reported number. Subtract it here — that difference
+        # is the only bwrap-attributable figure this probe produces.
+        local med="${sorted[$((cnt / 2))]}" attributable="-"
+        [ -n "${BASELINE_MED:-}" ] && attributable=$(( med - BASELINE_MED ))
+        printf '%-8s %-7s %-10s %-10s %-10s %-12s %s\n' \
+            "$n_binds" "$depth" "${sorted[0]}" "$med" "${sorted[$((cnt - 1))]}" "$attributable" "$cnt"
     done
 }
 
@@ -297,7 +330,8 @@ else
         -- /bin/sh -c 'grep -E "^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status'
 
     printf '\n  [point 3] the TOOL, post-drop through the real delphi-drop\n'
-    cap_read "point 3 (tool, post-drop)" '^Uid:\s+997' \
+    cap_read "point 3 (tool, post-drop)" \
+        "^Uid:[[:space:]]+$TOOL_UID\b;^Gid:[[:space:]]+$TOOL_GID\b" \
         "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') --chdir / \
         -- "$DROP_HELPER" "$TOOL_UID" "$TOOL_GID" - \
         /bin/sh sh -c 'grep -E "^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb):" /proc/self/status'
@@ -376,7 +410,8 @@ else
     printf '\n  [5b] FEASIBILITY: the real delphi-drop under the restriction\n'
     printf '       Does it still drop, and does the TOOL inherit the narrowed bounding set?\n'
     if [ -x "$DROP_HELPER" ]; then
-        cap_read "5b (tool under the restriction)" '^Uid:\s+997' \
+        cap_read "5b (tool under the restriction)" \
+            "^Uid:[[:space:]]+$TOOL_UID\b;^Gid:[[:space:]]+$TOOL_GID\b" \
             "$BWRAP" $(base_profile none | tr '\n' ' ') $(system_binds | tr '\n' ' ') $CAPFLAGS --chdir / \
             -- "$DROP_HELPER" "$TOOL_UID" "$TOOL_GID" - \
             /bin/sh sh -c 'grep -E "^(Uid|Gid|Groups|CapPrm|CapEff|CapBnd):" /proc/self/status'
@@ -477,6 +512,9 @@ EOF
         minimal=unknown
     fi
     printf '\n  MINIMALITY VERDICT: %s\n' "$minimal"
+    # D0A-R17-03: a verdict of anything but `yes` is a measurement that did not come out,
+    # and it was reaching the summary without touching the exit status.
+    [ "$minimal" = "yes" ] || probe_fail "minimality verdict is '$minimal', not 'yes'"
     EXECUTED=$((EXECUTED + 1))
 fi
 

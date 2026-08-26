@@ -136,7 +136,7 @@ cannot.
 | a **literal** nested `#!` interpreter never reaches execution | **PROVEN** at canonicalization — refused before any exec |
 | the snapshot is executable regardless of the source's mode (R14-04) | **DECLARED POLICY** — adopted deliberately; a 0644 source yields a runnable object, and `noexec` on the source mount does not stop an approved action |
 | **the loader and system libraries are immutable** | ~~DECLARED~~ → **FALSIFIED 2026-08-23 (D0A-R14-01).** An approved binary names its own `PT_INTERP`; a probe replaced the loader after sealing and changed executed code. **Struck from §3**, not qualified — a declaration the attacker can invalidate is not a boundary |
-| the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3** — v7 binds the FIRST OBJECT only. Closure is available **by construction** (a statically linked native ELF has no downstream hops), not by a computation of ours |
+| the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3** — v7 binds the FIRST OBJECT only. **CORRECTED 2026-08-26 (D0A-R17-01):** this row said closure was available by construction because *"a statically linked native ELF has no downstream hops"*. That is the claim D0A-R15-02 FALSIFIED — `binfmt_misc` dispatches on magic before the native handler, so the third hop is a property of the KERNEL, not of the file. §3 was corrected then and **this row was not**. The honest form: for a static native ELF, first-object binding is total **only on a system with no matching `binfmt_misc` handler** — a precondition a deployment must enforce and verify, and which this runtime does not check. Not hypothetical: the dev box carries a live registration (`python3.14`, magic `2b0e0d0a`), which does not match ELF magic but shows the precondition is not free |
 | the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED + RE-MEASURED on the shipping configuration (2026-08-26).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload; cap set proven MINIMAL (leg 7, each removal failing at a different syscall); guard **weaken-proven by a real RED** under NNP suppression, stable 30/30 with each `ok` verified to have run. Window **~9–13 ms of fixed bwrap setup cost — neither depth nor bind count drives it**; the earlier `~1.7 ms/bind` slope was an artifact of duplicate ancestor emission and does not exist. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured |
 | the pre-drop payload's BOUNDING set is narrowed | **OPEN — own row, split out of D0A-R10-12 (2026-08-25).** Measured: the R10-12 fix leaves `CapBnd = 000001ffffffffff` at both the payload and the tool. Left inside R10-12 it would let that row close with a named property still standing |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
@@ -391,10 +391,17 @@ with both fixed, on the shipping configuration:
 ancestor emission R16-06 named, work production never does. The corrected series does not
 rise with bind count at all (it drifts slightly *down*, which is noise).
 
-**So the honest statement is neither depth nor bind count drives the window: it is ~9–13 ms
-of essentially FIXED bwrap setup cost.** That is recorded as a replacement claim rather
-than a revised slope, because a revised slope would preserve the false structure — the
-original finding was "bind count is the driver", and the driver does not exist.
+**So the honest statement is that NO DRIVER WAS DETECTED across the range measured** —
+1, 4 and 8 binds at depths 1–8, window ~9–13 ms. It is recorded as a replacement claim
+rather than a revised slope, because a revised slope would preserve the false structure:
+the original finding was "bind count is the driver", and the driver does not exist.
+
+**"No driver detected" is deliberately weaker than "fixed cost" (D0A-R17-04).** Three
+medians that drift slightly downward support the absence of a trend over the range probed;
+they do not support a positive claim that the cost is constant, which would be a statement
+about bind counts and depths nobody measured. Naming the stronger version here would have
+been the same totality-claim shape this arc has now had contradicted four times — and it
+would have been the second one in this very section.
 
 This also retires the obligation's own framing. It worried that ancestor emission on a deep
 path would lengthen the window materially; measured, ancestor emission does not move it in

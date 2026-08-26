@@ -226,6 +226,15 @@ mechanism in front of us.
 Where an absence really is load-bearing, it is written as a **precondition the deployment
 enforces and verifies** — not as a property this system provides.
 
+**THIS RULE IS NOT §3-SHAPED, AND SCOPING IT HERE WAS ITSELF THE DEFECT (2026-08-26,
+D0A-R17-01).** Two further instances landed outside this section after the rule was written:
+one in a test doc comment and `docs/CONFORMANCE_REGISTER.md` (D0A-R16-01), and one where
+*this section's own corrected claim went on standing, uncorrected, in the register* — §3 was
+fixed and the same sentence was not. The class is sentence-shaped, not document-shaped, and
+now lives at `docs/DEFECT_CLASSES.md` class 45, which governs every document and every
+comment in the tree. §3 keeps the rule because §3 is where it is most load-bearing; it is no
+longer where it ends.
+
 ### WHAT v7 BINDS, STATED AT ITS ACTUAL EXTENT (2026-08-23, D0A-R14-01/02)
 
 **v7 binds THE FIRST OBJECT.** The bytes that `execve` receives are a sealed snapshot, the

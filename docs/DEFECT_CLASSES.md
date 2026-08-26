@@ -2488,6 +2488,50 @@ of the wrong tree while reporting success.
 
 ---
 
+## 45. The TOTALITY CLAIM — asserting an absence you cannot measure  *(new — D0A-R17-01; FOUR instances, and the rule that was supposed to stop it was scoped to one document)*
+
+**The shape.** A claim that some path is *absent* — "no handler", "no downstream hops", "not
+weaken-provable", "cannot be constructed" — is a claim about **every** mechanism and every
+configuration. It cannot be measured. A claim about what is **bound** can be.
+
+**Four instances, all falsified by measurement, none by argument:**
+
+| # | claim | falsified by |
+|---|---|---|
+| 1 | v7's contract version | D0A-R14 |
+| 2 | named limit 2 — the loader is an immutable platform TCB member | D0A-R14-01 (a probe replaced the loader after sealing) |
+| 3 | a static native ELF has "no handler" / "no downstream hops" | D0A-R15-02 (`binfmt_misc` dispatches on magic **before** the native handler) |
+| 4 | the NNP-absent shape is "NOT WEAKEN-PROVABLE IN-TREE" | D0A-R16-01 (bwrap calls `prctl` through the PLT; `LD_PRELOAD` reaches it) |
+
+**Why it earns its own entry rather than staying a §3 note.** After instance 3,
+`docs/TRUST_MODEL.md` §3 adopted the rule *"§3 states what is BOUND. It does not state what
+is UNREACHABLE."* **That rule was scoped to §3, and the class is not.** Instance 4 lived in a
+**test doc comment** and in `docs/CONFORMANCE_REGISTER.md`. Worse, D0A-R17-01 then found
+instance 3's own sentence **still standing in the register** after §3 had been corrected —
+the correction was applied to one document while the same claim went on being asserted in
+another. A rule with a document-shaped boundary does not close a class that is
+sentence-shaped.
+
+**The foreclosing discipline (no primitive; this is a writing rule):**
+
+1. **State what is bound, never what is unreachable.** "v7 binds the first object" survived
+   every probe. Every totality claim beside it fell.
+2. **Where an absence is genuinely load-bearing, write it as a PRECONDITION the deployment
+   enforces and verifies** — not as a property this system provides. Then it is checkable and
+   its owner is named.
+3. **Prefer the narrow true form.** "The only weaken I found removes the flags" would have
+   been true, and would have invited the fix instead of foreclosing it. The narrow form costs
+   nothing and cannot be falsified by someone spending five minutes with `readelf`.
+4. **A measured absence still needs its resolution floor.** "No driver detected" without the
+   instrument's noise figure is a totality claim wearing a measurement's clothes — see
+   D0A-R17-04, where the between-cell effect was smaller than one cell's run-to-run spread.
+
+**The RED-proof shape.** For any absence-claim that is load-bearing, the falsifier is
+*construct the thing said not to exist*. Instance 4's took one `readelf` (is the binary
+dynamically linked?) and a 20-line `LD_PRELOAD` shim. **If constructing the counterexample is
+cheap, the claim was never defensible** — and the cost asymmetry is the point: minutes to
+attempt, a review round to discover.
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

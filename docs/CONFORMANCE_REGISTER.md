@@ -381,11 +381,16 @@ flags** (D0A-R16-05 — it timed the pre-mitigation path) and **emitted duplicat
 ancestors** where production deduplicates through a `BTreeSet` (D0A-R16-06). Re-measured
 with both fixed, on the shipping configuration:
 
-| binds | window (median) |
+| binds | window, baseline-subtracted |
 |---|---|
-| 1 | 11.8 ms |
-| 4 | 10.7 ms |
-| 8 | 9.9 ms |
+| 1 | 7.5 – 8.3 ms (three depths) |
+| 4 | 9.3 ms |
+| 8 | 9.9 – 10.0 ms (two depths) |
+
+**Third withdrawal in this section, same cause each time: a value derived and not applied.**
+`BASELINE_MED` was computed by the probe and never read, so every figure reported before
+2026-08-26 still had the payload's own exec chain folded in. Corrected range: **7.3–10.1 ms**
+(D0A-R17-04).
 
 **THE BIND-COUNT SLOPE IS GONE.** `~1.7 ms/bind` did not exist — it was the duplicate
 ancestor emission R16-06 named, work production never does. The corrected series does not
@@ -396,12 +401,22 @@ rise with bind count at all (it drifts slightly *down*, which is noise).
 rather than a revised slope, because a revised slope would preserve the false structure:
 the original finding was "bind count is the driver", and the driver does not exist.
 
-**"No driver detected" is deliberately weaker than "fixed cost" (D0A-R17-04).** Three
-medians that drift slightly downward support the absence of a trend over the range probed;
-they do not support a positive claim that the cost is constant, which would be a statement
-about bind counts and depths nobody measured. Naming the stronger version here would have
-been the same totality-claim shape this arc has now had contradicted four times — and it
-would have been the second one in this very section.
+**"No driver detected" is deliberately weaker than "fixed cost" (D0A-R17-04), and the
+reason is the INSTRUMENT, not the shape of the series.** The corrected column is not flat:
+ordered by bind count it runs 7.9 → 9.3 → 9.95, monotone, about 0.3 ms/bind. Read naively
+that is a driver.
+
+**It is below this probe's resolution.** The same cell (1 bind, depth 1) measured 16.7, 17.6
+and 14.6 ms across three root runs — **~3.0 ms of run-to-run spread on one cell, against a
+2.1 ms difference between the extreme cells.** The noise is larger than the effect, so the
+probe cannot resolve a driver of this size in either direction.
+
+What it CAN do is exclude large ones, and that is the finding worth keeping: it excluded
+1.7 ms/bind (≈12 ms across the range), which is what the pre-R16-06 probe reported as its
+headline. Stating "no driver detected across the range measured" without naming the
+resolution floor would let the sentence be read as "no driver exists" — the same totality
+shape, wearing a measurement's clothes. **Establishing or excluding a ~0.3 ms/bind effect
+needs a different instrument, and is not owed by anything currently claimed.**
 
 This also retires the obligation's own framing. It worried that ancestor emission on a deep
 path would lengthen the window materially; measured, ancestor emission does not move it in

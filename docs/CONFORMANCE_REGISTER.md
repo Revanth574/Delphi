@@ -137,7 +137,7 @@ cannot.
 | the snapshot is executable regardless of the source's mode (R14-04) | **DECLARED POLICY** — adopted deliberately; a 0644 source yields a runnable object, and `noexec` on the source mount does not stop an approved action |
 | **the loader and system libraries are immutable** | ~~DECLARED~~ → **FALSIFIED 2026-08-23 (D0A-R14-01).** An approved binary names its own `PT_INTERP`; a probe replaced the loader after sealing and changed executed code. **Struck from §3**, not qualified — a declaration the attacker can invalidate is not a boundary |
 | the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3** — v7 binds the FIRST OBJECT only. Closure is available **by construction** (a statically linked native ELF has no downstream hops), not by a computation of ours |
-| the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED; duration WITHDRAWN pending re-measurement (2026-08-26).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload, cap set proven MINIMAL by leg 7. The `~9–11 ms` figure is withdrawn — D0A-R16-05/06 showed it timed the path WITHOUT the flags and with duplicated ancestors production dedupes. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured |
+| the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED + RE-MEASURED on the shipping configuration (2026-08-26).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload; cap set proven MINIMAL (leg 7, each removal failing at a different syscall); guard **weaken-proven by a real RED** under NNP suppression, stable 30/30 with each `ok` verified to have run. Window **~9–13 ms of fixed bwrap setup cost — neither depth nor bind count drives it**; the earlier `~1.7 ms/bind` slope was an artifact of duplicate ancestor emission and does not exist. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured |
 | the pre-drop payload's BOUNDING set is narrowed | **OPEN — own row, split out of D0A-R10-12 (2026-08-25).** Measured: the R10-12 fix leaves `CapBnd = 000001ffffffffff` at both the payload and the tool. Left inside R10-12 it would let that row close with a named property still standing |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
 
@@ -351,10 +351,23 @@ reaches it even under root. `scratch/nnp-shim/nnp_suppress.c` returns success fo
 `PR_SET_NO_NEW_PRIVS` without performing it; measured, bwrap's payload goes from
 `no-new-privs=1` to `no-new-privs=0`.
 
-So the NNP-absent shape **is** constructible in-tree, and the guard has a **real RED**: leg
-A of `scratch/d0a-r10-12-red-proof.sh` runs the guard under the shim, where it must fail on
-the `c0` assertion. The flag-removal weaken is demoted to a secondary leg exercising
-emission only.
+So the NNP-absent shape **is** constructible in-tree, and the guard **now has a real RED —
+RUN, not designed**. Leg A of `scratch/d0a-r10-12-red-proof.sh` executes the guard under
+the shim:
+
+```
+LEG A VERDICT: FAILED ON THE c0 ASSERTION under NNP suppression.
+               THIS IS THE REAL RED.
+```
+
+**The grading comes off.** The guard is weaken-proven against **the regression it exists
+for** — bwrap ceasing to set `no_new_privs` — and not merely against the absence of its own
+flags. The flag-removal weaken is demoted to a secondary leg exercising emission only.
+
+**Stability is also a stronger claim than the identical number it replaces.** `GUARD ok 30 /
+not-ok 0` now carries "each verified to have RUN": before D0A-R16-03, the leg accepted
+libtest's `ok`, which a SKIP prints too, so the earlier 30/30 was measuring a weaker
+property behind the same figure.
 
 **The lesson is about the shape of the claim, not the mechanism.** "No mechanism exists" is
 a claim about every mechanism, which is the same unmeasurable totality shape §3 was
@@ -362,14 +375,30 @@ rewritten to forbid — and it was made about a tool whose linkage takes one `re
 check. The narrow form ("the only weaken I found removes the flags") would have been true
 and would have invited the fix instead of foreclosing it.
 
-**Also withdrawn on the same round: the timing figures.** `~9–11 ms attributable` and
-`~1.7 ms/bind` were measured on a probe whose helper leg **omitted the capability flags**
-(D0A-R16-05 — it timed the pre-mitigation path) and which **emitted duplicate shared
-ancestors** where production deduplicates through a `BTreeSet` (D0A-R16-06 — inflating the
-per-bind slope that was the headline finding). Both are fixed; the numbers are **withdrawn
-pending re-measurement**, not adjusted. What survives unaffected: depth is not the driver
-(a comparison between cells that shared the defect), and the capability census, which does
-no timing.
+**THE TIMING FIGURES WERE WITHDRAWN AND RE-MEASURED, AND THE REPLACEMENT IS A DIFFERENT
+CLAIM — not a corrected number.** The old probe's helper leg **omitted the capability
+flags** (D0A-R16-05 — it timed the pre-mitigation path) and **emitted duplicate shared
+ancestors** where production deduplicates through a `BTreeSet` (D0A-R16-06). Re-measured
+with both fixed, on the shipping configuration:
+
+| binds | window (median) |
+|---|---|
+| 1 | 11.8 ms |
+| 4 | 10.7 ms |
+| 8 | 9.9 ms |
+
+**THE BIND-COUNT SLOPE IS GONE.** `~1.7 ms/bind` did not exist — it was the duplicate
+ancestor emission R16-06 named, work production never does. The corrected series does not
+rise with bind count at all (it drifts slightly *down*, which is noise).
+
+**So the honest statement is neither depth nor bind count drives the window: it is ~9–13 ms
+of essentially FIXED bwrap setup cost.** That is recorded as a replacement claim rather
+than a revised slope, because a revised slope would preserve the false structure — the
+original finding was "bind count is the driver", and the driver does not exist.
+
+This also retires the obligation's own framing. It worried that ancestor emission on a deep
+path would lengthen the window materially; measured, ancestor emission does not move it in
+either dimension. The capability census is unaffected — it does no timing.
 
 ### THE SUPERSEDED RECORD (2026-08-25), kept for the trail
 

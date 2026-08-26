@@ -24,8 +24,14 @@ set -u -o pipefail
 SRC_SANDBOX="runtime/src/sandbox.rs"
 TEST_NAME="the_predrop_payload_cannot_recover_capabilities_across_a_further_exec"
 ITERATIONS="${ITERATIONS:-30}"
-SHIM_DIR="scratch/nnp-shim"
-SHIM="$PWD/$SHIM_DIR/nnp_suppress.so"
+SHIM_SRC="scratch/nnp-shim/nnp_suppress.c"
+# Built into a temp dir, NOT into the repo (D0A-R17 cleanup pass). Two reasons, and the
+# second is the one that matters: a build artifact left in the tree persists after every
+# run, and its exclusion from git rested on `.gitignore`'s general `*.so` pattern rather
+# than an explicit entry — sufficiency resting on a default, class 42, in the one file
+# whose purpose is to suppress a security mechanism. A temp dir removes both at once.
+SHIM_BUILD_DIR="$(mktemp -d)"
+SHIM="$SHIM_BUILD_DIR/nnp_suppress.so"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/delphi-target}"
 
 FAILURES=0
@@ -50,6 +56,10 @@ restore() {
     cmp -s "$BACKUP" "$SRC_SANDBOX" \
         && echo "RESTORED: $SRC_SANDBOX byte-identical to the pre-run backup." \
         || echo "!!! RESTORE FAILED — $SRC_SANDBOX differs. Fix before committing."
+    rm -rf "$SHIM_BUILD_DIR"
+    [ -e "$SHIM_BUILD_DIR" ] \
+        && echo "!!! SHIM NOT REMOVED — $SHIM_BUILD_DIR still exists." \
+        || echo "REMOVED: the NNP shim build dir; no artifact is left in the tree."
 }
 trap restore EXIT
 
@@ -106,7 +116,7 @@ witnesses() { printf '%s' "$1" | grep -E "restricted \(|control    \(" | sed 's/
 # (Production's run_fd_pinned env_clear()s, so this reaches the TEST's bwrap only — which is
 # what is wanted: it simulates a bwrap that stopped setting NNP.)
 hr; echo "LEG A — REAL RED: bwrap's no_new_privs suppressed"; hr
-gcc -shared -fPIC -o "$SHIM" "$SHIM_DIR/nnp_suppress.c" -ldl || { echo "shim build failed"; exit 2; }
+gcc -shared -fPIC -o "$SHIM" "$SHIM_SRC" -ldl || { echo "shim build failed"; exit 2; }
 echo "  shim: $SHIM"
 if ! sudo env LD_PRELOAD="$SHIM" /usr/sbin/capsh --print 2>/dev/null | grep -q "no-new-privs=0"; then
     echo "  (note: capsh under the shim still reports NNP set for its own process; the"

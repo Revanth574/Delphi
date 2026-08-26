@@ -2361,6 +2361,26 @@ different test that does not bite.
 
 ---
 
+### Instance, 2026-08-26 — the class in an ANALYSIS rather than in an assertion
+
+**First occurrence of class 41 in a sweep instead of a test.** A dead-code pass over
+`runtime/src/**` asked "which `pub`/`pub(crate)` functions have no reference **outside their
+own file**?" and returned **eight**. All eight were false: they are module-internal helpers,
+used within the files that define them. The predicate was measuring **cross-file** usage while
+the question was **any** usage — the wrong altitude, and it produced a list of eight
+deletion candidates in security-relevant modules (`logind.rs`, `service.rs`,
+`consent_relay.rs`).
+
+Caught by re-checking with total reference counts, not by the sweep. **What makes it worth an
+entry: a wrong-altitude assertion fails loudly at the wrong moment, but a wrong-altitude
+ANALYSIS produces a confident list that someone then acts on.** There is no red to notice.
+
+The corrected predicate is the trivial one — count all references and subtract the
+definition. The generalisation: **when a sweep's output is a list of things to remove, the
+predicate needs the same weaken/restore treatment as an assertion** — run it against a symbol
+known to be live and confirm it is not listed. The eight false positives were exactly that
+control, arrived at by accident.
+
 ## 42. A negative assertion whose sufficiency rested on a default the change removed  *(new — D0A-R10, found by mutation audit)*
 
 **The test did not change. What its assertion was sufficient to prove did.**

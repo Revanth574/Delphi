@@ -391,7 +391,13 @@ fn exec_tail(
 /// D0A-R16-02: this exists so tests exercise the DECISION and not just the method. A test
 /// calling `with_credential_drop()` directly stays green when the `creds.is_some()` branch is
 /// deleted from the caller — the wiring, not the method, is what ships. The restriction rides
-/// the returned `SandboxProfile` so `sandbox_profile_digest` covers it once the audit is wired.
+/// the returned `SandboxProfile`, which is what `sandbox_profile_digest` hashes.
+///
+/// **That coverage is not in effect and is not merely "pending".** The `audit` module has no
+/// production entry point — `RuntimeAuditEntry::record` is called only from tests — so no
+/// approved action has ever produced an entry outside a test run. The restriction is enforced
+/// regardless; what does not exist is the record of it. `docs/CONFORMANCE_REGISTER.md`, §7
+/// "audit = reality is RECORDED AT ALL".
 pub(crate) fn assemble_profile(action: &PendingAction, creds: Option<(u32, u32)>) -> SandboxProfile {
     let profile = SandboxProfile::derive(action);
     if creds.is_some() {

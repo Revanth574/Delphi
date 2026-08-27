@@ -37,7 +37,34 @@ of those seventeen targets had never executed at root before run 3.
 | the drop helper the daemon runs is the one it was built against | **PROVEN** at root — built and installed agree at `aba0f0ea14b751aa…`, and the first time the digest binding refused a *legitimate* change rather than an attack |
 | every `b1_integration` / `end_to_end` / `divergence` root path | **PROVEN** — 0 failures, and **0 skips**, so nothing closed by ceasing to run |
 
-### The root EXECUTED figure is still NOT recorded, deliberately
+### THE ROOT FIGURE IS NOW RECORDED — from the tool, not by subtraction (run 7, 2026-08-26)
+
+**`EXECUTED 168 / SKIPPED 5 / reported 173`**, 0 failures, 0 leaks, PAM stack intact, 17/17
+targets reporting. Produced by `scripts/test-count.sh`'s parse-only mode
+(`DELPHI_TESTCOUNT_LOG`) over the concatenated per-target log, because the counter shells out
+to cargo and cannot run under `sudo` here. Written to
+`.githooks/runtime-test-count-baseline.root`. All three post-run-6 changes to `runtime/src/**`
+pass at root: the R10-12 capability restriction, the R16/R17 remediation, the preview allowlist.
+
+**168 IS NOT A SUPERSET OF 148, AND THE NUMBERS INVITE THAT READING.** Three of the five root
+skips exist *because* the run is privileged, and they EXECUTE unprivileged:
+
+| skip | reason it skips AT ROOT |
+|---|---|
+| `an_unreadable_login_defs…` | "this uid can read a 0000 file" |
+| `a_regular_login_user_is_not_refused…` | "running as root" |
+| `pidfd_refuses_a_recycled_pid_barrier` | userns unavailable to root here |
+
+The other two are euid-independent: `b1_daemon_binary…` needs `--features
+insecure-test-seams`, and `live_logind_query…` is the standing DEFER.
+
+**So the two runs are OVERLAPPING SETS, neither containing the other** — root executes tests
+the unprivileged run skips, and skips three the unprivileged run executes. "168 > 148" read as
+coverage would be wrong in both directions. The exact membership is readable from the two skip
+LISTS; it must not be computed from the two totals, which is the subtraction this section was
+written to refuse.
+
+### Why the figure was withheld until now
 
 `0 skips` and `169 reported` unprivileged would give `EXECUTED=169` at root by arithmetic.
 **That is two measurements and a subtraction, not a measurement**, and it is the move that put
@@ -136,7 +163,7 @@ cannot.
 | a **literal** nested `#!` interpreter never reaches execution | **PROVEN** at canonicalization — refused before any exec |
 | the snapshot is executable regardless of the source's mode (R14-04) | **DECLARED POLICY** — adopted deliberately; a 0644 source yields a runnable object, and `noexec` on the source mount does not stop an approved action |
 | **the loader and system libraries are immutable** | ~~DECLARED~~ → **FALSIFIED 2026-08-23 (D0A-R14-01).** An approved binary names its own `PT_INTERP`; a probe replaced the loader after sealing and changed executed code. **Struck from §3**, not qualified — a declaration the attacker can invalidate is not a boundary |
-| the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3 — and the `env`+`PATH` hop is an EXPOSURE, not merely a gap (2026-08-26).** Measured: 52 of 412 `/usr/bin` scripts carry an `env`-style shebang (41 of them `env node`), and `env -i PATH=<dir> /usr/bin/env python3` runs the impostor. The PREVIEW is fixed — code-selecting env values are shown and a non-flag interpreter arg is marked unbound — but that is a **DISCLOSURE fix, not a binding fix**: the hop is unchanged. **OWED:** the end-to-end demonstration through the real runtime. Original text follows — v7 binds the FIRST OBJECT only. **CORRECTED 2026-08-26 (D0A-R17-01):** this row said closure was available by construction because *"a statically linked native ELF has no downstream hops"*. That is the claim D0A-R15-02 FALSIFIED — `binfmt_misc` dispatches on magic before the native handler, so the third hop is a property of the KERNEL, not of the file. §3 was corrected then and **this row was not**. The honest form: for a static native ELF, first-object binding is total **only on a system with no matching `binfmt_misc` handler** — a precondition a deployment must enforce and verify, and which this runtime does not check. Not hypothetical: the dev box carries a live registration (`python3.14`, magic `2b0e0d0a`), which does not match ELF magic but shows the precondition is not free |
+| the execution CHAIN is bound (loader, `env`+`PATH`, `binfmt_misc`) | **ACCEPTED GAP, three hops named in §3 — and the `env`+`PATH` hop is an EXPOSURE, not merely a gap (2026-08-26).** Measured: 52 of 412 `/usr/bin` scripts carry an `env`-style shebang (41 of them `env node`), and `env -i PATH=<dir> /usr/bin/env python3` runs the impostor. The PREVIEW is fixed — code-selecting env values are shown and a non-flag interpreter arg is marked unbound — but that is a **DISCLOSURE fix, not a binding fix**: the hop is unchanged. **DEMONSTRATED END TO END 2026-08-26** — `chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it` composes canonicalize → preview → gate → execute: the impostor `python3` runs (marker written, exit 0), the preview discloses the deciding directory, and the CONTROL without `PATH` succeeds writing nothing. All three assertions proven to bite. **AND THE COMPOSITION FOUND SOMETHING ISOLATION COULD NOT** — see the multi-call `env` note below. Original text follows — v7 binds the FIRST OBJECT only. **CORRECTED 2026-08-26 (D0A-R17-01):** this row said closure was available by construction because *"a statically linked native ELF has no downstream hops"*. That is the claim D0A-R15-02 FALSIFIED — `binfmt_misc` dispatches on magic before the native handler, so the third hop is a property of the KERNEL, not of the file. §3 was corrected then and **this row was not**. The honest form: for a static native ELF, first-object binding is total **only on a system with no matching `binfmt_misc` handler** — a precondition a deployment must enforce and verify, and which this runtime does not check. Not hypothetical: the dev box carries a live registration (`python3.14`, magic `2b0e0d0a`), which does not match ELF magic but shows the precondition is not free |
 | the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED + RE-MEASURED on the shipping configuration (2026-08-26).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload; cap set proven MINIMAL (leg 7, each removal failing at a different syscall); guard **weaken-proven by a real RED** under NNP suppression, stable 30/30 with each `ok` verified to have run. Window **~9–13 ms of fixed bwrap setup cost — neither depth nor bind count drives it**; the earlier `~1.7 ms/bind` slope was an artifact of duplicate ancestor emission and does not exist. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured |
 | the pre-drop payload's BOUNDING set is narrowed | **OPEN — own row, split out of D0A-R10-12 (2026-08-25).** Measured: the R10-12 fix leaves `CapBnd = 000001ffffffffff` at both the payload and the tool. Left inside R10-12 it would let that row close with a named property still standing |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |

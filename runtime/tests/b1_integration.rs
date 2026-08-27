@@ -1901,3 +1901,138 @@ fn terminal_contract_release_produces_eof_no_wedge() {
     // POST-RELEASE: EOF → the host's recv_prompt → None → dismiss (no wedge).
     assert!(matches!(nb_read(sfd), Rd::Eof), "post-release: EOF → the host dismisses cleanly");
 }
+
+// ── THE CHAIN-GAP DEMONSTRATION (§3, 2026-08-26) ─────────────────────────────
+
+/// `#!/usr/bin/env python3` + an approved `PATH` selects an IMPOSTOR — composed through the
+/// real `canonicalize` → `preview` → gate → `execute` path, not reconstructed from argv.
+///
+/// Three assertions, and the third is what makes the first mean anything:
+///
+///   1. the impostor RAN — its marker, not a refusal;
+///   2. the PREVIEW discloses the deciding directory rather than `PATH=[redacted]`;
+///   3. CONTROL — the same action WITHOUT `PATH` succeeds and writes no marker.
+///
+/// **(3) must SUCCEED, not error.** A control that died at `execvp` would prove the impostor
+/// was UNREACHABLE rather than UNSELECTED. So the script body is valid Python: without
+/// `PATH`, `env` falls back to confstr `/bin:/usr/bin` (measured), the real `/usr/bin/python3`
+/// runs it, and the only difference between the legs is which binary `python3` named.
+///
+/// Runs privileged AND unprivileged on purpose — `env_delta` reaches the tool by DIFFERENT
+/// transports (a sealed memfd via `delphi-drop` when credentials exist; bwrap `--setenv`
+/// tokens when they do not), so both runs are informative and the root lane exercises the
+/// shipping one.
+#[test]
+fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
+    if !bwrap_available() {
+        eprintln!("SKIP chain_gap_approved_path: requires bwrap");
+        return;
+    }
+    let _tmp = tempfile::Builder::new()
+        .prefix("delphi-chain-gap-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("tempdir");
+    let dir = _tmp.path().to_path_buf();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let marker = dir.join("impostor-marker");
+
+    let impostor = bin.join("python3");
+    std::fs::write(
+        &impostor,
+        format!("#!/bin/sh\nprintf IMPOSTOR-RAN > {}\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = dir.join("act.py");
+    std::fs::write(&script, "#!/usr/bin/env python3\npass\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `chown_to_tool` is NOT recursive. Every path the dropped tool must traverse, execute
+    // or write gets it explicitly — the un-chowned nested path is the shape all four of this
+    // arc's Class 20 defects took, and three presented as an empty marker with no error.
+    credentials::chown_to_tool(&dir);
+    credentials::chown_to_tool(&bin);
+    credentials::chown_to_tool(&impostor);
+    credentials::chown_to_tool(&script);
+
+    let run = |with_path: bool| {
+        let mut proposal = marker_proposal(&script, "unused-argv", &dir);
+        // argv[0] MUST be `env` here, and finding that out is itself a result of composing
+        // rather than reconstructing. `/usr/bin/env` on this box is uutils coreutils — a
+        // MULTI-CALL binary that dispatches on argv[0] — so the approved argv[0] of `tool`
+        // made the interpreter refuse (`coreutils: unknown program 'tool'`) before it
+        // resolved anything. Fails CLOSED, so it is a functionality limit rather than a
+        // hole, but it is invisible to `env -i PATH=... /usr/bin/env python3`, which carries
+        // argv[0] = the path. See CONFORMANCE_REGISTER.md, the chain-gap row.
+        proposal.argv[0] = "env".into();
+        if with_path {
+            proposal.env_delta = vec![pb::EnvVar {
+                key: "PATH".into(),
+                value: bin.display().to_string(),
+            }];
+        }
+        let key = MintingKey::from_bytes(KEY);
+        let action = canonicalize(&proposal, "chain-gap".into()).unwrap();
+        let rendered = delphi_runtime::action::preview(&action);
+        let digest = canonical_action_digest(&action);
+        let token = mint(&key, &digest, NOW);
+        let mut ledger = ConsumptionLedger::new();
+        let out = delphi_runtime::execute::execute_approved(&action, &token, &key, NOW, &mut ledger);
+        (rendered, out)
+    };
+
+    let (preview_with_path, exec_with_path) = run(true);
+    let seen = std::fs::read_to_string(&marker).unwrap_or_default().trim().to_string();
+
+    // CLASS 43 — `execvp: No such file or directory` cannot distinguish a missing fd from a
+    // missing loader, and it has cost this arc two misdiagnoses. Print the CHILD's own
+    // stderr before any assertion runs, so a failure is diagnosed rather than guessed.
+    match &exec_with_path {
+        Ok(o) => eprintln!(
+            "chain-gap: exit={:?}\n  child stderr: {}\n  child stdout: {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim(),
+            String::from_utf8_lossy(&o.stdout).trim()
+        ),
+        Err(e) => eprintln!("chain-gap: REFUSED before exec (no child ran): {e}"),
+    }
+    eprintln!("chain-gap: preview =\n{preview_with_path}");
+
+    assert!(exec_with_path.is_ok(), "the action must EXECUTE, not be refused: {exec_with_path:?}");
+    assert_eq!(
+        seen, "IMPOSTOR-RAN",
+        "the approved PATH selected an impostor `python3` through the real composed path — \
+         empty here means the impostor did not run; check the child stderr above before \
+         concluding which of the four shapes it was"
+    );
+    assert!(
+        preview_with_path.contains(&bin.display().to_string()),
+        "the preview must DISCLOSE the directory that decides which python3 runs, not \
+         redact it:\n{preview_with_path}"
+    );
+
+    // CONTROL. Without PATH the same action must SUCCEED and write nothing — success is the
+    // load-bearing half: an error would prove unreachability, not unselection.
+    std::fs::remove_file(&marker).ok();
+    let (_preview_no_path, exec_no_path) = run(false);
+    let control_seen = std::fs::read_to_string(&marker).unwrap_or_default();
+    if let Ok(o) = &exec_no_path {
+        eprintln!(
+            "chain-gap CONTROL: exit={:?} stderr={}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
+    }
+    assert!(
+        exec_no_path.is_ok(),
+        "the CONTROL must SUCCEED without PATH — an error proves the impostor was \
+         UNREACHABLE rather than UNSELECTED: {exec_no_path:?}"
+    );
+    assert!(
+        control_seen.is_empty(),
+        "without PATH the impostor must NOT run; it did, so the marker is not attributable \
+         to PATH: {control_seen:?}"
+    );
+}

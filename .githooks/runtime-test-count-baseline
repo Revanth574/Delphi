@@ -73,5 +73,8 @@
 # `duplicate-macro-attributes`. The visible symptom — one test name printed TWICE in the run
 # output — was seen and dismissed as cargo noise. Recorded because the baseline exists to
 # catch counts that drift, and here the count drifted from a defect the test run could not see.
-EXECUTED=148
+# 2026-08-26 (chain-gap demonstration): 148/25 -> 149/25. One addition,
+# `chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it` in
+# b1_integration — an existing target, so the 17-target enumeration is unchanged.
+EXECUTED=149
 SKIPPED=25

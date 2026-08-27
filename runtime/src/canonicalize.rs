@@ -97,22 +97,57 @@ pub fn canonicalize(
 
     Ok(PendingAction {
         pending_id,
-        preview_version: 1,
+        preview_version: 2,
         executable_fd,
         executable_digest,
         argv: proposal.argv.clone(),
         cwd: PathBuf::from(&proposal.cwd),
-        env_delta: proposal
-            .env_delta
-            .iter()
-            .map(|e| (e.key.clone(), e.value.clone()))
-            .collect(),
+        env_delta: validate_env_delta(&proposal.env_delta)?,
         fs_binds,
         net_policy,
         timeout: Duration::from_secs(proposal.timeout_secs),
         required_tier,
         script,
     })
+}
+
+
+/// Reject environment entries `execve` cannot represent, BEFORE preview/digest/execution
+/// (D0A-R18-03).
+///
+/// Protobuf strings may contain U+0000; a Unix environment name or value may not, and a name
+/// may not contain `=`. The privileged transport serialises entries as `key=value\0` and
+/// `delphi-drop` splits on NUL, so a value of `x\0PATH=/attacker/bin` PREVIEWS as one entry
+/// and EXECUTES as two — the second invisible to the human who approved it. Validation lives
+/// here because this is the one place every proposal passes before anything is bound.
+///
+/// # Errors
+///
+/// [`RuntimeError::Protocol`] naming the offending key.
+fn validate_env_delta(entries: &[pb::EnvVar]) -> Result<Vec<(String, String)>, RuntimeError> {
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        if e.key.is_empty() {
+            return Err(RuntimeError::Protocol("environment entry with an empty name".into()));
+        }
+        if e.key.contains('\0') || e.value.contains('\0') {
+            return Err(RuntimeError::Protocol(format!(
+                "environment entry `{}` contains an embedded NUL. execve cannot represent it, \
+                 and on the privileged transport it would split into entries the preview never \
+                 showed (D0A-R18-03).",
+                e.key.escape_debug()
+            )));
+        }
+        if e.key.contains('=') {
+            return Err(RuntimeError::Protocol(format!(
+                "environment name `{}` contains `=`, which makes the name/value boundary \
+                 ambiguous (environ(7)).",
+                e.key.escape_debug()
+            )));
+        }
+        out.push((e.key.clone(), e.value.clone()));
+    }
+    Ok(out)
 }
 
 /// Parse the shebang, open + hash the interpreter through its fd, and seal the
@@ -202,6 +237,48 @@ mod tests {
         std::fs::write(&p, content).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    /// D0A-R18-03 — an embedded NUL in a VALUE would smuggle a second environment entry
+    /// past the preview. The privileged transport writes `key=value\0` and `delphi-drop`
+    /// splits on NUL, so `API_TOKEN=x\0PATH=/attacker/bin` previews as ONE entry and
+    /// executes as TWO — the second choosing which binary runs, and never shown to the
+    /// human who approved it. Refused at canonicalization, before preview/digest/exec.
+    #[test]
+    fn an_embedded_nul_or_equals_in_the_environment_is_refused() {
+        let exe = std::env::temp_dir().join("delphi-r1803-exe");
+        std::fs::write(&exe, b"#!/bin/sh\n:\n").unwrap();
+
+        let with_env = |k: &str, v: &str| {
+            let mut p = base_proposal(&exe.display().to_string());
+            p.env_delta = vec![pb::EnvVar { key: k.into(), value: v.into() }];
+            canonicalize(&p, "r1803".into())
+        };
+
+        // The smuggling shape itself.
+        // `PendingAction` has no `Debug` (it holds fds), so match on the ERROR rather than
+        // formatting the Result.
+        match with_env("API_TOKEN", "x\0PATH=/attacker/bin") {
+            Err(RuntimeError::Protocol(m)) => {
+                assert!(m.contains("NUL"), "refused, but not for the NUL: {m}");
+            }
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!("a NUL in a value was ACCEPTED — it would smuggle a second entry"),
+        }
+        // A NUL in the NAME is the same hazard from the other side.
+        assert!(
+            with_env("A\0B", "v").is_err(),
+            "a NUL in a name must be refused"
+        );
+        // `=` in a name makes the boundary ambiguous (environ(7)).
+        assert!(with_env("A=B", "v").is_err(), "`=` in a name must be refused");
+        // An empty name is not representable.
+        assert!(with_env("", "v").is_err(), "an empty name must be refused");
+        // POSITIVE CONTROL — an ordinary entry still canonicalizes, or the refusals above
+        // would be satisfied by everything failing.
+        assert!(with_env("PATH", "/usr/bin").is_ok(), "an ordinary entry must still pass");
+
+        let _ = std::fs::remove_file(&exe);
     }
 
     fn base_proposal(exe_path: &str) -> pb::Propose {

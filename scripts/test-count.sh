@@ -43,7 +43,12 @@ if [ -n "${DELPHI_TESTCOUNT_LOG:-}" ]; then
     # checkable by something other than itself.
     log="$DELPHI_TESTCOUNT_LOG"
     [ -r "$log" ] || REFUSE "DELPHI_TESTCOUNT_LOG=$log is not readable"
-    rc=0
+    # D0A-R18-04: rc WAS hard-coded 0 here, so a captured log containing a FAILED summary
+    # was reported with exit 0 — parse-only could certify a failed run. There is no producer
+    # status to inherit in this mode, so it is DERIVED from the log: any FAILED summary is a
+    # failure. The producer's own statuses must additionally be checked by the caller, which
+    # is what DELPHI_TESTCOUNT_EXPECT_TARGETS below exists to make non-optional.
+    if grep -qE '^test result: FAILED' "$log"; then rc=1; else rc=0; fi
 else
     log=$(mktemp -t delphi-testcount-XXXXXX) || REFUSE "mktemp failed"
     trap 'rm -f "$log"' EXIT
@@ -94,6 +99,21 @@ skipped=$(grep -cE '^test .+ \.\.\. (SKIP|DEFER)' "$log")
 if [ "$skipped" -gt "$reported" ]; then
     REFUSE "more skips ($skipped) than reported passes ($reported) — the parse is wrong, \
 and a wrong count is worse than none"
+fi
+
+# D0A-R18-04: a target that CRASHED before printing its summary simply vanishes from the
+# count, so a subset can be certified as the whole. The caller states how many targets it
+# enumerated and the parse must find exactly that many summaries — no more (a duplicated
+# append) and no fewer (a target that died).
+if [ -n "${DELPHI_TESTCOUNT_EXPECT_TARGETS:-}" ]; then
+    [[ "${DELPHI_TESTCOUNT_EXPECT_TARGETS}" =~ ^[0-9]{1,4}$ ]] \
+        || REFUSE "DELPHI_TESTCOUNT_EXPECT_TARGETS must be a small integer, got \
+'${DELPHI_TESTCOUNT_EXPECT_TARGETS}'"
+    if [ "$result_lines" -ne "${DELPHI_TESTCOUNT_EXPECT_TARGETS}" ]; then
+        REFUSE "expected ${DELPHI_TESTCOUNT_EXPECT_TARGETS} target summaries, found \
+$result_lines — a target that died before printing its summary is INVISIBLE to a count, \
+which is how a subset becomes a baseline"
+    fi
 fi
 
 executed=$(( reported - skipped ))

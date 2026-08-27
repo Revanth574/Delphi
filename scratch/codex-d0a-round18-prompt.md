@@ -16,7 +16,7 @@ it.
 
 ## Your target
 
-**`git diff db6393a..HEAD`** — nine commits. `db6393a` was round 17's review target; every
+**`git diff db6393a..d7c4df0`** — nine commits. **PINNED, not `..HEAD` (D0A-R18-09):** this prompt said `..HEAD`, and committing the prompt itself then moved HEAD, so the stated stat excluded a commit the target included. A prompt that names a moving reference cannot state a diff stat the reviewer can check against. `db6393a` was round 17's review target; every
 commit after it is unreviewed, **including round 17's own remediation** (`89a8b09`), which
 was fixed in response to findings and then never re-reviewed.
 

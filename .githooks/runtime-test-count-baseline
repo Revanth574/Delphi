@@ -76,5 +76,12 @@
 # 2026-08-26 (chain-gap demonstration): 148/25 -> 149/25. One addition,
 # `chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it` in
 # b1_integration — an existing target, so the 17-target enumeration is unchanged.
-EXECUTED=149
+# 2026-08-27 (round-18 remediation): 149/25 -> 150/25. Net +1 EXECUTED across a
+# replacement, not an addition: `preview_redacts_env_values_no_oracle` and
+# `preview_shows_code_selecting_env_and_redacts_the_rest` were REMOVED (they encoded the
+# redaction spec D0A-R18-05 retired), and three replaced them —
+# `preview_cannot_render_two_different_actions_identically`,
+# `preview_shows_env_values_in_full`, `preview_marks_every_interpreter_arg_as_unbound` —
+# plus `an_embedded_nul_or_equals_in_the_environment_is_refused` (D0A-R18-03).
+EXECUTED=150
 SKIPPED=25

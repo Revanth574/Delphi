@@ -69,11 +69,18 @@ A count below 17 means the run would silently cover a subset — the exact defec
 ## 3. The run — every target, serial, one log
 
 ```bash
-: > /tmp/root-run7.log
+: > /tmp/root-run7.log ; : > /tmp/root-run7.status
 while read -r b; do
   echo "### $b" >> /tmp/root-run7.log
   sudo "$b" --nocapture --test-threads=1 >> /tmp/root-run7.log 2>&1
+  printf '%s\t%s\n' "$?" "$b" >> /tmp/root-run7.status   # D0A-R18-04
 done < /tmp/targets.txt
+
+# Every producer's status, checked. A target that CRASHES before printing its summary
+# vanishes from the count entirely — the loop used to discard `$?` and the parse could not
+# see the gap, so a subset could become the "exact" baseline.
+awk -F'\t' '$1 != 0 {print "TARGET FAILED rc="$1" "$2; bad=1} END {exit bad}' /tmp/root-run7.status \
+  && echo "all producers exited 0"
 ```
 
 Serial is not a preference: `--test-threads=1` is what makes SKIP markers land
@@ -86,8 +93,16 @@ CLAUDE.md §6's fork+PAM carve-out makes the serial run the authoritative one fo
 **parse-only** mode on the captured log, unprivileged:
 
 ```bash
-DELPHI_TESTCOUNT_LOG=/tmp/root-run7.log scripts/test-count.sh
+DELPHI_TESTCOUNT_EXPECT_TARGETS=$(wc -l < /tmp/targets.txt) \
+  DELPHI_TESTCOUNT_LOG=/tmp/root-run7.log scripts/test-count.sh ; echo "rc=$?"
 ```
+
+**`DELPHI_TESTCOUNT_EXPECT_TARGETS` is not optional (D0A-R18-04).** Parse-only mode has no
+producer status to inherit, so it now derives failure from the log (any `FAILED` summary →
+rc 1) and refuses unless it finds exactly the number of summaries the caller enumerated
+(→ rc 2). Verified against three cases: a fixture with one plausible summary refuses at
+rc 2, a log containing `FAILED` exits 1, the real 17-target log exits 0. **Write the
+baseline only after this rc is 0 AND the producer-status check above passed.**
 
 **VERIFIED, not assumed (2026-08-26, unprivileged dry run).** Running the 17 targets
 separately and concatenating produces a log the extractor parses **identically** to the

@@ -404,38 +404,26 @@ fn hex32(d: &[u8; 32]) -> String {
     s
 }
 
-/// The human-readable rendering of the action — what the human approves.
+/// Quote and escape one field so the rendering is INJECTIVE (D0A-R18-02).
 ///
-/// One of the four derivations from the canonical object (preview / approval-digest
-/// / sandbox-profile / audit). It is the arbiter's rendering (never AI text, never
-/// derived from observed content — `docs/TRUST_MODEL.md` §3): what the human sees is
-/// what the digest binds and what the sandbox executes.
+/// The previous prose joined fields with `", "` and `" "`, which two DIFFERENT actions could
+/// render identically — `[("PATH", "/safe, LD_PRELOAD=/tmp/evil.so")]` and
+/// `[("PATH","/safe"), ("LD_PRELOAD","/tmp/evil.so")]` produced the same text while only the
+/// second defines `LD_PRELOAD`. The digest told them apart; the human could not, which is
+/// exactly the "preview = approval" property inverted. `escape_debug` escapes quotes,
+/// backslashes and control characters, so no value can forge a delimiter.
+fn q(s: &str) -> String {
+    format!("\"{}\"", s.escape_debug())
+}
+
+/// The arbiter's rendering of the canonical object — INJECTIVE, and complete.
 ///
-/// It renders **every behaviour-affecting field** — argv, cwd, env-delta, fs-binds,
-/// net policy, timeout, tier, the executable content fingerprint, and (for scripts)
-/// the interpreter + script content fingerprints — so the prompt-injection defence
-/// holds: the human can inspect everything that affects what runs, and any change to
-/// a behaviour-affecting field changes the preview.
-///
-/// Two renderings are deliberate, so "render everything" does not become "leak
-/// secrets" or "round away precision":
-/// * **env values** are rendered as `KEY=[redacted]` — the key (structure) is shown,
-///   the value is NOT. Env values are a classic secret location (API keys, tokens,
-///   passwords), and the preview is handed to the UNTRUSTED requester (§3:
-///   `{pending_id, preview}`). Plaintext would leak; an *unkeyed* value fingerprint
-///   would be an offline dictionary oracle for low-entropy values (the attacker holds
-///   the hash and enumerates guesses). The human's one-shot approval acts on WHICH
-///   vars are set (an injected `LD_PRELOAD`/`API_KEY` is the high-signal threat), and
-///   a human cannot verify a value fingerprint against intent anyway — so the value
-///   is redacted, not fingerprinted. The digest still binds the full value, so the
-///   approval covers the exact bytes that execute.
-/// * **timeout** is rendered via `Duration`'s `Debug` (e.g. `30s`, `30.9s`), which
-///   carries the same nanosecond precision the digest binds (`timeout.as_nanos()`),
-///   so a sub-second change is visible — not rounded to whole seconds.
-///
-/// The only fields NOT rendered are `pending_id` (a single-use id) and
-/// `preview_version` (the rendering's own schema version) — metadata that does not
-/// affect what executes; both are still bound by the digest.
+/// **Environment values are shown in full (D0A-R18-05).** They used to be `[redacted]`
+/// against a disclosure that does not occur: production sends the AI only `Pending {
+/// pending_id }` (`service.rs`), and the preview goes to the PINNED SHELL over the private
+/// channel. Redaction hid the fields that decide which code runs from the only party
+/// entitled to see them. A rendering for an untrusted audience, if one is ever needed, is a
+/// separate rendering — not a security allowlist doing double duty.
 ///
 /// # Examples
 ///
@@ -443,91 +431,68 @@ fn hex32(d: &[u8; 32]) -> String {
 /// use delphi_runtime::action::{preview, PendingAction, NetPolicy, RequiredTier};
 /// # use std::time::Duration;
 /// let a = PendingAction {
-///     pending_id: "p".into(), preview_version: 1,
+///     pending_id: "p".into(), preview_version: 2,
 ///     executable_fd: std::fs::File::open("/dev/null").unwrap().into(),
 ///     executable_digest: [0; 32], argv: vec!["echo".into(), "hi".into()],
 ///     cwd: "/".into(), env_delta: vec![("K".into(), "V".into())],
-///     fs_binds: vec![], net_policy: NetPolicy::None, timeout: Duration::from_secs(30),
+///     fs_binds: vec![], net_policy: NetPolicy::None,
+///     timeout: Duration::from_secs(30),
 ///     required_tier: RequiredTier::Biometric, script: None,
 /// };
 /// let p = preview(&a);
-/// // env value is redacted (key shown, value not), timeout at full precision.
-/// assert!(p.contains("echo hi") && p.contains("K=[redacted]") && !p.contains("K=V"));
+/// // Values are SHOWN (D0A-R18-05) and every field is quoted + indexed (D0A-R18-02).
+/// assert!(p.contains(r#"env[0]: name="K" value="V""#));
+/// assert!(p.contains(r#"argv[1]="hi""#));
 /// ```
-/// Env keys whose VALUE selects which code runs. Shown in full; everything else stays
-/// `[redacted]` because the delta may carry secrets.
-///
-/// **This is a DISCLOSURE fix, not a BINDING fix.** `env` still resolves through `PATH` and
-/// the loader still honours these — nothing here binds them. What it removes is a preview
-/// that showed a digest for `/usr/bin/env` beside a name the digest does not cover, while
-/// hiding the field that decides which binary runs. The sentence lives here rather than only
-/// in `docs/TRUST_MODEL.md` §3 because a qualification one document away stops being read
-/// (DEFECT_CLASSES 45, and D0A-R17-01 is the instance).
-///
-/// An allowlist, so a new `env`-shaped finding is one entry rather than a redesign. It is
-/// LOADER-level and deliberately does not reach interpreter-level path variables
-/// (`PYTHONPATH`, `NODE_PATH`, `PERL5LIB`, …): those are unbounded per runtime, and listing
-/// some would imply a completeness this list does not have.
-const CODE_SELECTING_ENV: &[&str] =
-    &["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "GCONV_PATH"];
-
 #[must_use]
 pub fn preview(action: &PendingAction) -> String {
-    let binds = action
-        .fs_binds
-        .iter()
-        .map(|(p, m)| {
-            let mode = match m {
-                BindMode::ReadOnly => "ro",
-                BindMode::ReadWrite => "rw",
-            };
-            format!("{}({mode})", p.display())
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let env = action
-        .env_delta
-        .iter()
-        .map(|(k, v)| {
-            if CODE_SELECTING_ENV.contains(&k.as_str()) {
-                format!("{k}={v}")
-            } else {
-                format!("{k}=[redacted]")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let net = match action.net_policy {
-        NetPolicy::None => "none",
-        NetPolicy::Full => "full",
-    };
-    let script = match &action.script {
-        None => "none".to_string(),
-        Some(sp) => {
-            // The digest binds the interpreter's BYTES and the arg STRING. It does not bind
-            // what the arg NAMES: `#!/usr/bin/env python3` pins `env` and leaves `python3`
-            // to PATH at run time. A flag (`-I`, `-e`) names no program, so it is not marked.
-            let arg = match sp.interpreter_arg.as_deref() {
-                None => "(none)".to_string(),
-                Some(a) if a.starts_with('-') => a.to_string(),
-                Some(a) => format!("{a} (resolved through PATH at run time — NOT bound)"),
-            };
-            format!(
-                "interp:{} arg:{arg} content:{}",
-                hex32(&sp.interpreter_digest),
-                hex32(&sp.script_digest)
-            )
+    let mut out = String::new();
+    out.push_str("preview_version=2\n");
+    for (i, a) in action.argv.iter().enumerate() {
+        out.push_str(&format!("  argv[{i}]={}\n", q(a)));
+    }
+    out.push_str(&format!("  cwd={}\n", q(&action.cwd.to_string_lossy())));
+    for (i, (k, v)) in action.env_delta.iter().enumerate() {
+        out.push_str(&format!("  env[{i}]: name={} value={}\n", q(k), q(v)));
+    }
+    out.push_str(&format!(
+        "  net={}\n",
+        match action.net_policy {
+            NetPolicy::None => "none",
+            NetPolicy::Full => "full",
         }
-    };
-    format!(
-        "Run: {}\n  cwd: {}\n  env: [{env}]\n  net: {net}\n  binds: [{binds}]\n  \
-         timeout: {:?}\n  tier: {:?}\n  exe: {}\n  script: {script}",
-        action.argv.join(" "),
-        action.cwd.display(),
-        action.timeout,
-        action.required_tier,
-        hex32(&action.executable_digest),
-    )
+    ));
+    for (i, (path, mode)) in action.fs_binds.iter().enumerate() {
+        let m = match mode {
+            BindMode::ReadOnly => "ro",
+            BindMode::ReadWrite => "rw",
+        };
+        out.push_str(&format!("  bind[{i}]: mode={m} path={}\n", q(&path.to_string_lossy())));
+    }
+    out.push_str(&format!("  timeout={:?}\n", action.timeout));
+    out.push_str(&format!("  tier={:?}\n", action.required_tier));
+    out.push_str(&format!("  exe_digest={}\n", hex32(&action.executable_digest)));
+    match &action.script {
+        None => out.push_str("  script=none\n"),
+        Some(sp) => {
+            out.push_str(&format!("  script.interp_digest={}\n", hex32(&sp.interpreter_digest)));
+            // D0A-R18-06: EVERY interpreter argument is marked, not only the ones that do not
+            // start with `-`. `#!/usr/bin/env -S python3 -I` begins with a dash and GNU `env`
+            // still splits it and resolves `python3` through PATH — so a leading-dash test
+            // exempted the exact multi-argument form it needed to catch. The digest binds the
+            // interpreter's BYTES and the argument STRING; it never binds what the argument
+            // NAMES, and that is true of every argument.
+            match sp.interpreter_arg.as_deref() {
+                None => out.push_str("  script.interp_arg=(none)\n"),
+                Some(a) => out.push_str(&format!(
+                    "  script.interp_arg={} (NOT bound — the interpreter resolves this at run time)\n",
+                    q(a)
+                )),
+            }
+            out.push_str(&format!("  script.content_digest={}\n", hex32(&sp.script_digest)));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -664,102 +629,84 @@ mod tests {
         );
     }
 
-    /// The chain-gap disclosure fix: a value that SELECTS CODE is shown, everything else
-    /// stays redacted. Both halves are asserted in one test because either alone is
-    /// satisfiable by the wrong change — showing everything would pass the first, and
-    /// redacting everything would pass the second.
+    /// D0A-R18-02 — THE RENDERING IS INJECTIVE. This is the collision the reviewer
+    /// constructed: one entry whose VALUE contains the old delimiter, versus two entries.
+    /// Under the previous `", "` join they rendered identically while only the second
+    /// defines `LD_PRELOAD` — the digest told them apart and the human could not, which
+    /// inverts the property the preview exists to provide.
     #[test]
-    fn preview_shows_code_selecting_env_and_redacts_the_rest() {
+    fn preview_cannot_render_two_different_actions_identically() {
+        let mut smuggled = sample();
+        smuggled.env_delta = vec![("PATH".into(), "/safe, LD_PRELOAD=/tmp/evil.so".into())];
+        let mut genuine = sample();
+        genuine.env_delta = vec![
+            ("PATH".into(), "/safe".into()),
+            ("LD_PRELOAD".into(), "/tmp/evil.so".into()),
+        ];
+        assert_ne!(
+            preview(&smuggled),
+            preview(&genuine),
+            "two actions with DIFFERENT env_delta rendered identically — the human cannot \
+             tell apart what the digest can"
+        );
+        let mut one = sample();
+        one.argv = vec!["a b".into()];
+        let mut two = sample();
+        two.argv = vec!["a".into(), "b".into()];
+        assert_ne!(preview(&one), preview(&two), "argv collision: one arg `a b` vs two args");
+    }
+
+    /// D0A-R18-05 — env VALUES are shown, because the audience is the pinned shell on the
+    /// private channel, not the AI. The old spec redacted them against a disclosure that
+    /// does not occur: production sends the AI only `Pending { pending_id }`. The test that
+    /// asserted redaction is REPLACED rather than repaired — its oracle argument was sound
+    /// GIVEN its premise, and the premise was false.
+    #[test]
+    fn preview_shows_env_values_in_full() {
         let mut a = sample();
         a.env_delta = vec![
-            ("PATH".into(), "/tmp/evil:/usr/bin".into()),
-            ("LD_PRELOAD".into(), "/tmp/evil/hook.so".into()),
-            ("LD_LIBRARY_PATH".into(), "/tmp/evil/lib".into()),
-            ("LD_AUDIT".into(), "/tmp/evil/audit.so".into()),
-            ("GCONV_PATH".into(), "/tmp/evil/gconv".into()),
+            ("PATH".into(), "/tmp/evil/bin".into()),
             ("API_TOKEN".into(), "s3cret-value".into()),
         ];
         let p = preview(&a);
-
-        for shown in [
-            "/tmp/evil:/usr/bin",
-            "/tmp/evil/hook.so",
-            "/tmp/evil/lib",
-            "/tmp/evil/audit.so",
-            "/tmp/evil/gconv",
-        ] {
-            assert!(p.contains(shown), "a code-selecting value must be VISIBLE: {shown}\n{p}");
-        }
-        assert!(!p.contains("s3cret-value"), "a non-code-selecting value must stay redacted:\n{p}");
-        assert!(p.contains("API_TOKEN=[redacted]"), "the KEY is still disclosed:\n{p}");
+        assert!(p.contains(r#"name="PATH" value="/tmp/evil/bin""#), "PATH shown in full:\n{p}");
+        assert!(
+            p.contains(r#"name="API_TOKEN" value="s3cret-value""#),
+            "every value is shown on the trusted channel, not only allowlisted ones:\n{p}"
+        );
     }
 
-    /// The arg names a program the digest does not cover — the preview must say so. A FLAG
-    /// names no program and must NOT be marked, or the marking means nothing.
+    /// D0A-R18-06 — EVERY interpreter argument is marked unbound, including one beginning
+    /// with `-`. The previous test exempted leading-dash args because a flag names no
+    /// program; `#!/usr/bin/env -S python3 -I` begins with a dash and GNU `env` still splits
+    /// it and resolves `python3` through PATH, so the exemption excluded exactly the form it
+    /// needed to catch.
     #[test]
-    fn preview_marks_a_path_resolved_interpreter_arg_as_unbound() {
+    fn preview_marks_every_interpreter_arg_as_unbound() {
         const UNBOUND: &str = "NOT bound";
-
-        let mut env_style = sample();
-        env_style.script = Some(ScriptPin {
+        let pin_with = |arg: Option<&str>| ScriptPin {
             interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
             interpreter_digest: [0x11; 32],
-            interpreter_arg: Some("python3".into()),
+            interpreter_arg: arg.map(str::to_string),
             script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
             script_digest: [0x22; 32],
-        });
-        let p = preview(&env_style);
-        assert!(
-            p.contains("python3") && p.contains(UNBOUND),
-            "`#!/usr/bin/env python3` pins env and leaves python3 to PATH — say so:\n{p}"
-        );
-
-        let mut flag_style = sample();
-        flag_style.script = Some(ScriptPin {
-            interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
-            interpreter_digest: [0x11; 32],
-            interpreter_arg: Some("-I".into()),
-            script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
-            script_digest: [0x22; 32],
-        });
-        let q = preview(&flag_style);
-        assert!(
-            q.contains("-I") && !q.contains(UNBOUND),
-            "a flag names no program; marking it would make the marking meaningless:\n{q}"
-        );
-    }
-
-    /// RUNTIME-1D-04 (#2, round-3): the preview shows WHICH env vars are set but the
-    /// value is `[redacted]` — neither plaintext (the round-2 finding) NOR a
-    /// value-derived token. The latter is the subtle one: an UNKEYED fingerprint is
-    /// an offline dictionary ORACLE for low-entropy values (the untrusted requester
-    /// sees the preview, holds the hash, and enumerates guesses). Redaction carries
-    /// no value-derived data, so it is unconditionally non-oracle.
-    #[test]
-    fn preview_redacts_env_values_no_oracle() {
-        // A low-entropy, enumerable value — exactly the oracle threat.
-        let mut a = sample();
-        a.env_delta = vec![("DEPLOY".into(), "production".into())];
-        let p = preview(&a);
-        assert!(p.contains("DEPLOY"), "the human sees WHICH env var is set (structure)");
-        assert!(!p.contains("production"), "the value plaintext must NOT appear");
-
-        // NON-ORACLE (distinct from not-plaintext): the unkeyed SHA-256 prefix an
-        // attacker would compute for the guess is ABSENT — the round-2 fingerprint
-        // scheme rendered exactly this, making the preview a dictionary oracle.
-        let unkeyed_guess = {
-            let d = sha256(b"production");
-            let mut s = String::with_capacity(16);
-            for b in &d[..8] {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-            }
-            s
         };
+        for arg in ["python3", "-S python3 -I", "-I"] {
+            let mut a = sample();
+            a.script = Some(pin_with(Some(arg)));
+            let p = preview(&a);
+            assert!(
+                p.contains(UNBOUND),
+                "interpreter arg {arg:?} must be marked unbound — the digest binds the \
+                 STRING, never what it NAMES:\n{p}"
+            );
+        }
+        let mut none = sample();
+        none.script = Some(pin_with(None));
         assert!(
-            !p.contains(&unkeyed_guess),
-            "no value-derived fingerprint the untrusted requester could dictionary-match \
-             (an unkeyed hash of a low-entropy value is an offline oracle)"
+            !preview(&none).contains(UNBOUND),
+            "with NO arg there is nothing to resolve, so the marking must be absent — \
+             otherwise it means nothing"
         );
     }
 
@@ -791,6 +738,11 @@ mod tests {
 
         let mut a = sample();
         a.script = Some(pin(Some("-I")));
-        assert!(preview(&a).contains("arg:-I"), "the preview renders the interpreter arg");
+        // The rendering changed shape in D0A-R18-02 (quoted + indexed); the PROPERTY this
+        // line asserts is unchanged — the arg is visible to the human who approves.
+        assert!(
+            preview(&a).contains(r#"script.interp_arg="-I""#),
+            "the preview renders the interpreter arg"
+        );
     }
 }

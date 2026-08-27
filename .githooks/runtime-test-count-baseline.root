@@ -1,2 +1,8 @@
+# STALE as of 2026-08-27 (D0A-R18-07). Measured at 71fd898; the chain-gap test landed later
+# in d4a741e and the round-18 remediation changed the suite again, so this pair does not
+# describe the current tree. It is kept rather than deleted because the SHAPE it recorded
+# (17 targets, 0 failures, 0 leaks) is still the evidence lane run 7 produced — but the
+# NUMBERS must not be cited for the current commit. Superseded by the next root run, which
+# must use DELPHI_TESTCOUNT_EXPECT_TARGETS and the per-target status check (D0A-R18-04).
 EXECUTED=168
 SKIPPED=5

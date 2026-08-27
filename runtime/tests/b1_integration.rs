@@ -1945,8 +1945,19 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
     .unwrap();
     std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+    // D0A-R18-01: the body writes a DISTINCT control marker, so the no-PATH leg has a
+    // POSITIVE witness that the real python3 ran — absence of the impostor marker alone was
+    // satisfiable by the real python failing, which `is_ok()` could not see.
+    let control_marker = dir.join("control-marker");
     let script = dir.join("act.py");
-    std::fs::write(&script, "#!/usr/bin/env python3\npass\n").unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/usr/bin/env python3\nopen({:?}, \"w\").write(\"REAL-PYTHON-RAN\")\n",
+            control_marker.display().to_string()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     // `chown_to_tool` is NOT recursive. Every path the dropped tool must traverse, execute
@@ -2000,7 +2011,22 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
     }
     eprintln!("chain-gap: preview =\n{preview_with_path}");
 
-    assert!(exec_with_path.is_ok(), "the action must EXECUTE, not be refused: {exec_with_path:?}");
+    // D0A-R18-01: `is_ok()` proves only that the child was SPAWNED AND REAPED —
+    // `Command::output()` returns Ok for a nonzero exit. Both legs must have SUCCEEDED.
+    let ok_and_zero = |r: &Result<std::process::Output, delphi_runtime::RuntimeError>, leg: &str| {
+        match r {
+            Err(e) => panic!("{leg}: refused before exec, no child ran: {e}"),
+            Ok(o) => assert!(
+                o.status.success(),
+                "{leg}: the child exited {:?} — a nonzero exit with no marker would otherwise \
+                 read as the control succeeding. stderr: {}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+        }
+    };
+
+    ok_and_zero(&exec_with_path, "PATH leg");
     assert_eq!(
         seen, "IMPOSTOR-RAN",
         "the approved PATH selected an impostor `python3` through the real composed path — \
@@ -2009,15 +2035,16 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
     );
     assert!(
         preview_with_path.contains(&bin.display().to_string()),
-        "the preview must DISCLOSE the directory that decides which python3 runs, not \
-         redact it:\n{preview_with_path}"
+        "the preview must DISCLOSE the directory that decides which python3 runs:\n{preview_with_path}"
     );
 
-    // CONTROL. Without PATH the same action must SUCCEED and write nothing — success is the
-    // load-bearing half: an error would prove unreachability, not unselection.
+    // CONTROL. Without PATH the same action must SUCCEED, write the CONTROL marker (positive
+    // evidence the real python3 ran) and NOT write the impostor marker.
     std::fs::remove_file(&marker).ok();
+    std::fs::remove_file(&control_marker).ok();
     let (_preview_no_path, exec_no_path) = run(false);
     let control_seen = std::fs::read_to_string(&marker).unwrap_or_default();
+    let control_witness = std::fs::read_to_string(&control_marker).unwrap_or_default();
     if let Ok(o) = &exec_no_path {
         eprintln!(
             "chain-gap CONTROL: exit={:?} stderr={}",
@@ -2025,10 +2052,12 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
             String::from_utf8_lossy(&o.stderr).trim()
         );
     }
-    assert!(
-        exec_no_path.is_ok(),
-        "the CONTROL must SUCCEED without PATH — an error proves the impostor was \
-         UNREACHABLE rather than UNSELECTED: {exec_no_path:?}"
+    ok_and_zero(&exec_no_path, "CONTROL leg");
+    assert_eq!(
+        control_witness.trim(),
+        "REAL-PYTHON-RAN",
+        "the CONTROL must show the REAL python3 ran. Without this witness, 'no impostor \
+         marker' is satisfied by the real python failing — which is what D0A-R18-01 found"
     );
     assert!(
         control_seen.is_empty(),

@@ -2552,6 +2552,42 @@ dynamically linked?) and a 20-line `LD_PRELOAD` shim. **If constructing the coun
 cheap, the claim was never defensible** — and the cost asymmetry is the point: minutes to
 attempt, a review round to discover.
 
+## 46. The isolated measurement cannot reach the SEAM  *(new — the chain-gap demonstration, 2026-08-26)*
+
+**The shape.** A mechanism measured in isolation is fed inputs *you* choose. Composed, it is
+fed inputs *production* chooses. Where those differ, the isolated measurement is not a weaker
+version of the composed one — **it is measuring a different thing**, and it will not fail
+where the composed path fails.
+
+**The grounding instance, first run.** `env -i PATH=<dir> /usr/bin/env python3 -c …` was
+measured and ran an impostor — the finding that made the `env`+`PATH` hop an exposure rather
+than a gap. It was correct, reproducible, and it **could not** have surfaced what composition
+surfaced immediately: `/usr/bin/env` on the box is **uutils coreutils, a MULTI-CALL binary
+dispatching on `argv[0]`**. The composed action carries the *approved* `argv[0]`, so the
+interpreter refused with `coreutils: unknown program 'tool'` before resolving anything. The
+isolated command carried `argv[0] = /usr/bin/env`, so multi-call dispatch never fired.
+
+**Consequence, recorded because a deployment will meet it:** on such a system an
+`env`-shebang action whose approved `argv[0]` is not `env` does not run at all. It fails
+CLOSED, so it is a functionality limit and not a hole.
+
+**Relation to class 20.** Class 20's four cases were latent defects waiting for an
+ENVIRONMENT nobody had used. This is a defect waiting for a COMPOSITION nobody had run. Same
+consequence — dormant until the missing context arrives — different missing context, so the
+foreclosing move is different: class 20 wants the environment exercised, this wants the seam
+crossed.
+
+**The foreclosing discipline.** An isolated measurement earns a finding, never a clearance.
+Where a claim depends on values production supplies — `argv[0]`, the environment, fds,
+credentials, the working directory — **the claim is not established until something composes
+the real path**. The demonstration test is the mechanism, and its own first run is the proof
+that the mechanism was needed.
+
+**RED-proof shape.** Compose, and diagnose the first failure from the CHILD's output rather
+than the parent's error (class 43). Here that discipline was written into the lane procedure
+before the test existed, and it converted `left: ""` — the signature that had cost this arc
+three inferences on four separate occasions — into a named cause on first use.
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

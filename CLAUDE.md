@@ -1158,6 +1158,29 @@ shipped at 830 lines for a ~200-line mechanism, most of the remainder being comm
 classes already written down elsewhere. Trimming existing over-budget files is owed work, done
 when those files are next touched — not as a sweep.
 
+### `git add -A` stages what you did not write — stage explicitly (2026-08-27)
+
+**Twice in one session, and the first was worse.** `git add -A` sweeps every modification in
+the tree, including work the operator made in parallel and work left over from an earlier
+task. Occurrence one put unrelated changes under **another session's commit message
+entirely**. Occurrence two swept an operator-authored register section and a generated
+baseline file into a commit whose message described only a test — so the commit's *content*
+was correct while its *message* was narrower than its diff, and it was reported to the
+operator as not containing them.
+
+**Neither was caught by self-check.** Both were found by reading `git show --stat`
+afterwards, which is the external check this rule turns into a habit.
+
+**The rule: stage the paths you changed.** `git add <path> …`, or `git add -p` when a file
+carries more than one change. Reserve `git add -A` for a tree you have just verified with
+`git status --porcelain` and can account for line by line.
+
+**Why it is not merely tidiness.** A commit message is the review ledger's index — every
+sweep in this project is reconstructed from it. A message that under-describes its own diff
+is a citation pointing at the wrong thing, and this project's central lesson is that
+citations are not measurements. When it does happen and the content is right, **record it
+rather than rewriting history**: the diff is the truth, the message is the defect.
+
 ### Git history surgery — NEVER rewrite history with a dirty working tree
 
 **The rule: commit or stash before any operation that moves `HEAD`.** `git reset --hard`,

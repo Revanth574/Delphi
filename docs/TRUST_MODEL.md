@@ -292,15 +292,24 @@ deciding directory; and the control without `PATH` **succeeds while writing noth
 leg must succeed rather than error, or it would prove the impostor unreachable rather than
 unselected.
 
-**AND THE COMPOSITION FOUND A LIMIT ISOLATION COULD NOT.** On this box `/usr/bin/env` is
-**uutils coreutils, a MULTI-CALL binary that dispatches on `argv[0]`**. The first run of the
-demonstration failed with `coreutils: unknown program 'tool'` — the approved `argv[0]`
-reached the interpreter, which refused before resolving anything. So on a multi-call
-coreutils system, **an `env`-shebang action whose approved `argv[0]` is not `env` does not
-run at all.** It fails CLOSED, so this is a functionality limit rather than a hole — but it
-is invisible to `env -i PATH=… /usr/bin/env python3`, which carries `argv[0]` = the path,
-and it was found only by composing. Recorded because a deployment shipping env-shebang
-actions on a uutils system will meet it.
+**AND THE COMPOSITION FOUND A LIMIT ISOLATION COULD NOT — WHICH IS LOCAL, NOT PORTABLE.**
+On this box `/usr/bin/env` is **uutils coreutils, a MULTI-CALL binary that dispatches on
+`argv[0]`**. The demonstration's first run failed with `coreutils: unknown program 'tool'` —
+the approved `argv[0]` reached the interpreter, which refused before resolving anything.
+
+**MEASURED both ways (2026-08-27), because "it fails closed" is the kind of claim that must
+not be assumed to travel:**
+
+| `env` implementation | approved `argv[0]` = `tool` |
+|---|---|
+| **uutils** (`/usr/bin/env` here) | refuses — `coreutils: unknown program` |
+| **GNU** (`/usr/bin/gnuenv`, same box) | **runs the impostor, rc=0** — no `argv[0]` dispatch |
+
+**So the refusal is a uutils property and NOT a mitigation this design provides.** On GNU
+coreutils — the far more common deployment — the approved `argv[0]` passes through and the
+exposure is unimpeded by it. Stating only the uutils half would have implied a limit that
+protects, when what actually exists is an accident that protects **here**. The demonstration
+sets `argv[0] = "env"` to accommodate uutils; on GNU it would run under any `argv[0]`.
 
 **THE CONFIGURATION WHERE FIRST-OBJECT BINDING IS CLOSEST TO TOTAL — offered, not imposed,
 and NOT total (corrected 2026-08-23, D0A-R15-02).** A **statically linked native ELF** removes

@@ -2567,9 +2567,17 @@ dispatching on `argv[0]`**. The composed action carries the *approved* `argv[0]`
 interpreter refused with `coreutils: unknown program 'tool'` before resolving anything. The
 isolated command carried `argv[0] = /usr/bin/env`, so multi-call dispatch never fired.
 
-**Consequence, recorded because a deployment will meet it:** on such a system an
-`env`-shebang action whose approved `argv[0]` is not `env` does not run at all. It fails
-CLOSED, so it is a functionality limit and not a hole.
+**Consequence, and then a SECOND measurement that corrected the first telling.** On such a
+system an `env`-shebang action whose approved `argv[0]` is not `env` does not run at all —
+which was first written up as "fails CLOSED, a functionality limit and not a hole". That
+framing was **local and was nearly recorded as general**: measured against GNU `env`
+(`/usr/bin/gnuenv`, same box), the identical shape **runs the impostor at rc=0**, because GNU
+`env` is single-purpose and does not dispatch on `argv[0]`. The refusal is a uutils property,
+not a protection this design supplies.
+
+**The compounding lesson: crossing ONE seam does not clear the class.** The composed run
+found what isolation could not, and the finding's first write-up still generalised from a
+single implementation. A seam crossed once is one data point.
 
 **Relation to class 20.** Class 20's four cases were latent defects waiting for an
 ENVIRONMENT nobody had used. This is a defect waiting for a COMPOSITION nobody had run. Same

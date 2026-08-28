@@ -1,8 +1,16 @@
-# STALE as of 2026-08-27 (D0A-R18-07). Measured at 71fd898; the chain-gap test landed later
-# in d4a741e and the round-18 remediation changed the suite again, so this pair does not
-# describe the current tree. It is kept rather than deleted because the SHAPE it recorded
-# (17 targets, 0 failures, 0 leaks) is still the evidence lane run 7 produced — but the
-# NUMBERS must not be cited for the current commit. Superseded by the next root run, which
-# must use DELPHI_TESTCOUNT_EXPECT_TARGETS and the per-target status check (D0A-R18-04).
-EXECUTED=168
+# Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
+#
+# LANE RUN 8, 2026-08-27, at the round-18 remediation. Produced by scripts/test-count.sh's
+# parse-only mode over the concatenated per-target log, gated by
+# DELPHI_TESTCOUNT_EXPECT_TARGETS and a per-target producer-status check (D0A-R18-04) — both
+# gates exercised on first real use, not merely specified.
+#
+# SUPERSEDES run 7's 168/5, which D0A-R18-07 found stale: it was measured at 71fd898, BEFORE
+# the chain-gap demonstration landed in d4a741e, and was nonetheless cited as covering it.
+# The +2 here IS that test and its control, at root for the first time.
+#
+# NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
+# the run is privileged and execute unprivileged, so 170 and 150 are overlapping sets and
+# neither contains the other.
+EXECUTED=170
 SKIPPED=5

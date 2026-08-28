@@ -37,10 +37,18 @@ of those seventeen targets had never executed at root before run 3.
 | the drop helper the daemon runs is the one it was built against | **PROVEN** at root — built and installed agree at `aba0f0ea14b751aa…`, and the first time the digest binding refused a *legitimate* change rather than an attack |
 | every `b1_integration` / `end_to_end` / `divergence` root path | **PROVEN** — 0 failures, and **0 skips**, so nothing closed by ceasing to run |
 
-### THE ROOT FIGURE IS NOW RECORDED — from the tool, not by subtraction (run 7, 2026-08-26)
+### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**`EXECUTED 168 / SKIPPED 5 / reported 173`**, 0 failures, 0 leaks, PAM stack intact, 17/17
-targets reporting. Produced by `scripts/test-count.sh`'s parse-only mode
+**LANE RUN 8 (2026-08-27, current): `EXECUTED 170 / SKIPPED 5 / reported 175`**, rc 0,
+0 failures, 0 leaks, PAM intact, all 17 producers exited 0.
+
+**Run 7's `168 / 5 / 173` is SUPERSEDED, not merely older (D0A-R18-07).** It was measured
+at `71fd898` — before the chain-gap demonstration existed — and was then cited as evidence
+covering it. The `+2` between the runs IS that test and its control, reaching root for the
+first time. **Both D0A-R18-04 gates passed on first real use**: the per-target producer
+status check, and `DELPHI_TESTCOUNT_EXPECT_TARGETS` with the extractor returning rc 0 — so
+the gate that would catch a crashed target vanishing from the count is now exercised
+rather than specified. Produced by `scripts/test-count.sh`'s parse-only mode
 (`DELPHI_TESTCOUNT_LOG`) over the concatenated per-target log, because the counter shells out
 to cargo and cannot run under `sudo` here. Written to
 `.githooks/runtime-test-count-baseline.root`. All three post-run-6 changes to `runtime/src/**`

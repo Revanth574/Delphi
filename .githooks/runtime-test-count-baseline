@@ -83,5 +83,11 @@
 # `preview_cannot_render_two_different_actions_identically`,
 # `preview_shows_env_values_in_full`, `preview_marks_every_interpreter_arg_as_unbound` —
 # plus `an_embedded_nul_or_equals_in_the_environment_is_refused` (D0A-R18-03).
-EXECUTED=150
+# 2026-08-27 (round-19 remediation): 150/25 -> 151/25. Net +1: D0A-R19-04 RESTORED two
+# tests deleted under R18-05 (`preview_redacts_env_values_no_oracle`,
+# `preview_shows_code_selecting_env_and_redacts_the_rest`) and removed the one that
+# asserted the opposite (`preview_shows_env_values_in_full`), so +2 -1. The restoration is
+# the point: R18-05's rationale was checked at the AI socket and generalised, and the
+# preview is also injected into the renderer's page realm.
+EXECUTED=151
 SKIPPED=25

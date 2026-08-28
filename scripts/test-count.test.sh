@@ -30,7 +30,7 @@ check() { # name expected-substring actual-output expected-rc actual-rc
 run_on_log() { # <log-content> -> sets OUT / RC
     local f; f=$(mktemp)
     printf '%s' "$1" > "$f"
-    OUT=$(DELPHI_TESTCOUNT_LOG="$f" "$EXTRACTOR" 2>&1); RC=$?
+    OUT=$(DELPHI_TESTCOUNT_EXPECT_TARGETS=any DELPHI_TESTCOUNT_LOG="$f" "$EXTRACTOR" 2>&1); RC=$?
     rm -f "$f"
 }
 
@@ -93,7 +93,7 @@ check "prose mentioning SKIP is not counted" "EXECUTED 2 / SKIPPED 0 / reported 
 # already been wrong once.
 run_with_floor() { # <floor-ms> <log-content>
     local f; f=$(mktemp); printf '%s' "$2" > "$f"
-    OUT=$(DELPHI_MIN_MS_PER_TEST="$1" DELPHI_TESTCOUNT_LOG="$f" "$EXTRACTOR" 2>&1); RC=$?
+    OUT=$(DELPHI_MIN_MS_PER_TEST="$1" DELPHI_TESTCOUNT_EXPECT_TARGETS=any DELPHI_TESTCOUNT_LOG="$f" "$EXTRACTOR" 2>&1); RC=$?
     rm -f "$f"
 }
 
@@ -159,7 +159,7 @@ check "an oversized floor REFUSES (must not disable itself)" "not a positive int
 # serial output, because libtest prefixes the line with `test <name> ... `. A fixture that is
 # constructed differently from the thing it stands in for is DEFECT_CLASSES 25 — here inside
 # the RED-proof of a tier-1 artifact.
-OUT=$(DELPHI_TESTCOUNT_LOG=testdata/real-libtest-serial.log "$EXTRACTOR" 2>&1); RC=$?
+OUT=$(DELPHI_TESTCOUNT_EXPECT_TARGETS=any DELPHI_TESTCOUNT_LOG=testdata/real-libtest-serial.log "$EXTRACTOR" 2>&1); RC=$?
 check "parses REAL captured libtest output" "EXECUTED 2 / SKIPPED 3 / reported 5" "$OUT" 0 "$RC"
 
 # ── 9. THE INVOCATION PATH — everything above tests the PARSER ─────────────────────────
@@ -192,6 +192,28 @@ else
     OUT=$(PATH="$stub:$PATH" "$stub/weak.sh" -p delphi-runtime --lib --bins 2>&1); RC=$?
     check "weakened: the same tree reports 99 instead of 108" "reported 99" "$OUT" 101 "$RC"
 fi
+
+# ── D0A-R19-02: THE GATE MUST BE NOTICED IF IT IS REMOVED ───────────────────────────────
+# The finding was not that the gate was wrong — it was that NOTHING WOULD NOTICE ITS
+# DELETION. Every case above waives it with `any` (they certify the PARSER, not a run), so
+# these three are the only ones that bite if the gate goes.
+PARTIAL=$(mktemp)
+
+printf 'test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n' > "$PARTIAL"
+OUT=$(DELPHI_TESTCOUNT_LOG="$PARTIAL" "$EXTRACTOR" 2>&1); RC=$?
+check "parse-only REFUSES when the gate is omitted (it was fail-open: rc 0 on a partial log)" \
+      "parse-only mode requires DELPHI_TESTCOUNT_EXPECT_TARGETS" "$OUT" 2 "$RC"
+
+OUT=$(DELPHI_TESTCOUNT_EXPECT_TARGETS=17 DELPHI_TESTCOUNT_LOG="$PARTIAL" "$EXTRACTOR" 2>&1); RC=$?
+check "a target that vanished before its summary is REFUSED, not silently dropped" \
+      "expected 17 target summaries, found 1" "$OUT" 2 "$RC"
+
+printf 'test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n' > "$PARTIAL"
+OUT=$(DELPHI_TESTCOUNT_EXPECT_TARGETS=1 DELPHI_TESTCOUNT_LOG="$PARTIAL" "$EXTRACTOR" 2>&1); RC=$?
+check "a log containing a FAILED summary exits NON-ZERO (rc was hard-coded 0)" \
+      "EXECUTED" "$OUT" 1 "$RC"
+
+rm -f "$PARTIAL"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES ABOVE"; fi

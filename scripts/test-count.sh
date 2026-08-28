@@ -105,9 +105,20 @@ fi
 # count, so a subset can be certified as the whole. The caller states how many targets it
 # enumerated and the parse must find exactly that many summaries — no more (a duplicated
 # append) and no fewer (a target that died).
-if [ -n "${DELPHI_TESTCOUNT_EXPECT_TARGETS:-}" ]; then
+# D0A-R19-02: this was DOCUMENTED non-optional and was OPTIONAL — a caller that omitted it
+# got a fail-open rc 0 on a partial log, and every regression in the self-test used exactly
+# that form, so nothing would have noticed the gate's removal. In parse-only mode the
+# variable is now REQUIRED, because parse-only has no producer status to inherit and
+# therefore cannot know a target vanished. The literal `any` is an explicit, greppable waiver
+# for the parser's OWN unit tests, which certify no run.
+if [ -n "${DELPHI_TESTCOUNT_LOG:-}" ] && [ -z "${DELPHI_TESTCOUNT_EXPECT_TARGETS:-}" ]; then
+    REFUSE "parse-only mode requires DELPHI_TESTCOUNT_EXPECT_TARGETS (the number of targets \
+you enumerated), or the literal 'any' to waive it. Without it a target that died before \
+printing its summary is invisible and a SUBSET becomes the baseline"
+fi
+if [ -n "${DELPHI_TESTCOUNT_EXPECT_TARGETS:-}" ] && [ "${DELPHI_TESTCOUNT_EXPECT_TARGETS}" != "any" ]; then
     [[ "${DELPHI_TESTCOUNT_EXPECT_TARGETS}" =~ ^[0-9]{1,4}$ ]] \
-        || REFUSE "DELPHI_TESTCOUNT_EXPECT_TARGETS must be a small integer, got \
+        || REFUSE "DELPHI_TESTCOUNT_EXPECT_TARGETS must be a small integer or 'any', got \
 '${DELPHI_TESTCOUNT_EXPECT_TARGETS}'"
     if [ "$result_lines" -ne "${DELPHI_TESTCOUNT_EXPECT_TARGETS}" ]; then
         REFUSE "expected ${DELPHI_TESTCOUNT_EXPECT_TARGETS} target summaries, found \

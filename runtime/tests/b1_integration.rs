@@ -1953,7 +1953,15 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
     std::fs::write(
         &script,
         format!(
-            "#!/usr/bin/env python3\nopen({:?}, \"w\").write(\"REAL-PYTHON-RAN\")\n",
+            // D0A-R19-08: the witness records WHICH interpreter ran, not merely that one
+            // did. `REAL-PYTHON-RAN` was satisfied by any python on any path — including,
+            // in principle, the impostor's directory — so it could not distinguish the
+            // control from a leaked selection.
+            // `sys.executable` is EMPTY when `env` resolved through its confstr fallback
+            // (measured in this arc's own probe and not carried forward until D0A-R19-08's
+            // first run failed on it), so the witness pairs it with something always
+            // populated. Emptiness of the path is then data, not an absent witness.
+            "#!/usr/bin/env python3\nimport sys\nopen({:?}, \"w\").write(\"py%d|%s\" % (sys.version_info[0], sys.executable))\n",
             control_marker.display().to_string()
         ),
     )
@@ -2053,11 +2061,17 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
         );
     }
     ok_and_zero(&exec_no_path, "CONTROL leg");
-    assert_eq!(
-        control_witness.trim(),
-        "REAL-PYTHON-RAN",
-        "the CONTROL must show the REAL python3 ran. Without this witness, 'no impostor \
-         marker' is satisfied by the real python failing — which is what D0A-R18-01 found"
+    assert!(
+        control_witness.starts_with("py3"),
+        "the CONTROL must show a PYTHON interpreter ran. Without this witness, 'no impostor \
+         marker' is satisfied by the real python failing — which is what D0A-R18-01 found. \
+         witness={control_witness:?}"
+    );
+    assert!(
+        !control_witness.contains(&bin.display().to_string()),
+        "the CONTROL's interpreter came from the IMPOSTOR directory ({}), so the leg does \
+         not establish that PATH is what selected it (D0A-R19-08). witness={control_witness:?}",
+        bin.display()
     );
     assert!(
         control_seen.is_empty(),

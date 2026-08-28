@@ -44,8 +44,11 @@ of those seventeen targets had never executed at root before run 3.
 
 **Run 7's `168 / 5 / 173` is SUPERSEDED, not merely older (D0A-R18-07).** It was measured
 at `71fd898` — before the chain-gap demonstration existed — and was then cited as evidence
-covering it. The `+2` between the runs IS that test and its control, reaching root for the
-first time. **Both D0A-R18-04 gates passed on first real use**: the per-target producer
+covering it. The `+2` between the runs is the chain-gap test and the D0A-R18-03 NUL-refusal test.
+**CORRECTED (D0A-R19-06):** it was first recorded as "that test and its control" — the
+control is an internal leg of one `#[test]`, not a second one. The figure was right and
+the account of it was wrong, which is the shape worth catching: a number nobody
+disputes, explained by a mechanism nobody checked. **Both D0A-R18-04 gates passed on first real use**: the per-target producer
 status check, and `DELPHI_TESTCOUNT_EXPECT_TARGETS` with the extractor returning rc 0 — so
 the gate that would catch a crashed target vanishing from the count is now exercised
 rather than specified. Produced by `scripts/test-count.sh`'s parse-only mode

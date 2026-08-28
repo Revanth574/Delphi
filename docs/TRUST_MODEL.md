@@ -275,9 +275,17 @@ ordinarily does. Only the second hop crosses:
   the binding does not cover, with the deciding field withheld.
 
 **What changed is the PREVIEW, and it is a DISCLOSURE fix, not a BINDING fix.** `preview()`
-now shows values for the keys that select code (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
-`LD_AUDIT`, `GCONV_PATH` — an allowlist, everything else still redacted because the delta may
-carry secrets), and marks a non-flag interpreter arg as resolved at run time and not bound.
+shows values for the keys that select code (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+`LD_AUDIT`, `GCONV_PATH` — an allowlist, everything else redacted because the delta may carry
+secrets), marks **every** interpreter argument as resolved at run time and not bound
+(D0A-R18-06), and renders every field quoted and indexed so two different actions cannot
+produce one preview (D0A-R18-02).
+
+**The allowlist was briefly removed and is RESTORED (D0A-R19-04).** The removal rested on
+"the preview reaches only the pinned shell", verified at the AI socket and generalised. It is
+also injected into the renderer's **page realm**, which this project treats as untrusted, and
+§4's flow permits the AI to be given `{pending_id, preview}` even though today's code sends
+only the id. This paragraph is the normative requirement; the code now matches it again.
 **The hop is unchanged: `env` still resolves through `PATH`.** The human can now see which
 directories decide; nothing prevents them deciding.
 

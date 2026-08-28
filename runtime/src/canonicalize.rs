@@ -246,7 +246,15 @@ mod tests {
     /// human who approved it. Refused at canonicalization, before preview/digest/exec.
     #[test]
     fn an_embedded_nul_or_equals_in_the_environment_is_refused() {
-        let exe = std::env::temp_dir().join("delphi-r1803-exe");
+        // D0A-R19-01: a PREDICTABLE /tmp path written with `fs::write`, in a test the lane
+        // runs AS ROOT — pre-creating a symlink there truncates an arbitrary root-writable
+        // target. RAII tempdir instead: unpredictable name, 0700, removed on drop including
+        // the panic path.
+        let tmp = tempfile::Builder::new()
+            .prefix("delphi-r1803-")
+            .tempdir()
+            .expect("tempdir");
+        let exe = tmp.path().join("exe");
         std::fs::write(&exe, b"#!/bin/sh\n:\n").unwrap();
 
         let with_env = |k: &str, v: &str| {
@@ -278,7 +286,7 @@ mod tests {
         // would be satisfied by everything failing.
         assert!(with_env("PATH", "/usr/bin").is_ok(), "an ordinary entry must still pass");
 
-        let _ = std::fs::remove_file(&exe);
+        // `tmp` drops here and removes the directory; no manual cleanup that a panic skips.
     }
 
     fn base_proposal(exe_path: &str) -> pb::Propose {

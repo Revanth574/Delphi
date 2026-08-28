@@ -7,7 +7,9 @@
 #
 # SUPERSEDES run 7's 168/5, which D0A-R18-07 found stale: it was measured at 71fd898, BEFORE
 # the chain-gap demonstration landed in d4a741e, and was nonetheless cited as covering it.
-# The +2 here IS that test and its control, at root for the first time.
+# The +2 here is the chain-gap test and the D0A-R18-03 NUL-refusal test. Recorded first
+# as "that test and its control", which was wrong (D0A-R19-06): the control is an
+# internal leg of one #[test], not a second one.
 #
 # NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
 # the run is privileged and execute unprivileged, so 170 and 150 are overlapping sets and

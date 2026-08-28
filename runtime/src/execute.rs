@@ -505,6 +505,19 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
         require_digest_matches(sp.interpreter_fd.as_raw_fd(), &sp.interpreter_digest, "interpreter")?;
         require_digest_matches(sp.script_memfd.as_raw_fd(), &sp.script_digest, "script")?;
     }
+    // D0A-R19-05: `PendingAction`'s fields are PUBLIC, so canonicalization is not the only
+    // way one is built — a direct builder recreates the NUL smuggling R18-03 closed. Re-checked
+    // HERE, at the one choke point every execution passes, for the same reason the seal checks
+    // are re-verified here rather than trusted from the constructor.
+    for (k, v) in &action.env_delta {
+        if k.is_empty() || k.contains('\0') || k.contains('=') || v.contains('\0') {
+            return Err(RuntimeError::Protocol(format!(
+                "environment entry `{}` is not representable by execve (empty name, embedded \
+                 NUL, or `=` in the name) — refused at the execute choke point (D0A-R19-05)",
+                k.escape_debug()
+            )));
+        }
+    }
     // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
     // is defence in depth on top of the uid drop rather than the barrier itself.
     // ORDER IS PART OF THE CONTRACT (D0A-R10-08). The SECURITY denial classifies

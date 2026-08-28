@@ -404,6 +404,17 @@ fn hex32(d: &[u8; 32]) -> String {
     s
 }
 
+/// Env names whose VALUE selects which code runs. Shown in full; everything else is
+/// `[redacted]`.
+///
+/// **Restored after D0A-R19-04.** Removing it rested on "the preview reaches only the pinned
+/// shell", which was checked at the AI socket and nowhere else — the preview is injected into
+/// the renderer's page realm, and `docs/TRUST_MODEL.md` §3 requires this list normatively.
+/// LOADER-level by design; it does not reach `PYTHONPATH`/`NODE_PATH`/`PERL5LIB`, and that
+/// under-inclusiveness is a recorded limit, not an oversight.
+const CODE_SELECTING_ENV: &[&str] =
+    &["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "GCONV_PATH"];
+
 /// Quote and escape one field so the rendering is INJECTIVE (D0A-R18-02).
 ///
 /// The previous prose joined fields with `", "` and `" "`, which two DIFFERENT actions could
@@ -412,6 +423,14 @@ fn hex32(d: &[u8; 32]) -> String {
 /// second defines `LD_PRELOAD`. The digest told them apart; the human could not, which is
 /// exactly the "preview = approval" property inverted. `escape_debug` escapes quotes,
 /// backslashes and control characters, so no value can forge a delimiter.
+///
+/// **NAMED LIMIT (D0A-R19-03): this is MACHINE injectivity, not human
+/// distinguishability.** Distinct strings always render distinctly, so the collision
+/// R18-02 closed cannot recur. Two renderings a HUMAN reads as identical can still
+/// differ — NFC/NFD normalisation forms, and homoglyphs across scripts. And `cwd` and
+/// bind paths reach this through `to_string_lossy`, which is itself not injective on
+/// non-UTF-8 bytes. The digest binds the true values in every case; the preview's
+/// guarantee is that it cannot MERGE two actions, not that a reader cannot be fooled.
 fn q(s: &str) -> String {
     format!("\"{}\"", s.escape_debug())
 }
@@ -440,8 +459,9 @@ fn q(s: &str) -> String {
 ///     required_tier: RequiredTier::Biometric, script: None,
 /// };
 /// let p = preview(&a);
-/// // Values are SHOWN (D0A-R18-05) and every field is quoted + indexed (D0A-R18-02).
-/// assert!(p.contains(r#"env[0]: name="K" value="V""#));
+/// // Every field is quoted + indexed (D0A-R18-02); a non-code-selecting value is
+/// // redacted (D0A-R19-04) while its NAME is shown.
+/// assert!(p.contains(r#"env[0]: name="K" value=[redacted]"#));
 /// assert!(p.contains(r#"argv[1]="hi""#));
 /// ```
 #[must_use]
@@ -453,7 +473,20 @@ pub fn preview(action: &PendingAction) -> String {
     }
     out.push_str(&format!("  cwd={}\n", q(&action.cwd.to_string_lossy())));
     for (i, (k, v)) in action.env_delta.iter().enumerate() {
-        out.push_str(&format!("  env[{i}]: name={} value={}\n", q(k), q(v)));
+        // D0A-R19-04: REDACTION RESTORED. R18-05 removed it after verifying the AI socket
+        // sends only `Pending { pending_id }` — true at that boundary, and generalised to
+        // "the only entitled consumer" without checking the others. The preview is injected
+        // into the WebView PAGE REALM (`shell-host` `drive_consent`), and this project treats
+        // the renderer as untrusted; §3 normatively requires this allowlist; and §4's flow
+        // permits the AI to receive `{pending_id, preview}` even though today's code does not.
+        // Values that SELECT CODE are shown because the human must see them; the rest stay
+        // redacted because the delta may carry secrets and the digest binds them regardless.
+        let shown = if CODE_SELECTING_ENV.contains(&k.as_str()) {
+            q(v)
+        } else {
+            "[redacted]".to_string()
+        };
+        out.push_str(&format!("  env[{i}]: name={} value={shown}\n", q(k)));
     }
     out.push_str(&format!(
         "  net={}\n",
@@ -484,8 +517,13 @@ pub fn preview(action: &PendingAction) -> String {
             // NAMES, and that is true of every argument.
             match sp.interpreter_arg.as_deref() {
                 None => out.push_str("  script.interp_arg=(none)\n"),
+                // D0A-R19-07: "NOT bound" was FALSE for an ordinary flag — `-I` IS bound, as
+                // a string, and names no program at all. The statement now says what is true
+                // of every argument: the string is bound, and any PROGRAM it names is not.
+                // That covers `-S python3 -I` without asserting something false about `-I`.
                 Some(a) => out.push_str(&format!(
-                    "  script.interp_arg={} (NOT bound — the interpreter resolves this at run time)\n",
+                    "  script.interp_arg={} (the string is bound; any PROGRAM it names is \
+resolved by the interpreter at run time and is NOT bound)\n",
                     q(a)
                 )),
             }
@@ -656,23 +694,58 @@ mod tests {
         assert_ne!(preview(&one), preview(&two), "argv collision: one arg `a b` vs two args");
     }
 
-    /// D0A-R18-05 — env VALUES are shown, because the audience is the pinned shell on the
-    /// private channel, not the AI. The old spec redacted them against a disclosure that
-    /// does not occur: production sends the AI only `Pending { pending_id }`. The test that
-    /// asserted redaction is REPLACED rather than repaired — its oracle argument was sound
-    /// GIVEN its premise, and the premise was false.
+    /// RESTORED (D0A-R19-04) — the allowlist shows what SELECTS CODE and redacts the rest.
+    /// Deleted under R18-05 on the reasoning that the preview reaches only the pinned shell;
+    /// it is also injected into the renderer's page realm, and §3 requires this list.
     #[test]
-    fn preview_shows_env_values_in_full() {
+    fn preview_shows_code_selecting_env_and_redacts_the_rest() {
         let mut a = sample();
         a.env_delta = vec![
-            ("PATH".into(), "/tmp/evil/bin".into()),
+            ("PATH".into(), "/tmp/evil:/usr/bin".into()),
+            ("LD_PRELOAD".into(), "/tmp/evil/hook.so".into()),
+            ("LD_LIBRARY_PATH".into(), "/tmp/evil/lib".into()),
+            ("LD_AUDIT".into(), "/tmp/evil/audit.so".into()),
+            ("GCONV_PATH".into(), "/tmp/evil/gconv".into()),
             ("API_TOKEN".into(), "s3cret-value".into()),
         ];
         let p = preview(&a);
-        assert!(p.contains(r#"name="PATH" value="/tmp/evil/bin""#), "PATH shown in full:\n{p}");
+        for shown in [
+            "/tmp/evil:/usr/bin",
+            "/tmp/evil/hook.so",
+            "/tmp/evil/lib",
+            "/tmp/evil/audit.so",
+            "/tmp/evil/gconv",
+        ] {
+            assert!(p.contains(shown), "a code-selecting value must be VISIBLE: {shown}\n{p}");
+        }
+        assert!(!p.contains("s3cret-value"), "a non-code-selecting value must stay redacted:\n{p}");
+        assert!(p.contains(r#"name="API_TOKEN" value=[redacted]"#), "the KEY is still shown:\n{p}");
+    }
+
+    /// RESTORED (D0A-R19-04). RUNTIME-1D-04: the preview shows WHICH env vars are set but a
+    /// redacted value is neither plaintext NOR a value-derived token — an UNKEYED fingerprint
+    /// would be an offline dictionary ORACLE for a low-entropy value against a reader that
+    /// holds the preview. The digest still binds the full value.
+    #[test]
+    fn preview_redacts_env_values_no_oracle() {
+        let mut a = sample();
+        a.env_delta = vec![("DEPLOY".into(), "production".into())];
+        let p = preview(&a);
+        assert!(p.contains(r#"name="DEPLOY""#), "the human sees WHICH env var is set");
+        assert!(!p.contains("production"), "the value plaintext must NOT appear");
+
+        let unkeyed_guess = {
+            let d = sha256(b"production");
+            let mut s = String::with_capacity(16);
+            for b in &d[..8] {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
         assert!(
-            p.contains(r#"name="API_TOKEN" value="s3cret-value""#),
-            "every value is shown on the trusted channel, not only allowlisted ones:\n{p}"
+            !p.contains(&unkeyed_guess),
+            "no value-derived fingerprint a preview-holder could dictionary-match"
         );
     }
 

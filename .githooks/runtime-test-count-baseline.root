@@ -8,9 +8,12 @@
 # names what it prevents. Round 19's finding was that the gate PASSED without ever having
 # been shown to BITE, so this is the distinction the round turned on.
 #
-# +1 against run 8's 170: the D0A-R18-03 NUL-refusal test. Attribution is checkable here
-# rather than asserted (D0A-R19-06 corrected the previous +2 account, which named an
-# internal test leg as if it were a second #[test]).
+# +1 against run 8's 170 is D0A-R19-04's net: TWO restored redaction tests minus the one
+# that asserted the opposite. **CORRECTED (D0A-R20-07):** this said the NUL-refusal test,
+# which already existed at 2f5a545 and belongs to run 7->8's accounting. The figure was
+# right and the explanation was wrong — for the second consecutive run, after R19-06
+# corrected the previous one. An attribution nobody recomputes is not checkable just
+# because it is written down.
 #
 # NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
 # the run is privileged and execute unprivileged, so 171 and 151 are overlapping sets and

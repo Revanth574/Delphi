@@ -43,7 +43,9 @@ of those seventeen targets had never executed at root before run 3.
 0 failures, 0 leaks, PAM intact, all 17 producers exited 0. **The D0A-R19-02 gate BIT on a
 real log rather than a fixture** — omitting `EXPECT_TARGETS` refuses at rc 2 and names what
 it prevents. Round 19's finding was that the gate had only ever been shown to PASS.
-`+1` against run 8: the NUL-refusal test.
+`+1` against run 8 is R19-04's net (two restored redaction tests, minus the one asserting
+the opposite) — **not** the NUL test, which already existed and belongs to run 7→8
+(D0A-R20-07, the second consecutive attribution error).
 
 **Run 7's `168 / 5 / 173` is SUPERSEDED, not merely older (D0A-R18-07).** It was measured
 at `71fd898` — before the chain-gap demonstration existed — and was then cited as evidence
@@ -181,6 +183,7 @@ cannot.
 | the pre-drop window is **SHORTENED** (D0A-R10-12) | **MITIGATION IMPLEMENTED + RE-MEASURED on the shipping configuration (2026-08-26).** `--cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID` on the payload; cap set proven MINIMAL (leg 7, each removal failing at a different syscall); guard **weaken-proven by a real RED** under NNP suppression, stable 30/30 with each `ok` verified to have run. Window **~9–13 ms of fixed bwrap setup cost — neither depth nor bind count drives it**; the earlier `~1.7 ms/bind` slope was an artifact of duplicate ancestor emission and does not exist. **Shortened, NOT closed** — bwrap's own setup still runs with the full set, and that phase is unmeasured |
 | the pre-drop payload's BOUNDING set is narrowed | **OPEN — own row, split out of D0A-R10-12 (2026-08-25).** Measured: the R10-12 fix leaves `CapBnd = 000001ffffffffff` at both the payload and the tool. Left inside R10-12 it would let that row close with a named property still standing |
 | the socket refusal (R9-01's second half) | **FIXTURE-MEASURED**, not against the real daemon |
+| §4's flow: the AI receives `{pending_id, preview}` | **DIVERGENT, UNRESOLVED — opened 2026-08-29 (D0A-R20-04).** `TRUST_MODEL.md` §4 says the AI is returned `{pending_id, preview}`; `runtime_wire.proto`'s `Pending` and `service.rs` carry **only the id**. The code is STRICTER than the contract, so this is not a live exposure — but it was cited as the reason redaction could be removed (R18-05), which made an unrecorded divergence load-bearing for a security decision. Either ratify id-only and amend §4, or implement the normative flow. Recorded as open rather than resolved because ratifying is a normative change |
 | §7 "audit = reality" is RECORDED AT ALL | **UNWIRED END TO END — opened 2026-08-26.** `RuntimeAuditEntry::record` has callers **only in tests** (`audit.rs`'s own module, `divergence.rs`, `end_to_end.rs`), and the `audit` module has **no production CALL, consumer, or persistence path**. **CORRECTED (D0A-R18-08):** this said "no reference from `lib.rs`", which is false — `lib.rs` publicly exports the module. The conclusion is unchanged and the supporting predicate was not reproducible as written; a module can be exported and still never invoked, which is the actual state. So no approved action has ever produced an audit entry outside a test. Distinct from the R9-07 row, which is about an entry being *wrong*; this is about there being *no entry* |
 
 **Why the gap is accepted rather than closed** (the decision, so it is not relitigated as an

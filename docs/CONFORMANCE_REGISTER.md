@@ -39,8 +39,11 @@ of those seventeen targets had never executed at root before run 3.
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**LANE RUN 8 (2026-08-27, current): `EXECUTED 170 / SKIPPED 5 / reported 175`**, rc 0,
-0 failures, 0 leaks, PAM intact, all 17 producers exited 0.
+**LANE RUN 9 (2026-08-27, current): `EXECUTED 171 / SKIPPED 5 / reported 176`**, rc 0,
+0 failures, 0 leaks, PAM intact, all 17 producers exited 0. **The D0A-R19-02 gate BIT on a
+real log rather than a fixture** — omitting `EXPECT_TARGETS` refuses at rc 2 and names what
+it prevents. Round 19's finding was that the gate had only ever been shown to PASS.
+`+1` against run 8: the NUL-refusal test.
 
 **Run 7's `168 / 5 / 173` is SUPERSEDED, not merely older (D0A-R18-07).** It was measured
 at `71fd898` — before the chain-gap demonstration existed — and was then cited as evidence

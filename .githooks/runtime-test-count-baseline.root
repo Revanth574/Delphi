@@ -1,18 +1,19 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 8, 2026-08-27, at the round-18 remediation. Produced by scripts/test-count.sh's
-# parse-only mode over the concatenated per-target log, gated by
-# DELPHI_TESTCOUNT_EXPECT_TARGETS and a per-target producer-status check (D0A-R18-04) — both
-# gates exercised on first real use, not merely specified.
+# LANE RUN 9, 2026-08-27, at the round-19 remediation. Parse-only extraction over the
+# concatenated per-target log, gated by DELPHI_TESTCOUNT_EXPECT_TARGETS (now MANDATORY in
+# parse-only mode, D0A-R19-02) and the per-target producer-status check.
 #
-# SUPERSEDES run 7's 168/5, which D0A-R18-07 found stale: it was measured at 71fd898, BEFORE
-# the chain-gap demonstration landed in d4a741e, and was nonetheless cited as covering it.
-# The +2 here is the chain-gap test and the D0A-R18-03 NUL-refusal test. Recorded first
-# as "that test and its control", which was wrong (D0A-R19-06): the control is an
-# internal leg of one #[test], not a second one.
+# THE GATE BIT ON A REAL LOG, not a fixture: omitting EXPECT_TARGETS refuses at rc 2 and
+# names what it prevents. Round 19's finding was that the gate PASSED without ever having
+# been shown to BITE, so this is the distinction the round turned on.
+#
+# +1 against run 8's 170: the D0A-R18-03 NUL-refusal test. Attribution is checkable here
+# rather than asserted (D0A-R19-06 corrected the previous +2 account, which named an
+# internal test leg as if it were a second #[test]).
 #
 # NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
-# the run is privileged and execute unprivileged, so 170 and 150 are overlapping sets and
+# the run is privileged and execute unprivileged, so 171 and 151 are overlapping sets and
 # neither contains the other.
-EXECUTED=170
+EXECUTED=171
 SKIPPED=5

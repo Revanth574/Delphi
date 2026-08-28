@@ -1,4 +1,14 @@
-# Lane run 7 — procedure (branch `phase-3b/d0-readiness-contract`, HEAD `71fd898`)
+# Lane runs 7–8 — procedure (branch `phase-3b/d0-readiness-contract`)
+
+> **RUN 7 ran at `71fd898` and its numbers are SUPERSEDED.** D0A-R18-07: the chain-gap test
+> landed later in `d4a741e`, so run 7 never exercised it, and the round-18 remediation
+> changed the suite again. `.githooks/runtime-test-count-baseline.root` is marked stale in
+> place.
+>
+> **RUN 8 is owed and uses this document at the CURRENT commit.** §3 and §4 were amended
+> after run 7 with the producer-status check and the expected-target gate (D0A-R18-04) — the
+> defect that amendment closes is one run 7 itself could have hidden, so the amendment is
+> recorded here rather than silently applied.
 
 **Why this run exists.** `runtime/src/**` has changed **three times** since run 6's clean
 sheet, and none of it has executed at root:
@@ -109,9 +119,10 @@ separately and concatenating produces a log the extractor parses **identically**
 normal cargo path — both `EXECUTED 148 / SKIPPED 25 / reported 173`. The concatenation is
 not a shape the parser had been shown before, so it was checked rather than specified.
 
-**This closes an open register item.** The root `EXECUTED` figure has deliberately never been
-recorded, because deriving it as `reported − skips` is arithmetic, and arithmetic of that
-shape is what put a withdrawn expectation in the baseline. If this prints cleanly, write it:
+**The root `EXECUTED` figure is recorded from the extractor, never by subtraction** —
+deriving it as `reported − skips` is arithmetic, and arithmetic of that shape put a withdrawn
+expectation in the baseline once already. Run 7 recorded it and D0A-R18-07 then found the
+figure stale (measured before the chain-gap test existed), so **run 8 overwrites it**:
 
 ```bash
 printf 'EXECUTED=%s\nSKIPPED=%s\n' <executed> <skipped> > .githooks/runtime-test-count-baseline.root
@@ -142,10 +153,13 @@ Not ceremony: fixtures deleting the operator's installed `/etc/pam.d/delphi-runt
 defect already paid for (`DEFECT_CLASSES` class 16), and it surfaced far away as unrelated
 tests reporting "not installed".
 
-## 7. The chain-gap demonstration — DIAGNOSIS DISCIPLINE (test not yet built)
+## 7. The chain-gap demonstration — DIAGNOSIS DISCIPLINE (test BUILT, `d4a741e`)
 
-When the composed test lands, its failures are ambiguous by default and must not be
-diagnosed from the message alone.
+`chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it` in
+`b1_integration`. Its failures are ambiguous by default and must not be diagnosed from the
+message alone. **This discipline has already paid once**: written before the test existed, it
+turned the first run's `left: ""` into `coreutils: unknown program 'tool'` immediately —
+the signature that had cost this arc three inferences on four occasions.
 
 **`execvp: No such file or directory` does not distinguish a missing fd from a missing
 loader** — class 43, two misdiagnoses in this arc. Before concluding anything:

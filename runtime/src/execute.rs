@@ -1453,6 +1453,38 @@ pub(crate) mod tests {
         );
     }
 
+    /// D0A-R20-03 — the execute-time environment validation had NO test that reached it.
+    /// The only malformed-env test is refused during canonicalization, so deleting the
+    /// choke-point block left the suite green — R19-02's exact shape ("nothing would notice
+    /// its removal"), one round later, in the fix for R19-05.
+    ///
+    /// This builds a `PendingAction` DIRECTLY — which is the bypass R19-05 exists to close,
+    /// since the fields are public — mints a valid token, and proves the refusal happens
+    /// BEFORE any transport or spawn.
+    #[test]
+    fn a_directly_built_action_with_a_malformed_environment_is_refused_at_execute() {
+        let out = tempfile::tempdir().unwrap();
+        let mut action = build_action(b"#!/bin/sh\n:\n", out.path());
+        // The smuggling shape: canonicalization would refuse this, and canonicalization is
+        // not the only builder.
+        action.env_delta = vec![("API_TOKEN".into(), "x\0PATH=/attacker/bin".into())];
+
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        match execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new()) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("not representable by execve"),
+                "refused, but not for the malformed environment: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "a directly built action carrying an embedded NUL EXECUTED — the public \
+                 fields bypass canonicalization and the choke point did not catch it"
+            ),
+        }
+    }
+
     #[test]
     fn an_approved_action_runs_with_the_tool_account_credentials() {
         if !bwrap_available() {

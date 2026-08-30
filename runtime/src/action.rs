@@ -404,17 +404,6 @@ fn hex32(d: &[u8; 32]) -> String {
     s
 }
 
-/// Env names whose VALUE selects which code runs. Shown in full; everything else is
-/// `[redacted]`.
-///
-/// **Restored after D0A-R19-04.** Removing it rested on "the preview reaches only the pinned
-/// shell", which was checked at the AI socket and nowhere else — the preview is injected into
-/// the renderer's page realm, and `docs/TRUST_MODEL.md` §3 requires this list normatively.
-/// LOADER-level by design; it does not reach `PYTHONPATH`/`NODE_PATH`/`PERL5LIB`, and that
-/// under-inclusiveness is a recorded limit, not an oversight.
-const CODE_SELECTING_ENV: &[&str] =
-    &["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "GCONV_PATH"];
-
 /// Quote and escape one field so the rendering is INJECTIVE (D0A-R18-02).
 ///
 /// The previous prose joined fields with `", "` and `" "`, which two DIFFERENT actions could
@@ -459,9 +448,9 @@ fn q(s: &str) -> String {
 ///     required_tier: RequiredTier::Biometric, script: None,
 /// };
 /// let p = preview(&a);
-/// // Every field is quoted + indexed (D0A-R18-02); a non-code-selecting value is
-/// // redacted (D0A-R19-04) while its NAME is shown.
-/// assert!(p.contains(r#"env[0]: name="K" value=[redacted]"#));
+/// // Every field is quoted + indexed (D0A-R18-02) and the COMPLETE action is shown
+/// // (D0A-R20-01) — §3 ratifies the renderer as a trusted audience.
+/// assert!(p.contains(r#"env[0]: name="K" value="V""#));
 /// assert!(p.contains(r#"argv[1]="hi""#));
 /// ```
 #[must_use]
@@ -473,20 +462,11 @@ pub fn preview(action: &PendingAction) -> String {
     }
     out.push_str(&format!("  cwd={}\n", q(&action.cwd.to_string_lossy())));
     for (i, (k, v)) in action.env_delta.iter().enumerate() {
-        // D0A-R19-04: REDACTION RESTORED. R18-05 removed it after verifying the AI socket
-        // sends only `Pending { pending_id }` — true at that boundary, and generalised to
-        // "the only entitled consumer" without checking the others. The preview is injected
-        // into the WebView PAGE REALM (`shell-host` `drive_consent`), and this project treats
-        // the renderer as untrusted; §3 normatively requires this allowlist; and §4's flow
-        // permits the AI to receive `{pending_id, preview}` even though today's code does not.
-        // Values that SELECT CODE are shown because the human must see them; the rest stay
-        // redacted because the delta may carry secrets and the digest binds them regardless.
-        let shown = if CODE_SELECTING_ENV.contains(&k.as_str()) {
-            q(v)
-        } else {
-            "[redacted]".to_string()
-        };
-        out.push_str(&format!("  env[{i}]: name={} value={shown}\n", q(k)));
+        // D0A-R20-01, ratified in §3: the renderer is untrusted as an ACTOR and trusted as
+        // an AUDIENCE — it already receives the user's PAM password and the full argv, so
+        // withholding other values protected nothing while BREAKING INJECTIVITY (measured:
+        // DEPLOY=production and DEPLOY=staging rendered identically with differing digests).
+        out.push_str(&format!("  env[{i}]: name={} value={}\n", q(k), q(v)));
     }
     out.push_str(&format!(
         "  net={}\n",
@@ -694,58 +674,50 @@ mod tests {
         assert_ne!(preview(&one), preview(&two), "argv collision: one arg `a b` vs two args");
     }
 
-    /// RESTORED (D0A-R19-04) — the allowlist shows what SELECTS CODE and redacts the rest.
-    /// Deleted under R18-05 on the reasoning that the preview reaches only the pinned shell;
-    /// it is also injected into the renderer's page realm, and §3 requires this list.
+    /// D0A-R20-01 — TWO DIFFERENT NON-ALLOWLISTED VALUES CANNOT SHARE AN APPROVAL DISPLAY.
+    /// This is the regression the finding required, and it is the exact pair that failed
+    /// under redaction: same name, different value, differing digests, one preview. It is
+    /// listed separately from the delimiter-collision test because the two break injectivity
+    /// by different mechanisms — one by joining, one by withholding.
     #[test]
-    fn preview_shows_code_selecting_env_and_redacts_the_rest() {
+    fn preview_distinguishes_two_values_of_the_same_variable() {
+        let mut prod = sample();
+        prod.env_delta = vec![("DEPLOY".into(), "production".into())];
+        let mut stage = sample();
+        stage.env_delta = vec![("DEPLOY".into(), "staging".into())];
+
+        assert_ne!(
+            canonical_action_digest(&prod),
+            canonical_action_digest(&stage),
+            "precondition: these must be different ACTIONS, or the test proves nothing"
+        );
+        assert_ne!(
+            preview(&prod),
+            preview(&stage),
+            "two different actions produced one approval display — the human approves \
+             `production` while `staging` runs, and the digest cannot repair what was never \
+             shown (D0A-R20-01)"
+        );
+    }
+
+    /// D0A-R20-01 — the complete action is rendered. No value is withheld, because §3 now
+    /// ratifies the renderer as a trusted AUDIENCE: it already holds the PAM password.
+    #[test]
+    fn preview_shows_every_env_value() {
         let mut a = sample();
         a.env_delta = vec![
-            ("PATH".into(), "/tmp/evil:/usr/bin".into()),
-            ("LD_PRELOAD".into(), "/tmp/evil/hook.so".into()),
-            ("LD_LIBRARY_PATH".into(), "/tmp/evil/lib".into()),
-            ("LD_AUDIT".into(), "/tmp/evil/audit.so".into()),
-            ("GCONV_PATH".into(), "/tmp/evil/gconv".into()),
+            ("PATH".into(), "/tmp/evil/bin".into()),
+            ("PYTHONPATH".into(), "/tmp/evil/mods".into()),
             ("API_TOKEN".into(), "s3cret-value".into()),
         ];
         let p = preview(&a);
-        for shown in [
-            "/tmp/evil:/usr/bin",
-            "/tmp/evil/hook.so",
-            "/tmp/evil/lib",
-            "/tmp/evil/audit.so",
-            "/tmp/evil/gconv",
-        ] {
-            assert!(p.contains(shown), "a code-selecting value must be VISIBLE: {shown}\n{p}");
+        for v in ["/tmp/evil/bin", "/tmp/evil/mods", "s3cret-value"] {
+            assert!(p.contains(v), "every value is shown to the approving human: {v}\n{p}");
         }
-        assert!(!p.contains("s3cret-value"), "a non-code-selecting value must stay redacted:\n{p}");
-        assert!(p.contains(r#"name="API_TOKEN" value=[redacted]"#), "the KEY is still shown:\n{p}");
-    }
-
-    /// RESTORED (D0A-R19-04). RUNTIME-1D-04: the preview shows WHICH env vars are set but a
-    /// redacted value is neither plaintext NOR a value-derived token — an UNKEYED fingerprint
-    /// would be an offline dictionary ORACLE for a low-entropy value against a reader that
-    /// holds the preview. The digest still binds the full value.
-    #[test]
-    fn preview_redacts_env_values_no_oracle() {
-        let mut a = sample();
-        a.env_delta = vec![("DEPLOY".into(), "production".into())];
-        let p = preview(&a);
-        assert!(p.contains(r#"name="DEPLOY""#), "the human sees WHICH env var is set");
-        assert!(!p.contains("production"), "the value plaintext must NOT appear");
-
-        let unkeyed_guess = {
-            let d = sha256(b"production");
-            let mut s = String::with_capacity(16);
-            for b in &d[..8] {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-            }
-            s
-        };
         assert!(
-            !p.contains(&unkeyed_guess),
-            "no value-derived fingerprint a preview-holder could dictionary-match"
+            !p.contains("[redacted]"),
+            "nothing is withheld — an allowlist that hid PYTHONPATH while showing PATH was \
+             both incoherent and injectivity-breaking:\n{p}"
         );
     }
 

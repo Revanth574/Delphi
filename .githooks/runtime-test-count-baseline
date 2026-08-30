@@ -89,5 +89,10 @@
 # asserted the opposite (`preview_shows_env_values_in_full`), so +2 -1. The restoration is
 # the point: R18-05's rationale was checked at the AI socket and generalised, and the
 # preview is also injected into the renderer's page realm.
-EXECUTED=151
+# 2026-08-29 (round-20, R20-01 amendment + R20-03): 151/25 -> 152/25. Net +1 across a
+# replacement: the two redaction tests are removed AGAIN — this time under a RATIFIED §3
+# amendment rather than against a live guard — replaced by
+# `preview_distinguishes_two_values_of_the_same_variable` and `preview_shows_every_env_value`,
+# plus `a_directly_built_action_with_a_malformed_environment_is_refused_at_execute` (R20-03).
+EXECUTED=152
 SKIPPED=25

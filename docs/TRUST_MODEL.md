@@ -275,17 +275,39 @@ ordinarily does. Only the second hop crosses:
   the binding does not cover, with the deciding field withheld.
 
 **What changed is the PREVIEW, and it is a DISCLOSURE fix, not a BINDING fix.** `preview()`
-shows values for the keys that select code (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
-`LD_AUDIT`, `GCONV_PATH` — an allowlist, everything else redacted because the delta may carry
-secrets), marks **every** interpreter argument as resolved at run time and not bound
-(D0A-R18-06), and renders every field quoted and indexed so two different actions cannot
-produce one preview (D0A-R18-02).
+renders **the complete action** — every field quoted and indexed, so two different actions
+cannot produce one preview (D0A-R18-02) — and marks every interpreter argument's named
+program as resolved at run time and not bound (D0A-R18-06, as qualified below).
 
-**The allowlist was briefly removed and is RESTORED (D0A-R19-04).** The removal rested on
-"the preview reaches only the pinned shell", verified at the AI socket and generalised. It is
-also injected into the renderer's **page realm**, which this project treats as untrusted, and
-§4's flow permits the AI to be given `{pending_id, preview}` even though today's code sends
-only the id. This paragraph is the normative requirement; the code now matches it again.
+### THE RENDERER IS UNTRUSTED AS AN ACTOR AND TRUSTED AS AN AUDIENCE (ratified 2026-08-29)
+
+**This sentence is the one whose absence produced three different positions in three review
+rounds**, so it is stated normatively rather than left to be re-derived:
+
+* **Untrusted as an ACTOR.** The page realm cannot manufacture a consent. That is R-2's
+  native relay (`renderer-cannot-forge`), and it is unchanged by anything here.
+* **Trusted as an AUDIENCE.** The page realm *sees* the approval content. It already receives
+  the **user's PAM password**, typed into that realm and returned over `window.ipc`, and the
+  full `argv`. A rule withholding `DEPLOY=production` from a process holding the password is
+  not a confidentiality control.
+
+**So the preview shows the complete action, and `preview()` carries no allowlist.** If a
+rendering for a *different* audience is ever needed — the AI, a log, a remote console — it is
+a **separate function** with its own audience stated. One rendering serving two audiences is
+what produced the cycle below.
+
+### THE THREE POSITIONS, RECORDED SO THE CYCLE IS NOT REPEATED
+
+| round | position | why it was wrong / different |
+|---|---|---|
+| R18-05 | redaction **removed** | right conclusion, unsound reasoning: "the only entitled consumer" was checked at the AI socket and generalised. The renderer was never examined |
+| R19-04 | redaction **restored** | corrected the reasoning and reinstated a rule that **breaks injectivity** — measured, `DEPLOY=production` and `DEPLOY=staging` render identically while their digests differ. It also left `PYTHONPATH`/`NODE_OPTIONS`/`BASH_ENV` redacted though they select code |
+| R20-01 | redaction **removed by amendment** | different because it names the actor/audience distinction and amends this document rather than inferring a boundary from one socket. The removal is now a ratified contract change, not a code change against a live guard |
+
+**The harm ordering that decides it:** redaction protects nothing from a party that already
+holds the password; injectivity protects the human from approving something other than what
+runs. A human approving `DEPLOY=production` when the action carries `staging` is a consent
+failure at the exact boundary this system exists to defend.
 **The hop is unchanged: `env` still resolves through `PATH`.** The human can now see which
 directories decide; nothing prevents them deciding.
 

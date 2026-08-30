@@ -721,14 +721,16 @@ mod tests {
         );
     }
 
-    /// D0A-R18-06 — EVERY interpreter argument is marked unbound, including one beginning
-    /// with `-`. The previous test exempted leading-dash args because a flag names no
-    /// program; `#!/usr/bin/env -S python3 -I` begins with a dash and GNU `env` still splits
-    /// it and resolves `python3` through PATH, so the exemption excluded exactly the form it
-    /// needed to catch.
+    /// D0A-R18-06, as corrected by R19-07 and R20-06 — the marking is on WHAT THE ARGUMENT
+    /// NAMES, not on the argument.
+    ///
+    /// The two cases are asserted separately because they differ semantically even though
+    /// the rendering treats them alike: `-I` is a flag, is bound by the digest, and names no
+    /// program; `-S python3 -I` is bound as a string and names `python3`, which `env`
+    /// resolves through `PATH` at run time. An earlier version exempted leading-dash
+    /// arguments, which excluded exactly the second form.
     #[test]
-    fn preview_marks_every_interpreter_arg_as_unbound() {
-        const UNBOUND: &str = "NOT bound";
+    fn preview_marks_what_an_interpreter_arg_names_not_the_arg() {
         let pin_with = |arg: Option<&str>| ScriptPin {
             interpreter_fd: std::fs::File::open("/dev/null").unwrap().into(),
             interpreter_digest: [0x11; 32],
@@ -736,22 +738,27 @@ mod tests {
             script_memfd: std::fs::File::open("/dev/null").unwrap().into(),
             script_digest: [0x22; 32],
         };
-        for arg in ["python3", "-S python3 -I", "-I"] {
+        let render = |arg: Option<&str>| {
             let mut a = sample();
-            a.script = Some(pin_with(Some(arg)));
-            let p = preview(&a);
-            assert!(
-                p.contains(UNBOUND),
-                "interpreter arg {arg:?} must be marked unbound — the digest binds the \
-                 STRING, never what it NAMES:\n{p}"
-            );
-        }
-        let mut none = sample();
-        none.script = Some(pin_with(None));
+            a.script = Some(pin_with(arg));
+            preview(&a)
+        };
+
+        // A BOUND FLAG. It is shown, and the qualification travels with it — the statement
+        // "the string is bound; any program it names is not" is TRUE of a flag vacuously,
+        // which is why the wording had to change rather than the coverage.
+        let flag = render(Some("-I"));
+        assert!(flag.contains(r#"script.interp_arg="-I""#), "the flag is shown:\n{flag}");
+        assert!(flag.contains("the string is bound"), "the qualification travels:\n{flag}");
+
+        // AN ARGUMENT NAMING AN UNBOUND PROGRAM — the form a leading-dash exemption missed.
+        let names = render(Some("-S python3 -I"));
+        assert!(names.contains("NOT bound"), "the named program is marked:\n{names}");
+
+        // NO ARGUMENT: nothing is named, so nothing is marked.
         assert!(
-            !preview(&none).contains(UNBOUND),
-            "with NO arg there is nothing to resolve, so the marking must be absent — \
-             otherwise it means nothing"
+            !render(None).contains("NOT bound"),
+            "with no argument there is nothing to resolve; marking it would empty the mark"
         );
     }
 

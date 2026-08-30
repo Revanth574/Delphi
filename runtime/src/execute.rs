@@ -518,6 +518,29 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
             )));
         }
     }
+    // D0A-R20-02: `cwd` and every bind path reach bwrap's argv through `to_string_lossy`
+    // (`sandbox.rs`), while the digest hashes the ORIGINAL bytes. So a non-UTF-8 path is
+    // bound-and-checked as bytes A and executed as the replacement-char string B — the same
+    // claimed-equality break as R20-01, except the mismatch reaches bwrap rather than a
+    // display. Refused here rather than preserved end-to-end: an approved action with a
+    // non-UTF-8 bind path is not something a deployment needs, and refusing is honest about
+    // what this system can represent. Same choke point, same shape as the R19-05 env check.
+    if action.cwd.to_str().is_none() {
+        return Err(RuntimeError::Protocol(format!(
+            "cwd is not valid UTF-8 ({}) — it would be digested as bytes and passed to the \
+             sandbox as a lossy replacement string (D0A-R20-02)",
+            action.cwd.display()
+        )));
+    }
+    for (path, _) in &action.fs_binds {
+        if path.to_str().is_none() {
+            return Err(RuntimeError::Protocol(format!(
+                "bind path is not valid UTF-8 ({}) — digest and sandbox argument would \
+                 disagree (D0A-R20-02)",
+                path.display()
+            )));
+        }
+    }
     // D0A-R9-10: refuse before any jail exists. See `refuse_denied_bind` for why this
     // is defence in depth on top of the uid drop rather than the barrier itself.
     // ORDER IS PART OF THE CONTRACT (D0A-R10-08). The SECURITY denial classifies
@@ -1481,6 +1504,39 @@ pub(crate) mod tests {
             Ok(_) => panic!(
                 "a directly built action carrying an embedded NUL EXECUTED — the public \
                  fields bypass canonicalization and the choke point did not catch it"
+            ),
+        }
+    }
+
+    /// D0A-R20-02 — a directly built action carrying a NON-UTF-8 bind path is refused at
+    /// the execute choke point, before any transport or spawn.
+    ///
+    /// Canonicalization cannot reach this for the same reason it could not reach the env
+    /// case: `PendingAction`'s fields are public, so it is not the only builder. Without the
+    /// guard the digest covers the raw bytes while bwrap receives `to_string_lossy`'s
+    /// replacement string — bound and checked as one path, executed as another.
+    #[test]
+    fn a_directly_built_action_with_a_non_utf8_bind_path_is_refused_at_execute() {
+        use std::os::unix::ffi::OsStrExt;
+        let out = tempfile::tempdir().unwrap();
+        let mut action = build_action(b"#!/bin/sh\n:\n", out.path());
+        // 0xFF is not valid UTF-8 in any position.
+        let bad = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/delphi-\xffbad"));
+        assert!(bad.to_str().is_none(), "precondition: the fixture path must be non-UTF-8");
+        action.fs_binds.push((bad, BindMode::ReadOnly));
+
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        match execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new()) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("not valid UTF-8"),
+                "refused, but not for the encoding: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "a non-UTF-8 bind path reached execution — the digest covered bytes the \
+                 sandbox never received (D0A-R20-02)"
             ),
         }
     }

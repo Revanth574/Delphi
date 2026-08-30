@@ -277,7 +277,14 @@ ordinarily does. Only the second hop crosses:
 **What changed is the PREVIEW, and it is a DISCLOSURE fix, not a BINDING fix.** `preview()`
 renders **the complete action** — every field quoted and indexed, so two different actions
 cannot produce one preview (D0A-R18-02) — and marks every interpreter argument's named
-program as resolved at run time and not bound (D0A-R18-06, as qualified below).
+program as resolved at run time and not bound.
+
+**Precisely (D0A-R18-06, corrected by D0A-R19-07 and propagated here by D0A-R20-06): the
+argument STRING is bound by the digest; any PROGRAM the argument names is not.** The earlier
+wording said the argument itself was "resolved at run time and not bound", which is FALSE for
+an ordinary flag — `-I` is bound, and names no program. The distinction matters because
+`#!/usr/bin/env -S python3 -I` begins with a dash and still resolves `python3` through
+`PATH`, so a leading-dash exemption would miss exactly the form it needed to catch.
 
 ### THE RENDERER IS UNTRUSTED AS AN ACTOR AND TRUSTED AS AN AUDIENCE (ratified 2026-08-29)
 

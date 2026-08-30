@@ -94,5 +94,10 @@
 # amendment rather than against a live guard — replaced by
 # `preview_distinguishes_two_values_of_the_same_variable` and `preview_shows_every_env_value`,
 # plus `a_directly_built_action_with_a_malformed_environment_is_refused_at_execute` (R20-03).
-EXECUTED=152
+# 2026-08-29 (round-20 completion, R20-02/05/06): 152/25 -> 153/25. +1:
+# `a_directly_built_action_with_a_non_utf8_bind_path_is_refused_at_execute`. R20-05 and
+# R20-06 changed existing tests rather than adding any — the arg test was renamed
+# (`preview_marks_what_an_interpreter_arg_names_not_the_arg`), which is a rename and not a
+# disappearance.
+EXECUTED=153
 SKIPPED=25

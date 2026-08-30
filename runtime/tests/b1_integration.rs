@@ -1961,7 +1961,12 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
             // (measured in this arc's own probe and not carried forward until D0A-R19-08's
             // first run failed on it), so the witness pairs it with something always
             // populated. Emptiness of the path is then data, not an absent witness.
-            "#!/usr/bin/env python3\nimport sys\nopen({:?}, \"w\").write(\"py%d|%s\" % (sys.version_info[0], sys.executable))\n",
+            // D0A-R20-05: `sys.executable` is EMPTY under env's confstr fallback, so a
+            // witness built on it permitted emptiness and then treated emptiness as proof of
+            // LOCATION — `py3|` passed both assertions while saying nothing about where the
+            // interpreter came from. `/proc/self/exe` is the kernel's own answer and is always
+            // populated, so the location claim is measured rather than assumed.
+            "#!/usr/bin/env python3\nimport os,sys\nopen({:?}, \"w\").write(\"py%d|%s\" % (sys.version_info[0], os.path.realpath(\"/proc/self/exe\")))\n",
             control_marker.display().to_string()
         ),
     )
@@ -2055,7 +2060,7 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
     let control_witness = std::fs::read_to_string(&control_marker).unwrap_or_default();
     if let Ok(o) = &exec_no_path {
         eprintln!(
-            "chain-gap CONTROL: exit={:?} stderr={}",
+            "chain-gap CONTROL: exit={:?} witness={control_witness:?} stderr={}",
             o.status.code(),
             String::from_utf8_lossy(&o.stderr).trim()
         );
@@ -2067,10 +2072,19 @@ fn chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it() {
          marker' is satisfied by the real python failing — which is what D0A-R18-01 found. \
          witness={control_witness:?}"
     );
+    // D0A-R20-05: the location must be PRESENT before its content can mean anything. An
+    // empty path trivially "does not contain" the impostor directory, which is how the
+    // previous form passed while measuring nothing.
+    let control_path = control_witness.split_once('|').map(|(_, p)| p).unwrap_or("");
     assert!(
-        !control_witness.contains(&bin.display().to_string()),
+        control_path.starts_with('/'),
+        "the CONTROL produced no interpreter LOCATION, so 'not from the impostor dir' is \
+         vacuous. witness={control_witness:?}"
+    );
+    assert!(
+        !control_path.contains(&bin.display().to_string()),
         "the CONTROL's interpreter came from the IMPOSTOR directory ({}), so the leg does \
-         not establish that PATH is what selected it (D0A-R19-08). witness={control_witness:?}",
+         not establish that PATH is what selected it. witness={control_witness:?}",
         bin.display()
     );
     assert!(

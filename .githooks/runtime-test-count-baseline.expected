@@ -19,18 +19,41 @@
 #   5. A mismatch is a RESULT, not an error to reconcile — record which side was wrong.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# LANE RUN 11 — expectation, committed 2026-08-29 at d6fb698, BEFORE the run.
+# SUPERSEDED — LANE RUN 11, first expectation (committed 2026-08-29 at d6fb698)
 #
-# DERIVATION, stated so it can be checked rather than believed:
+#   EXPECTED_EXECUTED=174  EXPECTED_SKIPPED=5
+#
+# NEVER MEASURED, and that is normal rather than a failure. It was derived from an
+# unprivileged 154/25; the R21-03 and R21-05 tests then landed and moved the tree to 156/25
+# before run 11 happened. The protocol's answer to drift is to RE-DERIVE and re-commit, not
+# to adjust the old number — amending it in the same commit as the tests that invalidated it
+# would have destroyed the only property this file has, which is that the prediction predates
+# the measurement. A reader of `git log` will see a prediction with no result beside it; this
+# note is why.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# LANE RUN 11 — expectation, committed 2026-08-29 at 298d4db, BEFORE the run.
+#
+# DERIVATION, written so it can be checked rather than believed:
 #   run 10 measured           EXECUTED=173 SKIPPED=5   (at unprivileged 153/25)
-#   unprivileged is now       EXECUTED=154 SKIPPED=25  (+1 since run 10)
-#   the +1 is `service::tests::a_gate_denied_action_sends_no_preview`, which is NOT
-#   root-gated — it uses a socketpair and a stub SessionSource, so it EXECUTES at root too.
-#   Therefore root gains exactly that one: 173 + 1 = 174, and no skip changes.
+#   unprivileged is now       EXECUTED=156 SKIPPED=25  (+3 since run 10)
+#
+#   The +3, each VERIFIED not root-gated (no geteuid check, no SKIP branch, no
+#   bwrap_available guard — grepped, not assumed), so each executes at root as well:
+#     1. service::tests::a_gate_denied_action_sends_no_preview          (R21-01, socketpair
+#        + stub SessionSource)
+#     2. action::tests::preview_renders_the_bound_schema_version        (R21-03, pure)
+#     3. service::tests::an_oversized_preview_is_denied_before_the_action_is_stored
+#        (R21-05, socketpair + stub SessionSource)
+#
+#   Therefore root gains exactly three: 173 + 3 = 176, and NO skip changes.
 #
 # The five root skips are unchanged: b1_daemon_binary (needs --features
 # insecure-test-seams), live_logind_query (standing DEFER), and three that skip BECAUSE the
 # run is privileged (an_unreadable_login_defs, a_regular_login_user_is_not_refused,
 # pidfd_refuses_a_recycled_pid_barrier).
-EXPECTED_EXECUTED=174
+#
+# IF THE MEASUREMENT DISAGREES, that is a RESULT. Record which side was wrong — the
+# derivation above is the thing to check first, since it is the part that can be audited.
+EXPECTED_EXECUTED=176
 EXPECTED_SKIPPED=5

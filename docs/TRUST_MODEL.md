@@ -862,10 +862,28 @@ impersonate the approver.
 
 ### The flow
 
-1. AI requests → arbiter builds `PendingAction` (§3) → returns `confirmation_required
-   {pending_id, preview}` (the AI gets an id, not a token).
-2. Arbiter delivers the preview to the **pidfd-pinned shell** on the private channel; the
-   shell renders the exact action.
+**THIS AMENDMENT RATIFIES BEHAVIOUR; IT DOES NOT CHANGE IT (D0A-R21-02).** §3 and §4 have now
+been amended five times in this arc, and it matters that this one is a different kind. The
+four before it changed a claim to match an argument and three were then reversed. **This one
+changes the document to match what the code has always done:** `runtime_wire.proto`'s
+`Pending` has only ever carried `pending_id`, and `service.rs` has only ever sent that. The
+divergence was the DOCUMENT describing a flow the implementation never had — and it was not
+harmless, because R18-05 cited that never-implemented flow as a reason redaction could be
+removed. An unrecorded divergence became load-bearing for a security decision.
+
+Ratifying the stricter behaviour is also the only reading compatible with §3 as amended: the
+complete preview is rendered for the renderer as a trusted audience, so delivering it to the
+AI — which §1 treats as the adversary — would disclose every environment value to exactly the
+party the preview exists to defend against. If a sanitised AI-facing rendering is ever needed,
+it is a separate function with its own stated audience.
+
+
+1. AI requests → arbiter builds `PendingAction` (§3) → returns `Pending {pending_id}`.
+   **The AI receives an ID AND NOTHING ELSE — no preview, no token** (ratified 2026-08-29,
+   D0A-R21-02).
+2. Arbiter runs the logind gate, and only then delivers the preview to the **pidfd-pinned
+   shell** on the private channel; the shell renders the exact action. **The gate precedes
+   the delivery** (D0A-R21-01), so a refused action discloses nothing.
 3. **Consent event.** Human clicks Approve/Deny. For a high-risk tier the **daemon** runs the
    logind active-session gate, then **`pam_authenticate`**, driving the conversation over the
    private channel to the pinned shell. Failure/absent session → DENY.

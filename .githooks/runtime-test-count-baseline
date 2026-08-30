@@ -102,5 +102,14 @@
 # 2026-08-29 (D0A-R21-01 disclosure half): 153/25 -> 154/25. +1:
 # `service::tests::a_gate_denied_action_sends_no_preview`, the first test module in
 # service.rs.
-EXECUTED=154
+# 2026-08-29 (R21-03 + R21-05): 154/25 -> 156/25. +2:
+# `preview_renders_the_bound_schema_version` and
+# `an_oversized_preview_is_denied_before_the_action_is_stored`. Both unprivileged.
+#
+# NOTE FOR LANE RUN 11: `.githooks/runtime-test-count-baseline.expected` was committed at
+# d6fb698 predicting EXECUTED=174 SKIPPED=5, derived from the then-current 154/25. These
+# two tests landed AFTER that prediction, so the expectation must be re-derived and
+# re-committed BEFORE run 11 — amending it now, in the same commit as the tests, would
+# destroy the property the file exists for.
+EXECUTED=156
 SKIPPED=25

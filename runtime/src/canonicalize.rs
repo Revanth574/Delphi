@@ -97,7 +97,7 @@ pub fn canonicalize(
 
     Ok(PendingAction {
         pending_id,
-        preview_version: 2,
+        preview_version: 3,
         executable_fd,
         executable_digest,
         argv: proposal.argv.clone(),

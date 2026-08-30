@@ -456,7 +456,12 @@ fn q(s: &str) -> String {
 #[must_use]
 pub fn preview(action: &PendingAction) -> String {
     let mut out = String::new();
-    out.push_str("preview_version=2\n");
+    // D0A-R21-03: RENDER THE BOUND FIELD, never a literal. Hardcoding it meant the
+    // redacted and complete-value formats both declared version 2 — one schema number for two
+    // renderings — and it meant two actions differing ONLY in `preview_version` had different
+    // digests and an identical preview, which is the injectivity break §3 claims cannot
+    // happen. Version 3 is the complete-value rendering.
+    out.push_str(&format!("preview_version={}\n", action.preview_version));
     for (i, a) in action.argv.iter().enumerate() {
         out.push_str(&format!("  argv[{i}]={}\n", q(a)));
     }
@@ -672,6 +677,31 @@ mod tests {
         let mut two = sample();
         two.argv = vec!["a".into(), "b".into()];
         assert_ne!(preview(&one), preview(&two), "argv collision: one arg `a b` vs two args");
+    }
+
+    /// D0A-R21-03 — the preview renders the BOUND schema version, not a literal.
+    ///
+    /// Two actions differing only in `preview_version` have different digests. With the
+    /// version hardcoded they had an IDENTICAL preview — the same injectivity break §3 says
+    /// cannot occur, on the one field that describes the rendering itself.
+    #[test]
+    fn preview_renders_the_bound_schema_version() {
+        let mut a = sample();
+        a.preview_version = 3;
+        let mut b = sample();
+        b.preview_version = 4;
+        assert_ne!(
+            canonical_action_digest(&a),
+            canonical_action_digest(&b),
+            "precondition: preview_version must be digest-bound"
+        );
+        assert_ne!(
+            preview(&a),
+            preview(&b),
+            "the rendering declared one version for two different actions — hardcoding it \
+             made the schema number a constant rather than a rendered field (D0A-R21-03)"
+        );
+        assert!(preview(&a).contains("preview_version=3"), "the bound value is rendered");
     }
 
     /// D0A-R20-01 — TWO DIFFERENT NON-ALLOWLISTED VALUES CANNOT SHARE AN APPROVAL DISPLAY.

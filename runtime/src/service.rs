@@ -42,6 +42,19 @@ use crate::RuntimeError;
 /// Largest private-channel datagram (preview + 32-byte digest prefix).
 const MAX_PRIV_MSG: usize = 8192;
 
+/// Does this preview fit the private channel, digest prefix included (D0A-R21-05)?
+///
+/// Two limits that never had to agree until the preview stopped redacting: a proposal may be
+/// up to `wire::MAX_FRAME` (64 KiB), and the private channel accepts `MAX_PRIV_MSG` (8 KiB).
+/// A ~9 KiB environment VALUE used to render as `[redacted]` and fit; it now renders in full
+/// and does not. Checked BEFORE the action is stored and before the AI is told `Pending`, so
+/// an oversized proposal is a clean DENIAL rather than an abort after the requester has
+/// already been handed an id for an action that will never be presented.
+#[must_use]
+pub fn preview_fits_private_channel(preview: &str) -> bool {
+    32usize.saturating_add(preview.len()) <= MAX_PRIV_MSG
+}
+
 /// A source of unix-seconds time — the seam (like the logind verdict) that keeps the
 /// token TTL a REAL control in the assembled loop.
 ///
@@ -253,6 +266,17 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     let action = canonicalize(&propose, id.clone())?;
     let digest = canonical_action_digest(&action);
     let preview_text = preview(&action);
+    // D0A-R21-05: BEFORE storing and before replying. Past this point the requester holds an
+    // id and the action is in the store, so a later size failure aborts the whole service
+    // call rather than denying one action.
+    if !preview_fits_private_channel(&preview_text) {
+        return deny(
+            ai,
+            &id,
+            "preview exceeds the private-channel datagram limit — the action cannot be \
+             presented to the human, so it is refused rather than executed unseen",
+        );
+    }
     ctx.store.insert(action);
     write_frame(ai, &pending_msg(&id))?;
 
@@ -552,6 +576,65 @@ mod tests {
         fn now_unix(&self) -> u64 {
             self.0
         }
+    }
+
+    /// D0A-R21-05 — a legal proposal whose PREVIEW exceeds the private channel is DENIED,
+    /// not aborted.
+    ///
+    /// The two limits never had to agree until the preview stopped redacting: a proposal may
+    /// be 64 KiB, the private channel takes 8 KiB. A ~9 KiB environment value used to render
+    /// as `[redacted]` and fit. It now renders in full — and without this check the action
+    /// was STORED and the requester was told `Pending` before the send failed, so a size
+    /// problem became an aborted service call instead of one refused action.
+    #[test]
+    fn an_oversized_preview_is_denied_before_the_action_is_stored() {
+        let (daemon_end, _shell_end) = crate::channel::approval_socketpair().expect("socketpair");
+        let (mut ai_daemon, mut ai_peer) = std::os::unix::net::UnixStream::pair().expect("ai pair");
+
+        // Legal as a proposal (well under wire::MAX_FRAME), oversized as a preview.
+        let big = "v".repeat(9 * 1024);
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![pb::EnvVar { key: "BIG".into(), value: big }],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
+
+        let mut store = PendingStore::new();
+        let mut ledger = ConsumptionLedger::new();
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let mut ctx = ServiceCtx {
+            channel_fd: daemon_end.as_raw_fd(),
+            session: &Seatless,
+            key: &key,
+            pam_service: "delphi-runtime",
+            session_user: "nobody",
+            store: &mut store,
+            ledger: &mut ledger,
+            clock: &At(1_000),
+        };
+
+        // A DENIAL, not an Err — the service call completes.
+        let outcome = serve_one_action(&mut ai_daemon, &mut ctx).expect("serves without aborting");
+        match outcome {
+            Outcome::Denied { ref reason, .. } => assert!(
+                reason.contains("private-channel datagram limit"),
+                "denied for the wrong reason: {reason}"
+            ),
+            other => panic!("an oversized preview must DENY, got: {other:?}"),
+        }
+        // And the action must NOT be in the store — the check precedes the insert. The id was
+        // allocated (denials need one), so look it up rather than counting.
+        assert!(
+            ctx.store.get("act-1").is_none(),
+            "the action was stored before the size check; a refused action must leave nothing \
+             behind for a later Present to find"
+        );
     }
 
     /// D0A-R21-01 (disclosure half) — A GATE-DENIED ACTION SENDS NO PREVIEW.

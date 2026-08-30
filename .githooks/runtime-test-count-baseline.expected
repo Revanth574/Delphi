@@ -1,0 +1,36 @@
+# EXPECTED root-lane counts for the NEXT lane run — WRITTEN AND COMMITTED BEFORE IT RUNS.
+#
+# WHY THIS FILE EXISTS (D0A-R21-07). Two consecutive lane runs had a correct figure and a
+# WRONG explanation of it: R19-06 (the "+2" named an internal test leg as a second #[test])
+# and R20-07 (the "+1" named a test that already existed). The second happened while claiming
+# the first had made attribution "checkable". It had not — it had made it more confidently
+# phrased.
+#
+# THE FIX IS COMMIT ORDER, NOT PROSE. A file recording EXPECTED=n in the SAME commit as the
+# result is no more auditable than a sentence in a commit message: both are written knowing
+# the answer. Only `git log` showing this file's commit STRICTLY BEFORE the result's commit
+# establishes that the prediction predates the measurement. That is the entire property.
+#
+# PROTOCOL
+#   1. Derive the expectation from the unprivileged pair and the root-gating of each change.
+#   2. Commit THIS FILE ALONE, with the derivation in the message.
+#   3. Run the lane.
+#   4. Commit the measured pair in `.githooks/runtime-test-count-baseline.root`, SEPARATELY.
+#   5. A mismatch is a RESULT, not an error to reconcile — record which side was wrong.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# LANE RUN 11 — expectation, committed 2026-08-29 at d6fb698, BEFORE the run.
+#
+# DERIVATION, stated so it can be checked rather than believed:
+#   run 10 measured           EXECUTED=173 SKIPPED=5   (at unprivileged 153/25)
+#   unprivileged is now       EXECUTED=154 SKIPPED=25  (+1 since run 10)
+#   the +1 is `service::tests::a_gate_denied_action_sends_no_preview`, which is NOT
+#   root-gated — it uses a socketpair and a stub SessionSource, so it EXECUTES at root too.
+#   Therefore root gains exactly that one: 173 + 1 = 174, and no skip changes.
+#
+# The five root skips are unchanged: b1_daemon_binary (needs --features
+# insecure-test-seams), live_logind_query (standing DEFER), and three that skip BECAUSE the
+# run is privileged (an_unreadable_login_defs, a_regular_login_user_is_not_refused,
+# pidfd_refuses_a_recycled_pid_barrier).
+EXPECTED_EXECUTED=174
+EXPECTED_SKIPPED=5

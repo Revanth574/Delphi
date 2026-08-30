@@ -1892,9 +1892,17 @@ fn terminal_contract_release_produces_eof_no_wedge() {
     assert!(matches!(outcome, Outcome::Denied { .. }), "gate must DENY: {outcome:?}");
 
     let sfd = shell_ch.as_raw_fd();
-    // The preview reached the shell (the approval-request datagram).
-    assert!(matches!(nb_read(sfd), Rd::Data), "shell received the approval request");
-    // PRE-RELEASE: the daemon has NOT closed → the next read WOULD BLOCK (the wedge).
+    // D0A-R21-01: a gate-DENIED action sends NO preview, so there is no approval-request
+    // datagram to read here. This line used to assert one arrived — scaffolding that
+    // established "there is data before release", not the property under test. The property
+    // is the TERMINAL CONTRACT below: after `serve_one_action` returns, the daemon releases
+    // the channel so the shell sees EOF instead of wedging. That is unchanged, and the
+    // pre-release WouldBlock still distinguishes "not yet released" from "released".
+    //
+    // NOT a weakening: keeping the old assertion would require reverting a security fix, and
+    // the discriminating question — would this edit be made if the test were passing? — is
+    // answered by the weaken below, which removes the release and still fails.
+    // PRE-RELEASE: the daemon has NOT closed → the read WOULD BLOCK (the wedge).
     assert!(matches!(nb_read(sfd), Rd::WouldBlock), "pre-release: no EOF → the shell would wedge");
     // THE TERMINAL CONTRACT: delphi-runtimed releases the daemon channel after serve.
     drop(daemon_ch);

@@ -256,14 +256,28 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     ctx.store.insert(action);
     write_frame(ai, &pending_msg(&id))?;
 
-    // 2. preview → the pinned shell on the private channel.
-    send_approval_request(ctx.channel_fd, &digest, &preview_text)?;
-
-    // 3. logind gate (composed), then live PAM over the private channel.
-    // FIRST of two reads: refuse to PROMPT at a surface that is not the seat's foreground.
+    // 2. logind gate FIRST — the preview is not sent until the gate passes (D0A-R21-01,
+    // disclosure half). This used to send the preview and THEN gate, so a denied action had
+    // already disclosed its complete environment to the renderer. That inverted the
+    // justification for showing complete values, which is that the renderer holds the
+    // password: for a DENIED action it never receives one, and denied actions are the
+    // population most likely to carry something an attacker proposed.
+    //
+    // This is a DISCLOSURE fix and NOT a resolution of D0A-R21-01, whose other half —
+    // a compromised renderer displaying a benign preview while collecting the genuine
+    // password, since the relay mints from its OWN held digest — is architectural and is
+    // recorded as an open finding for the native-UI increment.
+    //
+    // FIRST of two gate reads: refuse to PROMPT at a surface that is not the seat's
+    // foreground.
     if let Err(cause) = gate_check(ctx.session) {
         return deny(ai, &id, &cause.denial(false));
     }
+
+    // 3. preview → the pinned shell on the private channel, only now.
+    send_approval_request(ctx.channel_fd, &digest, &preview_text)?;
+
+    // 3b. live PAM over the private channel.
     if authenticate_over_channel(ctx.pam_service, ctx.session_user, ctx.channel_fd).is_err() {
         return deny(ai, &id, "PAM authentication failed");
     }
@@ -516,6 +530,83 @@ mod accept_deadline_tests {
         assert!(
             msg.contains("never reached connect()") && msg.contains("SETUP failure"),
             "the error must name the AI and say this is setup, not protocol: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    struct Seatless;
+    impl crate::logind::SessionSource for Seatless {
+        fn current(&self) -> crate::logind::SessionResolution {
+            crate::logind::SessionResolution::LookupNoData
+        }
+    }
+
+    struct At(u64);
+    impl Clock for At {
+        fn now_unix(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// D0A-R21-01 (disclosure half) — A GATE-DENIED ACTION SENDS NO PREVIEW.
+    ///
+    /// The preview used to go out BEFORE `gate_check`, so an action the system refused had
+    /// already handed its complete environment to the renderer. That inverts the reason
+    /// complete values are shown at all — that the renderer holds the password — because for
+    /// a DENIED action it never receives one, and denied actions are the population most
+    /// likely to carry something an attacker proposed.
+    ///
+    /// The assertion is that the private channel saw ZERO bytes. A preview sent and then
+    /// denied still writes, so this notices the ordering being put back.
+    #[test]
+    fn a_gate_denied_action_sends_no_preview() {
+        let (daemon_end, shell_end) = crate::channel::approval_socketpair().expect("socketpair");
+        let (mut ai_daemon, mut ai_peer) = std::os::unix::net::UnixStream::pair().expect("ai pair");
+
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![pb::EnvVar { key: "SECRET".into(), value: "s3cret-value".into() }],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
+
+        let mut store = PendingStore::new();
+        let mut ledger = ConsumptionLedger::new();
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let mut ctx = ServiceCtx {
+            channel_fd: daemon_end.as_raw_fd(),
+            session: &Seatless,
+            key: &key,
+            pam_service: "delphi-runtime",
+            session_user: "nobody",
+            store: &mut store,
+            ledger: &mut ledger,
+            clock: &At(1_000),
+        };
+
+        let outcome = serve_one_action(&mut ai_daemon, &mut ctx).expect("serves");
+        assert!(matches!(outcome, Outcome::Denied { .. }), "the gate must deny: {outcome:?}");
+
+        // Close the daemon end so a read cannot block, then prove nothing was written.
+        drop(daemon_end);
+        let mut shell = std::fs::File::from(shell_end);
+        let mut buf = [0u8; 64];
+        let n = shell.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "a gate-denied action wrote {n} byte(s) to the private channel — the preview \
+             reached the renderer for an action the system refused"
         );
     }
 }

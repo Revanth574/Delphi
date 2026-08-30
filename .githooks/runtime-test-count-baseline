@@ -99,5 +99,8 @@
 # R20-06 changed existing tests rather than adding any — the arg test was renamed
 # (`preview_marks_what_an_interpreter_arg_names_not_the_arg`), which is a rename and not a
 # disappearance.
-EXECUTED=153
+# 2026-08-29 (D0A-R21-01 disclosure half): 153/25 -> 154/25. +1:
+# `service::tests::a_gate_denied_action_sends_no_preview`, the first test module in
+# service.rs.
+EXECUTED=154
 SKIPPED=25

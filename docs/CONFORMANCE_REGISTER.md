@@ -114,6 +114,24 @@ the enumerating guard, whose record is now decisive: seal check found 9 fixtures
 
 ## SUPERSEDED CLAIMS FROM `docs/TRUST_MODEL.md` §3 (relocated here 2026-08-23, D0A-R15-02)
 
+### THE PREVIEW-REDACTION QUESTION — three positions in three rounds (relocated 2026-08-29)
+
+Relocated from §3 the day it was written there. **The amendment recorded this table inside
+the normative text, which is exactly what D0A-R15-02 ruled against** — and the rule was not
+merely unobserved, it was ratified in the same document five rounds earlier. The operator
+asked for the history to be recorded and I put it in §3 without flagging that a ratified rule
+said otherwise. Both intents are served here: the live requirement (the actor/audience
+distinction) stays normative, the reasoning that got there lives with the other superseded
+claims.
+
+| round | position | why it was wrong / different |
+|---|---|---|
+| R18-05 | redaction **removed** | right conclusion, unsound reasoning: "the only entitled consumer" was checked at the AI socket and generalised. The renderer was never examined |
+| R19-04 | redaction **restored** | corrected the reasoning and reinstated a rule that **breaks injectivity** — measured, `DEPLOY=production` and `DEPLOY=staging` render identically while their digests differ. It also left `PYTHONPATH`/`NODE_OPTIONS`/`BASH_ENV` redacted though they select code |
+| R20-01 | redaction **removed by amendment** | different because it names the actor/audience distinction and amends this document rather than inferring a boundary from one socket. The removal is now a ratified contract change, not a code change against a live guard |
+
+
+
 **Why they live here.** A normative document's one job is to let a reader tell what is
 required. Struck-through history in §3 made the reader distinguish preserved-falsified text
 from active requirement, so the narratives moved and §3 keeps a pointer. The trail survives;

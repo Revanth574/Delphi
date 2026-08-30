@@ -2596,6 +2596,41 @@ than the parent's error (class 43). Here that discipline was written into the la
 before the test existed, and it converted `left: ""` — the signature that had cost this arc
 three inferences on four separate occasions — into a named cause on first use.
 
+## 47. A DOCUMENTED FLAKE IS A HYPOTHESIS WITH A NAME ATTACHED  *(new — D0A-R21-01 remediation, 2026-08-29)*
+
+**The shape.** A test with a recorded flake rate fails. Every surface signal agrees: the name
+matches, the rate is documented, re-running is what the documentation invites. **The name
+offers an excuse and it is not evidence.** A known-flaky test can also fail for a real
+reason, and the exemption is exactly what makes that failure cheap to ship.
+
+**The grounding instance.** `terminal_contract_release_produces_eof_no_wedge` is documented in
+CLAUDE.md §6 at ~7–10% failure under parallel execution. It failed the pre-commit gate; three
+subsequent whole-suite runs came back clean; the obvious reading was "flake, re-run". It was a
+**real regression** from the change in that same commit — an ordering fix that made a
+gate-denied action stop sending a preview, while the test asserted a preview arrived.
+
+**What discriminated, and what it cost.** The panic message was `shell received the approval
+request` — a sentence naming *the change*, not a timing artifact. Reading it cost nothing.
+Confirming cost one serial re-run: **5/5 deterministic**, against a documented ~7–10%.
+
+**The foreclosing discipline — cheap and specific:**
+
+1. **Read the assertion message before invoking the exemption.** A timing artifact and a
+   semantic regression produce different sentences. The name is on the test; the reason is in
+   the message.
+2. **Confirm serially.** A parallel-only flake passes serially; a regression does not. One run
+   distinguishes them, and `--test-threads=1` is already this project's authoritative mode for
+   fork+PAM shapes.
+3. **Suspect the exemption most when the change is recent.** The failure landed in the same
+   commit as the code that caused it — which is when a standing exemption is most dangerous
+   and least examined.
+
+**Relation to Iron Law #15 clause 5.** The law says the harness is guilty only when SHOWN to
+be, and warns that an undemonstrated harness excuse is how a real defect ships green. This is
+the sharpest form of that: **the excuse arrives pre-named, pre-documented, and with a
+measured rate behind it.** A prior measurement of flakiness is evidence about the test's
+history, never about this failure.
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

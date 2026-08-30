@@ -39,11 +39,16 @@ of those seventeen targets had never executed at root before run 3.
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**LANE RUN 9 (2026-08-27, current): `EXECUTED 171 / SKIPPED 5 / reported 176`**, rc 0,
-0 failures, 0 leaks, PAM intact, all 17 producers exited 0. **The D0A-R19-02 gate BIT on a
-real log rather than a fixture** — omitting `EXPECT_TARGETS` refuses at rc 2 and names what
-it prevents. Round 19's finding was that the gate had only ever been shown to PASS.
-`+1` against run 8 is R19-04's net (two restored redaction tests, minus the one asserting
+**LANE RUN 10 (2026-08-29, current): `EXECUTED 173 / SKIPPED 5 / reported 178`**, rc 0,
+0 failures, 0 leaks, PAM intact, all 17 producers exited 0, at the round-20 remediation.
+All three round-20 tests EXECUTE at root rather than skipping.
+
+**Run 9's `171 / 5 / 176` is SUPERSEDED** (as run 8's superseded run 7's). D0A-R21-07:
+run 10 was first recorded in the root baseline ONLY, leaving this row and PROGRESS still
+calling run 9 current — a contradictory record on the branch that has been most careful
+about exactly that.
+
+SUPERSEDED DETAIL — `+1` against run 8 is R19-04's net (two restored redaction tests, minus the one asserting
 the opposite) — **not** the NUL test, which already existed and belongs to run 7→8
 (D0A-R20-07, the second consecutive attribution error).
 

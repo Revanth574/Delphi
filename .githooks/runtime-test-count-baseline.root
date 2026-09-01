@@ -1,12 +1,14 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 11, 2026-08-29, at the round-21 remediation. rc 0, 0 failures, 0 leaks, PAM
+# LANE RUN 11, at the round-21 remediation (date: see `git log` on this file —
+# D0A-R22-02, the hand-written one was wrong). rc 0, 0 failures, 0 leaks, PAM
 # intact, all 17 producers exited 0. Parse-only extraction, gated by
 # DELPHI_TESTCOUNT_EXPECT_TARGETS and the per-target producer-status check.
 #
-# THE PREDICTION MATCHED, AND THE ORDER IS IN GIT RATHER THAN IN A SENTENCE.
+# THE PREDICTION MATCHED. THE ORDER IS IN GIT — AND ONLY BY CONVENTION (D0A-R22-01):
+# nothing reads the expectation before a run, so the sequence is followed, not enforced.
 # `.githooks/runtime-test-count-baseline.expected` recorded EXPECTED_EXECUTED=176
-# EXPECTED_SKIPPED=5 at e400bae, committed ALONE and BEFORE this run. This file records the
+# EXPECTED_SKIPPED=5, committed ALONE and BEFORE this run. This file records the
 # measurement, committed separately after it (protocol step 4). `git log` on the two files
 # establishes the ordering — which is the property R19-06 and R20-07 both lacked, where the
 # figure was right and the explanation was reconstructed afterwards.

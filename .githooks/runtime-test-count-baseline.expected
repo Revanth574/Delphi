@@ -1,59 +1,64 @@
-# EXPECTED root-lane counts for the NEXT lane run — WRITTEN AND COMMITTED BEFORE IT RUNS.
+# EXPECTED root-lane counts for the NEXT lane run — COMMITTED BEFORE IT RUNS.
 #
 # WHY THIS FILE EXISTS (D0A-R21-07). Two consecutive lane runs had a correct figure and a
-# WRONG explanation of it: R19-06 (the "+2" named an internal test leg as a second #[test])
-# and R20-07 (the "+1" named a test that already existed). The second happened while claiming
-# the first had made attribution "checkable". It had not — it had made it more confidently
-# phrased.
+# WRONG explanation: R19-06 (a "+2" that named an internal test leg as a second #[test]) and
+# R20-07 (a "+1" that named a test which already existed). The second happened while claiming
+# the first had made attribution "checkable".
 #
-# THE FIX IS COMMIT ORDER, NOT PROSE. A file recording EXPECTED=n in the SAME commit as the
-# result is no more auditable than a sentence in a commit message: both are written knowing
-# the answer. Only `git log` showing this file's commit STRICTLY BEFORE the result's commit
-# establishes that the prediction predates the measurement. That is the entire property.
+# NO DATES OR COMMIT HASHES ARE WRITTEN IN THIS FILE (D0A-R22-02). The first version recorded
+# both by hand and BOTH WERE WRONG: it dated the predictions 2026-08-29 when the commits are
+# 2026-08-30 and the result is 2026-09-01, and it labelled them "committed at <hash>" using
+# the TREE THEY WERE DERIVED FROM rather than the commit that introduced them. A hand-copied
+# provenance in the one file whose entire claim is *git establishes the ordering* can only be
+# redundant or false. It was false. Use:
+#
+#   git log --format='%h %ad %s' --date=iso -- .githooks/runtime-test-count-baseline.expected
+#   git log --format='%h %ad %s' --date=iso -- .githooks/runtime-test-count-baseline.root
+#
+# TARGET_TREE below names the tree the derivation was computed against — a DIFFERENT thing
+# from the commit that introduces this file, and conflating them is what produced the error.
+#
+# WHAT THIS FILE DOES NOT DO, STATED PLAINLY (D0A-R22-01). Nothing consumes it. No hook, no
+# runner, no CI job reads it before a lane run. The ordering it claims is a CONVENTION the
+# author follows, not an invariant anything enforces: a lane measured first, an expectation
+# committed second and a result committed third produce history indistinguishable from the
+# required sequence. Until a tool binds tree + expectation + observed counts + captured time
+# into one artifact and returns non-zero on mismatch, THIS FILE IS DOCUMENTATION, NOT PROOF.
 #
 # PROTOCOL
 #   1. Derive the expectation from the unprivileged pair and the root-gating of each change.
 #   2. Commit THIS FILE ALONE, with the derivation in the message.
 #   3. Run the lane.
 #   4. Commit the measured pair in `.githooks/runtime-test-count-baseline.root`, SEPARATELY.
-#   5. A mismatch is a RESULT, not an error to reconcile — record which side was wrong.
+#   5. A mismatch is a RESULT. Record which side was wrong; do not adjust the derivation
+#      until it agrees.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPERSEDED — LANE RUN 11, first expectation (committed 2026-08-29 at d6fb698)
+# SUPERSEDED — LANE RUN 11, first expectation. NEVER MEASURED.
 #
-#   EXPECTED_EXECUTED=174  EXPECTED_SKIPPED=5
+#   EXPECTED_EXECUTED=174  EXPECTED_SKIPPED=5   TARGET_TREE=d6fb698
 #
-# NEVER MEASURED, and that is normal rather than a failure. It was derived from an
-# unprivileged 154/25; the R21-03 and R21-05 tests then landed and moved the tree to 156/25
-# before run 11 happened. The protocol's answer to drift is to RE-DERIVE and re-commit, not
-# to adjust the old number — amending it in the same commit as the tests that invalidated it
-# would have destroyed the only property this file has, which is that the prediction predates
-# the measurement. A reader of `git log` will see a prediction with no result beside it; this
-# note is why.
+# Derived from an unprivileged 154/25; the R21-03 and R21-05 tests then moved the tree to
+# 156/25 before run 11 happened. Drift is the normal case and the protocol answers it by
+# RE-DERIVING in a separate commit, not by adjusting — amending would have been tidier and
+# would have made the file indistinguishable from a claim written after the fact.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# LANE RUN 11 — expectation, committed 2026-08-29 at 298d4db, BEFORE the run.
+# LANE RUN 11 — MEASURED 176/5, matching. TARGET_TREE=298d4db
+#
+#   EXPECTED_EXECUTED=176  EXPECTED_SKIPPED=5
 #
 # DERIVATION, written so it can be checked rather than believed:
 #   run 10 measured           EXECUTED=173 SKIPPED=5   (at unprivileged 153/25)
-#   unprivileged is now       EXECUTED=156 SKIPPED=25  (+3 since run 10)
-#
-#   The +3, each VERIFIED not root-gated (no geteuid check, no SKIP branch, no
-#   bwrap_available guard — grepped, not assumed), so each executes at root as well:
-#     1. service::tests::a_gate_denied_action_sends_no_preview          (R21-01, socketpair
-#        + stub SessionSource)
-#     2. action::tests::preview_renders_the_bound_schema_version        (R21-03, pure)
+#   unprivileged at 298d4db   EXECUTED=156 SKIPPED=25  (+3 since run 10)
+#   the +3, each VERIFIED not root-gated by grep (no geteuid check, no SKIP branch, no
+#   bwrap_available guard), so each executes at root as well:
+#     1. service::tests::a_gate_denied_action_sends_no_preview
+#     2. action::tests::preview_renders_the_bound_schema_version
 #     3. service::tests::an_oversized_preview_is_denied_before_the_action_is_stored
-#        (R21-05, socketpair + stub SessionSource)
+#   therefore 173 + 3 = 176, no skip change.
 #
-#   Therefore root gains exactly three: 173 + 3 = 176, and NO skip changes.
-#
-# The five root skips are unchanged: b1_daemon_binary (needs --features
-# insecure-test-seams), live_logind_query (standing DEFER), and three that skip BECAUSE the
-# run is privileged (an_unreadable_login_defs, a_regular_login_user_is_not_refused,
-# pidfd_refuses_a_recycled_pid_barrier).
-#
-# IF THE MEASUREMENT DISAGREES, that is a RESULT. Record which side was wrong — the
-# derivation above is the thing to check first, since it is the part that can be audited.
-EXPECTED_EXECUTED=176
-EXPECTED_SKIPPED=5
+# ─────────────────────────────────────────────────────────────────────────────
+# LANE RUN 12 — no expectation recorded yet. Derive and commit ALONE before running.
+EXPECTED_EXECUTED=
+EXPECTED_SKIPPED=

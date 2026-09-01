@@ -6,9 +6,13 @@
 //! the AI's general socket (protobuf, [`wire`](crate::wire)) and the shell's private
 //! `SOCK_SEQPACKET` channel. One action, end to end:
 //!
-//! 1. read `Propose` (general socket) → **canonicalize + store** the one canonical
-//!    object under a `pending_id` → reply `Pending`.
-//! 2. deliver the preview to the shell (private channel).
+//! 1. read `Propose` (general socket) → **canonicalize** the one canonical object.
+//! 2. **refuse an unpresentable action** — a preview too large for the private channel is
+//!    denied BEFORE the store and BEFORE the `Pending` reply (D0A-R21-05).
+//! 3. **logind gate**, BEFORE the preview is sent (D0A-R21-01) — a denied action must not
+//!    disclose its environment to a renderer that will never receive a password.
+//! 4. store the object under a `pending_id`, reply `Pending`, and deliver the preview to the
+//!    shell (private channel).
 //! 3. **logind gate** (the ADDED composition — proven in `logind_gate`, here in the
 //!    sequence) → live **PAM** over the private channel.
 //! 4. read the shell's mint-confirm (private channel) → verify it matches the stored
@@ -684,8 +688,18 @@ mod tests {
         // Close the daemon end so a read cannot block, then prove nothing was written.
         drop(daemon_end);
         let mut shell = std::fs::File::from(shell_end);
+        // D0A-R22-07: `unwrap_or(0)` made EVERY read error look like a clean EOF, so an
+        // interrupted read would have "proved" nothing was sent. Retry EINTR; any other error
+        // is a failed measurement, not a zero.
         let mut buf = [0u8; 64];
-        let n = shell.read(&mut buf).unwrap_or(0);
+        let n = loop {
+            match shell.read(&mut buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("reading the private channel failed ({e}) — this measures \
+                                  nothing about whether a preview was sent"),
+            }
+        };
         assert_eq!(
             n, 0,
             "a gate-denied action wrote {n} byte(s) to the private channel — the preview \

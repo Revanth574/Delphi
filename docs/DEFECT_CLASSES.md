@@ -2609,21 +2609,43 @@ subsequent whole-suite runs came back clean; the obvious reading was "flake, re-
 **real regression** from the change in that same commit — an ordering fix that made a
 gate-denied action stop sending a preview, while the test asserted a preview arrived.
 
-**What discriminated, and what it cost.** The panic message was `shell received the approval
-request` — a sentence naming *the change*, not a timing artifact. Reading it cost nothing.
-Confirming cost one serial re-run: **5/5 deterministic**, against a documented ~7–10%.
+**What actually discriminated.** The panic message pointed at the change; reading the test
+then established the MECHANISM — the ordering fix made a gate-denied action stop sending a
+preview, and the assertion required one. **That mechanism is what settled it.** The 5/5
+serial re-run was corroboration and, as D0A-R22-04 records, was run in the wrong
+configuration for this test's shape and is too small a sample to compare against a rate.
 
-**The foreclosing discipline — cheap and specific:**
+**THE FIRST DISCIPLINE WRITTEN HERE WAS WRONG, AND IT WAS WRONG BY OVER-GENERALISING ONE
+DIAGNOSIS (corrected 2026-09-01, D0A-R22-04).** It said: read the assertion message, confirm
+serially, suspect the exemption when the change is recent. Three of those claims do not hold:
 
-1. **Read the assertion message before invoking the exemption.** A timing artifact and a
-   semantic regression produce different sentences. The name is on the test; the reason is in
-   the message.
-2. **Confirm serially.** A parallel-only flake passes serially; a regression does not. One run
-   distinguishes them, and `--test-threads=1` is already this project's authoritative mode for
-   fork+PAM shapes.
-3. **Suspect the exemption most when the change is recent.** The failure landed in the same
-   commit as the code that caused it — which is when a standing exemption is most dangerous
-   and least examined.
+- **An assertion message does not identify the cause.** It named the change *in this
+  instance*. A timing failure can trip a semantic-sounding assertion, and a semantic
+  regression can surface as a timeout.
+- **Serial confirmation is not a discriminator.** A genuine flake can fail serially, and a
+  CONCURRENCY regression can PASS serially — which is the dangerous direction, because the
+  rule would then excuse a real defect.
+- **One run distinguishes nothing.** 5/5 is a sample, not a rate, and the class was written
+  from it as though it were a proof.
+
+**And the confirmation used the wrong mode for that test's shape.**
+`terminal_contract_release_produces_eof_no_wedge` is an **fd/socket** test, not a fork+PAM
+one, so CLAUDE.md §6's carve-out does not apply to it and its authoritative configuration is
+**≥30 runs under DEFAULT PARALLEL settings**. It was confirmed with 5 serial runs — the
+configuration the carve-out reserves for a different shape.
+
+**The corrected discipline:**
+
+1. **Treat the message and a serial run as CLUES, not verdicts.** They are cheap and they
+   point somewhere; they do not conclude.
+2. **Reproduce under the configuration where the failure was MEASURED.** A parallel failure
+   is investigated in parallel. Switching configuration changes the subject.
+3. **Establish the MECHANISM.** "Which line, and why does the change reach it" is the thing
+   that ends the question — here, the ordering change made a gate-denied action stop sending a
+   preview while the test asserted one arrived. That was determinable by reading, and it is
+   what actually settled it.
+4. **Compare RATES over ≥30 runs in the failing configuration**, per §6. A documented ~7–10%
+   and an observed 100% are distinguishable only by a sample large enough to tell them apart.
 
 **Relation to Iron Law #15 clause 5.** The law says the harness is guilty only when SHOWN to
 be, and warns that an undemonstrated harness excuse is how a real defect ships green. This is

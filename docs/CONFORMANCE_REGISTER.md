@@ -39,9 +39,10 @@ of those seventeen targets had never executed at root before run 3.
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**LANE RUN 10 (2026-08-29, current): `EXECUTED 173 / SKIPPED 5 / reported 178`**, rc 0,
-0 failures, 0 leaks, PAM intact, all 17 producers exited 0, at the round-20 remediation.
-All three round-20 tests EXECUTE at root rather than skipping.
+**LANE RUN 11 (current): `EXECUTED 176 / SKIPPED 5 / reported 181`**, rc 0, 0 failures,
+0 leaks, PAM intact, all 17 producers exited 0, at the round-21 remediation. Its figure
+was recorded as an expectation in a separate, earlier commit and matched — though see
+D0A-R22-01: the ordering is convention, not mechanism. Run 10's `173 / 5` is superseded.
 
 **Run 9's `171 / 5 / 176` is SUPERSEDED** (as run 8's superseded run 7's). D0A-R21-07:
 run 10 was first recorded in the root baseline ONLY, leaving this row and PROGRESS still
@@ -118,6 +119,30 @@ the enumerating guard, whose record is now decisive: seal check found 9 fixtures
 2, credential guard 7, chown guard 5 — **reading found 0.**
 
 ## SUPERSEDED CLAIMS FROM `docs/TRUST_MODEL.md` §3 (relocated here 2026-08-23, D0A-R15-02)
+
+### THE §4 ID-ONLY RATIFICATION — why it differs from the four before it (relocated, D0A-R22-05)
+
+Written into normative §4 by D0A-R21-02 and relocated here one round later. **The relocation
+is itself the finding:** §3's history had just been moved for exactly this reason, and the
+same defect was committed in §4 in the next commit — the rule was applied to the section that
+had been criticised rather than to the class.
+
+**THIS AMENDMENT RATIFIES BEHAVIOUR; IT DOES NOT CHANGE IT (D0A-R21-02).** §3 and §4 have now
+been amended five times in this arc, and it matters that this one is a different kind. The
+four before it changed a claim to match an argument and three were then reversed. **This one
+changes the document to match what the code has always done:** `runtime_wire.proto`'s
+`Pending` has only ever carried `pending_id`, and `service.rs` has only ever sent that. The
+divergence was the DOCUMENT describing a flow the implementation never had — and it was not
+harmless, because R18-05 cited that never-implemented flow as a reason redaction could be
+removed. An unrecorded divergence became load-bearing for a security decision.
+
+Ratifying the stricter behaviour is also the only reading compatible with §3 as amended: the
+complete preview is rendered for the renderer as a trusted audience, so delivering it to the
+AI — which §1 treats as the adversary — would disclose every environment value to exactly the
+party the preview exists to defend against. If a sanitised AI-facing rendering is ever needed,
+it is a separate function with its own stated audience.
+
+
 
 ### THE PREVIEW-REDACTION QUESTION — three positions in three rounds (relocated 2026-08-29)
 

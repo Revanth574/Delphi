@@ -862,21 +862,13 @@ impersonate the approver.
 
 ### The flow
 
-**THIS AMENDMENT RATIFIES BEHAVIOUR; IT DOES NOT CHANGE IT (D0A-R21-02).** §3 and §4 have now
-been amended five times in this arc, and it matters that this one is a different kind. The
-four before it changed a claim to match an argument and three were then reversed. **This one
-changes the document to match what the code has always done:** `runtime_wire.proto`'s
-`Pending` has only ever carried `pending_id`, and `service.rs` has only ever sent that. The
-divergence was the DOCUMENT describing a flow the implementation never had — and it was not
-harmless, because R18-05 cited that never-implemented flow as a reason redaction could be
-removed. An unrecorded divergence became load-bearing for a security decision.
-
-Ratifying the stricter behaviour is also the only reading compatible with §3 as amended: the
-complete preview is rendered for the renderer as a trusted audience, so delivering it to the
-AI — which §1 treats as the adversary — would disclose every environment value to exactly the
-party the preview exists to defend against. If a sanitised AI-facing rendering is ever needed,
-it is a separate function with its own stated audience.
-
+**The AI receives an ID and nothing else.** Delivering the preview to the AI — which §1
+treats as the adversary — would hand it every environment value, and §3 renders the complete
+action for the renderer as a trusted audience. **Why this requirement was amended rather than
+enforced, and how it differs from the four amendments before it, is in
+`docs/CONFORMANCE_REGISTER.md`** (D0A-R21-02) — relocated there by D0A-R22-05, because
+D0A-R15-02 already ruled that superseded reasoning does not live in the normative text, and
+putting five amendments' history here repeated the defect one commit after §3's was moved.
 
 1. AI requests → arbiter builds `PendingAction` (§3) → returns `Pending {pending_id}`.
    **The AI receives an ID AND NOTHING ELSE — no preview, no token** (ratified 2026-08-29,
@@ -887,11 +879,22 @@ it is a separate function with its own stated audience.
 3. **Consent event.** Human clicks Approve/Deny. For a high-risk tier the **daemon** runs the
    logind active-session gate, then **`pam_authenticate`**, driving the conversation over the
    private channel to the pinned shell. Failure/absent session → DENY.
-4. **Mint (private channel only).** The shell returns `{pending_id, action_digest,
-   preview_version}` on the private channel; the arbiter verifies digest + version +
-   freshness **and the PAM result** for high-risk, then mints the HMAC capability
-   ([token.rs:67](die/inference/src/token.rs:67)) with the **root-held key**, bound to the
-   digest + TTL. The mint is reachable **only** here.
+4. **Mint (private channel only).** The shell returns **exactly `[digest:32]`** — the
+   action digest and nothing else. The arbiter checks **digest equality against the stored
+   action** and re-reads the **logind gate** adjacently to the mint (D0A-R1-02: PAM waits on a
+   human unboundedly, so a session going true→false during authentication must not mint), then
+   mints the HMAC capability with the **root-held key**, bound to the digest + TTL. The mint is
+   reachable **only** here.
+
+   **CORRECTED 2026-09-01 (D0A-R22-06).** This step described the shell returning
+   `{pending_id, action_digest, preview_version}` and the arbiter verifying "digest + version
+   + freshness". None of those three was accurate: the wire carries a bare 32-byte digest
+   (`service.rs`, `mint confirm (shell→daemon): [digest:32]`), `pending_id` and
+   `preview_version` are **bound by** that digest rather than transmitted beside it, and **no
+   pending-age freshness check exists** — what is re-read is the session gate, which is a
+   different property. A normative flow describing fields the protocol does not carry is the
+   same defect class as §4's `{pending_id, preview}` (D0A-R21-02), found in the round that
+   ratified it.
 5. **Complete (general socket).** The AI presents the token; the arbiter consumes it
    one-shot, **re-verifies the digest** against the live `PendingAction`, and executes the
    §6 sandbox built from that object.

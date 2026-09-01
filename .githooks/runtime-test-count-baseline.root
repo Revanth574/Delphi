@@ -1,20 +1,28 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 10, 2026-08-29, at the round-20 remediation. Parse-only extraction over the
-# concatenated per-target log, gated by DELPHI_TESTCOUNT_EXPECT_TARGETS and the per-target
-# producer-status check. rc 0, 0 failures, 0 leaks, PAM intact, all 17 producers exited 0.
+# LANE RUN 11, 2026-08-29, at the round-21 remediation. rc 0, 0 failures, 0 leaks, PAM
+# intact, all 17 producers exited 0. Parse-only extraction, gated by
+# DELPHI_TESTCOUNT_EXPECT_TARGETS and the per-target producer-status check.
 #
-# +2 against run 9's 171, and THE FIGURE WAS PREDICTED BEFORE THE RUN, not reconstructed
-# after it. Three tests were added by the round-20 remediation (R20-01's injectivity
-# regression, R20-02's non-UTF-8 refusal, R20-03's choke-point test) and one was removed
-# net of the redaction pair; all three new ones EXECUTE at root rather than skipping.
-# This matters because D0A-R19-06 and D0A-R20-07 were both attribution errors against a
-# correct figure, and the second occurred while claiming the first had made attribution
-# 'checkable'. Stating the number in advance is what makes it checkable; restating it
-# afterwards is what failed twice.
+# THE PREDICTION MATCHED, AND THE ORDER IS IN GIT RATHER THAN IN A SENTENCE.
+# `.githooks/runtime-test-count-baseline.expected` recorded EXPECTED_EXECUTED=176
+# EXPECTED_SKIPPED=5 at e400bae, committed ALONE and BEFORE this run. This file records the
+# measurement, committed separately after it (protocol step 4). `git log` on the two files
+# establishes the ordering — which is the property R19-06 and R20-07 both lacked, where the
+# figure was right and the explanation was reconstructed afterwards.
+#
+# The derivation that was checked, not merely the number that matched: run 10 measured
+# 173/5; unprivileged moved 153/25 -> 156/25; the +3 were each verified not root-gated
+# (no geteuid check, no SKIP branch, no bwrap_available guard); 173 + 3 = 176, skips
+# unchanged. All five skips reappeared with their named blockers.
+#
+# THE PROTOCOL ALSO SURVIVED DRIFT ON ITS FIRST USE. An earlier expectation (174/5, at
+# d6fb698) was invalidated when the R21-03 and R21-05 tests landed. It was RE-DERIVED in a
+# separate commit rather than amended; amending would have looked tidier and would have
+# destroyed the only property the file has.
 #
 # NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
-# the run is privileged and execute unprivileged, so 173 and 153 are overlapping sets and
+# the run is privileged and execute unprivileged, so 176 and 156 are overlapping sets and
 # neither contains the other.
-EXECUTED=173
+EXECUTED=176
 SKIPPED=5

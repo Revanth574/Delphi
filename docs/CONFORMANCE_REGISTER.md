@@ -118,6 +118,59 @@ before the marker**, so a fifth cause names itself instead of costing three infe
 the enumerating guard, whose record is now decisive: seal check found 9 fixtures, digest check
 2, credential guard 7, chown guard 5 — **reading found 0.**
 
+## THE LANE RUNNER — BUILT TO CLOSE D0A-R22-01, REVERTED AT D0A-R23 (2026-09-02)
+
+**Not deferred. Reverted, with the reason.**
+
+`scripts/lane-run.sh` was built because D0A-R22-01 found the expectation protocol's ordering
+claim was enforced by nothing — no hook, no runner, no CI job read the expectation before a
+run, so "the prediction predates the measurement" rested on the author's habit. The runner
+read the committed blob, refused a working copy that differed, refused an expectation
+committed beside a result, and bound tree + blob + counts + times into an artifact.
+
+**It worked, once, and that result is banked.** Run 12's artifact binds expectation commit
+`c16c3e9` to tree `0330b46` and remains checkable by someone who was not present. Removing the
+runner does not remove what it proved.
+
+**Round 23 returned 8×P1 against it**, and one of them decided the question:
+
+> **D0A-R23-05 — the replacement dropped five checks the procedure it superseded performed:**
+> helper-digest, free-space, forced-freshness, stale-session, and PAM before/after.
+
+That is not a new tool with gaps. It is a **regression in safety coverage sold as an
+upgrade**, on the path that produces every piece of root evidence this branch has — and
+class-16 PAM damage is a defect this project has already paid for once. The others: the
+runner certified its own target universe (R23-01), labelled a wholly-failing lane
+`DID_NOT_RUN` (R23-02), failed open when the artifact could not be written (R23-03), left no
+usable evidence on a hang or failure (R23-04), and could not enforce its own
+artifact-outside-the-tree property (R23-08).
+
+### THE FAILURE MODE, NAMED: class 48, at the level of a whole procedure
+
+**The runner replaced a procedure whose checks were load-bearing without enumerating them.**
+D0A-R22-01 named an instance — unenforced ordering — and the fix was scoped to that instance
+rather than to the class, which was *everything the procedure guaranteed*. Four of class 48's
+five recorded instances are now in this arc, and this is the largest: the others moved a
+sentence or a record, this one moved a safety boundary.
+
+### AND THE ROUND-SEQUENCE THAT PRODUCED IT
+
+Round 21's remediation produced round 22's findings; round 22's produced the runner; the
+runner produced round 23's eight P1s. **The product surface had not moved for three rounds —
+every finding in that stretch was verification infrastructure reviewing verification
+infrastructure.** That is the terminus shape the B2a composition sweep closed on ("round 7's
+fix created round 8's subject"), reached again and recognised from inside it rather than
+afterwards.
+
+**What is kept:** the expectation file and its protocol (enforced by convention, with the
+manual procedure's checks intact), `DEFECT_CLASSES` 47 and 48, and the record corrections from
+D0A-R23-06 and R23-11.
+
+**What a future increment inherits:** R23-01 through R23-10 are, between them, a written
+specification for a runner that would be worth having. It needs its own design, its own
+rounds and its own lane runs — not remediation folded into a branch whose product work is
+done.
+
 ## SUPERSEDED CLAIMS FROM `docs/TRUST_MODEL.md` §3 (relocated here 2026-08-23, D0A-R15-02)
 
 ### THE §4 ID-ONLY RATIFICATION — why it differs from the four before it (relocated, D0A-R22-05)

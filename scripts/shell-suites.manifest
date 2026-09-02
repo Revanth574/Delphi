@@ -10,5 +10,4 @@
 ./runtime/tests/pidfd-barrier.test.sh
 ./scripts/check-stale-test-sessions.test.sh
 ./scripts/ci-test-count-gate.test.sh
-./scripts/lane-run.test.sh
 ./scripts/test-count.test.sh

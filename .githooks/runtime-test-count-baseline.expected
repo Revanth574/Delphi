@@ -18,16 +18,17 @@
 # TARGET_TREE below names the tree the derivation was computed against — a DIFFERENT thing
 # from the commit that introduces this file, and conflating them is what produced the error.
 #
-# WHAT CONSUMES IT (D0A-R22-01, superseding this file's earlier "nothing does").
-# `scripts/lane-run.sh` reads the COMMITTED blob before a run, refuses if the working copy
-# differs, refuses if the expectation was committed beside a result, and binds tree +
-# expectation blob + commit + observed counts + captured times into an artifact outside the
-# repository. Run 12 was the first use.
+# WHAT CONSUMES IT: NOTHING. The ordering is a CONVENTION followed by hand.
 #
-# **ITS RELIABILITY IS UNDER REVIEW (D0A-R23, 8×P1).** The runner certifies its own target
-# universe, mislabels a wholly-failing lane as DID_NOT_RUN, fails open when the artifact
-# cannot be written, and drops safety checks the manual procedure performed. Until those are
-# closed, a green from it is weaker evidence than its own output implies.
+# `scripts/lane-run.sh` consumed it for exactly one run (run 12) and was then REVERTED —
+# D0A-R23 returned 8×P1 against it, including that it had dropped five safety checks
+# `scratch/lane-run-7-procedure.md` performs. A mechanism with eight open P1s that omits
+# helper-digest, free-space, forced-freshness, stale-session and PAM before/after checks is
+# weaker than a convention a human follows WITH them.
+#
+# So this file is DOCUMENTATION, NOT PROOF, and says so again rather than quietly reverting to
+# the claim R22-01 falsified. What run 12 proved is banked and survives: its artifact binds
+# expectation commit c16c3e9 to tree 0330b46, and that remains checkable.
 #
 # PROTOCOL
 #   1. Derive the expectation from the unprivileged pair and the root-gating of each change.

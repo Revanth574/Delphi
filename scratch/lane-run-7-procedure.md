@@ -10,17 +10,18 @@
 > defect that amendment closes is one run 7 itself could have hidden, so the amendment is
 > recorded here rather than silently applied.
 
-> **SUPERSEDED AS A PROCEDURE BY `scripts/lane-run.sh` (D0A-R22-01).** Runs 7–11 followed the
-> steps below by hand. D0A-R22-01 found the ordering they claimed was a CONVENTION nothing
-> enforced — no hook, no runner, no CI job read the expectation before a run, so measuring
-> first and committing an expectation afterwards produced indistinguishable history. The
-> script now performs the gates: expectation committed and matching its blob, its commit in
-> history, **not committed beside a result**, a numeric expectation present, and a clean tree
-> — then runs the targets and writes an artifact binding tree + expectation blob + counts +
-> captured times, returning non-zero on mismatch WITHOUT deleting the record.
+> **THIS IS THE SANCTIONED PROCEDURE. A runner that superseded it was REVERTED (D0A-R23).**
+> `scripts/lane-run.sh` was built to close D0A-R22-01 — the expectation protocol's ordering
+> was enforced by nothing — and it worked: run 12's ordering is machine-checkable and that
+> evidence survives its removal. But round 23 returned **8×P1 against the runner**, and
+> D0A-R23-05 is the one that decided it: **the runner dropped five checks this procedure
+> performs** — helper-digest, free-space, forced-freshness, stale-session, and PAM
+> before/after. That is not a new tool with gaps; it is a REGRESSION IN SAFETY COVERAGE sold
+> as an upgrade, on the path that produces every piece of root evidence this branch has, and
+> class-16 PAM damage is a defect this project has already paid for once.
 >
-> **This document remains the explanation.** The script enforces; the prose below says why
-> each step exists, and a reader who only has the script cannot reconstruct that.
+> **The ordering protocol therefore remains enforced by CONVENTION**, with §4's steps
+> followed by hand — which is what runs 7–11 did — and with every check below intact.
 
 **Why this run exists.** `runtime/src/**` has changed **three times** since run 6's clean
 sheet, and none of it has executed at root:

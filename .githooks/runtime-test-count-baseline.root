@@ -1,27 +1,21 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 11, at the round-21 remediation (date: see `git log` on this file —
-# D0A-R22-02, the hand-written one was wrong). rc 0, 0 failures, 0 leaks, PAM
-# intact, all 17 producers exited 0. Parse-only extraction, gated by
-# DELPHI_TESTCOUNT_EXPECT_TARGETS and the per-target producer-status check.
+# LANE RUN 12 — the FIRST run through `scripts/lane-run.sh`, and the first whose ordering is
+# readable from evidence rather than from a commit message.
 #
-# THE PREDICTION MATCHED. THE ORDER IS IN GIT — AND ONLY BY CONVENTION (D0A-R22-01):
-# nothing reads the expectation before a run, so the sequence is followed, not enforced.
-# `.githooks/runtime-test-count-baseline.expected` recorded EXPECTED_EXECUTED=176
-# EXPECTED_SKIPPED=5, committed ALONE and BEFORE this run. This file records the
-# measurement, committed separately after it (protocol step 4). `git log` on the two files
-# establishes the ordering — which is the property R19-06 and R20-07 both lacked, where the
-# figure was right and the explanation was reconstructed afterwards.
+#   status=RAN_MATCH   expected 176/5   observed 176/5   producer_failures=0
+#   extractor_rc=0     tree=0330b46     expectation_commit=c16c3e9
 #
-# The derivation that was checked, not merely the number that matched: run 10 measured
-# 173/5; unprivileged moved 153/25 -> 156/25; the +3 were each verified not root-gated
-# (no geteuid check, no SKIP branch, no bwrap_available guard); 173 + 3 = 176, skips
-# unchanged. All five skips reappeared with their named blockers.
+# THE EXPECTATION COMMIT IS THREE COMMITS BEHIND THE TREE, and the artifact records both.
+# That is the property the protocol asserted from R21-07 onward and could not demonstrate:
+# a reader who was not present can now check that the prediction predates the measurement,
+# because the runner read a COMMITTED blob it could not have written and bound the pair into
+# one artifact. The three commits between are runner fixes; none touched a Rust test, which
+# is what the derivation predicted and why the figure holding is informative rather than
+# merely unchanged.
 #
-# THE PROTOCOL ALSO SURVIVED DRIFT ON ITS FIRST USE. An earlier expectation (174/5, at
-# d6fb698) was invalidated when the R21-03 and R21-05 tests landed. It was RE-DERIVED in a
-# separate commit rather than amended; amending would have looked tidier and would have
-# destroyed the only property the file has.
+# Artifact (outside the repository, so it does not change the tree it names):
+#   ~/.local/state/delphi/lane-artifacts/lane-20260902T174359Z-0330b46.txt
 #
 # NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
 # the run is privileged and execute unprivileged, so 176 and 156 are overlapping sets and

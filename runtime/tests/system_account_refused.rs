@@ -37,9 +37,21 @@ fn is_system_account_refusal(text: &str, name: &str, uid: &str) -> bool {
 
 /// Pre-guard, THIS is where `--session root` died as an unprivileged caller — the
 /// root-owned runtime directory. Its presence means user resolution was passed.
+///
+/// **D0A-R23-12 — the `|| t.contains("permission denied")` alternative is REMOVED.** It was
+/// generic enough that ANY permission error satisfied it, so the positive control could pass
+/// for a reason unconnected to the guard. The daemon's actual anchor failure is
+/// `establishing the root-owned runtime directory`; "permission denied" appears only in the
+/// `Caused by:` chain beneath it, which is precisely the part another failure could forge.
+///
+/// **RESIDUAL, recorded rather than closed:** this is still a LATER-STAGE oracle — it infers
+/// "the guard passed" from "a subsequent stage was reached", so a new stage inserted between
+/// the guard and the anchor would invalidate it without any test going red. That is the same
+/// shape as a positive control asserting `build failed`. Closing it properly needs the daemon
+/// to emit a structured guard-passed witness; until then the narrowing above at least stops
+/// an UNRELATED error from satisfying it.
 fn reached_the_anchor(text: &str) -> bool {
-    let t = text.to_lowercase();
-    t.contains("runtime directory") || t.contains("permission denied")
+    text.to_lowercase().contains("root-owned runtime directory")
 }
 
 #[test]

@@ -6,22 +6,31 @@
 //! the AI's general socket (protobuf, [`wire`](crate::wire)) and the shell's private
 //! `SOCK_SEQPACKET` channel. One action, end to end:
 //!
-//! 1. read `Propose` (general socket) → **canonicalize** the one canonical object.
+//! **Transcribed from the implementation below, not from intent (D0A-R23-13).** The previous
+//! version placed the gate before the store and the reply, duplicated a step number, and left
+//! the old numbering beside the new — in the commit that claimed to renumber it. Read
+//! `serve_one_action` and this list together; if they disagree, this list is wrong.
+//!
+//! 1. read `Propose` (general socket) → **canonicalize** the one canonical object, then
+//!    render its preview.
 //! 2. **refuse an unpresentable action** — a preview too large for the private channel is
-//!    denied BEFORE the store and BEFORE the `Pending` reply (D0A-R21-05).
-//! 3. **logind gate**, BEFORE the preview is sent (D0A-R21-01) — a denied action must not
-//!    disclose its environment to a renderer that will never receive a password.
-//! 4. store the object under a `pending_id`, reply `Pending`, and deliver the preview to the
-//!    shell (private channel).
-//! 3. **logind gate** (the ADDED composition — proven in `logind_gate`, here in the
-//!    sequence) → live **PAM** over the private channel.
-//! 4. read the shell's mint-confirm (private channel) → verify it matches the stored
-//!    digest → **mint** the digest-bound token → reply `Granted`.
-//! 5. read `Present{pending_id, token}` (NO action data) → execute the **STORED**
+//!    denied here, BEFORE the store and BEFORE the `Pending` reply, so a size problem
+//!    refuses one action instead of aborting the service call (D0A-R21-05).
+//! 3. **store** the object under a `pending_id` and reply `Pending` (id only — the AI never
+//!    receives the preview, §4 as ratified by D0A-R21-02).
+//! 4. **logind gate.** It precedes the PREVIEW DELIVERY, not the store — a gate-denied action
+//!    leaves a stored entry and an already-sent `Pending`, and discloses NOTHING to the shell
+//!    (D0A-R21-01). What the gate protects here is the renderer, not the store.
+//! 5. **deliver the preview** to the pinned shell (private channel), then live **PAM** over
+//!    that same channel.
+//! 6. read the shell's mint-confirm — a bare `[digest:32]` — verify it equals the stored
+//!    digest, **re-read the gate adjacently to the mint** (D0A-R1-02), then **mint** the
+//!    digest-bound token and reply `Granted`.
+//! 7. read `Present{pending_id, token}` (NO action data) → execute the **STORED**
 //!    object for that `pending_id`, re-verifying the token against ITS digest →
 //!    audit → reply `Completed`/`Denied`.
 //!
-//! THE HALF-(ii) INVARIANT lives at step 5: the executed action is the **stored
+//! THE HALF-(ii) INVARIANT lives at step 7: the executed action is the **stored
 //! canonical object**, never anything re-supplied on `Present`. A token minted for A
 //! cannot drive execution of B — [`execute_approved`] re-verifies the presented
 //! token against `canonical_action_digest(stored object)`.

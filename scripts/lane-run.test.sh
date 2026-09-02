@@ -55,10 +55,32 @@ OUT=$(bash scripts/lane-run.sh 2>&1); RC=$?
 check "a dirty working tree is refused" 2 "modified path" "$RC" "$OUT"
 rm -f stray.txt
 
-# POSITIVE CONTROL — with every gate satisfied it must get PAST them. It then fails on the
-# build (no cargo project here), which is the point: the gates are not refusing everything.
+# POSITIVE CONTROL — with the repository-state gates satisfied it must get PAST them. It
+# prints "gates passed" with the tree and blob, and then stops at the LAST gate, sudo, which
+# no unprivileged offline test can satisfy. That is the point: the git/expectation gates are
+# not refusing everything, and the control names exactly how far it got.
+#
+# It previously expected "build failed" — correct until GATE 6 (sudo priming) was added ahead
+# of the build. The control was asserting the OLD last gate, so it broke the moment a new one
+# landed in front of it. A positive control has to name the boundary it actually reaches.
 OUT=$(bash scripts/lane-run.sh 2>&1); RC=$?
-check "gates PASS on a well-formed setup (fails later, at the build)" 2 "build failed" "$RC" "$OUT"
+check "repository-state gates PASS on a well-formed setup" 2 "LANE RUN — gates passed" "$RC" "$OUT"
+check "...and it stops at the LAST gate (sudo), not an earlier one" 2 "sudo is not usable" "$RC" "$OUT"
+
+# ── THE SELF-BLOCK, which only a SECOND run can find ────────────────────────────────────
+# The artifact used to be written to `scratch/lane-artifacts/` — untracked, un-ignored, and
+# INSIDE the tree — so the first run dirtied the tree and the SECOND failed GATE 5. A
+# single-run test of the gates could never see it. This asserts the default artifact
+# directory is outside any repository, which is the property that makes the runner re-runnable
+# AND the reason an artifact naming a tree must not live in it.
+DEFAULT_DIR=$(grep -E '^ARTIFACT_DIR=' "$SCRIPT" | tail -1)
+check "the default artifact dir is OUTSIDE the repo (self-block: only run TWO finds it)" \
+      0 "" 0 "$DEFAULT_DIR"
+case "$DEFAULT_DIR" in
+    *scratch/*|*./*) printf '  FAIL  default artifact dir is inside the tree: %s\n' "$DEFAULT_DIR"; fail=1 ;;
+    *XDG_STATE_HOME*|*HOME*) printf '  ok    default artifact dir resolves outside the repo\n' ;;
+    *) printf '  FAIL  cannot tell where the default artifact dir points: %s\n' "$DEFAULT_DIR"; fail=1 ;;
+esac
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES ABOVE"; fi

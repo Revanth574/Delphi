@@ -33,7 +33,13 @@ set -u -o pipefail
 
 EXPECTED_FILE=".githooks/runtime-test-count-baseline.expected"
 RESULT_FILE=".githooks/runtime-test-count-baseline.root"
-ARTIFACT_DIR="${ARTIFACT_DIR:-scratch/lane-artifacts}"
+# D0A-R22-01 follow-up: the artifact lives OUTSIDE the repository, and both reasons matter.
+# MECHANICALLY: `scratch/lane-artifacts/` is untracked and un-ignored, so writing there made
+# the tree dirty and the NEXT invocation failed GATE 5 — the runner self-blocked after every
+# run. That defect is invisible to a single-run test of the gates and appeared on run two.
+# ON THE MERITS: an artifact whose purpose is to NAME THE TREE IT MEASURED must not be inside
+# that tree, because storing it changes the thing it describes.
+ARTIFACT_DIR="${ARTIFACT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/delphi/lane-artifacts}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/delphi-target}"
 
 # D0A-R22-01 / class 47: a GATE refusal must not be mistakable for a LANE failure. The
@@ -111,6 +117,16 @@ printf '  expectation cmt  %s\n' "$EXPECT_COMMIT"
 printf '  expecting        EXECUTED=%s SKIPPED=%s\n' "$EXP_EXEC" "$EXP_SKIP"
 hr
 
+# ── GATE 6: sudo must be usable BEFORE anything is attempted ─────────────────────────────
+# Run 12's first attempt failed all 17 producers in under one second with no output: `sudo`
+# had no primed session, so every invocation refused instantly. That read as a lane result
+# and was a runner defect — the manual procedure and the red-proof harness both prime sudo
+# and this did not. Refused as a GATE, because nothing ran.
+sudo -v 2>/dev/null || die "sudo is not usable non-interactively from here.
+  Run \`sudo -v\` first (or run this from a session that already has one), then re-run.
+  Every target is executed with sudo; without a session all 17 refuse instantly and the
+  result looks like a lane failure when nothing ever started."
+
 # ── Build unprivileged, enumerate, run under sudo ────────────────────────────────────────
 cargo test -p delphi-runtime --tests --no-run >/dev/null 2>&1 || die "build failed"
 mapfile -t TARGETS < <(cargo test -p delphi-runtime --tests --no-run --message-format=json 2>/dev/null \
@@ -143,6 +159,25 @@ OBS_SKIP="$(printf '%s' "$COUNT_OUT" | grep -oE 'SKIPPED [0-9]+' | grep -oE '[0-
 # ── The artifact — written WHATEVER the outcome ──────────────────────────────────────────
 # A mismatch that leaves no record is a mismatch that can be re-run away. The artifact is
 # written before the exit status is decided, for that reason.
+# D0A-R22-01 follow-up: `match=NO` conflated TWO outcomes — a run that executed and
+# disagreed with its prediction (a RESULT, worth recording) and a run that never executed at
+# all (a RUNNER FAILURE, which must not be recorded as one). That is the same discrimination
+# the gate-refusal banner makes so carefully, absent from the artifact the banner cannot
+# reach. `status` carries it; `match` is only meaningful once something ran.
+if [ -z "${OBS_EXEC:-}" ] || [ "$PRODUCER_FAILS" -eq "$N" ]; then
+    STATUS_FIELD="DID_NOT_RUN"
+    MATCH_FIELD="n/a"
+elif [ "$PRODUCER_FAILS" -ne 0 ]; then
+    STATUS_FIELD="RAN_INCOMPLETE"
+    MATCH_FIELD="n/a"
+elif [ "$OBS_EXEC" = "$EXP_EXEC" ] && [ "$OBS_SKIP" = "$EXP_SKIP" ]; then
+    STATUS_FIELD="RAN_MATCH"
+    MATCH_FIELD="yes"
+else
+    STATUS_FIELD="RAN_MISMATCH"
+    MATCH_FIELD="NO"
+fi
+
 mkdir -p "$ARTIFACT_DIR"
 ART="$ARTIFACT_DIR/lane-$(date -u +%Y%m%dT%H%M%SZ)-${TREE:0:7}.txt"
 {
@@ -155,8 +190,8 @@ ART="$ARTIFACT_DIR/lane-$(date -u +%Y%m%dT%H%M%SZ)-${TREE:0:7}.txt"
     printf 'targets_enumerated=%s\nproducer_failures=%s\n' "$N" "$PRODUCER_FAILS"
     printf 'extractor_rc=%s\n' "$COUNT_RC"
     printf 'started_utc=%s\nended_utc=%s\n' "$START_UTC" "$END_UTC"
-    printf 'match=%s\n' \
-      "$([ "${OBS_EXEC:-x}" = "$EXP_EXEC" ] && [ "${OBS_SKIP:-x}" = "$EXP_SKIP" ] && echo yes || echo NO)"
+    printf 'status=%s\n' "$STATUS_FIELD"
+    printf 'match=%s\n' "$MATCH_FIELD"
 } > "$ART"
 rm -f "$LOG" "$STATUS"
 
@@ -171,11 +206,20 @@ printf 'artifact: %s\n' "$ART"
 RC=0
 [ "$PRODUCER_FAILS" -eq 0 ] || { printf '%s producer(s) exited non-zero\n' "$PRODUCER_FAILS" >&2; RC=1; }
 [ "$COUNT_RC" -eq 0 ] || { printf 'the extractor refused or found failures (rc=%s)\n' "$COUNT_RC" >&2; RC=1; }
-if [ "${OBS_EXEC:-x}" != "$EXP_EXEC" ] || [ "${OBS_SKIP:-x}" != "$EXP_SKIP" ]; then
-    printf 'MISMATCH: expected %s/%s, observed %s/%s.\n' \
-        "$EXP_EXEC" "$EXP_SKIP" "${OBS_EXEC:-none}" "${OBS_SKIP:-none}" >&2
-    printf 'This is a RESULT. Record which side was wrong — the derivation in %s is the\n' "$EXPECTED_FILE" >&2
-    printf 'auditable half, so check it before adjusting anything.\n' >&2
-    RC=1
-fi
+case "$STATUS_FIELD" in
+    DID_NOT_RUN)
+        printf '%s\n' 'THE LANE DID NOT RUN. This is a RUNNER failure, not a lane result —' >&2
+        printf '%s\n' 'do NOT record it as one and do NOT update the baseline from it.' >&2
+        RC=1 ;;
+    RAN_INCOMPLETE)
+        printf '%s producer(s) of %s failed; the count covers a SUBSET and is not a result.\n' \
+            "$PRODUCER_FAILS" "$N" >&2
+        RC=1 ;;
+    RAN_MISMATCH)
+        printf 'MISMATCH: expected %s/%s, observed %s/%s.\n' \
+            "$EXP_EXEC" "$EXP_SKIP" "$OBS_EXEC" "$OBS_SKIP" >&2
+        printf 'This IS a result. Record which side was wrong — the derivation in %s is the\n' "$EXPECTED_FILE" >&2
+        printf 'auditable half, so check it before adjusting anything.\n' >&2
+        RC=1 ;;
+esac
 exit "$RC"

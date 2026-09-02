@@ -59,6 +59,28 @@
 #   therefore 173 + 3 = 176, no skip change.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# LANE RUN 12 — no expectation recorded yet. Derive and commit ALONE before running.
-EXPECTED_EXECUTED=
-EXPECTED_SKIPPED=
+# LANE RUN 12 — the first run through `scripts/lane-run.sh`. TARGET_TREE: this commit.
+#
+# DERIVATION — the prediction is that NOTHING MOVES, which is a real prediction and not a
+# default, because it rests on a checkable claim:
+#
+#   run 11 measured              EXECUTED=176 SKIPPED=5   (at unprivileged 156/25)
+#   unprivileged is STILL        EXECUTED=156 SKIPPED=25
+#   changed since run 11's tree  runtime/src/service.rs ONLY (+18/-4)
+#   new `#[test]` since then     ZERO  (`git diff 298d4db..HEAD -- runtime/ | grep -c '^+    #\[test\]'`)
+#
+#   The two commits touching runtime/ since run 11 are R22-07 (the no-preview regression's
+#   read no longer turns every error into EOF) and R22-08 (the module doc's flow renumbered).
+#   Neither adds or removes a test and neither is root-gated, so the root pair is unchanged.
+#
+# THE ONE THING THAT COULD MOVE IT, named so a mismatch has a first suspect: R22-07 changed
+# `a_gate_denied_action_sends_no_preview` to PANIC on a read error where it previously
+# returned 0. That test runs at root. If a privileged socketpair read behaves differently
+# there — EINTR under load, say — the test would newly FAIL rather than silently pass, and
+# EXECUTED would hold while the extractor's rc went non-zero. That is the failure this change
+# was made to expose, so seeing it would be the fix working, not the prediction being wrong.
+#
+# Everything else in this range is documentation, the corpus (classes 47 correction and 48),
+# and the lane runner itself with its own shell suite — none of which is a Rust test.
+EXPECTED_EXECUTED=176
+EXPECTED_SKIPPED=5

@@ -2653,6 +2653,54 @@ the sharpest form of that: **the excuse arrives pre-named, pre-documented, and w
 measured rate behind it.** A prior measurement of flakiness is evidence about the test's
 history, never about this failure.
 
+## 48. THE FIX IS SCOPED TO THE INSTANCE THE REVIEWER NAMED  *(new — D0A-R22, three instances in one round)*
+
+**The shape.** A finding names an instance. The instance is fixed — correctly, at root, with
+a regression. **The class is not.** The reviewer named what they found, not the boundary of
+what they found, and the remediation took the example for the extent.
+
+**Distinct from 17 and 37, and the difference decides the remedy:**
+
+| class | what goes wrong |
+|---|---|
+| **17** | one defect COPIED to several sites; fixing one leaves the others |
+| **37** | the FIX carries the defect it was closing |
+| **48** | the fix is correct and complete FOR THE NAMED CASE, and the same class stands untouched elsewhere — the scoping error is in the REMEDIATION POLICY, not in the code |
+
+**Three instances in round 22 alone, every one a correction I had just made somewhere else:**
+
+- **D0A-R22-03** — R21-07 fixed the lane-record propagation defect *for run 10*. Run 11 was
+  then recorded in the root baseline only, leaving the register and PROGRESS calling run 10
+  current. The remedy covered a run, not the habit.
+- **D0A-R22-05** — D0A-R15-02 ruled that superseded reasoning leaves the normative text; §3's
+  history was relocated accordingly, and **the next commit wrote five amendments' history into
+  §4**. The rule was applied to the section that had been criticised.
+- **D0A-R22-06** — R21-02 corrected §4's flow where it claimed the AI receives
+  `{pending_id, preview}`. The *next step of the same section* described a mint-confirm
+  carrying fields the wire does not carry. One step was checked; the section was not.
+
+**Why it recurs.** A finding arrives with an ID, a file and a line. That specificity is what
+makes it actionable and is also what makes the fix's boundary feel decided. Closing the named
+line feels like closing the finding, and the ledger then records it closed.
+
+**The foreclosing discipline — one question, asked before the fix:**
+
+> **What is the class, and where else does it hold?**
+
+Then fix that, and say in the commit what the swept scope was. Concretely:
+
+1. **Name the class in one sentence** without referring to the instance. If that cannot be
+   done, the finding is not yet understood well enough to fix.
+2. **Enumerate the other sites mechanically**, not from memory — grep the pattern, list the
+   documents, walk the sibling steps. Round 22's three were all findable that way.
+3. **Record the scope in the commit**, so a later reviewer can check the boundary rather than
+   re-derive it. "Fixed run 11's record" and "fixed every place a lane run is called current"
+   are different claims and only the second is auditable.
+
+**RED-proof shape.** After fixing, apply the reviewer's own predicate to the rest of the tree.
+If it finds a second instance, the fix was scoped to the example — which is the finding, not a
+new one.
+
 ## Appendix: foreclosure status at a glance
 
 | Class | Foreclosed by | Status |

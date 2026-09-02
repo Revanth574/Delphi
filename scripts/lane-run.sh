@@ -36,7 +36,24 @@ RESULT_FILE=".githooks/runtime-test-count-baseline.root"
 ARTIFACT_DIR="${ARTIFACT_DIR:-scratch/lane-artifacts}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/delphi-target}"
 
-die() { printf 'REFUSING: %s\n' "$*" >&2; exit 2; }
+# D0A-R22-01 / class 47: a GATE refusal must not be mistakable for a LANE failure. The
+# runner now gates the lane, so its first defect will present as "the lane broke" — and class
+# 47's lesson is that the MESSAGE is what discriminates. Every refusal therefore says which
+# it is, in its own words, and exits 2 (gate) where a lane failure exits 1.
+die() {
+    printf '\n' >&2
+    # `printf '---…'` makes bash read the leading dashes as OPTIONS — it printed
+    # "printf: --: invalid option" into the middle of the refusal that exists to be legible.
+    # Every literal goes through '%s\n'.
+    printf '%s\n' '=== GATE REFUSED — NOTHING RAN ==============================' >&2
+    printf '%s\n' 'This is the lane RUNNER refusing to start. No test executed,' >&2
+    printf '%s\n' 'no target was built, and no result was produced. It is NOT a' >&2
+    printf '%s\n' 'test failure and NOT a lane result — do not record it as one.' >&2
+    printf '%s\n' '-------------------------------------------------------------' >&2
+    printf '%s\n' "$*" >&2
+    printf '%s\n' '=============================================================' >&2
+    exit 2
+}
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 
 [ -f "$EXPECTED_FILE" ] || die "run from the repo root (no $EXPECTED_FILE)"
@@ -148,6 +165,9 @@ cat "$ART"
 hr
 printf 'artifact: %s\n' "$ART"
 
+# EXIT CODES ARE PART OF THE INTERFACE: 2 = a GATE refused and nothing ran (above);
+# 1 = the lane RAN and its result disagrees with the expectation or itself. A caller that
+# cannot tell those apart will record a refusal as a failed lane.
 RC=0
 [ "$PRODUCER_FAILS" -eq 0 ] || { printf '%s producer(s) exited non-zero\n' "$PRODUCER_FAILS" >&2; RC=1; }
 [ "$COUNT_RC" -eq 0 ] || { printf 'the extractor refused or found failures (rc=%s)\n' "$COUNT_RC" >&2; RC=1; }

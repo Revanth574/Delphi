@@ -6,7 +6,12 @@
 #   status=RAN_MATCH   expected 176/5   observed 176/5   producer_failures=0
 #   extractor_rc=0     tree=0330b46     expectation_commit=c16c3e9
 #
-# THE EXPECTATION COMMIT IS THREE COMMITS BEHIND THE TREE, and the artifact records both.
+# THE EXPECTATION COMMIT IS 1 COMMIT BEHIND THE TREE (`git rev-list --count
+# c16c3e9..0330b46`), and the artifact records both. **CORRECTED (D0A-R23-11): this said
+# THREE, conflating three FIXES with three COMMITS — all three runner fixes landed in one
+# commit, 0330b46.** That is the same fixes-versus-commits confusion R22-02 removed from this
+# file's hand-written provenance, recurring in the sentence that describes the mechanism which
+# replaced it. Counts belong to `git rev-list`, not to recollection.
 # That is the property the protocol asserted from R21-07 onward and could not demonstrate:
 # a reader who was not present can now check that the prediction predates the measurement,
 # because the runner read a COMMITTED blob it could not have written and bound the pair into

@@ -18,12 +18,16 @@
 # TARGET_TREE below names the tree the derivation was computed against — a DIFFERENT thing
 # from the commit that introduces this file, and conflating them is what produced the error.
 #
-# WHAT THIS FILE DOES NOT DO, STATED PLAINLY (D0A-R22-01). Nothing consumes it. No hook, no
-# runner, no CI job reads it before a lane run. The ordering it claims is a CONVENTION the
-# author follows, not an invariant anything enforces: a lane measured first, an expectation
-# committed second and a result committed third produce history indistinguishable from the
-# required sequence. Until a tool binds tree + expectation + observed counts + captured time
-# into one artifact and returns non-zero on mismatch, THIS FILE IS DOCUMENTATION, NOT PROOF.
+# WHAT CONSUMES IT (D0A-R22-01, superseding this file's earlier "nothing does").
+# `scripts/lane-run.sh` reads the COMMITTED blob before a run, refuses if the working copy
+# differs, refuses if the expectation was committed beside a result, and binds tree +
+# expectation blob + commit + observed counts + captured times into an artifact outside the
+# repository. Run 12 was the first use.
+#
+# **ITS RELIABILITY IS UNDER REVIEW (D0A-R23, 8×P1).** The runner certifies its own target
+# universe, mislabels a wholly-failing lane as DID_NOT_RUN, fails open when the artifact
+# cannot be written, and drops safety checks the manual procedure performed. Until those are
+# closed, a green from it is weaker evidence than its own output implies.
 #
 # PROTOCOL
 #   1. Derive the expectation from the unprivileged pair and the root-gating of each change.
@@ -69,9 +73,11 @@
 #   changed since run 11's tree  runtime/src/service.rs ONLY (+18/-4)
 #   new `#[test]` since then     ZERO  (`git diff 298d4db..HEAD -- runtime/ | grep -c '^+    #\[test\]'`)
 #
-#   The two commits touching runtime/ since run 11 are R22-07 (the no-preview regression's
-#   read no longer turns every error into EOF) and R22-08 (the module doc's flow renumbered).
-#   Neither adds or removes a test and neither is root-gated, so the root pair is unchanged.
+#   The commit touching runtime/ since run 11 is af46083, carrying BOTH R22-07 (the
+#   no-preview regression's
+#   read no longer turns every error into EOF) and R22-08 (the module doc's flow
+#   renumbered) — ONE commit, not two (D0A-R23-11). Neither fix adds or removes a test
+#   and neither is root-gated, so the root pair is unchanged.
 #
 # THE ONE THING THAT COULD MOVE IT, named so a mismatch has a first suspect: R22-07 changed
 # `a_gate_denied_action_sends_no_preview` to PANIC on a read error where it previously

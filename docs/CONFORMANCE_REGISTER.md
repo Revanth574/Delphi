@@ -39,7 +39,7 @@ of those seventeen targets had never executed at root before run 3.
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**LANE RUN 11 (current): `EXECUTED 176 / SKIPPED 5 / reported 181`**, rc 0, 0 failures,
+**LANE RUN 12 (current, first through `scripts/lane-run.sh`): `EXECUTED 176 / SKIPPED 5 / reported 181`**, rc 0, 0 failures,
 0 leaks, PAM intact, all 17 producers exited 0, at the round-21 remediation. Its figure
 was recorded as an expectation in a separate, earlier commit and matched — though see
 D0A-R22-01: the ordering is convention, not mechanism. Run 10's `173 / 5` is superseded.

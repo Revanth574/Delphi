@@ -39,10 +39,24 @@ of those seventeen targets had never executed at root before run 3.
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**LANE RUN 12 (current, first through `scripts/lane-run.sh`): `EXECUTED 176 / SKIPPED 5 / reported 181`**, rc 0, 0 failures,
-0 leaks, PAM intact, all 17 producers exited 0, at the round-21 remediation. Its figure
-was recorded as an expectation in a separate, earlier commit and matched — though see
-D0A-R22-01: the ordering is convention, not mechanism. Run 10's `173 / 5` is superseded.
+**THE CURRENT EVIDENCE IS TWO RUNS, NOT ONE, AND THEY COVER DIFFERENT DIMENSIONS
+(D0A-R24-01).** Run 11 was swapped for run 12 as "current" without recomputing WHICH
+dimensions survived the swap — so the record credited run 12 with hygiene the runner it went
+through never performed.
+
+| | run 11 (manual procedure) | run 12 (through the reverted runner) |
+|---|---|---|
+| counts | `EXECUTED 176 / SKIPPED 5 / reported 181` | same, and matched a prior committed expectation |
+| producers / failures | checked | checked |
+| **ordering (prediction predates measurement)** | convention | **machine-bound in an artifact** |
+| **helper digest, forced freshness, stale sessions, PAM before/after** | **performed** | **NOT PERFORMED** |
+
+**So: run 12 is COUNT-AND-ORDERING evidence only. Run 11 remains the last FULL-HYGIENE lane.**
+Neither alone is the current lane record; citing run 12 as if it were was a claim of
+privileged hygiene that was never measured, and reverting the runner restores those checks
+PROSPECTIVELY — it cannot add them to a run already taken.
+
+Run 10's `173 / 5` is superseded by both.
 
 **Run 9's `171 / 5 / 176` is SUPERSEDED** (as run 8's superseded run 7's). D0A-R21-07:
 run 10 was first recorded in the root baseline ONLY, leaving this row and PROGRESS still
@@ -156,15 +170,29 @@ sentence or a record, this one moved a safety boundary.
 ### AND THE ROUND-SEQUENCE THAT PRODUCED IT
 
 Round 21's remediation produced round 22's findings; round 22's produced the runner; the
-runner produced round 23's eight P1s. **The product surface had not moved for three rounds —
-every finding in that stretch was verification infrastructure reviewing verification
-infrastructure.** That is the terminus shape the B2a composition sweep closed on ("round 7's
-fix created round 8's subject"), reached again and recognised from inside it rather than
-afterwards.
+runner produced round 23's eight P1s.
+
+**NARROWED TO WHAT THE HISTORY SUPPORTS (D0A-R24-07).** The claim was "the product surface had
+not moved for three rounds" and that is too broad: round 21's own remediation commits
+`d6fb698` and `298d4db` changed runtime behaviour. The verifiable claim, with a pinned start:
+**since `298d4db`, no executable product behaviour has changed**; rounds 22–23 concentrated on
+verification and documentation; and `cfb8ba3` changes one test ORACLE without changing the
+test inventory. That is a narrower statement than the terminus narrative it was serving, and
+it is the one that survives checking — a defensible scope decision does not need the stronger
+version, and presenting it as stronger convergence than occurred is how a stopping decision
+acquires more authority than its evidence.
 
 **What is kept:** the expectation file and its protocol (enforced by convention, with the
 manual procedure's checks intact), `DEFECT_CLASSES` 47 and 48, and the record corrections from
 D0A-R23-06 and R23-11.
+
+**D0A-R22-01 IS REOPENED, NOT CLOSED (D0A-R24-02).** The expectation protocol's ordering is
+again enforced by nothing. It does not fit the branch's three-state partition — it is not
+dependent on the native-UI increment, not scoped elsewhere, and not merely inherited: it is an
+invariant that was closed and is open again. Recorded here as its own state so it is not
+carried as "done". `scratch/lane-run-7-procedure.md` step −1 now carries the sequence a human
+must follow meanwhile. **D0A-R23-04 and R23-05 likewise remain limitations of the EXISTING run-12
+artifact** — no timeouts, no preserved evidence on failure, and the five hygiene checks absent.
 
 **What a future increment inherits:** R23-01 through R23-10 are, between them, a written
 specification for a runner that would be worth having. It needs its own design, its own

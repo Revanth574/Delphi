@@ -27,8 +27,13 @@
 //!    digest, **re-read the gate adjacently to the mint** (D0A-R1-02), then **mint** the
 //!    digest-bound token and reply `Granted`.
 //! 7. read `Present{pending_id, token}` (NO action data) → execute the **STORED**
-//!    object for that `pending_id`, re-verifying the token against ITS digest →
-//!    audit → reply `Completed`/`Denied`.
+//!    object for that `pending_id`, re-verifying the token against ITS digest → reply
+//!    `Completed`/`Denied`.
+//!
+//! **THERE IS NO AUDIT STEP, and this list used to claim one (D0A-R24-03).** `audit` appears
+//! nowhere in this module and `RuntimeAuditEntry::record` has no production caller — §7 is
+//! unwired end to end, which is an OPEN row in `docs/CONFORMANCE_REGISTER.md`. A flow
+//! document that lists the gap as a step describes it as closed.
 //!
 //! THE HALF-(ii) INVARIANT lives at step 7: the executed action is the **stored
 //! canonical object**, never anything re-supplied on `Present`. A token minted for A
@@ -270,7 +275,8 @@ pub fn accept_requester(listener: &UnixListener, expected_uid: u32) -> Result<Un
 /// /[`RuntimeError::Syscall`] on canonicalization or channel I/O failure. A *policy*
 /// denial (gate/PAM/token) is `Ok(Outcome::Denied)`, not an error.
 pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Outcome, RuntimeError> {
-    // 1. Propose → canonicalize + store the ONE object.
+    // Steps 1-3 (see the module header): canonicalize, refuse an unpresentable preview,
+    // then store the ONE object and reply `Pending`.
     let propose = match read_frame::<pb::AiToDaemon>(ai)?.msg {
         Some(pb::ai_to_daemon::Msg::Propose(p)) => p,
         other => return Err(RuntimeError::Protocol(format!("expected Propose, got {other:?}"))),
@@ -293,7 +299,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     ctx.store.insert(action);
     write_frame(ai, &pending_msg(&id))?;
 
-    // 2. logind gate FIRST — the preview is not sent until the gate passes (D0A-R21-01,
+    // Step 4. logind gate FIRST — the preview is not sent until the gate passes (D0A-R21-01,
     // disclosure half). This used to send the preview and THEN gate, so a denied action had
     // already disclosed its complete environment to the renderer. That inverted the
     // justification for showing complete values, which is that the renderer holds the
@@ -311,7 +317,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
         return deny(ai, &id, &cause.denial(false));
     }
 
-    // 3. preview → the pinned shell on the private channel, only now.
+    // Step 5. preview → the pinned shell on the private channel, only now.
     send_approval_request(ctx.channel_fd, &digest, &preview_text)?;
 
     // 3b. live PAM over the private channel.
@@ -319,7 +325,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
         return deny(ai, &id, "PAM authentication failed");
     }
 
-    // 4. shell mint-confirm → must match the stored digest → mint.
+    // Step 6. shell mint-confirm → must match the stored digest → mint.
     let confirm = recv_mint_confirm(ctx.channel_fd)?;
     if confirm != digest {
         return deny(ai, &id, "shell mint-confirm digest != stored digest");
@@ -338,7 +344,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     }
     write_frame(ai, &granted_msg(&id, &token.to_wire()))?;
 
-    // 5. Present{pending_id, token} — NO action data. Execute the STORED object.
+    // Step 7. Present{pending_id, token} — NO action data. Execute the STORED object.
     let present = match read_frame::<pb::AiToDaemon>(ai)?.msg {
         Some(pb::ai_to_daemon::Msg::Present(p)) => p,
         other => return Err(RuntimeError::Protocol(format!("expected Present, got {other:?}"))),

@@ -54,6 +54,38 @@ fn reached_the_anchor(text: &str) -> bool {
     text.to_lowercase().contains("root-owned runtime directory")
 }
 
+/// D0A-R24-04 — the predicate's DISCRIMINATION, as a durable test rather than a sentence in
+/// a commit message.
+///
+/// R23-12 narrowed `reached_the_anchor` because the old `|| "permission denied"` alternative
+/// let ANY permission error satisfy the positive control. That was demonstrated once, by
+/// hand, and encoded nowhere — so restoring the broad alternative would have left the suite
+/// green. Both integration legs below produce output the OLD and NEW predicates accept
+/// identically, which is exactly why neither of them can guard this.
+#[test]
+fn reached_the_anchor_rejects_an_unrelated_permission_error() {
+    // The real thing: the daemon's anchor failure, which must be ACCEPTED.
+    assert!(
+        reached_the_anchor("Error: establishing the root-owned runtime directory\n\nCaused by:\n    Permission denied (os error 13)"),
+        "the genuine anchor failure must still be recognised"
+    );
+    // The forgeable part on its own: a permission error from anywhere else, which must be
+    // REJECTED. Under the pre-R23-12 predicate this returned true.
+    for unrelated in [
+        "Error: opening the config file\n\nCaused by:\n    Permission denied (os error 13)",
+        "Error: binding a socket\n\nCaused by:\n    permission denied",
+        "thread 'main' panicked: Permission denied",
+    ] {
+        assert!(
+            !reached_the_anchor(unrelated),
+            "an unrelated permission error must NOT read as reaching the anchor — that is \
+             what let the positive control pass for a reason unconnected to the guard: {unrelated}"
+        );
+    }
+    // And the phrase must be required in full: a fragment is not the anchor.
+    assert!(!reached_the_anchor("Error: runtime directory"), "a fragment must not satisfy it");
+}
+
 #[test]
 fn root_session_is_refused_as_a_system_account_before_the_anchor() {
     let out = run_daemon("root");

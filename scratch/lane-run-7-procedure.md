@@ -1,4 +1,35 @@
-# Lane runs 7–8 — procedure (branch `phase-3b/d0-readiness-contract`)
+# THE LANE RUN PROCEDURE — current and reusable (branch `phase-3b/d0-readiness-contract`)
+
+**This is the sanctioned procedure for ANY lane run, not a record of runs 7–8** (D0A-R24-02:
+it was still titled for them, so the reactivated runbook read as history rather than as the
+current process). Substitute the run number wherever `N` appears; `/tmp/root-runN.log` and
+`.status` are per-run.
+
+## STEP −1 — DERIVE AND COMMIT THE EXPECTATION, ALONE, BEFORE ANYTHING ELSE
+
+The steps below measure. **This one predicts, and it must be committed first or the
+measurement proves only itself** (D0A-R21-07; R19-06 and R20-07 are the two runs whose figure
+was right and whose explanation was reconstructed afterwards).
+
+1. Derive `EXPECTED_EXECUTED` / `EXPECTED_SKIPPED` from the current unprivileged pair plus the
+   root-gating of every test added or removed since the last run. **Verify root-gating by
+   grep — a `geteuid` check, a `SKIP` branch, a `bwrap_available` guard — never from memory.**
+2. Write it into `.githooks/runtime-test-count-baseline.expected` **with the derivation**, so
+   the reasoning is checkable independently of whether the number matches.
+3. **Commit that file ALONE.** A prediction committed beside a measurement establishes no
+   ordering between them, and only commit order establishes that the prediction came first.
+4. Then run the steps below, and commit the measured pair SEPARATELY afterwards.
+5. **A mismatch is a RESULT.** Record which side was wrong; do not adjust the derivation until
+   it agrees.
+
+**D0A-R22-01 IS REOPENED AND FUTURE-OWNED.** Nothing enforces this ordering — `scripts/
+lane-run.sh` did, for one run, and was reverted at D0A-R23 for dropping §0/§5/§6's checks.
+So steps 1–5 are a CONVENTION a human follows, which is what runs 7–11 did. R23-01..R23-10
+specify what a runner that enforced it without losing those checks would have to be.
+
+---
+
+## Historical notes
 
 > **RUN 7 ran at `71fd898` and its numbers are SUPERSEDED.** D0A-R18-07: the chain-gap test
 > landed later in `d4a741e`, so run 7 never exercised it, and the round-18 remediation

@@ -111,5 +111,10 @@
 # two tests landed AFTER that prediction, so the expectation must be re-derived and
 # re-committed BEFORE run 11 — amending it now, in the same commit as the tests, would
 # destroy the property the file exists for.
-EXECUTED=156
+# 2026-09-02 (D0A-R24-04): 156/25 -> 157/25. +1:
+# `reached_the_anchor_rejects_an_unrelated_permission_error` — the oracle discrimination
+# R23-12 demonstrated in a commit message and encoded nowhere. Both existing integration
+# legs stayed GREEN under the weaken that restores the broad predicate, which is why
+# neither could guard it.
+EXECUTED=157
 SKIPPED=25

@@ -53,24 +53,20 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**THE CURRENT EVIDENCE IS TWO RUNS, NOT ONE, AND THEY COVER DIFFERENT DIMENSIONS
-(D0A-R24-01).** Run 11 was swapped for run 12 as "current" without recomputing WHICH
-dimensions survived the swap — so the record credited run 12 with hygiene the runner it went
-through never performed.
+**LANE RUN 13 (current) — `EXECUTED 177 / SKIPPED 5 / reported 182`, rc 0, 0 failures,
+17/17 producers exited 0, and EVERY HYGIENE CHECK PERFORMED WITH ITS OWN CAPTURED OUTPUT:**
+helper digest installed == staged (`aba0f0ea…`), forced freshness (identical executable set
+after a forced rebuild), free space above floor on three filesystems, stale sessions none
+before AND after, PAM `439c1d15…` → `md5sum -c` **OK**.
 
-| | run 11 (manual procedure) | run 12 (through the reverted runner) |
-|---|---|---|
-| counts | `EXECUTED 176 / SKIPPED 5 / reported 181` | same, and matched a prior committed expectation |
-| producers / failures | checked | checked |
-| **ordering (prediction predates measurement)** | convention | **machine-bound in an artifact** |
-| **helper digest, forced freshness, stale sessions, PAM before/after** | **performed** | **NOT PERFORMED** |
+**This closes D0A-R24-01.** The evidence had been split across two runs covering different
+dimensions — run 11 the hygiene, run 12 the counts and machine-bound ordering — because run 11
+was swapped for run 12 as "current" without recomputing which dimensions survived the swap.
+Run 13 covers both, so both are superseded, as is run 10's `173 / 5`.
 
-**So: run 12 is COUNT-AND-ORDERING evidence only. Run 11 remains the last FULL-HYGIENE lane.**
-Neither alone is the current lane record; citing run 12 as if it were was a claim of
-privileged hygiene that was never measured, and reverting the runner restores those checks
-PROSPECTIVELY — it cannot add them to a run already taken.
-
-Run 10's `173 / 5` is superseded by both.
+**Its ordering is convention, not mechanism** (D0A-R22-01, reopened): predicted 177/5 at
+`feabc56`, committed alone and before the run, with `git log` on the two files as the only
+evidence — which holds here, and is a property to check rather than one that is enforced.
 
 **Run 9's `171 / 5 / 176` is SUPERSEDED** (as run 8's superseded run 7's). D0A-R21-07:
 run 10 was first recorded in the root baseline ONLY, leaving this row and PROGRESS still

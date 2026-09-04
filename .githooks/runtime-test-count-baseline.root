@@ -1,32 +1,34 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 12 — the FIRST run through `scripts/lane-run.sh`, and the first whose ordering is
-# readable from evidence rather than from a commit message.
+# LANE RUN 13 — THE FULL-HYGIENE RUN. It replaces the two-run split D0A-R24-01 found, where
+# run 11 carried the hygiene checks and run 12 carried counts-and-ordering and neither alone
+# was the lane record. This one covers both.
 #
-#   status=RAN_MATCH   expected 176/5   observed 176/5   producer_failures=0
-#   extractor_rc=0     tree=0330b46     expectation_commit=c16c3e9
+#   EXECUTED 177 / SKIPPED 5 / reported 182     extractor rc=0
+#   producers: 17/17 exited 0                   failures: 0
+#   predicted 177/5 at feabc56, committed ALONE and BEFORE the run
 #
-# THE EXPECTATION COMMIT IS 1 COMMIT BEHIND THE TREE (`git rev-list --count
-# c16c3e9..0330b46`), and the artifact records both. **CORRECTED (D0A-R23-11): this said
-# THREE, conflating three FIXES with three COMMITS — all three runner fixes landed in one
-# commit, 0330b46.** That is the same fixes-versus-commits confusion R22-02 removed from this
-# file's hand-written provenance, recurring in the sentence that describes the mechanism which
-# replaced it. Counts belong to `git rev-list`, not to recollection.
-# That is the property the protocol asserted from R21-07 onward and could not demonstrate:
-# a reader who was not present can now check that the prediction predates the measurement,
-# because the runner read a COMMITTED blob it could not have written and bound the pair into
-# one artifact. The ONE commit between carries three runner fixes; none touched a Rust test,
-# which is what the derivation predicted and why the figure holding is informative rather than
-# merely unchanged.
+# EVERY HYGIENE CHECK, CAPTURED SEPARATELY — the procedure's failure mode is a human
+# confirming the set rather than each member, so each is recorded with its own evidence:
 #
-# Artifact (outside the repository, so it does not change the tree it names):
-#   ~/.local/state/delphi/lane-artifacts/lane-20260902T174359Z-0330b46.txt
+#   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
+#   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED
+#   bwrap            0.11.1
+#   free space       /run, target dir, /tmp      all above floor
+#   forced freshness identical executable set after `touch runtime/src/execute.rs` + rebuild
+#   PAM before       439c1d1521d86e4eb011a927aff659db
+#   PAM after        md5sum -c → OK              (class 16, the defect already paid for)
+#   stale sessions   none, checked before AND after
 #
-# NOT COMPARABLE TO THE UNPRIVILEGED PAIR BY SUBSET. Three of the five skips skip BECAUSE
-# the run is privileged and execute unprivileged, so 176 and 156 are overlapping sets and
+# THE FIVE SKIPS, each naming its own blocker: b1_daemon_binary (needs --features
+# insecure-test-seams), an_unreadable_login_defs (this uid can read a 0000 file),
+# pidfd_refuses_a_recycled_pid_barrier (no user namespaces), live_logind_query (standing
+# DEFER), a_regular_login_user_is_not_refused (running as root). Three of the five skip
+# BECAUSE the run is privileged, so 177 and the unprivileged 157 are OVERLAPPING SETS and
 # neither contains the other.
-# WHAT THIS RUN DID NOT MEASURE (D0A-R24-01): helper digest, forced freshness, stale
-# sessions, PAM before/after. It went through `scripts/lane-run.sh`, which omitted them and
-# was reverted for that. This file is COUNT evidence; run 11 is the last full-hygiene lane.
-EXECUTED=176
+#
+# ORDERING IS CONVENTION AGAIN (D0A-R22-01, reopened). `git log` on this file and on
+# `.expected` is the only evidence the prediction preceded the measurement — and it is
+# evidence only because feabc56 contains that file alone. Nothing enforces it.
+EXECUTED=177
 SKIPPED=5

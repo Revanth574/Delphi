@@ -37,6 +37,20 @@ of those seventeen targets had never executed at root before run 3.
 | the drop helper the daemon runs is the one it was built against | **PROVEN** at root — built and installed agree at `aba0f0ea14b751aa…`, and the first time the digest binding refused a *legitimate* change rather than an attack |
 | every `b1_integration` / `end_to_end` / `divergence` root path | **PROVEN** — 0 failures, and **0 skips**, so nothing closed by ceasing to run |
 
+### A COUNT IS A PROPERTY OF THE COMMIT **AND THE LANE** — reviewer figures are not comparable
+
+**Recorded 2026-09-02 so it is not discovered later as a discrepancy.** Round 24's reviewer
+reported `EXECUTED 128 / SKIPPED 53 / reported 181` against this tree and three shell suites
+failing at `unshare … Operation not permitted`. **That is their environment lacking user
+namespaces, not a finding about the tree** — `reported 181` agrees with ours exactly; the
+extra 28 skips are tests that gate on `bwrap_available` and userns.
+
+**So their pair and ours measure different things and must never be cited as a check on each
+other.** This is the same constraint `.githooks/runtime-test-count-baseline` already states
+for a restricted container (D0A-R15-04: `EXECUTED=115 SKIPPED=46` against an identical tree)
+— a pair is a property of the commit AND the lane, and only `reported` is portable across
+them. A future round comparing 128 to 157 would be reading a lane difference as a regression.
+
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
 **THE CURRENT EVIDENCE IS TWO RUNS, NOT ONE, AND THEY COVER DIFFERENT DIMENSIONS

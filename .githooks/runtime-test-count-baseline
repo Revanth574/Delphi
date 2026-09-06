@@ -147,5 +147,28 @@
 #              factored pure so it needs no `set_var` (a racing env write would make every
 #              other test in the binary flaky, which is worse than a failure).
 # SKIPPED unchanged: all five run unprivileged.
-EXECUTED=172
+# 2026-09-07 (round-27 remediation): 172/25 -> 180/25. +8 EXECUTED, all additions:
+#   R27-01 (2) `the_read_budget_is_spent_across_reads_not_reset_per_object` (weaken-proven:
+#              restoring the per-object ceiling makes a second 600-byte read SUCCEED against a
+#              budget already charged 600), and
+#              `the_derived_ceiling_admits_the_largest_executables_known_on_this_class_of_machine`
+#              — the SANITY CHECK on the derived ceiling, explicitly not part of the derivation.
+#   R27-02 (3) `a_stalled_peer_cannot_hold_the_daemon_past_the_frame_deadline`,
+#              `a_trickling_peer_cannot_extend_the_frame_deadline_by_making_progress` (the
+#              discriminating one — a per-read timeout passes the stall and fails this), and
+#              `a_complete_frame_within_the_deadline_is_still_accepted` (positive control).
+#   R27-03 (1) `a_non_utf8_configured_ceiling_is_refused_not_defaulted`, over `ceiling_from_var`
+#              — the decision moved DOWN to the env boundary because the bug lived in `.ok()`,
+#              which no test of `parse_ceiling` could ever reach.
+#   argv   (1) `an_argv_entry_with_an_embedded_nul_is_refused_at_proposal_time` — the argv/env
+#              asymmetry round 26 left unanswered.
+#   clock  (1) `the_consent_window_decision_is_exact_at_its_edges` — expiry at every edge with
+#              NO clock involved. The prior clock test was shown by reviewer mutation to
+#              discriminate neither suspend behaviour nor clock identity on this lane.
+# One RENAME, not an addition: boot_secs_reads_the_boottime_clock... ->
+# boot_secs_agrees_with_a_direct_boottime_read_and_reports_its_own_discriminating_power, which
+# now PRINTS the BOOTTIME-MONOTONIC delta so a reader can see whether the run had any
+# discriminating power rather than inferring it from green.
+# SKIPPED unchanged: all eight run unprivileged.
+EXECUTED=180
 SKIPPED=25

@@ -258,6 +258,9 @@ pub fn accept_requester(listener: &UnixListener, expected_uid: u32) -> Result<Un
     })?;
     let cred = getsockopt(&stream, PeerCredentials)
         .map_err(|source| RuntimeError::Syscall { op: "getsockopt SO_PEERCRED", source })?;
+    // D0A-R27-02: arm the per-read timeout so `read_frame`'s absolute deadline is reachable.
+    // Without it a stalled peer blocks the root daemon inside `read`, before consent.
+    crate::wire::arm_frame_liveness(&stream)?;
     if cred.uid() != expected_uid {
         return Err(RuntimeError::Protocol(format!(
             "requester uid {} != session uid {expected_uid}",
@@ -295,14 +298,14 @@ pub fn accept_requester(listener: &UnixListener, expected_uid: u32) -> Result<Un
 /// branching is added, the floor is here to be consulted, and the requester (the AI, i.e.
 /// untrusted input) cannot obtain a weaker gate by classifying its own action.
 ///
-/// **What the fixture migration exposed, which is a finding about the tier system rather than
-/// about the fixtures (D0A-R26-01):** every fixture in the crate proposed `Biometric`, and
-/// moving them all to `Confirm` cost NO coverage — because nothing had ever asserted on what
-/// `Biometric` MEANT. The only two tier-touching tests assert that *changing* the tier changes
-/// the digest and the preview, which holds for any two distinct values. The label was
-/// decoration end to end, and that is precisely why R25-01's "descriptive only" defect could
-/// live here undetected: no test could have caught it, because no test claimed any tier meant
-/// anything.
+/// **What the fixture migration exposed — CORRECTED at D0A-R27-05.** The note here claimed
+/// that nothing had ever asserted what `Biometric` MEANT and that the migration cost no
+/// coverage. Both were false: round 25 had already added two tier-semantic assertions
+/// (`Hardware` denied as unenforceable; `Biometric` passing the tier check), so the migration
+/// **flipped a live assertion** rather than filling a vacuum — the control asserted *Biometric
+/// passes* and now asserts *Confirm passes*. What is true, and is why R25-01's defect was
+/// undetectable, is that NO tier assertion existed before round 25. See
+/// `docs/CONFORMANCE_REGISTER.md` for the three-phase account.
 const ENFORCED_TIER: RequiredTier = RequiredTier::Confirm;
 
 /// Service exactly one action over an accepted AI connection (the §4 flow).
@@ -459,7 +462,9 @@ pub fn present_and_execute(
         // machine closed between consent and Present returns with its window barely moved.
         // `CLOCK_BOOTTIME` is monotonic and suspend-inclusive.
         match (entry.granted_at_boot_secs, crate::store::boot_secs()) {
-            (Some(at), Some(now)) if now.saturating_sub(at) > crate::token::TOKEN_TTL_SECS => {
+            (Some(at), Some(now))
+                if crate::store::consent_window_elapsed(at, now, crate::token::TOKEN_TTL_SECS) =>
+            {
                 return denied(
                     "the consent window has elapsed on CLOCK_BOOTTIME — more than the TTL of \
                      real time has passed since consent, including any suspend, whatever the \
@@ -688,9 +693,13 @@ mod tests {
     /// a `Biometric` action was satisfied by a password with the stronger claim recorded in
     /// its preview, digest and audit entry.
     ///
-    /// This test is what makes the tighter ceiling a fact rather than a comment. It is also
-    /// the FIRST test in this crate to assert anything about a specific tier's meaning — see
-    /// `ENFORCED_TIER`'s note on why the fixture migration cost no coverage.
+    /// This test is what makes the tighter ceiling a fact rather than a comment.
+    ///
+    /// **It is NOT the first tier-semantic assertion in this crate (D0A-R27-05), which is what
+    /// this comment used to claim.** Round 25 added two: `Hardware` denied as unenforceable,
+    /// and `Biometric` PASSING the tier check. This test **inverts the second one** — the
+    /// control it sits beside was rewritten from `Biometric` to `Confirm` in the same change.
+    /// What is first here is the assertion that `Biometric` is specifically NOT enforceable.
     #[test]
     fn biometric_is_refused_because_the_shipped_pam_stack_has_no_biometric_factor() {
         let (daemon_end, _shell_end) = crate::channel::approval_socketpair().expect("socketpair");

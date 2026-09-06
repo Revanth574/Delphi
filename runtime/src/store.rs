@@ -17,6 +17,36 @@ use std::collections::HashMap;
 
 use crate::action::PendingAction;
 
+/// Has the consent window elapsed? A PURE function of the two readings and the TTL.
+///
+/// **D0A-R27 self-correction.** The clock change (R26-03) shipped with a test that reads the
+/// real clock, and a reviewer's mutation — swapping production `CLOCK_BOOTTIME` for
+/// `CLOCK_MONOTONIC` — **still passed it**. On a machine that has never suspended the two are
+/// identical, so that test discriminates NEITHER suspend behaviour NOR clock identity. The
+/// disclosure written beside it ("checks identity, not suspend behaviour") therefore CLAIMED
+/// MORE THAN THE TEST DID, which is worse than no disclosure: it stops the question being
+/// asked.
+///
+/// Separating the decision from the reading is what makes expiry testable at all — the edges
+/// (exactly at TTL, one past, a clock that went backwards) are reachable with injected values
+/// and unreachable through a real clock.
+///
+/// # Examples
+///
+/// ```
+/// use delphi_runtime::store::consent_window_elapsed;
+/// assert!(!consent_window_elapsed(100, 130, 30), "exactly at the TTL is still live");
+/// assert!(consent_window_elapsed(100, 131, 30), "one second past is expired");
+/// ```
+#[must_use]
+pub fn consent_window_elapsed(granted_at: u64, now: u64, ttl_secs: u64) -> bool {
+    // `saturating_sub` makes a backwards reading (which CLOCK_BOOTTIME forbids, but a corrupt
+    // or mocked value could produce) read as ZERO elapsed rather than as a huge unsigned
+    // wrap — fail-closed would be the opposite, so it is stated: a backwards clock cannot
+    // EXPIRE a token early, and cannot extend one either, because the boot clock cannot be set.
+    now.saturating_sub(granted_at) > ttl_secs
+}
+
 /// `CLOCK_BOOTTIME` in whole seconds — monotonic AND suspend-inclusive (D0A-R26-03).
 ///
 /// `None` if the clock cannot be read, which every caller treats as fail-closed. See
@@ -174,38 +204,62 @@ mod tests {
         }
     }
 
-    /// D0A-R26-03 — `boot_secs` reads `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`.
+    /// D0A-R27 — the consent-window decision, at every edge, with NO clock involved.
     ///
-    /// **WHAT THIS TEST CANNOT DO, stated rather than implied.** The property that matters is
-    /// that the consent window keeps running across SUSPEND, and the two clocks differ by
-    /// exactly the accumulated suspend time. On a machine that has never suspended they are
-    /// identical — measured on the development box at the time of the fix,
-    /// `BOOTTIME - MONOTONIC = 0.000s` — so **no assertion available here can distinguish
-    /// them**, and a test claiming to prove suspend behaviour would be proving nothing.
-    ///
-    /// So this asserts the weaker thing it can actually decide: `boot_secs` agrees with a
-    /// direct `CLOCK_BOOTTIME` reading and is monotonically non-decreasing. The suspend
-    /// behaviour itself is inherited from the documented semantics of the clock, not measured.
-    /// A lane that has suspended would strengthen this into a real discriminator.
+    /// This is the coverage the clock test could not provide. A reviewer's mutation replaced
+    /// production `CLOCK_BOOTTIME` with `CLOCK_MONOTONIC` and the clock test still passed, so
+    /// expiry had no discriminating test at all. These edges are unreachable through a real
+    /// clock and are the whole of the decision.
     #[test]
-    fn boot_secs_reads_the_boottime_clock_and_does_not_go_backwards() {
-        let direct = unsafe {
-            let mut ts: nix::libc::timespec = std::mem::zeroed();
-            assert_eq!(
-                nix::libc::clock_gettime(nix::libc::CLOCK_BOOTTIME, &mut ts),
-                0,
-                "CLOCK_BOOTTIME must be readable"
-            );
-            u64::try_from(ts.tv_sec).expect("boottime seconds fit u64")
-        };
-        let ours = boot_secs().expect("boot_secs must read the clock");
+    fn the_consent_window_decision_is_exact_at_its_edges() {
+        const TTL: u64 = 30;
+        assert!(!consent_window_elapsed(1_000, 1_000, TTL), "same instant is live");
+        assert!(!consent_window_elapsed(1_000, 1_029, TTL), "one before the TTL is live");
+        assert!(!consent_window_elapsed(1_000, 1_030, TTL), "EXACTLY at the TTL is live");
+        assert!(consent_window_elapsed(1_000, 1_031, TTL), "one past the TTL is expired");
+        assert!(consent_window_elapsed(1_000, u64::MAX, TTL), "far future is expired");
+        // A backwards reading reads as zero elapsed, not as an unsigned wrap to ~u64::MAX.
         assert!(
-            ours.abs_diff(direct) <= 1,
-            "boot_secs ({ours}) disagrees with a direct CLOCK_BOOTTIME read ({direct}) by more \
-             than the one-second sampling gap — it is reading a different clock"
+            !consent_window_elapsed(1_000, 900, TTL),
+            "a backwards reading must not wrap into 'expired' — it reads as zero elapsed"
         );
-        let later = boot_secs().expect("second read");
-        assert!(later >= ours, "the boot clock went backwards: {ours} -> {later}");
+    }
+
+    /// D0A-R26-03 / D0A-R27 — `boot_secs` agrees with a direct `CLOCK_BOOTTIME` read.
+    ///
+    /// **THIS TEST DISCRIMINATES NOTHING ON A MACHINE THAT HAS NEVER SUSPENDED, AND SAYS SO
+    /// OUT LOUD.** `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC` differ by exactly the accumulated
+    /// suspend time; where that is zero, production could read either and this test passes
+    /// — which a reviewer demonstrated by mutation. The previous version of this comment
+    /// claimed it "checks clock IDENTITY"; it does not, here.
+    ///
+    /// It is kept because it costs nothing and becomes a real discriminator on a lane that has
+    /// suspended. It prints the measured delta so a reader can see whether this run had any
+    /// discriminating power at all, rather than inferring it from green.
+    #[test]
+    fn boot_secs_agrees_with_a_direct_boottime_read_and_reports_its_own_discriminating_power() {
+        let read = |clk| unsafe {
+            let mut ts: nix::libc::timespec = std::mem::zeroed();
+            assert_eq!(nix::libc::clock_gettime(clk, &mut ts), 0, "clock must be readable");
+            ts.tv_sec as i64
+        };
+        let boot = read(nix::libc::CLOCK_BOOTTIME);
+        let mono = read(nix::libc::CLOCK_MONOTONIC);
+        let ours = boot_secs().expect("boot_secs must read the clock") as i64;
+        assert!(
+            (ours - boot).abs() <= 1,
+            "boot_secs ({ours}) disagrees with CLOCK_BOOTTIME ({boot}) beyond the sampling gap"
+        );
+        let delta = boot - mono;
+        eprintln!(
+            "DISCRIMINATION: BOOTTIME - MONOTONIC = {delta}s.              {}",
+            if delta > 1 {
+                "This lane HAS suspended — the assertion above distinguishes the two clocks."
+            } else {
+                "This lane has NOT suspended — the two clocks are identical here, so this test                  CANNOT distinguish them and a green proves nothing about clock selection.                  Expiry coverage comes from the_consent_window_decision_is_exact_at_its_edges."
+            }
+        );
+        assert!(boot_secs().expect("second read") as i64 >= ours, "the boot clock went backwards");
     }
 
     #[test]

@@ -41,40 +41,96 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// root-owned unit file; nothing the AI or the user's session controls can reach this.
 pub const MAX_EXECUTABLE_BYTES_ENV: &str = "DELPHI_MAX_EXECUTABLE_BYTES";
 
-/// Default ceiling on bytes read from a proposed executable or script interpreter.
+/// Peak resident content, as a multiple of the per-proposal budget — **a property of the code
+/// in this module, not of any observed workload** (D0A-R27-01).
 ///
-/// **DERIVED FROM WHAT IT PROTECTS AGAINST — a pre-consent memory bound — and not from the
-/// largest binary that happened to be observed.** D0A-R26-04 rejected the previous 64 MiB for
-/// being the latter: it was measured `maxdepth 1` over `/usr/bin`, `/bin` and `/usr/libexec`,
-/// concluded "0 of 1449 exceed 64 MiB", and was wrong **on the machine it was derived from** —
-/// `~/.local/share/claude` (262 MiB), `~/.codex/.../codex` (246 MiB) and
-/// `/usr/lib/claude-desktop` (207 MiB) all exceed it. A sample's blind spot became a universal.
+/// Derived by reading `canonicalize` + `build_script_pin`, for a script proposal of `S` bytes
+/// naming an interpreter of `I` bytes:
 ///
-/// The arithmetic, so the next round can attack the budget rather than the observation:
+/// | object | bytes | why it exists |
+/// |---|---|---|
+/// | `executable_fd` | `S` | `seal_executable_snapshot` of the script — RETAINED |
+/// | `interpreter_fd` | `I` | `seal_executable_snapshot` of the interpreter — RETAINED |
+/// | `script_memfd` | `S` | `ScriptPin::sealed` snapshots the script **a second time** — RETAINED |
+/// | `bytes` | `S` | the read buffer, live until end of scope |
+/// | `interp_bytes` | `I` | the interpreter read buffer, live until end of scope |
 ///
-/// * **What is at risk.** `canonicalize` runs in the single-threaded ROOT daemon on an
-///   AI-supplied path, before the pending action exists and therefore before any human gate.
-/// * **Peak cost per proposal = 2x the ceiling**: the `Vec` read here, plus the copy
-///   [`seal_executable_snapshot`](crate::action::seal_executable_snapshot) writes into a
-///   memfd, both live at once. (The script path is not worse: a script is small and its
-///   interpreter is the only large object, so it is also 2x.)
-/// * **Budget.** Pre-consent transient is capped at **1/8 of the target deployment class's
-///   RAM floor**. Phase 3B/3C targets developer workstations; taking 8 GiB as that floor gives
-///   1 GiB of allowed transient.
-/// * **Therefore** ceiling = 1 GiB / 2 = **512 MiB**.
+/// Retained `2S + I`; peak during construction `3S + 2I`. Under an AGGREGATE budget `B` where
+/// `S + I <= B`, the worst case is `S = B, I = 0`, giving **peak = 3B**.
 ///
-/// That it also clears the largest real executable found on any searched path (262 MiB, ~95%
-/// headroom) is a CHECK on the budget, not the derivation of it.
+/// **D0A-R27-01 found this at 5x, not the 2x the previous derivation claimed.** That claim
+/// rested on a parenthetical — "a script is small and its interpreter is the only large
+/// object" — which **nothing enforced**: the ceiling was per-object, so a proposal could carry
+/// a 512 MiB script AND a 512 MiB interpreter. A reviewer's probe canonicalized a 1 MiB script
+/// referencing a 1 MiB interpreter and retained 3 MiB of sealed objects under a 1 MiB ceiling.
 ///
-/// **The trade-off this makes explicit, which is why it is configuration and not a constant:**
-/// a 2 GiB deployment should set this to 128 MiB, and thereby cannot run 262 MiB tools. That
-/// choice belongs to the deployment. No single number both admits a quarter-gigabyte binary
-/// and protects a 2 GiB machine, and pretending otherwise is what produced the last number.
+/// **CHANGING `canonicalize` CHANGES THIS NUMBER.** Removing the duplicate script snapshot
+/// would take it to 2; adding another retained copy would take it to 4. It is derived from the
+/// table above and must be re-derived when that table changes — it is not a tuning constant.
+const PEAK_MULTIPLE_OF_BUDGET: u64 = 3;
+
+/// Pre-consent memory the daemon may hold for one proposal.
+///
+/// **1/8 of the target deployment class's RAM floor.** Phase 3B/3C targets developer
+/// workstations; taking 8 GiB as that floor gives 1 GiB. This is the number to attack — it is
+/// a deployment assumption, and it is the only free choice in the derivation below.
+const PRE_CONSENT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Default AGGREGATE byte budget for one proposal: everything `canonicalize` reads, summed.
+///
+/// **`budget / peak_multiplier`, COMPUTED, not written down** (D0A-R27-01). Both inputs are
+/// stated above: [`PRE_CONSENT_BUDGET_BYTES`] is the deployment assumption,
+/// [`PEAK_MULTIPLE_OF_BUDGET`] is read off this module's own allocation table. `1 GiB / 3 =
+/// 357,913,941 bytes` (341.3 MiB).
+///
+/// It is an expression rather than a literal on purpose: a literal would let the derivation
+/// and the value drift, and drift is what produced 64 MiB. **Change the allocation table and
+/// the ceiling changes with it** — which is the property that makes the multiplier a fact
+/// about `canonicalize` rather than a tuning knob. There is no rounding to a pretty number,
+/// because a pretty number is a second, undocumented choice.
+///
+/// **AGGREGATE, not per object.** The previous ceiling applied to each read separately, so a
+/// script proposal could spend it twice (once on the script, once on the interpreter). This
+/// budget is consumed across every read in one proposal.
+///
+/// **THE LARGEST-KNOWN-BINARY CHECK IS A SANITY TEST ON THE RESULT, NOT PART OF THE
+/// DERIVATION.** That distinction is the whole lesson of D0A-R26-04, where 64 MiB was chosen
+/// *because* it exceeded the largest thing then observed — and was wrong on the machine it was
+/// measured on. Applied to this result: the largest executables found on any searched path here
+/// are 262 MiB, 246 MiB and 207 MiB, all of which fit with margin. **If they had not fit, the
+/// correct response would be to revisit the BUDGET or the MULTIPLIER — not to raise the
+/// ceiling to accommodate them.**
 ///
 /// **Bounded scope, stated rather than implied:** this bounds ONE proposal. The pending store
 /// has no cap, so a daemon that loops (B2; B1 services one action and exits) can accumulate
-/// sealed memfds across proposals. That is a separate bound and is not closed here.
-pub const DEFAULT_MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+/// sealed memfds across proposals. Separate bound; not closed here.
+pub const DEFAULT_MAX_EXECUTABLE_BYTES: u64 = PRE_CONSENT_BUDGET_BYTES / PEAK_MULTIPLE_OF_BUDGET;
+
+/// The aggregate byte budget for one proposal, consumed across every read it performs.
+///
+/// Exists because a PER-OBJECT ceiling is not a bound on a proposal (D0A-R27-01): a script and
+/// its interpreter are two reads, and the old ceiling admitted the full amount twice.
+struct ReadBudget {
+    remaining: u64,
+}
+
+impl ReadBudget {
+    fn new(total: u64) -> Self {
+        Self { remaining: total }
+    }
+
+    /// Deduct `n` bytes already read.
+    ///
+    /// INFALLIBLE ON PURPOSE. The enforcement happens at the read itself, whose ceiling IS
+    /// `remaining` — so by the time this is called the bytes are known to fit, and a guard
+    /// here could never fire. An unreachable error path is worse than none: it reads as a
+    /// second check and is not one. There is exactly ONE enforcement site, in
+    /// `read_bounded_inner`, and its messages name the aggregate so the mechanism is legible
+    /// from the failure alone.
+    fn spend(&mut self, n: u64) {
+        self.remaining = self.remaining.saturating_sub(n);
+    }
+}
 
 /// The active ceiling: [`MAX_EXECUTABLE_BYTES_ENV`] if set, else
 /// [`DEFAULT_MAX_EXECUTABLE_BYTES`].
@@ -83,7 +139,29 @@ pub const DEFAULT_MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 /// deployment that meant to tighten this must not be given a looser bound because it made a
 /// typo (fail-closed, D0A-R26-04).
 fn max_executable_bytes() -> Result<u64, RuntimeError> {
-    parse_ceiling(std::env::var(MAX_EXECUTABLE_BYTES_ENV).ok().as_deref())
+    ceiling_from_var(std::env::var(MAX_EXECUTABLE_BYTES_ENV))
+}
+
+/// The env-boundary decision as a PURE function of what `std::env::var` returned.
+///
+/// **D0A-R27-03 lived in the call `.ok()`, not in the parser** — `.ok()` maps BOTH
+/// `NotPresent` and `NotUnicode` to `None`, so a non-UTF-8 configured value fell through to
+/// the DEFAULT, which is looser than anything a deployment bothers to set. That is fail-OPEN,
+/// in the function whose own doc promised fail-closed.
+///
+/// The reviewer's point was that testing [`parse_ceiling`] alone could never catch it, and
+/// that was right: the collapse happened one level up, in code no test could reach without
+/// mutating process-global env. So the decision moved DOWN into a function that takes the
+/// `Result` itself. No `set_var`, no subprocess, and the `NotUnicode` branch is reachable.
+fn ceiling_from_var(v: Result<String, std::env::VarError>) -> Result<u64, RuntimeError> {
+    match v {
+        Err(std::env::VarError::NotPresent) => parse_ceiling(None),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(RuntimeError::Protocol(format!(
+            "{MAX_EXECUTABLE_BYTES_ENV} is set to a non-UTF-8 value ({raw:?}), which cannot be \
+             a byte count. Refusing rather than falling back to the default (D0A-R27-03)"
+        ))),
+        Ok(raw) => parse_ceiling(Some(&raw)),
+    }
 }
 
 /// The ceiling decision as a PURE function of the configured string.
@@ -135,7 +213,12 @@ where
 }
 
 /// [`read_bounded_inner`] under [`READ_DEADLINE`], on a disposable thread.
-fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, RuntimeError> {
+fn open_and_read_bounded(
+    path: &str,
+    what: &'static str,
+    budget: &mut ReadBudget,
+) -> Result<Vec<u8>, RuntimeError> {
+    let ceiling = budget.remaining;
     let owned = path.to_string();
     let timeout_msg = format!(
         "{what}: `{}` did not open-and-read within {}s — a stalled filesystem (FUSE, NFS) \
@@ -144,7 +227,13 @@ fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, Runt
         path.escape_debug(),
         READ_DEADLINE.as_secs()
     );
-    under_deadline(READ_DEADLINE, move || read_bounded_inner(&owned, what), &timeout_msg)
+    let bytes = under_deadline(
+        READ_DEADLINE,
+        move || read_bounded_inner(&owned, what, ceiling),
+        &timeout_msg,
+    )?;
+    budget.spend(bytes.len() as u64);
+    Ok(bytes)
 }
 
 /// Open `path` and read it, bounded in both TYPE and SIZE, before anything is bound
@@ -173,10 +262,12 @@ fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, Runt
 /// The type and size are taken from the HELD fd, never the path: the fd is the object that
 /// gets hashed and exec'd, so checking anything else would reintroduce the swap window that
 /// hashing-through-the-fd exists to close.
-fn read_bounded_inner(path: &str, what: &'static str) -> Result<Vec<u8>, RuntimeError> {
+fn read_bounded_inner(
+    path: &str,
+    what: &'static str,
+    ceiling: u64,
+) -> Result<Vec<u8>, RuntimeError> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-
-    let ceiling = max_executable_bytes()?;
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -218,8 +309,11 @@ fn read_bounded_inner(path: &str, what: &'static str) -> Result<Vec<u8>, Runtime
 
     if meta.len() > ceiling {
         return Err(RuntimeError::Protocol(format!(
-            "{what}: `{}` is {} bytes, over the {ceiling}-byte ceiling (set by \
-             {MAX_EXECUTABLE_BYTES_ENV} or its default) — D0A-R25-02, D0A-R26-04",
+            "{what}: `{}` is {} bytes, over the {ceiling} bytes REMAINING of this proposal's \
+             aggregate budget. The budget is spent across every read one proposal performs, \
+             not reset per object — a script and its interpreter would otherwise each spend it \
+             in full (D0A-R25-02, D0A-R26-04, D0A-R27-01). Total is set by \
+             {MAX_EXECUTABLE_BYTES_ENV} or its default",
             path.escape_debug(),
             meta.len()
         )));
@@ -239,7 +333,8 @@ fn read_bounded_inner(path: &str, what: &'static str) -> Result<Vec<u8>, Runtime
         })?;
     if bytes.len() as u64 > ceiling {
         return Err(RuntimeError::Protocol(format!(
-            "{what}: `{}` grew past the {ceiling}-byte ceiling while being read (D0A-R25-02)",
+            "{what}: `{}` grew past the {ceiling} bytes remaining of this proposal's aggregate \
+             budget while being read (D0A-R25-02, D0A-R27-01)",
             path.escape_debug()
         )));
     }
@@ -261,7 +356,8 @@ pub fn canonicalize(
     // Open the executable, then hash the bytes READ THROUGH the held fd — the same
     // fd `execute` re-exec's, so the hash and the exec see the same kernel object.
     // Type- and size-bounded (D0A-R25-02): this runs in the root daemon before any gate.
-    let bytes = open_and_read_bounded(&proposal.exe_path, "open proposed executable")?;
+    let mut budget = ReadBudget::new(max_executable_bytes()?);
+    let bytes = open_and_read_bounded(&proposal.exe_path, "open proposed executable", &mut budget)?;
     // TRUST_MODEL v7 (D0A-R9-02): bind an IMMUTABLE SNAPSHOT, not the filesystem object.
     // Nothing after this line can be changed by whoever owns the path.
     let executable_fd = crate::action::seal_executable_snapshot(&bytes)?;
@@ -269,7 +365,7 @@ pub fn canonicalize(
 
     // Shebang → pin the interpreter object + seal the script content (R3-04).
     let script = if bytes.starts_with(b"#!") {
-        Some(build_script_pin(&bytes)?)
+        Some(build_script_pin(&bytes, &mut budget)?)
     } else {
         None
     };
@@ -295,6 +391,22 @@ pub fn canonicalize(
              (D0A-R25-03)"
                 .into(),
         ));
+    }
+    // D0A-R27 (the argv/env asymmetry the round-26 prompt raised and round 26 left open).
+    // `env_delta` has been NUL-validated at both doors since R18-03/R19-05; argv was checked
+    // only for emptiness. The reviewer established the exec side FAILS CLOSED — `Command`
+    // returns InvalidInput ("nul byte found in provided data") and never splits the argument —
+    // so this is NOT the env-smuggling shape. What it changes is WHEN the refusal happens: an
+    // action carrying a NUL is unexecutable, and without this check it is previewed,
+    // consented to by a human, minted a token, and CONSUMES the one-shot approval before
+    // failing to spawn. Refusing here means nobody authenticates for an action that cannot run.
+    if let Some(bad) = proposal.argv.iter().find(|a| a.contains('\0')) {
+        return Err(RuntimeError::Protocol(format!(
+            "argv entry `{}` contains an embedded NUL, which execve cannot represent. Refused \
+             at proposal time so it does not reach a human for consent and consume the \
+             one-shot approval on an action that cannot spawn (D0A-R27)",
+            bad.escape_debug()
+        )));
     }
     let fs_binds = proposal
         .fs_binds
@@ -363,7 +475,7 @@ fn validate_env_delta(entries: &[pb::EnvVar]) -> Result<Vec<(String, String)>, R
 
 /// Parse the shebang, open + hash the interpreter through its fd, and seal the
 /// script content (`ScriptPin::sealed` applies the full immutability seal set).
-fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
+fn build_script_pin(script_bytes: &[u8], budget: &mut ReadBudget) -> Result<ScriptPin, RuntimeError> {
     let line_end = script_bytes.iter().position(|&b| b == b'\n').unwrap_or(script_bytes.len());
     // Kernel cap (BINPRM_BUF_SIZE): the interpreted `#!` line is bounded; a longer one
     // is malformed/hostile — reject before parsing.
@@ -385,7 +497,7 @@ fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
     // Same bounds as the executable (D0A-R25-02): the interpreter path comes from the
     // script's own shebang, which is AI-selected content, so it is the second door to the
     // same FIFO / endless-device / oversize stall in the root daemon.
-    let interp_bytes = open_and_read_bounded(interp_path, "open script interpreter")?;
+    let interp_bytes = open_and_read_bounded(interp_path, "open script interpreter", budget)?;
     // TRUST_MODEL v7 NAMED LIMIT 1: a nested shebang is REFUSED, here, before anything
     // executes. The kernel opens every interpreter in a chain BY PATH, recursively
     // (fs/binfmt_script.c), so pinning one interpreter leaves the rest unpinned; and
@@ -560,6 +672,112 @@ mod tests {
         }
     }
 
+    /// D0A-R27-01 — the SANITY CHECK on the derived ceiling. **Not part of the derivation.**
+    ///
+    /// The distinction is the whole lesson of D0A-R26-04, where 64 MiB was chosen *because* it
+    /// cleared the largest binary then observed — and was wrong on the machine it was measured
+    /// on. Here the ceiling comes from `budget / multiplier` and this test merely CHECKS the
+    /// result against reality. **If it failed, the correct response would be to revisit the
+    /// budget or the multiplier — never to raise the ceiling to accommodate a binary.**
+    #[test]
+    fn the_derived_ceiling_admits_the_largest_executables_known_on_this_class_of_machine() {
+        assert_eq!(
+            DEFAULT_MAX_EXECUTABLE_BYTES,
+            PRE_CONSENT_BUDGET_BYTES / PEAK_MULTIPLE_OF_BUDGET,
+            "the ceiling must remain the quotient, not a literal that drifted from it"
+        );
+        // Measured on this host (D0A-R26-04): the three executables that broke the 64 MiB
+        // ceiling. Named as data, with their sizes, so a future reader can re-measure.
+        for (name, bytes) in [
+            ("claude", 275_012_592u64),
+            ("codex", 258_638_944),
+            ("claude-desktop", 217_799_896),
+        ] {
+            assert!(
+                bytes < DEFAULT_MAX_EXECUTABLE_BYTES,
+                "{name} ({bytes} bytes) exceeds the derived ceiling ({}) — revisit the BUDGET \
+                 or the MULTIPLIER, do not raise the ceiling to fit it",
+                DEFAULT_MAX_EXECUTABLE_BYTES
+            );
+        }
+    }
+
+    /// D0A-R27-01 — the budget is AGGREGATE across a proposal's reads, not per object.
+    ///
+    /// The defect: the ceiling applied to each read separately, so a script proposal spent it
+    /// TWICE — once on the script, once on its interpreter — and the retained snapshots
+    /// (`2S + I`, because `ScriptPin::sealed` copies the script a second time) blew the
+    /// derived memory budget by 2.5x. A reviewer's probe canonicalized a 1 MiB script naming a
+    /// 1 MiB interpreter under a 1 MiB ceiling and retained 3 MiB.
+    ///
+    /// Exercises `ReadBudget` + `open_and_read_bounded` directly, so the budget can be small
+    /// enough to test without touching the 320 MiB default or process-global env.
+    #[test]
+    fn the_read_budget_is_spent_across_reads_not_reset_per_object() {
+        let tmp = tempfile::Builder::new().prefix("delphi-r2701-").tempdir().unwrap();
+        let a = write_exe(tmp.path(), "a", &vec![b'x'; 600]);
+        let b = write_exe(tmp.path(), "b", &vec![b'y'; 600]);
+
+        // POSITIVE CONTROL FIRST: 600 + 300 fits in 1000, so the budget is not simply refusing.
+        let small = write_exe(tmp.path(), "small", &vec![b'z'; 300]);
+        let mut ok_budget = ReadBudget::new(1000);
+        assert!(open_and_read_bounded(a.to_str().unwrap(), "first", &mut ok_budget).is_ok());
+        assert!(
+            open_and_read_bounded(small.to_str().unwrap(), "second", &mut ok_budget).is_ok(),
+            "600 + 300 must fit a 1000-byte budget, or this test proves only that reads fail"
+        );
+
+        // THE PROPERTY: each read fits alone; together they do not.
+        let mut budget = ReadBudget::new(1000);
+        assert!(
+            open_and_read_bounded(a.to_str().unwrap(), "first", &mut budget).is_ok(),
+            "600 alone must fit a 1000-byte budget"
+        );
+        match open_and_read_bounded(b.to_str().unwrap(), "second", &mut budget) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("aggregate"),
+                "refused, but not by the aggregate budget: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "a second 600-byte read succeeded against a 1000-byte budget already charged \
+                 600 — the budget resets per object, which is D0A-R27-01"
+            ),
+        }
+    }
+
+    /// D0A-R27-03 — a non-UTF-8 configured ceiling is REFUSED, not silently defaulted.
+    ///
+    /// The bug was in the `.ok()` at the env boundary, which `parse_ceiling`'s test could not
+    /// reach — so the decision moved into `ceiling_from_var`, which takes the `Result` and is
+    /// therefore testable without `set_var` or a subprocess.
+    #[test]
+    fn a_non_utf8_configured_ceiling_is_refused_not_defaulted() {
+        use std::env::VarError;
+        use std::os::unix::ffi::OsStringExt;
+
+        // NotPresent -> default. This is the branch that must KEEP working.
+        assert_eq!(
+            ceiling_from_var(Err(VarError::NotPresent)).expect("unset -> default"),
+            DEFAULT_MAX_EXECUTABLE_BYTES
+        );
+        // A valid value is honoured.
+        assert_eq!(ceiling_from_var(Ok("4096".into())).expect("valid"), 4096);
+        // NotUnicode must NOT become the default.
+        let bad = std::ffi::OsString::from_vec(vec![0xFF, 0xFE]);
+        match ceiling_from_var(Err(VarError::NotUnicode(bad))) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("non-UTF-8"),
+                "refused, but not for the encoding: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(n) => panic!(
+                "a non-UTF-8 ceiling silently became {n} bytes — `.ok()` collapsed NotUnicode \
+                 into unset and fell through to the default (D0A-R27-03)"
+            ),
+        }
+    }
+
     /// D0A-R26-02 — the read deadline fires, and the daemon survives the thing that would
     /// have wedged it.
     ///
@@ -709,6 +927,41 @@ mod tests {
             canonicalize(&base_proposal(path), "r2502-ok".into()).is_ok(),
             "a {len}-byte real executable was refused — the ceiling is too low (D0A-R25-02)"
         );
+    }
+
+    /// D0A-R27 — an argv entry carrying a NUL is refused at proposal time.
+    ///
+    /// The asymmetry the round-26 prompt raised and round 26 did not answer: `env_delta` had
+    /// been NUL-checked at both doors since R18-03/R19-05; argv was checked only for
+    /// emptiness. The reviewer then established that the exec side FAILS CLOSED — `Command`
+    /// returns `InvalidInput` and never splits the argument — so this is not the
+    /// env-smuggling shape, and the fix is about WHEN, not WHETHER.
+    ///
+    /// Without it the action is previewed, a human authenticates, a token is minted, and the
+    /// ONE-SHOT APPROVAL IS CONSUMED before the spawn fails. That is a human asked to consent
+    /// to something that cannot run, and an approval burned on it.
+    #[test]
+    fn an_argv_entry_with_an_embedded_nul_is_refused_at_proposal_time() {
+        let dir = tempdir();
+        let exe = write_exe(dir.path(), "tool", b"\x7fELF binary-ish");
+        let mut p = base_proposal(exe.to_str().unwrap());
+        p.argv = vec!["tool".into(), "a\0b".into()];
+
+        match canonicalize(&p, "act-nul".into()) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("embedded NUL"),
+                "refused, but not for the NUL: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "an argv NUL canonicalized — it will reach a human for consent and burn the \
+                 one-shot approval on an action Command cannot spawn (D0A-R27)"
+            ),
+        }
+        // POSITIVE CONTROL: an ordinary argv is untouched.
+        let mut ok = base_proposal(exe.to_str().unwrap());
+        ok.argv = vec!["tool".into(), "--flag".into()];
+        assert!(canonicalize(&ok, "act-ok".into()).is_ok(), "a normal argv must still pass");
     }
 
     /// D0A-R25-03 — an empty argv is refused at proposal time.

@@ -520,6 +520,17 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
                 .into(),
         ));
     }
+    // D0A-R27: the same NUL validation `env_delta` has had since R19-05, at the same choke
+    // point and for the same reason — the public fields mean canonicalization is not the only
+    // builder. `Command` would refuse this anyway (fail-closed), so what this buys is the
+    // refusal happening BEFORE the ledger consumes the one-shot approval.
+    if let Some(bad) = action.argv.iter().find(|a| a.contains('\0')) {
+        return Err(RuntimeError::Protocol(format!(
+            "argv entry `{}` contains an embedded NUL — refused at the execute choke point \
+             before the approval is consumed (D0A-R27)",
+            bad.escape_debug()
+        )));
+    }
     // D0A-R19-05: `PendingAction`'s fields are PUBLIC, so canonicalization is not the only
     // way one is built — a direct builder recreates the NUL smuggling R18-03 closed. Re-checked
     // HERE, at the one choke point every execution passes, for the same reason the seal checks

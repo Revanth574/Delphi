@@ -288,18 +288,31 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**CURRENT ROOT RECORD: LANE RUN 15** — `EXECUTED 192 / SKIPPED 5 / reported 197`, freshness
-**ENFORCED** (D0A-R26-05: enumeration asserted at 17, both hash sides asserted equal to it,
-rebuild failure fatal — run 14's version printed those numbers and compared anyway). Predicted
-`192/5/197` at `0ad6556`, committed alone before the run, matched exactly. It is the first root
-execution of the round-26 remediation: the tier ceiling at `Confirm`, the deadline-bounded
-read, the `CLOCK_BOOTTIME` consent window and the configurable read ceiling had never run as
-root before it.
+**CURRENT ROOT RECORD: LANE RUN 16** — `EXECUTED 200 / SKIPPED 5 / reported 205`, predicted
+`200/5/205` at `09dc36b` and matched exactly. First root execution of the round-27 remediation:
+the absolute frame deadline in `wire.rs`, the aggregate read budget, `ceiling_from_var`, argv
+NUL validation and `consent_window_elapsed` had none of them run as root before it.
 
-**What run 15 does NOT establish** is in `OPEN AFTER ROUND 26` above and repeated in the lane
-record itself: the suspend divergence is unmeasured on a box that has never suspended, the
-pending store has no cap, and `argv` remains emptiness-checked only. A green root run is not
-evidence about any of the three.
+**Its membership is proven by IDENTITY, not inferred from equal totals (D0A-R27-04):** `root
+205 identities / unpriv 205`, **zero in either direction**, `membership rc=0`. Note 205 rather
+than 200 — membership covers the whole set, executed *and* skipped; the 200/5 split is the
+count check. Runs 14 and 15 asserted set equality from matching totals; that inference was
+true, but equal cardinality cannot detect a compensating removal and addition, so the evidence
+did not establish the claim. Run 16 is the first where it does.
+
+**The clock test reported its own powerlessness**, which was the point of changing it:
+`BOOTTIME - MONOTONIC = 0s … this test CANNOT distinguish them and a green proves nothing
+about clock selection.` The prior disclosure claimed the test "checks clock IDENTITY"; a
+reviewer's mutation showed it checks neither. The transcript now states the limit rather than
+letting green imply its absence.
+
+**What run 16 does NOT establish** is unchanged and listed in the lane record: the suspend
+divergence (unmeasured on a lane that has never suspended), the uncapped pending store, and
+the fact that the 30 s deadline and the 1 GiB / 8 GiB budget are choices rather than
+demonstrated bounds.
+
+**Run 15 is SUPERSEDED but not in doubt** (`192/5/197`, `0ad6556`): sound, superseded only
+because it predates the round-27 remediation.
 
 **Run 14 is SUPERSEDED but not in doubt** (`EXECUTED 187 / SKIPPED 5 / reported 192`,
 `af6dde0`): it closed D0A-R24-01 with the first freshness check that actually hashed anything.

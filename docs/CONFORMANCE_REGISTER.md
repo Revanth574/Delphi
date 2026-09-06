@@ -42,7 +42,25 @@ the right place, found the thing, and a second step threw it away. Recorded as
 mechanism and can silently invert it* — with the remedy that a suppression pattern owes the
 same discrimination test as an assertion: does it exclude only what it names?
 
-### What R26-01's fixture migration exposed
+### What R26-01's fixture migration exposed — **the round's real output**
+
+**The tier system was uninspectable by construction.** Not "twelve fixtures changed a label":
+**no test in the crate had ever asserted that any tier meant anything.** The only two
+tier-touching tests assert that *changing* the tier changes the digest and the preview, which
+holds for any two distinct values and would pass with the tiers renamed to colours.
+`end_to_end.rs` says "one Biometric action" in a doc comment. **The label was decoration end to
+end.**
+
+That is why R25-01's "descriptive only" defect could live here undetected — **it could not have
+been caught, because nothing claimed a tier had consequences.** A defect is only findable
+against an assertion, and there was none to violate.
+
+So the fix's value is **less "Biometric is now refused" than "a tier now has an assertion
+attached to it at all"**. `biometric_is_refused_because_the_shipped_pam_stack_has_no_biometric_factor`
+is the first test in this crate to make a claim about what a specific tier is worth. The
+refusal is the occasion; the assertion is the thing that was missing.
+
+### The migration itself
 
 Every fixture in the crate proposed `Biometric`. Moving all of them to `Confirm` cost **no
 coverage**, because **nothing had ever asserted what `Biometric` meant** — the only two
@@ -53,17 +71,20 @@ about the fixtures, and it is why R25-01's "descriptive only" defect could live 
 test could have caught it, because no test claimed any tier meant anything.**
 `biometric_is_refused_…` is the first test in this crate to assert on a tier's meaning.
 
-### Honest residuals carried out of this round
+### OPEN AFTER ROUND 26 — each stated so it cannot be read as settled
 
-- **The suspend divergence is reasoned, not measured.** `BOOTTIME - MONOTONIC = 0.000s` on this
-  box (never suspended), so no assertion available here distinguishes the two clocks. The test
-  checks clock IDENTITY and says so; a lane that has suspended would strengthen it.
-- **The deadline's timeout branch is proven on a sleeping closure, not a stalled mount.** That a
-  real FUSE stall reaches it is a property of the filesystem, not of this code.
-- **The pending store still has no cap.** The ceiling bounds ONE proposal; a looping daemon (B2;
-  B1 services one action and exits) accumulates sealed memfds across proposals. Not closed here.
-- **`argv` is validated for emptiness only** while `env_delta` is NUL-checked at both doors.
-  Surfaced in the round-26 prompt, unanswered by this round's findings, still open.
+**These are carried in the lane record too**, because a residual recorded only beside the fix
+that created it is read as part of that fix.
+
+| # | item | why it is easy to mistake for closed | state |
+|---|---|---|---|
+| **1** | **The suspend divergence is REASONED, NOT MEASURED.** `CLOCK_BOOTTIME` replaced `Instant` because `CLOCK_MONOTONIC` pauses across suspend | this box has **never suspended** — `BOOTTIME - MONOTONIC = 0.000s` — so **no assertion available here distinguishes the two clocks.** The test that exists checks clock IDENTITY, and a reader skimming a green suite will take the R26-03 change as *proven* | **UNMEASURED, not unproven-and-ignored.** An honest limit of the lane, not a gap to close by trying harder here. A lane that has suspended turns the identity test into a real discriminator |
+| **2** | **The pending store has NO CAP.** `DEFAULT_MAX_EXECUTABLE_BYTES` bounds ONE proposal at 2x the ceiling; nothing bounds how many proposals accumulate | **it is adjacent to what R26-04 just fixed**, which is the specific way an open item disappears: the neighbour got a derivation, a config knob and a test, so the region reads as handled. It is not — B1 services one action and exits, so the absence is invisible today and becomes live the moment B2 loops | **OPEN.** Belongs with the B2 loop work |
+| **3** | **`argv` is validated for EMPTINESS ONLY**, while `env_delta` is NUL-checked at BOTH doors (D0A-R18-03 / R19-05) | **it was raised in the round-26 prompt and the findings did not answer it.** A question a reviewer declined to answer reads as settled unless it is recorded as unanswered — that is the whole reason this row exists | **OPEN AND UNANSWERED.** Known: the preview renders argv through `escape_debug`, so a NUL would be visible rather than hidden, unlike the env-smuggling shape. Unknown and **not asserted**: what `Command` does with an interior NUL at spawn |
+
+Also carried, lower stakes: **the deadline's timeout branch is proven on a sleeping closure,
+not a stalled mount** — that a real FUSE stall reaches it is a property of the filesystem, not
+of this code.
 
 ---
 

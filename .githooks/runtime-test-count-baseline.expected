@@ -1,120 +1,78 @@
-# EXPECTED root-lane counts for the NEXT lane run — COMMITTED BEFORE IT RUNS.
+# PREDICTION for the next ROOT lane run (run 14), committed ALONE and BEFORE the run.
 #
-# WHY THIS FILE EXISTS (D0A-R21-07). Two consecutive lane runs had a correct figure and a
-# WRONG explanation: R19-06 (a "+2" that named an internal test leg as a second #[test]) and
-# R20-07 (a "+1" that named a test which already existed). The second happened while claiming
-# the first had made attribution "checkable".
+# STEP -1 of `scratch/lane-run-7-procedure.md`. The derivation is written out so it is
+# checkable independently of whether the number turns out to match — R19-06 and R20-07 are the
+# two runs whose FIGURE was right and whose EXPLANATION was reconstructed afterwards, which is
+# the failure this file exists to prevent.
 #
-# NO DATES OR COMMIT HASHES ARE WRITTEN IN THIS FILE (D0A-R22-02). The first version recorded
-# both by hand and BOTH WERE WRONG: it dated the predictions 2026-08-29 when the commits are
-# 2026-08-30 and the result is 2026-09-01, and it labelled them "committed at <hash>" using
-# the TREE THEY WERE DERIVED FROM rather than the commit that introduced them. A hand-copied
-# provenance in the one file whose entire claim is *git establishes the ordering* can only be
-# redundant or false. It was false. Use:
+# ORDERING IS CONVENTION, NOT MECHANISM (D0A-R22-01, reopened). `git log` on this file versus
+# the result file is the only evidence that the prediction came first. It held for run 13.
 #
-#   git log --format='%h %ad %s' --date=iso -- .githooks/runtime-test-count-baseline.expected
-#   git log --format='%h %ad %s' --date=iso -- .githooks/runtime-test-count-baseline.root
+# ---------------------------------------------------------------------------------------
+# WHY RUN 14 IS OWED: D0A-R24-01 IS REOPENED.
 #
-# TARGET_TREE below names the tree the derivation was computed against — a DIFFERENT thing
-# from the commit that introduces this file, and conflating them is what produced the error.
+# Run 13 was recorded as the full-hygiene run closing R24-01. D0A-R25-05 withdrew one of its
+# checks: the procedure claimed "an unchanged set of hashes after a forced rebuild is the
+# proof" while its commands computed NO hashes — `| tail -3` printed three artifact PATHS (and
+# masked cargo's exit status, having no pipefail), and the forced rebuild went to /dev/null.
+# So run 13's counts carry an unproven premise: that the binaries executed were built from the
+# tree being measured. That cannot be repaired after the fact. Run 14 re-establishes it under
+# the corrected section 2b, which hashes the FULL enumerated set before and after a forced
+# rebuild and refuses a short list.
 #
-# WHAT CONSUMES IT: NOTHING. The ordering is a CONVENTION followed by hand.
+# ---------------------------------------------------------------------------------------
+# DERIVATION
 #
-# `scripts/lane-run.sh` consumed it for exactly one run (run 12) and was then REVERTED —
-# D0A-R23 returned 8×P1 against it, including that it had dropped five safety checks
-# `scratch/lane-run-7-procedure.md` performs. A mechanism with eight open P1s that omits
-# helper-digest, free-space, forced-freshness, stale-session and PAM before/after checks is
-# weaker than a convention a human follows WITH them.
+# Base: run 13 measured EXECUTED 177 / SKIPPED 5 / reported 182 at root.
+#       The current unprivileged pair is EXECUTED 167 / SKIPPED 25 / reported 192 (measured
+#       2026-09-06 at 3b9ce08, and independently re-measured by the pre-commit hook at both
+#       3b9ce08 and e4a8f05 across all 17 targets).
 #
-# So this file is DOCUMENTATION, NOT PROOF, and says so again rather than quietly reverting to
-# the claim R22-01 falsified. What run 12 proved is banked and survives: its artifact binds
-# expectation commit c16c3e9 to tree 0330b46, and that remains checkable.
+# Delta since run 13: the round-25 remediation added TEN tests and removed none.
+# Each was checked for root-gating BY GREP of its body — a geteuid check, a SKIP branch, a
+# bwrap_available guard — not from memory:
 #
-# PROTOCOL
-#   1. Derive the expectation from the unprivileged pair and the root-gating of each change.
-#   2. Commit THIS FILE ALONE, with the derivation in the message.
-#   3. Run the lane.
-#   4. Commit the measured pair in `.githooks/runtime-test-count-baseline.root`, SEPARATELY.
-#   5. A mismatch is a RESULT. Record which side was wrong; do not adjust the derivation
-#      until it agrees.
+#   canonicalize.rs  an_empty_argv_is_refused_during_canonicalization            no gate
+#   canonicalize.rs  a_fifo_executable_is_refused_promptly_...                   no gate
+#   canonicalize.rs  a_character_device_executable_is_refused_on_type            no gate
+#   canonicalize.rs  an_oversized_executable_is_refused_on_size                  no gate
+#   canonicalize.rs  a_real_large_executable_is_still_accepted                   SKIP branch *
+#   execute.rs       a_directly_built_action_with_an_empty_argv_..._at_execute   no gate
+#   service.rs       a_tier_the_daemon_cannot_enforce_is_denied_...              no gate
+#   service.rs       the_enforced_tier_passes_the_tier_check_and_reaches_gate    no gate
+#   service.rs       an_elapsed_consent_window_..._wall_clock_is_frozen_...      no gate
+#   service.rs       a_granted_entry_without_a_monotonic_instant_...             no gate
 #
-# ─────────────────────────────────────────────────────────────────────────────
-# SUPERSEDED — LANE RUN 11, first expectation. NEVER MEASURED.
+#   * The one SKIP branch gates on a PATH EXISTING, not on euid:
+#     `/usr/bin/coreutils` (root:root 0755, 11352352 bytes on this box). Root sees the same
+#     file, so it EXECUTES in both environments. This is the only one of the ten whose
+#     outcome could differ between lanes, and it does not.
 #
-#   EXPECTED_EXECUTED=174  EXPECTED_SKIPPED=5   TARGET_TREE=d6fb698
+# The four service tests are worth naming separately because they are the category that has
+# executed at root every time: they use a socketpair and a stub SessionSource (`Seatless`),
+# reach a denial BEFORE any gate, PAM call or spawn, and so depend on no privileged facility.
+# Two of them (the tier pair) deny before the action is even stored.
 #
-# Derived from an unprivileged 154/25; the R21-03 and R21-05 tests then moved the tree to
-# 156/25 before run 11 happened. Drift is the normal case and the protocol answers it by
-# RE-DERIVING in a separate commit, not by adjusting — amending would have been tidier and
-# would have made the file indistinguishable from a claim written after the fact.
+# So all ten execute at root:  177 + 10 = 187 EXECUTED.
+# None of them skips in either lane, so the root skip set is UNCHANGED at 5:
+#   b1_daemon_binary                      needs --features insecure-test-seams
+#   an_unreadable_login_defs              this uid can read a 0000 file          (root-caused)
+#   a_regular_login_user_is_not_refused   running as root                        (root-caused)
+#   pidfd_refuses_a_recycled_pid_barrier  userns unavailable to root here        (root-caused)
+#   live_logind_query                     standing DEFER
 #
-# ─────────────────────────────────────────────────────────────────────────────
-# LANE RUN 13 — THE FULL-HYGIENE RUN. TARGET_TREE: this commit.
+# CONSISTENCY CHECK, because the two lanes must describe the SAME test set:
+#   unprivileged  167 + 25 = 192 reported
+#   root          187 +  5 = 192 reported
+# A run 14 whose `reported` is not 192 means the test SET changed, not the skip distribution —
+# a different defect from a count mismatch, and it must be diagnosed as such.
 #
-# WHY THIS RUN EXISTS: D0A-R24-01. Run 12 went through `scripts/lane-run.sh`, which omitted
-# helper-digest, forced-freshness, stale-session and PAM before/after — so the current root
-# evidence is split across two runs covering different dimensions (run 11 hygiene, run 12
-# counts+ordering). This run replaces both with one record covering everything.
+# Root and unprivileged remain OVERLAPPING SETS, neither a superset: three of the five root
+# skips execute unprivileged. 187 > 167 is NOT a coverage claim and must not be read as one.
 #
-# DERIVATION — checkable, not asserted:
-#   run 12 measured           EXECUTED=176 SKIPPED=5   (at unprivileged 156/25)
-#   unprivileged is now       EXECUTED=157 SKIPPED=25  (+1 since run 12)
-#   the +1 is `reached_the_anchor_rejects_an_unrelated_permission_error` (D0A-R24-04), and
-#   it is NOT root-gated — grepped for a geteuid check, a SKIP branch and a
-#   bwrap_available guard across its body: ZERO hits. It is a pure predicate test with no
-#   process spawn, so it executes at root exactly as it does unprivileged.
-#   therefore 176 + 1 = 177, and NO skip changes.
-#
-# The five root skips are unchanged: b1_daemon_binary (needs --features
-# insecure-test-seams), live_logind_query (standing DEFER), and three that skip BECAUSE the
-# run is privileged (an_unreadable_login_defs, a_regular_login_user_is_not_refused,
-# pidfd_refuses_a_recycled_pid_barrier).
-#
-# THE ORDERING IS BACK TO CONVENTION (D0A-R22-01, reopened). Nothing reads this file before
-# the run. `git log` on this file and on the .root file is the only evidence of ordering, and
-# it is evidence only if this commit contains THIS FILE ALONE.
-EXPECTED_EXECUTED=177
-EXPECTED_SKIPPED=5
+# A MISMATCH IS A RESULT. Record which side was wrong. Do not adjust this derivation until it
+# agrees with the measurement.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LANE RUN 11 — MEASURED 176/5, matching. TARGET_TREE=298d4db
-#
-#   EXPECTED_EXECUTED=176  EXPECTED_SKIPPED=5
-#
-# DERIVATION, written so it can be checked rather than believed:
-#   run 10 measured           EXECUTED=173 SKIPPED=5   (at unprivileged 153/25)
-#   unprivileged at 298d4db   EXECUTED=156 SKIPPED=25  (+3 since run 10)
-#   the +3, each VERIFIED not root-gated by grep (no geteuid check, no SKIP branch, no
-#   bwrap_available guard), so each executes at root as well:
-#     1. service::tests::a_gate_denied_action_sends_no_preview
-#     2. action::tests::preview_renders_the_bound_schema_version
-#     3. service::tests::an_oversized_preview_is_denied_before_the_action_is_stored
-#   therefore 173 + 3 = 176, no skip change.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# LANE RUN 12 — the first run through `scripts/lane-run.sh`. TARGET_TREE: this commit.
-#
-# DERIVATION — the prediction is that NOTHING MOVES, which is a real prediction and not a
-# default, because it rests on a checkable claim:
-#
-#   run 11 measured              EXECUTED=176 SKIPPED=5   (at unprivileged 156/25)
-#   unprivileged is STILL        EXECUTED=156 SKIPPED=25
-#   changed since run 11's tree  runtime/src/service.rs ONLY (+18/-4)
-#   new `#[test]` since then     ZERO  (`git diff 298d4db..HEAD -- runtime/ | grep -c '^+    #\[test\]'`)
-#
-#   The commit touching runtime/ since run 11 is af46083, carrying BOTH R22-07 (the
-#   no-preview regression's
-#   read no longer turns every error into EOF) and R22-08 (the module doc's flow
-#   renumbered) — ONE commit, not two (D0A-R23-11). Neither fix adds or removes a test
-#   and neither is root-gated, so the root pair is unchanged.
-#
-# THE ONE THING THAT COULD MOVE IT, named so a mismatch has a first suspect: R22-07 changed
-# `a_gate_denied_action_sends_no_preview` to PANIC on a read error where it previously
-# returned 0. That test runs at root. If a privileged socketpair read behaves differently
-# there — EINTR under load, say — the test would newly FAIL rather than silently pass, and
-# EXECUTED would hold while the extractor's rc went non-zero. That is the failure this change
-# was made to expose, so seeing it would be the fix working, not the prediction being wrong.
-#
-# Everything else in this range is documentation, the corpus (classes 47 correction and 48),
-# and the lane runner itself with its own shell suite — none of which is a Rust test.
-#   (run 12: EXPECTED_EXECUTED=176 EXPECTED_SKIPPED=5 — measured, matched)
+EXPECTED_EXECUTED=187
+EXPECTED_SKIPPED=5
+EXPECTED_REPORTED=192

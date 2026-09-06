@@ -47,7 +47,7 @@ use std::time::Duration;
 use nix::sys::socket::sockopt::PeerCredentials;
 use nix::sys::socket::getsockopt;
 
-use crate::action::{canonical_action_digest, preview};
+use crate::action::{canonical_action_digest, preview, RequiredTier};
 use crate::canonicalize::canonicalize;
 use crate::execute::{execute_approved, ConsumptionLedger};
 use crate::logind::{session_passes_gate, SessionSource};
@@ -267,6 +267,26 @@ pub fn accept_requester(listener: &UnixListener, expected_uid: u32) -> Result<Un
     Ok(stream)
 }
 
+/// The consent tier the daemon's ONE gate sequence actually implements (D0A-R25-01).
+///
+/// `RequiredTier` has four values; `serve_one_action` has always run a single sequence for
+/// all of them — logind gate → live PAM over the private channel → shell mint-confirm →
+/// second gate read. That sequence IS `Biometric` as this crate defines it ([`RequiredTier`]:
+/// "live PAM authentication"), and `docs/TRUST_MODEL.md` describes the biometric/TPM tiers as
+/// riding this same daemon-driven PAM stack rather than a separate agent.
+///
+/// It is NOT `Hardware`. The shipped `/etc/pam.d/delphi-runtime` is `pam_unix` only, so a
+/// `Hardware` action would be authorized by a PASSWORD while its preview, its digest and its
+/// audit record all claim a hardware-backed factor. That is a false claim about a security
+/// property, which is why the tier above this constant is REFUSED rather than accepted.
+///
+/// The other direction is fail-safe and deliberately not "corrected": an action requesting
+/// `Autonomous` or `Confirm` receives this STRONGER sequence, because no tier-specific
+/// branching exists. Naming the constant is what makes that safe by decision rather than by
+/// coincidence — when branching is added, the floor is here to be consulted, and a requester
+/// (the AI, i.e. untrusted input) cannot obtain a weaker gate by classifying its own action.
+const ENFORCED_TIER: RequiredTier = RequiredTier::Biometric;
+
 /// Service exactly one action over an accepted AI connection (the §4 flow).
 ///
 /// # Errors
@@ -283,6 +303,22 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     };
     let id = ctx.store.next_id();
     let action = canonicalize(&propose, id.clone())?;
+    // D0A-R25-01: refuse a tier this daemon cannot enforce, BEFORE storing or previewing.
+    // Accepting it would authorize a hardware-claimed action with a password and record the
+    // stronger claim in the preview, the digest and the audit entry.
+    if action.required_tier > ENFORCED_TIER {
+        return deny(
+            ai,
+            &id,
+            &format!(
+                "action requires {:?} consent, which this daemon cannot enforce — its gate \
+                 sequence implements {ENFORCED_TIER:?} (live PAM over the private channel) and \
+                 the installed PAM stack provides no stronger factor. Refused rather than \
+                 satisfied with a weaker one (D0A-R25-01)",
+                action.required_tier
+            ),
+        );
+    }
     let digest = canonical_action_digest(&action);
     let preview_text = preview(&action);
     // D0A-R21-05: BEFORE storing and before replying. Past this point the requester holds an
@@ -339,9 +375,10 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     }
     // Mint at the time of consent (read FRESH — not a frozen snapshot).
     let token = mint(ctx.key, &digest, ctx.clock.now_unix());
-    if let Some(e) = ctx.store.get_mut(&id) {
-        e.state = PendingState::Granted;
-    }
+    // D0A-R25-04: `grant` sets the state AND the monotonic consent instant together. The
+    // token carries the wall-clock issue time because that is what its MAC binds; the instant
+    // is what the elapsed check reads, because a wall clock can be set backwards.
+    ctx.store.grant(&id);
     write_frame(ai, &granted_msg(&id, &token.to_wire()))?;
 
     // Step 7. Present{pending_id, token} — NO action data. Execute the STORED object.
@@ -396,6 +433,27 @@ pub fn present_and_execute(
         };
         if entry.state != PendingState::Granted {
             return denied("action not in Granted state (replay or never granted)");
+        }
+        // D0A-R25-04: the AUTHORITATIVE expiry check, on a clock nobody can adjust.
+        // `execute_approved`'s `within_ttl` compares Unix timestamps, so rolling the system
+        // clock backwards shrinks the apparent age and keeps a consented token live
+        // indefinitely. `Instant` has no setter; this is the check that actually bounds the
+        // window between consent and execution.
+        match entry.granted_at {
+            Some(at) if at.elapsed().as_secs() > crate::token::TOKEN_TTL_SECS => {
+                return denied(
+                    "the consent window has elapsed on the monotonic clock — the token was \
+                     minted more than the TTL ago in real time, whatever the system clock \
+                     now reads (D0A-R25-04)",
+                );
+            }
+            Some(_) => {}
+            None => {
+                return denied(
+                    "granted action carries no monotonic consent instant — refusing rather \
+                     than falling back to the adjustable wall clock (D0A-R25-04)",
+                );
+            }
         }
         execute_approved(&entry.action, &candidate, key, now, ledger)
     };
@@ -594,6 +652,218 @@ mod tests {
     impl Clock for At {
         fn now_unix(&self) -> u64 {
             self.0
+        }
+    }
+
+    /// D0A-R25-04 — an elapsed consent window is denied even when the WALL CLOCK says the
+    /// token is fresh.
+    ///
+    /// The token's TTL is checked against Unix timestamps, so an attacker who can set the
+    /// system clock backwards keeps a consented token live indefinitely: `now - issued_at`
+    /// never grows. This fixture is that attack in its purest form — the wall clock passed to
+    /// `present_and_execute` is EXACTLY the mint time, so `within_ttl` is satisfied, while the
+    /// monotonic instant shows the window closed long ago.
+    #[test]
+    fn an_elapsed_consent_window_is_denied_even_when_the_wall_clock_is_frozen_at_mint_time() {
+        const MINT_AT: u64 = 1_000;
+
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        let action = canonicalize(&propose, "act-1".into()).expect("canonicalize");
+        let digest = canonical_action_digest(&action);
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let token = crate::token::mint(&key, &digest, MINT_AT);
+
+        let mut store = PendingStore::new();
+        store.insert(action);
+        let entry = store.get_mut("act-1").expect("stored");
+        entry.state = PendingState::Granted;
+        // Real elapsed time is past the TTL.
+        entry.granted_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(crate::token::TOKEN_TTL_SECS + 5));
+        assert!(
+            entry.granted_at.is_some(),
+            "precondition: the platform must be able to express an Instant in the past"
+        );
+
+        let mut ledger = ConsumptionLedger::new();
+        // The wall clock reads the MINT time — the rollback. `within_ttl` is satisfied here.
+        assert!(
+            crate::token::verify(&key, &token, &digest, MINT_AT),
+            "precondition: the token MUST still verify on the frozen wall clock, or this test \
+             proves nothing about the monotonic check"
+        );
+
+        match present_and_execute(&mut store, &mut ledger, &key, "act-1", &token.to_wire(), MINT_AT)
+        {
+            Outcome::Denied { ref reason, .. } => assert!(
+                reason.contains("monotonic"),
+                "denied, but not by the monotonic window check: {reason}"
+            ),
+            other => panic!(
+                "a token whose consent window elapsed in REAL time was accepted because the \
+                 wall clock was rolled back: {other:?}"
+            ),
+        }
+    }
+
+    /// D0A-R25-04 — a `Granted` entry with NO monotonic instant is refused, not waved through.
+    ///
+    /// `PendingStore::grant` sets both fields together so this cannot arise from the normal
+    /// path, but `PendingEntry`'s fields are public (the R19-05 shape), so the state can still
+    /// be set without the instant. The choice recorded here is that such an entry is DENIED
+    /// rather than falling back to the adjustable wall clock — the fallback would silently
+    /// restore exactly the weakness the instant exists to remove.
+    #[test]
+    fn a_granted_entry_without_a_monotonic_instant_is_refused_rather_than_wall_clocked() {
+        const MINT_AT: u64 = 1_000;
+
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        let action = canonicalize(&propose, "act-1".into()).expect("canonicalize");
+        let digest = canonical_action_digest(&action);
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let token = crate::token::mint(&key, &digest, MINT_AT);
+
+        let mut store = PendingStore::new();
+        store.insert(action);
+        // The split update `grant` exists to prevent.
+        let entry = store.get_mut("act-1").expect("stored");
+        entry.state = PendingState::Granted;
+        assert!(entry.granted_at.is_none(), "precondition: the instant must be unset");
+
+        let mut ledger = ConsumptionLedger::new();
+        match present_and_execute(&mut store, &mut ledger, &key, "act-1", &token.to_wire(), MINT_AT)
+        {
+            Outcome::Denied { ref reason, .. } => assert!(
+                reason.contains("no monotonic consent instant"),
+                "denied, but not for the missing instant: {reason}"
+            ),
+            other => panic!(
+                "an entry marked Granted without a consent instant executed on the wall clock \
+                 alone: {other:?}"
+            ),
+        }
+    }
+
+    /// D0A-R25-01 — an action demanding a tier the daemon cannot enforce is DENIED, and
+    /// denied BEFORE it is stored or previewed.
+    ///
+    /// `required_tier` arrived from the AI, was bound into the digest, rendered into the
+    /// preview and written to the audit entry — and was never once consulted. All four tiers
+    /// took the identical logind → PAM → mint sequence, so a `Hardware` action was authorized
+    /// by `pam_unix`'s password while every artifact claimed a hardware factor.
+    ///
+    /// The seat is deliberately `Seatless` here: the denial must happen BEFORE the gate, so a
+    /// gate-passing lane is not needed to prove it, and a test that needed one could not run
+    /// unprivileged.
+    #[test]
+    fn a_tier_the_daemon_cannot_enforce_is_denied_before_the_action_is_stored() {
+        let (daemon_end, _shell_end) = crate::channel::approval_socketpair().expect("socketpair");
+        let (mut ai_daemon, mut ai_peer) = std::os::unix::net::UnixStream::pair().expect("ai pair");
+
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            // The tier nothing in the shipped PAM stack can satisfy.
+            required_tier: pb::RequiredTier::TierHardware as i32,
+        };
+        crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
+
+        let mut store = PendingStore::new();
+        let mut ledger = ConsumptionLedger::new();
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let mut ctx = ServiceCtx {
+            channel_fd: daemon_end.as_raw_fd(),
+            session: &Seatless,
+            key: &key,
+            pam_service: "delphi-runtime",
+            session_user: "nobody",
+            store: &mut store,
+            ledger: &mut ledger,
+            clock: &At(1_000),
+        };
+
+        let outcome = serve_one_action(&mut ai_daemon, &mut ctx).expect("serves without aborting");
+        match outcome {
+            Outcome::Denied { ref reason, .. } => assert!(
+                reason.contains("cannot enforce"),
+                "denied, but not for the unenforceable tier — a Seatless fixture also denies \
+                 at the GATE, so this assertion is what distinguishes the two: {reason}"
+            ),
+            other => panic!("an unenforceable tier must DENY, got: {other:?}"),
+        }
+        assert!(
+            ctx.store.get("act-1").is_none(),
+            "the action was stored despite demanding a tier that cannot be satisfied"
+        );
+    }
+
+    /// D0A-R25-01 — the positive control: the ENFORCED tier is still accepted past this check.
+    ///
+    /// Without it, a guard that denied every tier would pass the test above. `Seatless` means
+    /// this proposal is denied at the GATE, one step later — so the discriminating assertion
+    /// is that the reason is the gate's, NOT the tier's.
+    #[test]
+    fn the_enforced_tier_passes_the_tier_check_and_reaches_the_gate() {
+        let (daemon_end, _shell_end) = crate::channel::approval_socketpair().expect("socketpair");
+        let (mut ai_daemon, mut ai_peer) = std::os::unix::net::UnixStream::pair().expect("ai pair");
+
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
+
+        let mut store = PendingStore::new();
+        let mut ledger = ConsumptionLedger::new();
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let mut ctx = ServiceCtx {
+            channel_fd: daemon_end.as_raw_fd(),
+            session: &Seatless,
+            key: &key,
+            pam_service: "delphi-runtime",
+            session_user: "nobody",
+            store: &mut store,
+            ledger: &mut ledger,
+            clock: &At(1_000),
+        };
+
+        let outcome = serve_one_action(&mut ai_daemon, &mut ctx).expect("serves without aborting");
+        match outcome {
+            Outcome::Denied { ref reason, .. } => assert!(
+                !reason.contains("cannot enforce"),
+                "the ENFORCED tier was refused by the tier check — the guard rejects \
+                 everything, so the refusal test above proves nothing: {reason}"
+            ),
+            other => panic!("Seatless must deny at the gate, got: {other:?}"),
         }
     }
 

@@ -116,5 +116,19 @@
 # R23-12 demonstrated in a commit message and encoded nowhere. Both existing integration
 # legs stayed GREEN under the weaken that restores the broad predicate, which is why
 # neither could guard it.
-EXECUTED=157
+# 2026-09-06 (round-25 remediation): 157/25 -> 167/25. +10 EXECUTED, all additions, no
+# disappearance. Four product findings, each with a weaken-proven RED:
+#   R25-03 (2) `an_empty_argv_is_refused_during_canonicalization`,
+#              `a_directly_built_action_with_an_empty_argv_is_refused_at_execute`
+#   R25-02 (4) `a_fifo_executable_is_refused_promptly_rather_than_blocking_the_daemon`,
+#              `a_character_device_executable_is_refused_on_type`,
+#              `an_oversized_executable_is_refused_on_size`,
+#              `a_real_large_executable_is_still_accepted` (the positive control)
+#   R25-01 (2) `a_tier_the_daemon_cannot_enforce_is_denied_before_the_action_is_stored`,
+#              `the_enforced_tier_passes_the_tier_check_and_reaches_the_gate` (control)
+#   R25-04 (2) `an_elapsed_consent_window_is_denied_even_when_the_wall_clock_is_frozen_at_mint_time`,
+#              `a_granted_entry_without_a_monotonic_instant_is_refused_rather_than_wall_clocked`
+# SKIPPED unchanged: every one runs unprivileged. Two of the ten are POSITIVE CONTROLS,
+# recorded as such because a guard that refused everything would satisfy its own refusal test.
+EXECUTED=167
 SKIPPED=25

@@ -48,7 +48,12 @@ pub enum BindMode {
 }
 
 /// The required human-consent tier for the action (mirrors the Fortress tiers).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Ord` is derived and MEANINGFUL: the discriminants ascend with the strength of the human
+/// factor demanded, so `Autonomous < Confirm < Biometric < Hardware`. D0A-R25-01 relies on
+/// that ordering to refuse a tier the daemon cannot enforce rather than silently satisfying
+/// it with a weaker factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum RequiredTier {
     /// No confirmation (autonomous).

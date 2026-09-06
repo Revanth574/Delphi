@@ -1303,12 +1303,12 @@ fn b1_approve_a_execute_b_is_rejected() {
     let action_a: PendingAction = canonicalize(&marker_proposal(&exe_a, "MARKER-A", &dir), id_a.clone()).unwrap();
     let digest_a = canonical_action_digest(&action_a);
     store.insert(action_a);
-    store.get_mut(&id_a).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id_a), "fixture: the entry must exist to be granted");
 
     let id_b = store.next_id();
     let action_b: PendingAction = canonicalize(&marker_proposal(&exe_b, "MARKER-B", &dir), id_b.clone()).unwrap();
     store.insert(action_b);
-    store.get_mut(&id_b).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id_b), "fixture: the entry must exist to be granted");
 
     let token_a = mint(&key, &digest_a, NOW).to_wire();
     let mut ledger = ConsumptionLedger::new();
@@ -1356,7 +1356,7 @@ fn b1_swap_after_canonicalize_runs_the_pinned_content() {
     let action = canonicalize(&marker_proposal(&exe, "PINNED", &dir), id.clone()).unwrap();
     let digest = canonical_action_digest(&action);
     store.insert(action);
-    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id), "fixture: the entry must exist to be granted");
     let token = mint(&key, &digest, NOW).to_wire();
 
     // SWAP the script PATH to a new inode that ignores argv and echoes SWAPPED.
@@ -1411,7 +1411,7 @@ fn b1_a_snapshot_mismatch_consumes_the_approval_and_blames_the_snapshot() {
     action.executable_digest = [0x11; 32];
     let digest = canonical_action_digest(&action);
     store.insert(action);
-    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id), "fixture: the entry must exist to be granted");
     let good = mint(&key, &digest, NOW).to_wire();
     let mut ledger = ConsumptionLedger::new();
 
@@ -1470,7 +1470,7 @@ fn b1_wrong_token_does_not_burn_the_approval() {
     let action = canonicalize(&marker_proposal(&exe, "RIGHT", &dir), id.clone()).unwrap();
     let digest = canonical_action_digest(&action);
     store.insert(action);
-    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id), "fixture: the entry must exist to be granted");
     let good = mint(&key, &digest, NOW).to_wire();
     let wrong = mint(&key, &[0xFF; 32], NOW).to_wire(); // a token bound to a different digest
     let mut ledger = ConsumptionLedger::new();
@@ -1526,7 +1526,7 @@ fn b1_verified_then_execution_failed_consumes_the_approval() {
     };
     let digest = canonical_action_digest(&action);
     store.insert(action);
-    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id), "fixture: the entry must exist to be granted");
     let token = mint(&key, &digest, NOW).to_wire(); // a VALID token for this exact action
     let mut ledger = ConsumptionLedger::new();
 
@@ -1579,7 +1579,7 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
     let action = canonicalize(&marker_proposal(&exe, "ignored-argv", &dir), id.clone()).unwrap();
     let digest = canonical_action_digest(&action);
     store.insert(action);
-    store.get_mut(&id).unwrap().state = PendingState::Granted;
+    assert!(store.grant(&id), "fixture: the entry must exist to be granted");
     let token = mint(&key, &digest, NOW).to_wire();
 
     let mut ledger = ConsumptionLedger::new();

@@ -36,6 +36,16 @@ pub struct PendingEntry {
     pub action: PendingAction,
     /// Where this action is in the consent → present → execute lifecycle.
     pub state: PendingState,
+    /// MONOTONIC instant at which the token for this action was minted (D0A-R25-01's
+    /// sibling, D0A-R25-04). `None` until the action reaches `Granted`.
+    ///
+    /// The token's own TTL is checked against `SystemTime` because the issue time is bound
+    /// into the token's MAC and must survive as an absolute value. But a security LIFETIME
+    /// measured on an adjustable clock can be extended by adjusting it: setting the wall
+    /// clock back makes `now - issued_at` shrink, and a token stays live for as long as the
+    /// clock keeps moving backwards. `Instant` cannot be set, so the elapsed check that
+    /// actually gates execution reads this instead.
+    pub granted_at: Option<std::time::Instant>,
 }
 
 /// The daemon's pending registry. The single-threaded service loop owns it; it is
@@ -66,7 +76,38 @@ impl PendingStore {
     /// the action's own `pending_id` (assigned via [`next_id`](Self::next_id)).
     pub fn insert(&mut self, action: PendingAction) {
         let id = action.pending_id.clone();
-        self.entries.insert(id, PendingEntry { action, state: PendingState::Proposed });
+        self.entries.insert(id, PendingEntry { action, state: PendingState::Proposed, granted_at: None });
+    }
+
+    /// Move an entry to `Granted`, stamping the monotonic consent instant in the same step.
+    ///
+    /// Returns `false` if no entry has that id.
+    ///
+    /// The two fields are set TOGETHER and only here (D0A-R25-04). Setting `state` by hand
+    /// leaves `granted_at` unset, which `present_and_execute` treats as fail-closed — so a
+    /// split update produces an action that can never execute, and six integration fixtures
+    /// did exactly that the moment the field was added. Making the transition a single
+    /// operation removes the drift rather than relying on every future caller to set both.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use delphi_runtime::store::{PendingStore, PendingState};
+    /// # fn f(store: &mut PendingStore, id: &str) {
+    /// assert!(store.grant(id));
+    /// assert_eq!(store.get(id).unwrap().state, PendingState::Granted);
+    /// assert!(store.get(id).unwrap().granted_at.is_some());
+    /// # }
+    /// ```
+    pub fn grant(&mut self, pending_id: &str) -> bool {
+        match self.entries.get_mut(pending_id) {
+            Some(e) => {
+                e.state = PendingState::Granted;
+                e.granted_at = Some(std::time::Instant::now());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Borrow a registered entry by id, if present.

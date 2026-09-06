@@ -505,6 +505,21 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
         require_digest_matches(sp.interpreter_fd.as_raw_fd(), &sp.interpreter_digest, "interpreter")?;
         require_digest_matches(sp.script_memfd.as_raw_fd(), &sp.script_digest, "script")?;
     }
+    // D0A-R25-03: an EMPTY argv is representable in the canonical action AND in the digest,
+    // but not in the exec — so the approved object names something `execve` cannot reproduce.
+    // BOTH transport shapes then invent an argv0 the human never saw, by different routes:
+    // with a helper it is synthesised by the `unwrap_or_else` below; without one `--argv0` is
+    // simply dropped and bwrap hands the tool `/proc/self/fd/N`, the value the comment there
+    // calls invisible to the audit. Refused at both ends (canonicalize + here) for the
+    // R19-05 reason: the fields are public, so the constructor is not the only builder.
+    if action.argv.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "argv is empty — argv[0] would be SYNTHESISED at exec (`/proc/self/fd/N`) rather \
+             than approved, so preview, digest and execution would disagree on what runs \
+             (D0A-R25-03)"
+                .into(),
+        ));
+    }
     // D0A-R19-05: `PendingAction`'s fields are PUBLIC, so canonicalization is not the only
     // way one is built — a direct builder recreates the NUL smuggling R18-03 closed. Re-checked
     // HERE, at the one choke point every execution passes, for the same reason the seal checks
@@ -1537,6 +1552,39 @@ pub(crate) mod tests {
             Ok(_) => panic!(
                 "a non-UTF-8 bind path reached execution — the digest covered bytes the \
                  sandbox never received (D0A-R20-02)"
+            ),
+        }
+    }
+
+    /// D0A-R25-03 — an EMPTY argv is refused at the execute choke point.
+    ///
+    /// The canonical action can hold `argv: []` and the digest covers it, but `execve` has no
+    /// representation for a process with no `argv[0]`, so the transport invents one: with a
+    /// helper, `unwrap_or_else` synthesises `/proc/self/fd/N`; without one, `--argv0` is
+    /// dropped and bwrap supplies the same value. Either way the program observes an argv0
+    /// that was never previewed and never approved — the exact-approval invariant broken by
+    /// the canonical form admitting something exec cannot reproduce.
+    ///
+    /// Built DIRECTLY for the R19-05/R20-03 reason: `PendingAction`'s fields are public, so
+    /// the canonicalization-side check is not the only door.
+    #[test]
+    fn a_directly_built_action_with_an_empty_argv_is_refused_at_execute() {
+        let out = tempfile::tempdir().unwrap();
+        let mut action = build_action(b"#!/bin/sh\n:\n", out.path());
+        action.argv = Vec::new();
+
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+
+        match execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new()) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("argv is empty"),
+                "refused, but not for the empty argv: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "an empty argv reached execution — the program would receive a synthesised \
+                 `/proc/self/fd/N` as argv[0], which no preview showed (D0A-R25-03)"
             ),
         }
     }

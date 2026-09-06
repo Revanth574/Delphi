@@ -17,7 +17,6 @@
 //!
 //! The AI never sees this object or its fds; it gets only a `pending_id`.
 
-use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,6 +34,103 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Ceiling on bytes read from a proposed executable or script interpreter (D0A-R25-02).
+///
+/// DERIVED from what a legitimate action references, not chosen round. Measured across
+/// `/usr/bin`, `/bin` and `/usr/libexec` on a full desktop install (1449 executables): the
+/// largest is `x86_64-linux-gnu-lto-dump-15` at 34.5 MiB, 5 exceed 16 MiB, 1 exceeds 32 MiB,
+/// and **0 exceed 64 MiB**. 64 MiB is the next power of two above the observed maximum — a
+/// 1.85x margin over the largest real binary, and it admits every executable on the system.
+/// A proposal above it is not a legitimate tool; it is the exhaustion case.
+const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Open `path` and read it, bounded in both TYPE and SIZE, before anything is bound
+/// (D0A-R25-02).
+///
+/// Unbounded `read_to_end` on an AI-selected path let a proposal stall or exhaust the ROOT
+/// daemon **before** the pending action exists and therefore before any human gate:
+///
+/// * a **FIFO** blocks — and it blocks in `open(2)`, not in the read, which is why this
+///   opens with `O_NONBLOCK` rather than only checking the type afterwards. On a regular
+///   file the flag is a no-op, so it costs nothing in the legitimate case.
+/// * a **character device** such as `/dev/zero` never ends.
+/// * an oversized regular file exhausts memory.
+///
+/// The type and size are taken from the HELD fd, never the path: the fd is the object that
+/// gets hashed and exec'd, so checking anything else would reintroduce the swap window that
+/// hashing-through-the-fd exists to close.
+fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, RuntimeError> {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|source| RuntimeError::Filesystem {
+            op: what,
+            path: PathBuf::from(path),
+            source,
+        })?;
+
+    let meta = file.metadata().map_err(|source| RuntimeError::Filesystem {
+        op: "stat the opened object",
+        path: PathBuf::from(path),
+        source,
+    })?;
+
+    let ft = meta.file_type();
+    if !ft.is_file() {
+        let kind = if ft.is_fifo() {
+            "a FIFO (would block the root daemon indefinitely)"
+        } else if ft.is_char_device() {
+            "a character device (an endless read, e.g. /dev/zero)"
+        } else if ft.is_block_device() {
+            "a block device"
+        } else if ft.is_socket() {
+            "a socket"
+        } else if ft.is_dir() {
+            "a directory"
+        } else {
+            "not a regular file"
+        };
+        return Err(RuntimeError::Protocol(format!(
+            "{what}: `{}` is {kind} — only a regular file can be hashed and exec'd, and the \
+             read happens BEFORE any human gate (D0A-R25-02)",
+            path.escape_debug()
+        )));
+    }
+
+    if meta.len() > MAX_EXECUTABLE_BYTES {
+        return Err(RuntimeError::Protocol(format!(
+            "{what}: `{}` is {} bytes, over the {MAX_EXECUTABLE_BYTES}-byte ceiling \
+             (D0A-R25-02)",
+            path.escape_debug(),
+            meta.len()
+        )));
+    }
+
+    // Bounded read DESPITE the size check above: a regular file can grow between the `fstat`
+    // and the read, so the ceiling has to hold at the read itself. `+ 1` so exceeding it is
+    // observable rather than silently truncated into a digest over partial bytes.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.by_ref()
+        .take(MAX_EXECUTABLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| RuntimeError::Filesystem {
+            op: what,
+            path: PathBuf::from(path),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_EXECUTABLE_BYTES {
+        return Err(RuntimeError::Protocol(format!(
+            "{what}: `{}` grew past the {MAX_EXECUTABLE_BYTES}-byte ceiling while being read \
+             (D0A-R25-02)",
+            path.escape_debug()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Build the canonical [`PendingAction`] from an AI [`pb::Propose`], assigning
 /// `pending_id`.
 ///
@@ -49,23 +145,12 @@ pub fn canonicalize(
 ) -> Result<PendingAction, RuntimeError> {
     // Open the executable, then hash the bytes READ THROUGH the held fd — the same
     // fd `execute` re-exec's, so the hash and the exec see the same kernel object.
-    let mut file = File::open(&proposal.exe_path).map_err(|source| RuntimeError::Filesystem {
-        op: "open proposed executable",
-        path: PathBuf::from(&proposal.exe_path),
-        source,
-    })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|source| RuntimeError::Filesystem {
-        op: "read proposed executable",
-        path: PathBuf::from(&proposal.exe_path),
-        source,
-    })?;
+    // Type- and size-bounded (D0A-R25-02): this runs in the root daemon before any gate.
+    let bytes = open_and_read_bounded(&proposal.exe_path, "open proposed executable")?;
     // TRUST_MODEL v7 (D0A-R9-02): bind an IMMUTABLE SNAPSHOT, not the filesystem object.
-    // The mutable source fd is dropped here — after this line nothing in the action can be
-    // changed by whoever owns the path.
+    // Nothing after this line can be changed by whoever owns the path.
     let executable_fd = crate::action::seal_executable_snapshot(&bytes)?;
     let executable_digest = sha256(&bytes);
-    drop(file);
 
     // Shebang → pin the interpreter object + seal the script content (R3-04).
     let script = if bytes.starts_with(b"#!") {
@@ -85,6 +170,17 @@ pub fn canonicalize(
         pb::RequiredTier::try_from(proposal.required_tier)
             .map_err(|_| RuntimeError::Protocol(format!("invalid required_tier {}", proposal.required_tier)))?,
     );
+    // D0A-R25-03: refuse an empty argv HERE as well as at the execute choke point. `execve`
+    // has no representation for it, so both transport shapes invent an argv0 — see the
+    // matching check in `execute`. Rejecting at proposal time means the AI gets a Protocol
+    // error naming the field instead of a pending action that can never be executed.
+    if proposal.argv.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "argv is empty — argv[0] would be synthesised at exec rather than approved \
+             (D0A-R25-03)"
+                .into(),
+        ));
+    }
     let fs_binds = proposal
         .fs_binds
         .iter()
@@ -171,17 +267,10 @@ fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
         .ok_or_else(|| RuntimeError::Protocol("empty shebang interpreter".into()))?;
     let interpreter_arg = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
 
-    let mut interp = File::open(interp_path).map_err(|source| RuntimeError::Filesystem {
-        op: "open script interpreter",
-        path: PathBuf::from(interp_path),
-        source,
-    })?;
-    let mut interp_bytes = Vec::new();
-    interp.read_to_end(&mut interp_bytes).map_err(|source| RuntimeError::Filesystem {
-        op: "read script interpreter",
-        path: PathBuf::from(interp_path),
-        source,
-    })?;
+    // Same bounds as the executable (D0A-R25-02): the interpreter path comes from the
+    // script's own shebang, which is AI-selected content, so it is the second door to the
+    // same FIFO / endless-device / oversize stall in the root daemon.
+    let interp_bytes = open_and_read_bounded(interp_path, "open script interpreter")?;
     // TRUST_MODEL v7 NAMED LIMIT 1: a nested shebang is REFUSED, here, before anything
     // executes. The kernel opens every interpreter in a chain BY PATH, recursively
     // (fs/binfmt_script.c), so pinning one interpreter leaves the rest unpinned; and
@@ -198,7 +287,6 @@ fn build_script_pin(script_bytes: &[u8]) -> Result<ScriptPin, RuntimeError> {
     let interpreter_digest = sha256(&interp_bytes);
     // Snapshotted too: for a script it is the interpreter that actually executes.
     let interpreter_fd = crate::action::seal_executable_snapshot(&interp_bytes)?;
-    drop(interp);
 
     ScriptPin::sealed(interpreter_fd, interpreter_digest, interpreter_arg, script_bytes)
 }
@@ -331,6 +419,141 @@ mod tests {
         assert_eq!(sp.script_digest, sha256(script), "script content bound");
         // /bin/sh exists on the build host; its interpreter digest is non-zero.
         assert_ne!(sp.interpreter_digest, [0u8; 32]);
+    }
+
+    /// D0A-R25-02 — a FIFO proposed as the executable is refused PROMPTLY, not waited on.
+    ///
+    /// The property is "the root daemon does not block", so the test must be able to OBSERVE
+    /// blocking: the call runs on a worker thread and the assertion is a `recv_timeout`. A
+    /// plain `is_err()` could not distinguish a refusal from a hang, and the hang is the
+    /// finding — `open(2)` on a FIFO with no writer blocks forever, before the pending action
+    /// exists and therefore before any human gate.
+    ///
+    /// This is also why the fix opens with `O_NONBLOCK` rather than only checking the type
+    /// after opening: the type check is unreachable if the open never returns.
+    #[test]
+    fn a_fifo_executable_is_refused_promptly_rather_than_blocking_the_daemon() {
+        let tmp = tempfile::Builder::new().prefix("delphi-r2502-fifo-").tempdir().unwrap();
+        let fifo = tmp.path().join("tool");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o644))
+            .expect("mkfifo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.display().to_string();
+        std::thread::spawn(move || {
+            let refused = matches!(
+                canonicalize(&base_proposal(&path), "r2502-fifo".into()),
+                Err(RuntimeError::Protocol(ref m)) if m.contains("FIFO")
+            );
+            let _ = tx.send(refused);
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(true) => {}
+            Ok(false) => panic!("returned, but not with the FIFO refusal"),
+            Err(_) => panic!(
+                "canonicalize did not return within 5s on a FIFO — the ROOT daemon is blocked \
+                 in open(2), before any human gate (D0A-R25-02)"
+            ),
+        }
+    }
+
+    /// D0A-R25-02 — a character device (`/dev/zero`) is refused on TYPE, before any read.
+    ///
+    /// NOTE ON ITS WEAKEN, recorded rather than performed: removing the type check and running
+    /// this test would read `/dev/zero` without end and exhaust the machine's memory. That
+    /// outcome IS the finding, so it is reasoned rather than executed — the FIFO leg above and
+    /// the oversize leg below are the two that carry the executed weaken proof for this guard,
+    /// and all three refusals come from the same `is_file()` / ceiling code path.
+    #[test]
+    fn a_character_device_executable_is_refused_on_type() {
+        match canonicalize(&base_proposal("/dev/zero"), "r2502-chr".into()) {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("character device"),
+                "refused, but not for the device type: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "/dev/zero canonicalized — an endless read in the root daemon (D0A-R25-02)"
+            ),
+        }
+    }
+
+    /// D0A-R25-02 — a regular file above `MAX_EXECUTABLE_BYTES` is refused on SIZE.
+    ///
+    /// Uses `set_len` for a SPARSE file: the metadata length exceeds the ceiling while no
+    /// blocks are allocated, so the rejection is exercised without writing 64 MiB to disk.
+    /// That is legitimate here because the guard reads `metadata().len()`, which is exactly
+    /// what a sparse file sets.
+    #[test]
+    fn an_oversized_executable_is_refused_on_size() {
+        let tmp = tempfile::Builder::new().prefix("delphi-r2502-big-").tempdir().unwrap();
+        let big = tmp.path().join("tool");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_EXECUTABLE_BYTES + 1).expect("sparse set_len");
+        drop(f);
+
+        match canonicalize(&base_proposal(&big.display().to_string()), "r2502-big".into()) {
+            // NAMES WHICH GUARD FIRED. `contains("ceiling")` was the first draft and it
+            // PASSED under the weaken that removes this guard, because the bounded `take`
+            // below catches the same file with a message that also says "ceiling" — a
+            // PASS/PASS, worthless (Iron Law #15 clause 2). The two are deliberately
+            // redundant in the product and must therefore be distinguishable in the test.
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("bytes, over the"),
+                "refused, but not by the fstat size check — this is the message the BOUNDED \
+                 READ produces, so the fstat ceiling may be gone: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "a {} byte executable canonicalized — over the ceiling (D0A-R25-02)",
+                MAX_EXECUTABLE_BYTES + 1
+            ),
+        }
+    }
+
+    /// D0A-R25-02 — the ceiling admits every real executable it was derived from.
+    ///
+    /// The positive control for the two refusals above: a guard that rejected everything
+    /// would pass them both. `coreutils` (11.4 MiB) is the largest binary this system's own
+    /// sandbox actually runs, and it canonicalizes.
+    #[test]
+    fn a_real_large_executable_is_still_accepted() {
+        let path = "/usr/bin/coreutils";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("SKIP a_real_large_executable_is_still_accepted: {path} not present");
+            return;
+        }
+        let len = std::fs::metadata(path).unwrap().len();
+        assert!(len > 8 * 1024 * 1024, "control is only meaningful if the binary is large: {len}");
+        assert!(
+            canonicalize(&base_proposal(path), "r2502-ok".into()).is_ok(),
+            "a {len}-byte real executable was refused — the ceiling is too low (D0A-R25-02)"
+        );
+    }
+
+    /// D0A-R25-03 — an empty argv is refused at proposal time.
+    ///
+    /// The pair to `a_directly_built_action_with_an_empty_argv_is_refused_at_execute`: this
+    /// leg closes the door the AI can reach, that one closes the door a direct builder can.
+    /// Neither substitutes for the other (R19-05).
+    #[test]
+    fn an_empty_argv_is_refused_during_canonicalization() {
+        let dir = tempdir();
+        let exe = write_exe(dir.path(), "tool", b"\x7fELF binary-ish");
+        let mut proposal = base_proposal(exe.to_str().unwrap());
+        proposal.argv = vec![];
+
+        match canonicalize(&proposal, "act-argv0".into()) {
+            Err(RuntimeError::Protocol(m)) => {
+                assert!(m.contains("argv is empty"), "refused, but not for argv: {m}");
+            }
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "an empty argv canonicalized — the resulting action names an argv0 that only \
+                 the transport can invent (D0A-R25-03)"
+            ),
+        }
     }
 
     /// A missing executable surfaces a typed, actionable error (not a panic).

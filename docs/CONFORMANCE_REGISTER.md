@@ -28,7 +28,7 @@ to be handed over.
 | §3 canonicalisation | the arbiter opens and hashes before preview | **CLOSED** at this commit | R25-02 — unbounded `read_to_end` on two AI-selected paths, with no type check. A FIFO blocks the ROOT daemon in `open(2)`; `/dev/zero` never ends; a large file exhausts memory — all **before** the pending action exists, so before any human gate | `O_NONBLOCK` open + `is_file()` + a derived 64 MiB ceiling + bounded read; FIFO leg proven by a `recv_timeout` that observes blocking |
 | §3 exact approval | what is approved is what executes | **CLOSED** at this commit | R25-03 — `argv: []` is representable in the canonical action and the digest but not in `execve`, so both transport shapes invent an `argv0`: synthesised `/proc/self/fd/N` with a helper, and bwrap's own with `--argv0` dropped | refused at canonicalisation AND the execute choke point (the R19-05 two-door reason); the RED reaches the `Ok(_)` arm, i.e. it executed |
 | §3 token lifetime | the consent window is bounded | **CLOSED** at this commit | R25-04 — the TTL compares Unix timestamps, so setting the system clock backwards keeps a consented token live indefinitely | a monotonic `granted_at` stamped by `PendingStore::grant` and checked at Present; the RED returns `Completed`, i.e. an expired action ran |
-| — (process) | root evidence is what it says it is | **OPEN — D0A-R24-01 REOPENED** | R25-05 — run 13's "forced freshness proven" rested on commands that computed **no hashes**: `\| tail -3` printed three artifact PATHS (and masked cargo's status, no `pipefail`), and the forced rebuild went to `/dev/null` | the next root run, under the §2b procedure that hashes the full enumerated set before and after a forced rebuild |
+| — (process) | root evidence is what it says it is | **CLOSED by LANE RUN 14** (`af6dde0`, 2026-09-06) | R25-05 — run 13's "forced freshness proven" rested on commands that computed **no hashes**: `\| tail -3` printed three artifact PATHS (and masked cargo's status, no `pipefail`), and the forced rebuild went to `/dev/null` | **closed.** Run 14 under the corrected §2b: `sha256sum` over the enumerated set before and after a forced rebuild, `before=17 after=17`, `diff` EMPTY. `EXECUTED 187 / SKIPPED 5 / reported 192`, rc 0, 17/17 producers exited 0, PAM `md5sum -c` OK, no stale sessions |
 
 **R25-05 is the finding that matters most, and it is worse than a missed check.** The operator
 had specifically asked that each hygiene check's output be captured separately, *because* the
@@ -56,6 +56,27 @@ same file with a message that also says "ceiling". A PASS/PASS, worthless under 
 clause 2. The two guards are deliberately redundant in the product, so the test had to name which
 one fired. This is the second time in this arc that performing a weaken, rather than reasoning
 about it, was the only thing that found the flaw.
+
+### Run 14 — the close, and what the prediction bought (2026-09-06)
+
+`EXECUTED 187 / SKIPPED 5 / reported 192`, **exactly the pair predicted at `af6dde0`** and
+committed alone before the run. The derivation was checkable in advance and is worth recording
+because it held under test: run 13's 177 plus the ten round-25 tests, with root-gating verified
+by grepping each test body rather than recalled — nine ungated, and the tenth gating on
+`/usr/bin/coreutils` **existing** rather than on euid, so root sees the same file.
+
+Both lanes report **192**, which was the consistency check written into the expectation: same
+test set, different skip distribution. A different total would have meant the set changed,
+which is a distinct defect from a count mismatch.
+
+**The freshness step produced hashes this time** — `before=17 after=17`, `diff` empty. That is
+the whole of R25-05: the prior step's commands printed artifact paths and discarded the rebuild
+output, and the result was accepted. A check that emits *something* is not a check that decides
+*the thing*.
+
+**Ordering held under convention for the second consecutive run.** `af6dde0` contains the
+expectation file alone; the result follows. That makes D0A-R22-01's failure non-guaranteed — it
+does not make convention sufficient, and the reopening stands.
 
 ---
 
@@ -104,14 +125,24 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 **LANE RUN 13 (current) — `EXECUTED 177 / SKIPPED 5 / reported 182`, rc 0, 0 failures,
 17/17 producers exited 0, and EVERY HYGIENE CHECK PERFORMED WITH ITS OWN CAPTURED OUTPUT:**
-helper digest installed == staged (`aba0f0ea…`), forced freshness (identical executable set
-after a forced rebuild), free space above floor on three filesystems, stale sessions none
-before AND after, PAM `439c1d15…` → `md5sum -c` **OK**.
+helper digest installed == staged (`aba0f0ea…`), ~~forced freshness (identical executable set
+after a forced rebuild)~~ **— WITHDRAWN by D0A-R25-05, the command behind it computed no
+hashes** —, free space above floor on three filesystems, stale sessions none before AND after,
+PAM `439c1d15…` → `md5sum -c` **OK**.
 
-**This closes D0A-R24-01.** The evidence had been split across two runs covering different
+**This was recorded as closing D0A-R24-01. IT DID NOT — see the round-25 section above; the
+close is LANE RUN 14.** The evidence had been split across two runs covering different
 dimensions — run 11 the hygiene, run 12 the counts and machine-bound ordering — because run 11
 was swapped for run 12 as "current" without recomputing which dimensions survived the swap.
-Run 13 covers both, so both are superseded, as is run 10's `173 / 5`.
+Run 13 covers both of THOSE, so both are superseded, as is run 10's `173 / 5`. But run 13
+carried a freshness line its own commands could not produce, so it closed R24-01 in form only
+and D0A-R25-05 reopened it.
+
+**This correction was found by the class-48 predicate, not by the finding.** R25-05 named the
+procedure and the root baseline; this section — an earlier part of the same register — still
+asserted the withdrawn check as fact AND still claimed the closure. Third consecutive round in
+which running the predicate mechanically after the primary fix caught a site the finding had
+not named.
 
 **Its ordering is convention, not mechanism** (D0A-R22-01, reopened): predicted 177/5 at
 `feabc56`, committed alone and before the run, with `git log` on the two files as the only

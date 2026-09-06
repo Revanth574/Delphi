@@ -10,6 +10,63 @@ what closes it. A row leaves only when a test proves it closed.
 
 ---
 
+## Opened 2026-09-06 — D0-A round 26 (verdict: **FAIL**, 5xP1 2xP2)
+
+**Round 25's answer held up: the hypothesis was coverage, not convergence, and the round-26
+prompt handed over class 49's check as data rather than a claim** — 14 of 26 `runtime/src`
+files never named across five rounds, 7 of them tier 1. The findings that came back were not in
+those files, though: they were in the round-25 fixes themselves, and **three of the five P1s
+land on refusals whose enumerations were incomplete**. A refusal is only as good as what it
+knows to refuse.
+
+| § | ratified clause | status | finding | closes when |
+|---|---|---|---|---|
+| §3 consent tiers | the tier demanded is the tier enforced | **CLOSED** at this commit | R26-01 — R25-01 set the ceiling at `Biometric` reasoning that this crate defines it as "live PAM". But the shipped stack is `pam_unix` alone, so a `Biometric` action was satisfied by a PASSWORD with the stronger claim in its preview, digest and audit — **the identical false claim `Hardware` was refused for**, one rung down | `ENFORCED_TIER = Confirm`, weaken-proven by a test that fails at `Biometric` while the `Hardware` test and the positive control both still pass |
+| §3 canonicalisation | the daemon cannot be wedged pre-consent | **CLOSED** at this commit | R26-02 — `O_NONBLOCK` is **ignored by Linux for regular files**, so a stalled FUSE/NFS mount still wedges the single-threaded root daemon in `read`. The prior comment noted the no-op as a *benefit* when it was the gap | the whole open-and-read runs under a 30 s deadline on a disposable thread; `under_deadline` is factored out so the timeout branch is directly testable |
+| §3 token lifetime | the consent window is bounded in REAL time | **CLOSED** at this commit | R26-03 — `Instant` is `CLOCK_MONOTONIC` (measured: 51.048 ms `elapsed()` vs a 0.051 s MONOTONIC delta), which **pauses during suspend**. A machine closed for an hour between consent and Present returns with its window barely moved | `CLOCK_BOOTTIME` via `store::boot_secs`, fail-closed when unreadable |
+| §3 canonicalisation | the read bound admits legitimate tools | **CLOSED** at this commit | R26-04 — the 64 MiB ceiling generalised from a `maxdepth 1` sample of three directories and was **wrong on the machine it was derived from**: `claude` (262 MiB), `codex` (246 MiB) and `claude-desktop` (207 MiB) all exceed it | root-controlled `DELPHI_MAX_EXECUTABLE_BYTES`, default 512 MiB **derived from the exhaustion budget** (peak = 2x ceiling; 1/8 of an 8 GiB workstation floor = 1 GiB; ceiling = 512 MiB), with a malformed value refused rather than defaulted |
+| — (process) | a check decides, it does not display | **CLOSED** at this commit | R26-05 — the *corrected* freshness step still only PRINTED `rebuild rc` and the hash counts. A failed rebuild would compare two stale sets and print `FRESH`; two identically-short lists compare equal | every check `exit`s: enumeration asserted at 17, both hash sides asserted equal to it, rebuild failure fatal |
+| — (record) | the derivation is checkable | **CLOSED** at this commit | R26-06 — the run-14 expectation described all four service tests as one fixture shape. Two use a socketpair via `serve_one_action`; two call `present_and_execute` directly, and the tier *control* reaches the gate rather than preceding it. **The number was right and the explanation was wrong** — R19-06/R20-07's shape, third occurrence | corrected in place, labelled post-hoc; the file's protected property rests on commit order (`af6dde0` precedes `53e2b5a`), not on its wording |
+| — (record) | one current root record | **CLOSED** at this commit | R26-07 — the register still read `LANE RUN 13 (current)` beside run 14's closure of the finding run 13 had failed to close | run 13 marked superseded; run 14 named as the current record at the head of the section |
+
+### R26-07 is the sharpest result, and it is about METHOD
+
+Class 48's predicate **worked**. It surfaced the line. The output was then filtered with
+`grep -viE "…|run 13 \(|…"` to separate live claims from deliberate history — and
+`RUN 13 (current)` contains `run 13 (`. **The pattern written to hide historical mentions
+deleted the one line asserting currency.**
+
+That is not class 41 (wrong altitude): the sweep did not look in the wrong place, it looked in
+the right place, found the thing, and a second step threw it away. Recorded as
+`DEFECT_CLASSES.md` **class 50** — *a filter applied to a mechanism's output is not part of the
+mechanism and can silently invert it* — with the remedy that a suppression pattern owes the
+same discrimination test as an assertion: does it exclude only what it names?
+
+### What R26-01's fixture migration exposed
+
+Every fixture in the crate proposed `Biometric`. Moving all of them to `Confirm` cost **no
+coverage**, because **nothing had ever asserted what `Biometric` meant** — the only two
+tier-touching tests assert that *changing* the tier changes the digest and the preview, which
+holds for any two distinct values, and `end_to_end.rs` says "one Biometric action" in a doc
+comment. The label was decoration end to end. **That is a finding about the tier system, not
+about the fixtures, and it is why R25-01's "descriptive only" defect could live undetected: no
+test could have caught it, because no test claimed any tier meant anything.**
+`biometric_is_refused_…` is the first test in this crate to assert on a tier's meaning.
+
+### Honest residuals carried out of this round
+
+- **The suspend divergence is reasoned, not measured.** `BOOTTIME - MONOTONIC = 0.000s` on this
+  box (never suspended), so no assertion available here distinguishes the two clocks. The test
+  checks clock IDENTITY and says so; a lane that has suspended would strengthen it.
+- **The deadline's timeout branch is proven on a sleeping closure, not a stalled mount.** That a
+  real FUSE stall reaches it is a property of the filesystem, not of this code.
+- **The pending store still has no cap.** The ceiling bounds ONE proposal; a looping daemon (B2;
+  B1 services one action and exits) accumulates sealed memfds across proposals. Not closed here.
+- **`argv` is validated for emptiness only** while `env_delta` is NUL-checked at both doors.
+  Surfaced in the round-26 prompt, unanswered by this round's findings, still open.
+
+---
+
 ## Opened 2026-09-06 — D0-A round 25 (verdict: **FAIL**, 4xP1 4xP2)
 
 **This round answered the convergence question, against both the operator and me.** Rounds 22-24
@@ -123,7 +180,10 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**LANE RUN 13 (current) — `EXECUTED 177 / SKIPPED 5 / reported 182`, rc 0, 0 failures,
+**CURRENT ROOT RECORD: LANE RUN 14** — `EXECUTED 187 / SKIPPED 5 / reported 192`, freshness
+MEASURED. Everything below this line is the superseded history that led to it.
+
+**LANE RUN 13 — SUPERSEDED BY RUN 14 (D0A-R26-07). `EXECUTED 177 / SKIPPED 5 / reported 182`, rc 0, 0 failures,
 17/17 producers exited 0, and EVERY HYGIENE CHECK PERFORMED WITH ITS OWN CAPTURED OUTPUT:**
 helper digest installed == staged (`aba0f0ea…`), ~~forced freshness (identical executable set
 after a forced rebuild)~~ **— WITHDRAWN by D0A-R25-05, the command behind it computed no

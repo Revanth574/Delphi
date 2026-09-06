@@ -48,10 +48,28 @@
 #     file, so it EXECUTES in both environments. This is the only one of the ten whose
 #     outcome could differ between lanes, and it does not.
 #
-# The four service tests are worth naming separately because they are the category that has
-# executed at root every time: they use a socketpair and a stub SessionSource (`Seatless`),
-# reach a denial BEFORE any gate, PAM call or spawn, and so depend on no privileged facility.
-# Two of them (the tier pair) deny before the action is even stored.
+# CORRECTED POST-HOC (D0A-R26-06). The paragraph that stood here said all four service tests
+# "use a socketpair and a stub SessionSource, reach a denial BEFORE any gate, PAM call or
+# spawn". **The number it supported was right and the explanation was wrong** — the R19-06 /
+# R20-07 shape, third occurrence, and this time inside the file whose whole purpose is that the
+# derivation be checkable independently of whether the number matches. What is actually true:
+#
+#   a_tier_the_daemon_cannot_enforce_…    socketpair + Seatless, via serve_one_action;
+#                                         denies at the TIER check, before the store
+#   the_enforced_tier_passes_…            socketpair + Seatless, via serve_one_action;
+#                                         passes the tier check, is STORED, then denies AT THE
+#                                         GATE — which is the point of it, and the opposite of
+#                                         "before any gate"
+#   an_elapsed_consent_window_…           NO socketpair, NO Seatless; calls
+#                                         present_and_execute directly
+#   a_granted_entry_without_…             NO socketpair, NO Seatless; calls
+#                                         present_and_execute directly
+#
+# The CONCLUSION survives — none of the four needs a privileged facility, so all four execute
+# at root — but it survives for two different reasons, not one. This annotation is added after
+# the run rather than rewritten silently: the file's protected property (prediction before
+# measurement) rests on commit order (af6dde0 precedes 53e2b5a), not on its wording, so a
+# labelled correction costs nothing and hiding the error would cost the record.
 #
 # So all ten execute at root:  177 + 10 = 187 EXECUTED.
 # None of them skips in either lane, so the root skip set is UNCHANGED at 5:

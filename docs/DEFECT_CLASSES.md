@@ -2793,3 +2793,53 @@ either genuinely closed by construction — say by what — or it is unexamined.
 **Related:** [45] (the totality claim) is the same disease in a single sentence; this is 45
 spread across a whole review. [41] (wrong altitude) is why the *measurement* must be
 mechanical: three grep sweeps in this arc returned confident false negatives.
+
+## 50. THE FILTER ON A MECHANISM'S OUTPUT IS NOT PART OF THE MECHANISM, AND CAN SILENTLY INVERT IT  *(new — D0A-R26-07, found by the reviewer after the predicate had already succeeded)*
+
+**The class.** A checking mechanism produces output; a human pipes that output through a
+suppression pattern to cut noise; **the pattern matches the signal and deletes it.** The
+mechanism succeeded. The post-processing defeated it. The result is indistinguishable from the
+mechanism having found nothing — which is the worst available failure shape, because the
+mechanism's success is what you then trust.
+
+**This is NOT class 41 (wrong altitude).** There the sweep itself looks in the wrong place and
+never sees the thing. Here the sweep sees it, reports it, and a *second* step throws it away.
+The remedies differ: 41 says widen the search; 50 says audit the filter.
+
+**The instance.** Running class 48's predicate over `CONFORMANCE_REGISTER.md` correctly
+surfaced every line naming run 13. To separate live claims from deliberate history, the output
+was filtered with `grep -viE "supersed|withdrew|prior|run 13's|historical|run 13 \("`. The line
+that mattered read:
+
+```
+**LANE RUN 13 (current) — `EXECUTED 177 / SKIPPED 5 / reported 182` …
+```
+
+`RUN 13 (current)` contains the substring `run 13 (` — case-insensitively — so the pattern
+written to hide *historical* mentions deleted the one line asserting run 13 was **current**.
+The register shipped saying run 13 was current AND that run 14 closed the finding run 13 had
+failed to close. The predicate had done its job three lines earlier.
+
+**The discipline: a suppression pattern needs the same discrimination test as an assertion.**
+
+1. **Does it exclude only what it names?** `run 13 \(` was meant to name a parenthetical
+   citation. It also names `RUN 13 (current)`, `RUN 13 (superseded)`, and every other
+   parenthesis that could follow. A pattern that cannot state what it excludes is not a filter,
+   it is a guess.
+2. **Count what you removed, and look at it.** `grep -c` before and after costs one command.
+   Any filter dropping more than a couple of lines is doing enough work to be reviewed.
+3. **Prefer positive selection to negative suppression.** "Show me the lines that assert
+   currency" is auditable; "hide the lines that look historical" is a claim about everything
+   you did not read.
+4. **When the filter and the mechanism disagree, the mechanism wins.** If the raw output has a
+   hit and the filtered output does not, that difference is the finding.
+
+**The RED-proof shape.** Run the mechanism twice — once raw, once filtered — and diff. Every
+line the filter removed must be one you can name a reason for. This is cheap enough to be
+unconditional whenever a sweep's output feeds a decision.
+
+**Related:** [41] (wrong altitude) is the sibling failure in the search itself. [48] (the fix
+scoped to the named instance) is the mechanism this defeated — note that 48's predicate has now
+caught three sites the findings did not name, so the tool was working and the wrapper was not.
+[45] (the totality claim) is what the filtered output then licenses: "no remaining sites" stated
+from a search whose results were partly discarded.

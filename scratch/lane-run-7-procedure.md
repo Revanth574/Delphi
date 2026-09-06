@@ -86,7 +86,7 @@ two helper digests must MATCH; a mismatch is a stale install, not a profile diff
 ## 0b. SET THE RUN NUMBER ONCE — every path below derives from it
 
 ```bash
-export RUN=13                     # <- the only edit per run
+export RUN=15                     # <- the only edit per run (14 was the last run)
 export LOG=/tmp/root-run$RUN.log
 export STATUS=/tmp/root-run$RUN.status
 ```
@@ -134,18 +134,36 @@ the commands computed **no hashes at all** — the first printed artifact *paths
 "forced freshness proven" on the strength of that. It was not proven; it was asserted next to
 a command that could not check it. It runs HERE, after §2, because its input is the enumerated target list:
 
+**D0A-R26-05: THIS STEP MUST *ENFORCE*, NOT PRINT.** The first corrected version printed
+`rebuild rc=$?` and `before=N after=N` and then compared anyway — so a FAILED rebuild would
+compare two STALE hash sets and print `FRESH`, and two identically-SHORT lists would compare
+equal. That is the same defect one level up: a step that displays a number instead of deciding
+on it. Every check below `exit`s.
+
 ```bash
-# Hash the enumerated set, force a rebuild, hash again. All 17, not the last three.
+set -o pipefail
+N=$(wc -l < /tmp/targets.txt)
+[ "$N" -eq 17 ] || { echo "REFUSE: enumeration is $N, not 17"; exit 1; }
+
 sha256sum $(cat /tmp/targets.txt) | sort -k2 > /tmp/hashes-before.txt
+[ "$(wc -l < /tmp/hashes-before.txt)" -eq "$N" ] || { echo "REFUSE: hashed fewer than $N before"; exit 1; }
+
 touch runtime/src/execute.rs
-cargo test -p delphi-runtime --tests --no-run 2>&1 | tail -3 ; echo "rebuild rc=$?"
+cargo test -p delphi-runtime --tests --no-run > /tmp/rebuild.log 2>&1 \
+  || { echo "REFUSE: the forced rebuild FAILED — comparing stale hashes would print FRESH"; tail -20 /tmp/rebuild.log; exit 1; }
+
 sha256sum $(cat /tmp/targets.txt) | sort -k2 > /tmp/hashes-after.txt
-diff /tmp/hashes-before.txt /tmp/hashes-after.txt && echo "FRESH: all $(wc -l < /tmp/targets.txt) executables identical after a forced rebuild"
-wc -l < /tmp/hashes-after.txt     # MUST equal the target count; a short list is a false green
+[ "$(wc -l < /tmp/hashes-after.txt)" -eq "$N" ] || { echo "REFUSE: hashed fewer than $N after"; exit 1; }
+
+diff /tmp/hashes-before.txt /tmp/hashes-after.txt \
+  || { echo "REFUSE: the executables CHANGED under a forced rebuild — the earlier set was stale"; exit 1; }
+echo "FRESH: all $N executables identical after a forced rebuild (both sides hashed $N)"
 ```
 
-`diff` returning 0 over the FULL enumerated set is the proof. A path listing is not a hash,
-and three paths are not seventeen.
+`diff` returning 0 over the FULL enumerated set, **with both sides asserted to contain exactly
+the enumerated count and the rebuild asserted to have succeeded**, is the proof. A path listing
+is not a hash; three paths are not seventeen; and a comparison of two stale sets is not a
+freshness check.
 
 ## 3. The run — every target, serial, one log
 

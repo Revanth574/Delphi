@@ -182,7 +182,7 @@ fn one_biometric_action_through_1a_to_1d() {
         ],
         net_policy: NetPolicy::None,
         timeout: Duration::from_secs(30),
-        required_tier: RequiredTier::Biometric,
+        required_tier: RequiredTier::Confirm,
         script: None,
     };
     let digest = canonical_action_digest(&action);

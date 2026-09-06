@@ -17,6 +17,24 @@ use std::collections::HashMap;
 
 use crate::action::PendingAction;
 
+/// `CLOCK_BOOTTIME` in whole seconds — monotonic AND suspend-inclusive (D0A-R26-03).
+///
+/// `None` if the clock cannot be read, which every caller treats as fail-closed. See
+/// [`PendingEntry::granted_at_boot_secs`] for why this clock and not `Instant`.
+#[must_use]
+pub fn boot_secs() -> Option<u64> {
+    // SAFETY: `clock_gettime` writes through a pointer to a `timespec` this frame owns and
+    // fully initialises; the return value is checked before the value is read. CLOCK_BOOTTIME
+    // has existed since Linux 2.6.39.
+    unsafe {
+        let mut ts: nix::libc::timespec = std::mem::zeroed();
+        if nix::libc::clock_gettime(nix::libc::CLOCK_BOOTTIME, &mut ts) != 0 {
+            return None;
+        }
+        u64::try_from(ts.tv_sec).ok()
+    }
+}
+
 /// The lifecycle of a registered action. The transitions are the protocol's state
 /// machine; a `Present` is only honored against a `Granted` entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,16 +54,24 @@ pub struct PendingEntry {
     pub action: PendingAction,
     /// Where this action is in the consent → present → execute lifecycle.
     pub state: PendingState,
-    /// MONOTONIC instant at which the token for this action was minted (D0A-R25-01's
-    /// sibling, D0A-R25-04). `None` until the action reaches `Granted`.
+    /// `CLOCK_BOOTTIME` seconds at which the token for this action was minted (D0A-R25-04,
+    /// corrected by D0A-R26-03). `None` until the action reaches `Granted`.
     ///
     /// The token's own TTL is checked against `SystemTime` because the issue time is bound
     /// into the token's MAC and must survive as an absolute value. But a security LIFETIME
-    /// measured on an adjustable clock can be extended by adjusting it: setting the wall
-    /// clock back makes `now - issued_at` shrink, and a token stays live for as long as the
-    /// clock keeps moving backwards. `Instant` cannot be set, so the elapsed check that
-    /// actually gates execution reads this instead.
-    pub granted_at: Option<std::time::Instant>,
+    /// measured on an adjustable clock can be extended by adjusting it: setting the wall clock
+    /// back makes `now - issued_at` shrink, and a token stays live for as long as the clock
+    /// keeps moving backwards.
+    ///
+    /// **Why not `Instant` — which is what R25-04 used.** Rust's `Instant` is `CLOCK_MONOTONIC`
+    /// on Linux (measured: a 51.048 ms `elapsed()` against a 0.051 s `CLOCK_MONOTONIC` delta),
+    /// and `CLOCK_MONOTONIC` **does not advance while the machine is suspended**. So a laptop
+    /// closed for an hour between consent and `Present` returns with its consent window barely
+    /// moved — the token outlives its TTL in wall-clock reality by exactly the suspend
+    /// duration, which is the scenario an unattended machine makes routine. `CLOCK_BOOTTIME`
+    /// is the same monotonic guarantee INCLUDING suspend, so it is the one a consent window
+    /// must be measured on.
+    pub granted_at_boot_secs: Option<u64>,
 }
 
 /// The daemon's pending registry. The single-threaded service loop owns it; it is
@@ -76,7 +102,7 @@ impl PendingStore {
     /// the action's own `pending_id` (assigned via [`next_id`](Self::next_id)).
     pub fn insert(&mut self, action: PendingAction) {
         let id = action.pending_id.clone();
-        self.entries.insert(id, PendingEntry { action, state: PendingState::Proposed, granted_at: None });
+        self.entries.insert(id, PendingEntry { action, state: PendingState::Proposed, granted_at_boot_secs: None });
     }
 
     /// Move an entry to `Granted`, stamping the monotonic consent instant in the same step.
@@ -96,14 +122,16 @@ impl PendingStore {
     /// # fn f(store: &mut PendingStore, id: &str) {
     /// assert!(store.grant(id));
     /// assert_eq!(store.get(id).unwrap().state, PendingState::Granted);
-    /// assert!(store.get(id).unwrap().granted_at.is_some());
+    /// assert!(store.get(id).unwrap().granted_at_boot_secs.is_some());
     /// # }
     /// ```
     pub fn grant(&mut self, pending_id: &str) -> bool {
         match self.entries.get_mut(pending_id) {
             Some(e) => {
                 e.state = PendingState::Granted;
-                e.granted_at = Some(std::time::Instant::now());
+                e.granted_at_boot_secs = boot_secs();
+                // A clock that cannot be read is fail-closed, not fail-open: leaving this
+                // `None` makes `present_and_execute` refuse the action (D0A-R26-03).
                 true
             }
             None => false,
@@ -141,9 +169,43 @@ mod tests {
             fs_binds: vec![(PathBuf::from("/x"), BindMode::ReadOnly)],
             net_policy: NetPolicy::None,
             timeout: Duration::from_secs(30),
-            required_tier: RequiredTier::Biometric,
+            required_tier: RequiredTier::Confirm,
             script: None,
         }
+    }
+
+    /// D0A-R26-03 — `boot_secs` reads `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`.
+    ///
+    /// **WHAT THIS TEST CANNOT DO, stated rather than implied.** The property that matters is
+    /// that the consent window keeps running across SUSPEND, and the two clocks differ by
+    /// exactly the accumulated suspend time. On a machine that has never suspended they are
+    /// identical — measured on the development box at the time of the fix,
+    /// `BOOTTIME - MONOTONIC = 0.000s` — so **no assertion available here can distinguish
+    /// them**, and a test claiming to prove suspend behaviour would be proving nothing.
+    ///
+    /// So this asserts the weaker thing it can actually decide: `boot_secs` agrees with a
+    /// direct `CLOCK_BOOTTIME` reading and is monotonically non-decreasing. The suspend
+    /// behaviour itself is inherited from the documented semantics of the clock, not measured.
+    /// A lane that has suspended would strengthen this into a real discriminator.
+    #[test]
+    fn boot_secs_reads_the_boottime_clock_and_does_not_go_backwards() {
+        let direct = unsafe {
+            let mut ts: nix::libc::timespec = std::mem::zeroed();
+            assert_eq!(
+                nix::libc::clock_gettime(nix::libc::CLOCK_BOOTTIME, &mut ts),
+                0,
+                "CLOCK_BOOTTIME must be readable"
+            );
+            u64::try_from(ts.tv_sec).expect("boottime seconds fit u64")
+        };
+        let ours = boot_secs().expect("boot_secs must read the clock");
+        assert!(
+            ours.abs_diff(direct) <= 1,
+            "boot_secs ({ours}) disagrees with a direct CLOCK_BOOTTIME read ({direct}) by more \
+             than the one-second sampling gap — it is reading a different clock"
+        );
+        let later = boot_secs().expect("second read");
+        assert!(later >= ours, "the boot clock went backwards: {ours} -> {later}");
     }
 
     #[test]

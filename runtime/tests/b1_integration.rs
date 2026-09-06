@@ -318,7 +318,7 @@ fn marker_proposal(exe: &Path, marker: &str, out_dir: &Path) -> pb::Propose {
         exe_path: exe.display().to_string(),
         net_policy: pb::NetPolicy::NetNone as i32,
         timeout_secs: 30,
-        required_tier: pb::RequiredTier::TierBiometric as i32,
+        required_tier: pb::RequiredTier::TierConfirm as i32,
     }
 }
 
@@ -1515,7 +1515,7 @@ fn b1_verified_then_execution_failed_consumes_the_approval() {
         fs_binds: vec![],
         net_policy: NetPolicy::None,
         timeout: std::time::Duration::from_secs(30),
-        required_tier: RequiredTier::Biometric,
+        required_tier: RequiredTier::Confirm,
         script: Some(ScriptPin {
             interpreter_fd: std::fs::File::open("/bin/sh").unwrap().into(),
             interpreter_digest: [0x01; 32],
@@ -1869,7 +1869,7 @@ fn terminal_contract_release_produces_eof_no_wedge() {
         exe_path: "/bin/true".into(),
         net_policy: pb::NetPolicy::NetNone as i32,
         timeout_secs: 30,
-        required_tier: pb::RequiredTier::TierBiometric as i32,
+        required_tier: pb::RequiredTier::TierConfirm as i32,
     };
     write_frame(&mut ai_client, &propose_msg(propose)).expect("send propose");
 

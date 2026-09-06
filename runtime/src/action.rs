@@ -322,7 +322,7 @@ pub struct PendingAction {
 ///     executable_digest: [0xAB; 32], argv: vec!["echo".into()],
 ///     cwd: "/tmp".into(), env_delta: vec![], fs_binds: vec![],
 ///     net_policy: NetPolicy::None, timeout: Duration::from_secs(30),
-///     required_tier: RequiredTier::Biometric, script: None,
+///     required_tier: RequiredTier::Confirm, script: None,
 /// };
 /// assert_eq!(canonical_action_digest(&a).len(), 32);
 /// ```
@@ -450,7 +450,7 @@ fn q(s: &str) -> String {
 ///     cwd: "/".into(), env_delta: vec![("K".into(), "V".into())],
 ///     fs_binds: vec![], net_policy: NetPolicy::None,
 ///     timeout: Duration::from_secs(30),
-///     required_tier: RequiredTier::Biometric, script: None,
+///     required_tier: RequiredTier::Confirm, script: None,
 /// };
 /// let p = preview(&a);
 /// // Every field is quoted + indexed (D0A-R18-02) and the COMPLETE action is shown
@@ -539,7 +539,7 @@ mod tests {
             fs_binds: vec![(PathBuf::from("/tmp/out"), BindMode::ReadWrite)],
             net_policy: NetPolicy::None,
             timeout: Duration::from_secs(30),
-            required_tier: RequiredTier::Biometric,
+            required_tier: RequiredTier::Confirm,
             script: None,
         }
     }

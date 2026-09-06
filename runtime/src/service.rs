@@ -267,25 +267,43 @@ pub fn accept_requester(listener: &UnixListener, expected_uid: u32) -> Result<Un
     Ok(stream)
 }
 
-/// The consent tier the daemon's ONE gate sequence actually implements (D0A-R25-01).
+/// The consent tier the daemon's ONE gate sequence can actually ENFORCE (D0A-R25-01,
+/// tightened by D0A-R26-01).
 ///
-/// `RequiredTier` has four values; `serve_one_action` has always run a single sequence for
-/// all of them — logind gate → live PAM over the private channel → shell mint-confirm →
-/// second gate read. That sequence IS `Biometric` as this crate defines it ([`RequiredTier`]:
-/// "live PAM authentication"), and `docs/TRUST_MODEL.md` describes the biometric/TPM tiers as
-/// riding this same daemon-driven PAM stack rather than a separate agent.
+/// `RequiredTier` has four values; `serve_one_action` runs a single sequence for all of them —
+/// logind gate → live PAM over the private channel → shell mint-confirm → second gate read.
+/// The question this constant answers is what that sequence is WORTH, and R25-01 answered it
+/// one tier too generously.
 ///
-/// It is NOT `Hardware`. The shipped `/etc/pam.d/delphi-runtime` is `pam_unix` only, so a
-/// `Hardware` action would be authorized by a PASSWORD while its preview, its digest and its
-/// audit record all claim a hardware-backed factor. That is a false claim about a security
-/// property, which is why the tier above this constant is REFUSED rather than accepted.
+/// **R25-01 set this to `Biometric`**, reasoning that this crate's own doc comment defines
+/// that value as "live PAM authentication" and the sequence is exactly that. **R26-01 rejected
+/// the reasoning as self-serving**, and it was: the shipped `/etc/pam.d/delphi-runtime` is
+/// `pam_unix` alone, `docs/TRUST_MODEL.md` describes the biometric/TPM tiers as riding this
+/// stack *because a biometric module would be in it*, and no such module is. So a `Biometric`
+/// action was authorised by a PASSWORD while its preview, digest and audit entry claimed a
+/// biometric factor — **the identical false claim R25-01 refused `Hardware` for**, one rung
+/// down. The argument that refused `Hardware` always refused `Biometric` too; R25-01 stopped
+/// where it had already gone far enough to feel finished.
+///
+/// What the stack provides is a password prompt in front of a human at the seat. That is
+/// `Confirm`. Anything above is refused until a factor is shipped AND proven, not until it is
+/// merely configured.
 ///
 /// The other direction is fail-safe and deliberately not "corrected": an action requesting
-/// `Autonomous` or `Confirm` receives this STRONGER sequence, because no tier-specific
-/// branching exists. Naming the constant is what makes that safe by decision rather than by
-/// coincidence — when branching is added, the floor is here to be consulted, and a requester
-/// (the AI, i.e. untrusted input) cannot obtain a weaker gate by classifying its own action.
-const ENFORCED_TIER: RequiredTier = RequiredTier::Biometric;
+/// `Autonomous` still receives this stronger sequence, because no tier-specific branching
+/// exists. Naming the constant is what makes that a decision rather than a coincidence — when
+/// branching is added, the floor is here to be consulted, and the requester (the AI, i.e.
+/// untrusted input) cannot obtain a weaker gate by classifying its own action.
+///
+/// **What the fixture migration exposed, which is a finding about the tier system rather than
+/// about the fixtures (D0A-R26-01):** every fixture in the crate proposed `Biometric`, and
+/// moving them all to `Confirm` cost NO coverage — because nothing had ever asserted on what
+/// `Biometric` MEANT. The only two tier-touching tests assert that *changing* the tier changes
+/// the digest and the preview, which holds for any two distinct values. The label was
+/// decoration end to end, and that is precisely why R25-01's "descriptive only" defect could
+/// live here undetected: no test could have caught it, because no test claimed any tier meant
+/// anything.
+const ENFORCED_TIER: RequiredTier = RequiredTier::Confirm;
 
 /// Service exactly one action over an accepted AI connection (the §4 flow).
 ///
@@ -434,24 +452,31 @@ pub fn present_and_execute(
         if entry.state != PendingState::Granted {
             return denied("action not in Granted state (replay or never granted)");
         }
-        // D0A-R25-04: the AUTHORITATIVE expiry check, on a clock nobody can adjust.
-        // `execute_approved`'s `within_ttl` compares Unix timestamps, so rolling the system
-        // clock backwards shrinks the apparent age and keeps a consented token live
-        // indefinitely. `Instant` has no setter; this is the check that actually bounds the
-        // window between consent and execution.
-        match entry.granted_at {
-            Some(at) if at.elapsed().as_secs() > crate::token::TOKEN_TTL_SECS => {
+        // D0A-R25-04, corrected by D0A-R26-03: the AUTHORITATIVE expiry check, on a clock
+        // nobody can adjust AND that keeps running across suspend. `execute_approved`'s
+        // `within_ttl` compares Unix timestamps, so rolling the system clock backwards shrinks
+        // the apparent age; `CLOCK_MONOTONIC` fixes that but PAUSES while suspended, so a
+        // machine closed between consent and Present returns with its window barely moved.
+        // `CLOCK_BOOTTIME` is monotonic and suspend-inclusive.
+        match (entry.granted_at_boot_secs, crate::store::boot_secs()) {
+            (Some(at), Some(now)) if now.saturating_sub(at) > crate::token::TOKEN_TTL_SECS => {
                 return denied(
-                    "the consent window has elapsed on the monotonic clock — the token was \
-                     minted more than the TTL ago in real time, whatever the system clock \
-                     now reads (D0A-R25-04)",
+                    "the consent window has elapsed on CLOCK_BOOTTIME — more than the TTL of \
+                     real time has passed since consent, including any suspend, whatever the \
+                     system clock now reads (D0A-R25-04, D0A-R26-03)",
                 );
             }
-            Some(_) => {}
-            None => {
+            (Some(_), Some(_)) => {}
+            (None, _) => {
                 return denied(
-                    "granted action carries no monotonic consent instant — refusing rather \
-                     than falling back to the adjustable wall clock (D0A-R25-04)",
+                    "granted action carries no consent instant — refusing rather than falling \
+                     back to the adjustable wall clock (D0A-R25-04)",
+                );
+            }
+            (_, None) => {
+                return denied(
+                    "CLOCK_BOOTTIME could not be read, so the consent window cannot be \
+                     bounded — refusing rather than executing unbounded (D0A-R26-03)",
                 );
             }
         }
@@ -655,6 +680,63 @@ mod tests {
         }
     }
 
+    /// D0A-R26-01 — **`Biometric` is refused**, because `pam_unix` is not a biometric factor.
+    ///
+    /// R25-01 set the ceiling at `Biometric` on the grounds that this crate defines it as
+    /// "live PAM authentication". That reasoning refuses `Hardware` for a false claim while
+    /// admitting the same false claim one rung down: the shipped stack is `pam_unix` alone, so
+    /// a `Biometric` action was satisfied by a password with the stronger claim recorded in
+    /// its preview, digest and audit entry.
+    ///
+    /// This test is what makes the tighter ceiling a fact rather than a comment. It is also
+    /// the FIRST test in this crate to assert anything about a specific tier's meaning — see
+    /// `ENFORCED_TIER`'s note on why the fixture migration cost no coverage.
+    #[test]
+    fn biometric_is_refused_because_the_shipped_pam_stack_has_no_biometric_factor() {
+        let (daemon_end, _shell_end) = crate::channel::approval_socketpair().expect("socketpair");
+        let (mut ai_daemon, mut ai_peer) = std::os::unix::net::UnixStream::pair().expect("ai pair");
+
+        let propose = pb::Propose {
+            argv: vec!["tool".into()],
+            cwd: "/".into(),
+            env_delta: vec![],
+            fs_binds: vec![],
+            exe_path: "/bin/sh".into(),
+            net_policy: pb::NetPolicy::NetNone as i32,
+            timeout_secs: 5,
+            required_tier: pb::RequiredTier::TierBiometric as i32,
+        };
+        crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
+
+        let mut store = PendingStore::new();
+        let mut ledger = ConsumptionLedger::new();
+        let key = crate::token::MintingKey::from_bytes([7u8; 32]);
+        let mut ctx = ServiceCtx {
+            channel_fd: daemon_end.as_raw_fd(),
+            session: &Seatless,
+            key: &key,
+            pam_service: "delphi-runtime",
+            session_user: "nobody",
+            store: &mut store,
+            ledger: &mut ledger,
+            clock: &At(1_000),
+        };
+
+        let outcome = serve_one_action(&mut ai_daemon, &mut ctx).expect("serves without aborting");
+        match outcome {
+            Outcome::Denied { ref reason, .. } => assert!(
+                reason.contains("cannot enforce"),
+                "denied, but not for the unenforceable tier — Seatless also denies at the GATE, \
+                 so this assertion is what distinguishes the two: {reason}"
+            ),
+            other => panic!("Biometric must DENY while the stack is pam_unix only, got: {other:?}"),
+        }
+        assert!(
+            ctx.store.get("act-1").is_none(),
+            "a Biometric action was stored despite demanding a factor the stack cannot supply"
+        );
+    }
+
     /// D0A-R25-04 — an elapsed consent window is denied even when the WALL CLOCK says the
     /// token is fresh.
     ///
@@ -675,7 +757,7 @@ mod tests {
             exe_path: "/bin/sh".into(),
             net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 5,
-            required_tier: pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierConfirm as i32,
         };
         let action = canonicalize(&propose, "act-1".into()).expect("canonicalize");
         let digest = canonical_action_digest(&action);
@@ -687,11 +769,11 @@ mod tests {
         let entry = store.get_mut("act-1").expect("stored");
         entry.state = PendingState::Granted;
         // Real elapsed time is past the TTL.
-        entry.granted_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(crate::token::TOKEN_TTL_SECS + 5));
+        entry.granted_at_boot_secs =
+            crate::store::boot_secs().map(|n| n.saturating_sub(crate::token::TOKEN_TTL_SECS + 5));
         assert!(
-            entry.granted_at.is_some(),
-            "precondition: the platform must be able to express an Instant in the past"
+            entry.granted_at_boot_secs.is_some(),
+            "precondition: CLOCK_BOOTTIME must be readable for this test to mean anything"
         );
 
         let mut ledger = ConsumptionLedger::new();
@@ -705,8 +787,8 @@ mod tests {
         match present_and_execute(&mut store, &mut ledger, &key, "act-1", &token.to_wire(), MINT_AT)
         {
             Outcome::Denied { ref reason, .. } => assert!(
-                reason.contains("monotonic"),
-                "denied, but not by the monotonic window check: {reason}"
+                reason.contains("CLOCK_BOOTTIME has elapsed") || reason.contains("elapsed on CLOCK_BOOTTIME"),
+                "denied, but not by the boottime window check: {reason}"
             ),
             other => panic!(
                 "a token whose consent window elapsed in REAL time was accepted because the \
@@ -734,7 +816,7 @@ mod tests {
             exe_path: "/bin/sh".into(),
             net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 5,
-            required_tier: pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierConfirm as i32,
         };
         let action = canonicalize(&propose, "act-1".into()).expect("canonicalize");
         let digest = canonical_action_digest(&action);
@@ -746,13 +828,13 @@ mod tests {
         // The split update `grant` exists to prevent.
         let entry = store.get_mut("act-1").expect("stored");
         entry.state = PendingState::Granted;
-        assert!(entry.granted_at.is_none(), "precondition: the instant must be unset");
+        assert!(entry.granted_at_boot_secs.is_none(), "precondition: the instant must be unset");
 
         let mut ledger = ConsumptionLedger::new();
         match present_and_execute(&mut store, &mut ledger, &key, "act-1", &token.to_wire(), MINT_AT)
         {
             Outcome::Denied { ref reason, .. } => assert!(
-                reason.contains("no monotonic consent instant"),
+                reason.contains("no consent instant"),
                 "denied, but not for the missing instant: {reason}"
             ),
             other => panic!(
@@ -838,7 +920,7 @@ mod tests {
             exe_path: "/bin/sh".into(),
             net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 5,
-            required_tier: pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierConfirm as i32,
         };
         crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
 
@@ -890,7 +972,7 @@ mod tests {
             exe_path: "/bin/sh".into(),
             net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 5,
-            required_tier: pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierConfirm as i32,
         };
         crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
 
@@ -949,7 +1031,7 @@ mod tests {
             exe_path: "/bin/sh".into(),
             net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 5,
-            required_tier: pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierConfirm as i32,
         };
         crate::wire::write_frame(&mut ai_peer, &propose_msg(propose)).expect("send propose");
 

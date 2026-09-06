@@ -61,7 +61,7 @@ fn default_deny_action() -> PendingAction {
         fs_binds: vec![], // default-deny: no scope binds
         net_policy: NetPolicy::None,
         timeout: std::time::Duration::from_secs(30),
-        required_tier: RequiredTier::Biometric,
+        required_tier: RequiredTier::Confirm,
         script: None,
     }
 }

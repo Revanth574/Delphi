@@ -130,5 +130,22 @@
 #              `a_granted_entry_without_a_monotonic_instant_is_refused_rather_than_wall_clocked`
 # SKIPPED unchanged: every one runs unprivileged. Two of the ten are POSITIVE CONTROLS,
 # recorded as such because a guard that refused everything would satisfy its own refusal test.
-EXECUTED=167
+# 2026-09-06 (round-26 remediation): 167/25 -> 172/25. +5 EXECUTED, all additions:
+#   R26-01 (1) `biometric_is_refused_because_the_shipped_pam_stack_has_no_biometric_factor`
+#              — the FIRST test in this crate to assert on a specific tier's MEANING. That it
+#              did not exist is why R25-01's defect survived: every fixture proposed Biometric
+#              and nothing asserted what Biometric was worth.
+#   R26-02 (2) `a_read_that_does_not_return_is_refused_by_the_deadline` + its positive control
+#              `work_that_completes_within_the_deadline_is_not_refused`. They exercise
+#              `under_deadline` with a sleeping closure because a stalled FUSE/NFS mount cannot
+#              be built in-process, and a file-based test could never reach the timeout branch.
+#   R26-03 (1) `boot_secs_reads_the_boottime_clock_and_does_not_go_backwards` — a BOUNDED
+#              claim: on a never-suspended machine CLOCK_BOOTTIME and CLOCK_MONOTONIC are
+#              identical, so no assertion here can distinguish them. It checks clock identity,
+#              not suspend behaviour, and says so.
+#   R26-04 (1) `a_malformed_ceiling_is_refused_rather_than_defaulted` — over `parse_ceiling`,
+#              factored pure so it needs no `set_var` (a racing env write would make every
+#              other test in the binary flaky, which is worse than a failure).
+# SKIPPED unchanged: all five run unprivileged.
+EXECUTED=172
 SKIPPED=25

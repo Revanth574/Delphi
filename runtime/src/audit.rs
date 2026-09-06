@@ -168,7 +168,7 @@ mod tests {
             fs_binds: vec![(PathBuf::from("/data"), BindMode::ReadOnly)],
             net_policy: NetPolicy::None,
             timeout: Duration::from_secs(30),
-            required_tier: RequiredTier::Biometric,
+            required_tier: RequiredTier::Confirm,
             script: None,
         }
     }
@@ -285,7 +285,7 @@ mod tests {
             ],
             net_policy: NetPolicy::None,
             timeout: Duration::from_secs(30),
-            required_tier: RequiredTier::Biometric,
+            required_tier: RequiredTier::Confirm,
             script: None,
         }
     }

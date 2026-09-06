@@ -34,15 +34,118 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Ceiling on bytes read from a proposed executable or script interpreter (D0A-R25-02).
+/// Environment variable, set by the root-owned systemd unit, overriding the read ceiling.
 ///
-/// DERIVED from what a legitimate action references, not chosen round. Measured across
-/// `/usr/bin`, `/bin` and `/usr/libexec` on a full desktop install (1449 executables): the
-/// largest is `x86_64-linux-gnu-lto-dump-15` at 34.5 MiB, 5 exceed 16 MiB, 1 exceeds 32 MiB,
-/// and **0 exceed 64 MiB**. 64 MiB is the next power of two above the observed maximum — a
-/// 1.85x margin over the largest real binary, and it admits every executable on the system.
-/// A proposal above it is not a legitimate tool; it is the exhaustion case.
-const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
+/// Root-controlled deployment configuration, in the same place and by the same mechanism as
+/// `DELPHI_AI_BIN` and `DELPHI_SHELL_VT` (D0A-R26-04). The daemon runs as root from a
+/// root-owned unit file; nothing the AI or the user's session controls can reach this.
+pub const MAX_EXECUTABLE_BYTES_ENV: &str = "DELPHI_MAX_EXECUTABLE_BYTES";
+
+/// Default ceiling on bytes read from a proposed executable or script interpreter.
+///
+/// **DERIVED FROM WHAT IT PROTECTS AGAINST — a pre-consent memory bound — and not from the
+/// largest binary that happened to be observed.** D0A-R26-04 rejected the previous 64 MiB for
+/// being the latter: it was measured `maxdepth 1` over `/usr/bin`, `/bin` and `/usr/libexec`,
+/// concluded "0 of 1449 exceed 64 MiB", and was wrong **on the machine it was derived from** —
+/// `~/.local/share/claude` (262 MiB), `~/.codex/.../codex` (246 MiB) and
+/// `/usr/lib/claude-desktop` (207 MiB) all exceed it. A sample's blind spot became a universal.
+///
+/// The arithmetic, so the next round can attack the budget rather than the observation:
+///
+/// * **What is at risk.** `canonicalize` runs in the single-threaded ROOT daemon on an
+///   AI-supplied path, before the pending action exists and therefore before any human gate.
+/// * **Peak cost per proposal = 2x the ceiling**: the `Vec` read here, plus the copy
+///   [`seal_executable_snapshot`](crate::action::seal_executable_snapshot) writes into a
+///   memfd, both live at once. (The script path is not worse: a script is small and its
+///   interpreter is the only large object, so it is also 2x.)
+/// * **Budget.** Pre-consent transient is capped at **1/8 of the target deployment class's
+///   RAM floor**. Phase 3B/3C targets developer workstations; taking 8 GiB as that floor gives
+///   1 GiB of allowed transient.
+/// * **Therefore** ceiling = 1 GiB / 2 = **512 MiB**.
+///
+/// That it also clears the largest real executable found on any searched path (262 MiB, ~95%
+/// headroom) is a CHECK on the budget, not the derivation of it.
+///
+/// **The trade-off this makes explicit, which is why it is configuration and not a constant:**
+/// a 2 GiB deployment should set this to 128 MiB, and thereby cannot run 262 MiB tools. That
+/// choice belongs to the deployment. No single number both admits a quarter-gigabyte binary
+/// and protects a 2 GiB machine, and pretending otherwise is what produced the last number.
+///
+/// **Bounded scope, stated rather than implied:** this bounds ONE proposal. The pending store
+/// has no cap, so a daemon that loops (B2; B1 services one action and exits) can accumulate
+/// sealed memfds across proposals. That is a separate bound and is not closed here.
+pub const DEFAULT_MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The active ceiling: [`MAX_EXECUTABLE_BYTES_ENV`] if set, else
+/// [`DEFAULT_MAX_EXECUTABLE_BYTES`].
+///
+/// A malformed or zero value is an ERROR, not a silent fall back to the default — a
+/// deployment that meant to tighten this must not be given a looser bound because it made a
+/// typo (fail-closed, D0A-R26-04).
+fn max_executable_bytes() -> Result<u64, RuntimeError> {
+    parse_ceiling(std::env::var(MAX_EXECUTABLE_BYTES_ENV).ok().as_deref())
+}
+
+/// The ceiling decision as a PURE function of the configured string.
+///
+/// Separated from the `std::env` read so it is testable without mutating process-global state:
+/// `set_var` races every other test in the binary under the default parallel runner, and a
+/// flaky test is worse than a failing one (CLAUDE.md §6). The env lookup is the trivial half;
+/// this is the half with a decision in it.
+fn parse_ceiling(configured: Option<&str>) -> Result<u64, RuntimeError> {
+    match configured {
+        None => Ok(DEFAULT_MAX_EXECUTABLE_BYTES),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(RuntimeError::Protocol(format!(
+                "{MAX_EXECUTABLE_BYTES_ENV} is `{}`, which is not a positive byte count. \
+                 Refusing rather than falling back to the {DEFAULT_MAX_EXECUTABLE_BYTES}-byte \
+                 default, which could be LOOSER than the deployment intended (D0A-R26-04)",
+                raw.escape_debug()
+            ))),
+        },
+    }
+}
+
+/// How long the root daemon will wait for a proposed path to be opened and read
+/// (D0A-R26-02).
+///
+/// Generous by design: a legitimate 512 MiB read from a cold local disk must not trip it, so
+/// this is not a performance bound. It is the bound that keeps a stalled network filesystem
+/// from wedging the daemon, and only a filesystem that has stopped answering reaches it.
+const READ_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Run `f` on a disposable thread, giving up at `deadline`.
+///
+/// Factored out so the DECIDING mechanism is directly testable. A stalled FUSE/NFS mount
+/// cannot be constructed in-process, so a test that only exercised the file path could never
+/// reach the timeout branch — and an untimed-out timeout is decoration. Here a test supplies
+/// a closure that simply sleeps, which is the same branch the stalled filesystem takes.
+fn under_deadline<T, F>(deadline: Duration, f: F, on_timeout: &str) -> Result<T, RuntimeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RuntimeError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(deadline)
+        .unwrap_or_else(|_| Err(RuntimeError::Protocol(on_timeout.to_string())))
+}
+
+/// [`read_bounded_inner`] under [`READ_DEADLINE`], on a disposable thread.
+fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, RuntimeError> {
+    let owned = path.to_string();
+    let timeout_msg = format!(
+        "{what}: `{}` did not open-and-read within {}s — a stalled filesystem (FUSE, NFS) \
+         blocks in read even on a regular file, where O_NONBLOCK does not apply. Refused so \
+         the root daemon is not wedged before any human gate (D0A-R26-02)",
+        path.escape_debug(),
+        READ_DEADLINE.as_secs()
+    );
+    under_deadline(READ_DEADLINE, move || read_bounded_inner(&owned, what), &timeout_msg)
+}
 
 /// Open `path` and read it, bounded in both TYPE and SIZE, before anything is bound
 /// (D0A-R25-02).
@@ -51,16 +154,29 @@ const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 /// daemon **before** the pending action exists and therefore before any human gate:
 ///
 /// * a **FIFO** blocks — and it blocks in `open(2)`, not in the read, which is why this
-///   opens with `O_NONBLOCK` rather than only checking the type afterwards. On a regular
-///   file the flag is a no-op, so it costs nothing in the legitimate case.
+///   opens with `O_NONBLOCK` rather than only checking the type afterwards.
 /// * a **character device** such as `/dev/zero` never ends.
 /// * an oversized regular file exhausts memory.
+/// * a **regular file on a stalled FUSE or NFS mount blocks in `read`**, and `O_NONBLOCK`
+///   does NOT help there — Linux ignores it for regular files. D0A-R26-02: the previous
+///   version of this comment noted the no-op as a benefit ("costs nothing in the legitimate
+///   case") when it was the gap. Type and size bounds are not TIME bounds.
+///
+/// So the whole open-and-read runs on a **disposable worker thread** with a deadline. On
+/// timeout the daemon abandons the thread and refuses the proposal. **The abandoned thread is
+/// a real cost, stated rather than hidden:** it holds one fd and its buffer until the
+/// filesystem responds, and nothing reaps it. That is accepted because the alternative is the
+/// single-threaded ROOT daemon wedging before any human gate — a leaked thread degrades, a
+/// wedged daemon stops. A deployment seeing these accumulate has a filesystem problem the
+/// daemon is correctly surviving.
 ///
 /// The type and size are taken from the HELD fd, never the path: the fd is the object that
 /// gets hashed and exec'd, so checking anything else would reintroduce the swap window that
 /// hashing-through-the-fd exists to close.
-fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, RuntimeError> {
+fn read_bounded_inner(path: &str, what: &'static str) -> Result<Vec<u8>, RuntimeError> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+    let ceiling = max_executable_bytes()?;
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -100,10 +216,10 @@ fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, Runt
         )));
     }
 
-    if meta.len() > MAX_EXECUTABLE_BYTES {
+    if meta.len() > ceiling {
         return Err(RuntimeError::Protocol(format!(
-            "{what}: `{}` is {} bytes, over the {MAX_EXECUTABLE_BYTES}-byte ceiling \
-             (D0A-R25-02)",
+            "{what}: `{}` is {} bytes, over the {ceiling}-byte ceiling (set by \
+             {MAX_EXECUTABLE_BYTES_ENV} or its default) — D0A-R25-02, D0A-R26-04",
             path.escape_debug(),
             meta.len()
         )));
@@ -114,17 +230,16 @@ fn open_and_read_bounded(path: &str, what: &'static str) -> Result<Vec<u8>, Runt
     // observable rather than silently truncated into a digest over partial bytes.
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.by_ref()
-        .take(MAX_EXECUTABLE_BYTES + 1)
+        .take(ceiling + 1)
         .read_to_end(&mut bytes)
         .map_err(|source| RuntimeError::Filesystem {
             op: what,
             path: PathBuf::from(path),
             source,
         })?;
-    if bytes.len() as u64 > MAX_EXECUTABLE_BYTES {
+    if bytes.len() as u64 > ceiling {
         return Err(RuntimeError::Protocol(format!(
-            "{what}: `{}` grew past the {MAX_EXECUTABLE_BYTES}-byte ceiling while being read \
-             (D0A-R25-02)",
+            "{what}: `{}` grew past the {ceiling}-byte ceiling while being read (D0A-R25-02)",
             path.escape_debug()
         )));
     }
@@ -386,7 +501,7 @@ mod tests {
             exe_path: exe_path.into(),
             net_policy: pb::NetPolicy::NetNone as i32,
             timeout_secs: 30,
-            required_tier: pb::RequiredTier::TierBiometric as i32,
+            required_tier: pb::RequiredTier::TierConfirm as i32,
         }
     }
 
@@ -419,6 +534,70 @@ mod tests {
         assert_eq!(sp.script_digest, sha256(script), "script content bound");
         // /bin/sh exists on the build host; its interpreter digest is non-zero.
         assert_ne!(sp.interpreter_digest, [0u8; 32]);
+    }
+
+    /// D0A-R26-04 — a malformed ceiling is REFUSED, never silently replaced by the default.
+    ///
+    /// The direction matters: the default (512 MiB) is LOOSER than most deployments that
+    /// bother to set this will want. Falling back on a typo would hand a deployment that meant
+    /// to tighten the bound a wider one, silently — which is the fail-OPEN direction.
+    #[test]
+    fn a_malformed_ceiling_is_refused_rather_than_defaulted() {
+        assert_eq!(
+            parse_ceiling(None).expect("unset -> default"),
+            DEFAULT_MAX_EXECUTABLE_BYTES
+        );
+        assert_eq!(parse_ceiling(Some(" 1048576 ")).expect("valid"), 1_048_576, "trimmed + parsed");
+        for bad in ["0", "-1", "many", "", "64MiB", "1e9"] {
+            match parse_ceiling(Some(bad)) {
+                Err(RuntimeError::Protocol(m)) => assert!(
+                    m.contains(MAX_EXECUTABLE_BYTES_ENV),
+                    "refusal must name the variable so the operator can fix it: {m}"
+                ),
+                Err(other) => panic!("`{bad}` refused with the wrong variant: {other}"),
+                Ok(n) => panic!("`{bad}` was accepted as a ceiling of {n} bytes"),
+            }
+        }
+    }
+
+    /// D0A-R26-02 — the read deadline fires, and the daemon survives the thing that would
+    /// have wedged it.
+    ///
+    /// Exercises `under_deadline` directly with a sleeping closure, because a stalled FUSE/NFS
+    /// mount cannot be built in-process — and the timeout branch is precisely what a
+    /// file-based test could never reach. The closure is the same branch the stalled
+    /// filesystem takes: work that does not return.
+    ///
+    /// The RESIDUAL, stated: this proves the deadline mechanism decides correctly. It does not
+    /// prove that a real stalled mount reaches it rather than failing some earlier way. That
+    /// is a property of the filesystem, not of this code.
+    #[test]
+    fn a_read_that_does_not_return_is_refused_by_the_deadline() {
+        let started = std::time::Instant::now();
+        let r: Result<Vec<u8>, RuntimeError> = under_deadline(
+            Duration::from_millis(150),
+            || {
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(Vec::new())
+            },
+            "TIMEOUT-MARKER",
+        );
+        match r {
+            Err(RuntimeError::Protocol(m)) => assert_eq!(m, "TIMEOUT-MARKER", "wrong refusal"),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!("a closure that never returns was allowed to succeed"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not bound the wait — the daemon would be wedged"
+        );
+    }
+
+    /// D0A-R26-02 — the positive control: the deadline does not refuse ordinary work.
+    #[test]
+    fn work_that_completes_within_the_deadline_is_not_refused() {
+        let r = under_deadline(Duration::from_secs(5), || Ok(vec![1u8, 2, 3]), "unused");
+        assert_eq!(r.expect("must succeed"), vec![1u8, 2, 3]);
     }
 
     /// D0A-R25-02 — a FIFO proposed as the executable is refused PROMPTLY, not waited on.
@@ -490,7 +669,7 @@ mod tests {
         let tmp = tempfile::Builder::new().prefix("delphi-r2502-big-").tempdir().unwrap();
         let big = tmp.path().join("tool");
         let f = std::fs::File::create(&big).unwrap();
-        f.set_len(MAX_EXECUTABLE_BYTES + 1).expect("sparse set_len");
+        f.set_len(DEFAULT_MAX_EXECUTABLE_BYTES + 1).expect("sparse set_len");
         drop(f);
 
         match canonicalize(&base_proposal(&big.display().to_string()), "r2502-big".into()) {
@@ -507,7 +686,7 @@ mod tests {
             Err(other) => panic!("refused with the wrong variant: {other}"),
             Ok(_) => panic!(
                 "a {} byte executable canonicalized — over the ceiling (D0A-R25-02)",
-                MAX_EXECUTABLE_BYTES + 1
+                DEFAULT_MAX_EXECUTABLE_BYTES + 1
             ),
         }
     }

@@ -106,7 +106,7 @@ fn action_with_marker(env: &Env, marker: &str) -> PendingAction {
         exe_path: env.exe.to_string_lossy().into_owned(),
         net_policy: pb::NetPolicy::NetNone as i32,
         timeout_secs: 30,
-        required_tier: pb::RequiredTier::TierBiometric as i32,
+        required_tier: pb::RequiredTier::TierConfirm as i32,
     };
     canonicalize(&proposal, "act-div".into()).expect("canonicalize the proposal")
 }

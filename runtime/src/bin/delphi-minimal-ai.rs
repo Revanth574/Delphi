@@ -42,7 +42,7 @@ fn main() {
         exe_path: exe,
         net_policy: pb::NetPolicy::NetNone as i32,
         timeout_secs: 30,
-        required_tier: pb::RequiredTier::TierBiometric as i32,
+        required_tier: pb::RequiredTier::TierConfirm as i32,
     };
 
     // Propose → Pending.

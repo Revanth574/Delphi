@@ -219,6 +219,42 @@ printf 'EXECUTED=%s\nSKIPPED=%s\n' <executed> <skipped> > .githooks/runtime-test
 
 Only from the extractor's own output. Never by subtraction.
 
+## 4b. THE MEMBERSHIP CHECK — identities, never counts (D0A-R27-04)
+
+**Equal totals are not equal test sets.** Both lanes reporting the same `reported` number
+cannot detect a compensating removal and addition, and the run-14/15 records cited exactly that
+as proof the sets were identical. It happened to be true — a reviewer verified it independently
+— but the evidence recorded did not establish it.
+
+```bash
+python3 - <<'EOF'
+import re,subprocess,os,collections
+root=collections.Counter(); target=None
+for line in open(os.environ["LOG"], errors="replace"):
+    if line.startswith("### "): target=os.path.basename(line.strip()[4:]).rsplit("-",1)[0]
+    m=re.match(r"^test (\S+) \.\.\. ", line)
+    if m: root[(target,m.group(1))]+=1
+unpriv=collections.Counter()
+for exe in open("/tmp/targets.txt").read().split():
+    t=os.path.basename(exe).rsplit("-",1)[0]
+    for l in subprocess.run([exe,"--list"],capture_output=True,text=True).stdout.splitlines():
+        if l.endswith(": test"): unpriv[(t,l[:-6])]+=1
+only_root=root-unpriv; only_unpriv=unpriv-root
+print(f"root {sum(root.values())} / unpriv {sum(unpriv.values())}")
+print(f"IN ROOT NOT UNPRIV: {sum(only_root.values())}"); [print("  ",k) for k in only_root]
+print(f"IN UNPRIV NOT ROOT: {sum(only_unpriv.values())}"); [print("  ",k) for k in only_unpriv]
+raise SystemExit(0 if not only_root and not only_unpriv else 1)
+EOF
+echo "membership rc=$?"    # 0 = identical sets; ANY non-empty side is a RESULT
+```
+
+Counters, not sets — a duplicated `#[test]` inflated a count once already, and set arithmetic
+would hide it. **A non-empty side is a result, not noise:** name the tests and explain each,
+exactly as a count mismatch would be explained. If the tree has moved since the root run, the
+delta must be exactly the tests added or removed since — verify that by name, not by number.
+
+**RETAIN `$LOG`** until this has run. It is the only record of which tests actually executed.
+
 ## 5. The three checks, BY NAME
 
 ```bash

@@ -10,6 +10,66 @@ what closes it. A row leaves only when a test proves it closed.
 
 ---
 
+## Opened 2026-09-07 — D0-A round 27 (verdict: **FAIL**, 2xP1 3xP2)
+
+**The prompt asked for a defect in `wire.rs` — the untrusted-input parser six rounds had never
+named — and got one.** It also returned the correction that matters most this round: a claim in
+this register was **false at the pinned base of the range it described**.
+
+| § | ratified clause | status | finding | closes when |
+|---|---|---|---|---|
+| §3 canonicalisation | the pre-consent memory bound is real | **CLOSED** at this commit | R27-01 — the ceiling was **per object**, so a script proposal spent it twice; and `ScriptPin::sealed` snapshots the script a SECOND time, so retained is `2S + I` and peak `3S + 2I`. Worst case was **5x** the ceiling, not the 2x claimed. The "a script is small" justification was an assumption **enforced by nothing** | an AGGREGATE `ReadBudget` spent across every read in one proposal; the default is now **computed** as `PRE_CONSENT_BUDGET_BYTES / PEAK_MULTIPLE_OF_BUDGET`, with the multiplier read off this module's own allocation table |
+| §4 the daemon cannot be held pre-consent | a peer cannot stall the boundary | **CLOSED** at this commit | R27-02 — `read_frame` bounded frame LENGTH and nothing about DURATION. Both `read_exact` calls blocked; the only other timeout covers `accept`. One prefix byte held the ROOT daemon before canonicalisation and before consent | an ABSOLUTE `FRAME_DEADLINE` across the whole frame (progress does not buy time) plus `arm_frame_liveness` at accept so the deadline is reachable. Three tests incl. the **trickle** case a per-read timeout cannot catch |
+| §3 configuration is fail-closed | a malformed bound is refused | **CLOSED** at this commit | R27-03 — `std::env::var(...).ok()` collapsed `NotUnicode` into `NotPresent`, so a non-UTF-8 configured ceiling fell through to the DEFAULT — which is looser than anything a deployment sets. Fail-OPEN, in the function whose own doc promised fail-closed | `ceiling_from_var` takes the `Result`, so the branch is reachable without `set_var` or a subprocess — the reviewer's point that testing `parse_ceiling` alone never could |
+| — (record) | evidence establishes its claim | **CLOSED** at this commit | R27-04 — the run-14/15 records inferred identical test SETS from equal totals. Equal cardinality cannot detect a compensating removal and addition | procedure **§4b**: compare `(target, test-name)` identities as COUNTERS between the root log and unprivileged `--list`, and cite that comparison |
+| — (record) | the register's claims are true at their base | **CLOSED** at this commit | **R27-05 — see below** | the three-phase account replaces the false claim at all four sites |
+
+### R27-05 — a false claim, in the register, that the operator asked for and I did not verify
+
+The register asserted that *no test in the crate had ever asserted that any tier meant
+anything*. **At `53e2b5a`, the pinned base, two such tests already existed** — both added by
+round 25: `Hardware` denied as unenforceable, and `Biometric` PASSING the tier check.
+
+So the round-26 migration **flipped a live assertion** rather than filling a vacuum: the control
+asserted *Biometric passes* and now asserts *Confirm passes*. "Cost no coverage" was wrong.
+
+**The provenance is part of the finding.** The operator asked for the claim in those terms, on
+the strength of my analysis; I wrote it without checking it against the base. That "who asked
+for it" is not a defence is why it is recorded here rather than quietly amended. **Class 48's
+predicate then found three further sites carrying the same claim** — one in this register, one
+in `service.rs`'s `ENFORCED_TIER` doc, one in the test's own doc comment. Fourth consecutive
+round in which the predicate caught sites the finding did not name.
+
+### Two self-corrections the reviewer forced, both about MY disclosures
+
+1. **The decoration check had a FALSE NEGATIVE I did not disclose.** I reported its 2-in-3
+   false-positive rate. It also classified `timeout` as "decides — `readiness.rs:137,267`" by
+   matching the bare word inside `poll_timeout(remaining)` — **readiness's own timeout, not
+   `action.timeout`**, which is enforced nowhere and is already open as R9-04. The reviewer's
+   verdict on the method is adopted rather than patched: **the check finds CANDIDATES; only
+   tracing a field to its observable effect and mutating that effect certifies enforcement.**
+2. **My "honest limit" on the clock overstated the test.** I wrote that it "checks clock
+   IDENTITY, not suspend behaviour". The reviewer swapped production `CLOCK_BOOTTIME` for
+   `CLOCK_MONOTONIC` and it **still passed** — on a lane that has never suspended it checks
+   NEITHER. *A disclosure that overstates what a test does is worse than no disclosure, because
+   it stops the question being asked.* Fixed by extracting `consent_window_elapsed` (expiry at
+   every edge, no clock involved) and by making the clock test PRINT the BOOTTIME−MONOTONIC
+   delta, so a reader sees whether the run had discriminating power instead of inferring it.
+
+### Still open after round 27
+
+- **The pending store has no cap** (unchanged). The reviewer confirmed B1's one-action exit
+  limits accumulation *within one invocation* and establishes nothing about a B2 loop.
+- **`preview_version`** — judged NOT a current defect: production builds the action locally and
+  ships rendered text, so there is no versioned-schema consumer to break. Carried as a
+  single-authoritative-constant cleanup, not a defect.
+- **The abandoned read worker** — 30 s is an engineering choice, not a demonstrated bound.
+- **`PRE_CONSENT_BUDGET_BYTES` (1 GiB) and the 8 GiB floor** remain deployment assumptions. The
+  round-27 defect was that the implementation did not honour even the chosen budget; the budget
+  itself is still unvalidated.
+
+---
+
 ## Opened 2026-09-06 — D0-A round 26 (verdict: **FAIL**, 5xP1 2xP2)
 
 **Round 25's answer held up: the hypothesis was coverage, not convergence, and the round-26
@@ -42,23 +102,45 @@ the right place, found the thing, and a second step threw it away. Recorded as
 mechanism and can silently invert it* — with the remedy that a suppression pattern owes the
 same discrimination test as an assertion: does it exclude only what it names?
 
-### What R26-01's fixture migration exposed — **the round's real output**
+### What R26-01's fixture migration exposed — **CORRECTED at D0A-R27-05**
 
-**The tier system was uninspectable by construction.** Not "twelve fixtures changed a label":
-**no test in the crate had ever asserted that any tier meant anything.** The only two
-tier-touching tests assert that *changing* the tier changes the digest and the preview, which
-holds for any two distinct values and would pass with the tiers renamed to colours.
-`end_to_end.rs` says "one Biometric action" in a doc comment. **The label was decoration end to
-end.**
+**THE CLAIM THAT STOOD HERE WAS FALSE, AND IT WAS FALSE AT THE PINNED BASE OF THE VERY RANGE
+IT DESCRIBED.** It read: *no test in the crate had ever asserted that any tier meant anything*,
+and *`biometric_is_refused_…` is the first assertion on a tier's meaning in the crate's
+history*. At `53e2b5a` — round 27's base — `runtime/src/service.rs` already contained **two**
+tier-semantic assertions, both added by round 25:
 
-That is why R25-01's "descriptive only" defect could live here undetected — **it could not have
-been caught, because nothing claimed a tier had consequences.** A defect is only findable
-against an assertion, and there was none to violate.
+- `a_tier_the_daemon_cannot_enforce_is_denied_before_the_action_is_stored` — asserts `Hardware`
+  is denied **specifically because it cannot be enforced**;
+- `the_enforced_tier_passes_the_tier_check_and_reaches_the_gate` — asserts `Biometric`
+  **passes** the tier check.
 
-So the fix's value is **less "Biometric is now refused" than "a tier now has an assertion
-attached to it at all"**. `biometric_is_refused_because_the_shipped_pam_stack_has_no_biometric_factor`
-is the first test in this crate to make a claim about what a specific tier is worth. The
-refusal is the occasion; the assertion is the thing that was missing.
+**Provenance, because it matters more than the fix:** the operator asked for the claim to be
+recorded in those terms, on the strength of my analysis. I did not verify it against the base
+before writing it, and the reviewer caught it. The register therefore carried a claim the
+operator requested and I had not checked — recorded here rather than quietly amended, because
+"who asked for it" is not a defence and the failure was mine.
+
+**The three-phase account, which is what is actually true:**
+
+| phase | state of tier assertions |
+|---|---|
+| **Before round 25** | **None.** No test asserted that any tier had any consequence. This part of the old claim survives, and it is why R25-01's "descriptive only" defect was undetectable: a defect is findable only against an assertion, and there was none to violate |
+| **Round 25** | Created the **first two** — but encoded the **WRONG boundary**, asserting `Biometric` enforceable when the shipped stack is `pam_unix` alone |
+| **Round 26** | **Inverted one of them.** `Biometric` moved from *passes* to *refused*; the control was rewritten to `Confirm` |
+
+**So the migration FLIPPED A LIVE ASSERTION rather than filling a vacuum**, and that is the
+substantive difference. "Cost no coverage" was wrong: the control asserted *Biometric passes*
+and now asserts *Confirm passes* — an existing semantic expectation was **changed**, not a
+decorative label. Round 26 established the first assertion that `Biometric` **is not**
+enforceable; it did not establish the first tier-semantic assertion.
+
+**What survives the correction:** the pre-round-25 vacuum is real, and it is still the reason
+R25-01's defect could not have been caught by any test that existed at the time. The
+generalisation drawn from it — *look for fields that are constructed, bound and rendered but
+never decided on* — also survives, and produced its own findings (see round 27).
+
+### The migration itself
 
 ### The migration itself
 
@@ -66,10 +148,15 @@ Every fixture in the crate proposed `Biometric`. Moving all of them to `Confirm`
 coverage**, because **nothing had ever asserted what `Biometric` meant** — the only two
 tier-touching tests assert that *changing* the tier changes the digest and the preview, which
 holds for any two distinct values, and `end_to_end.rs` says "one Biometric action" in a doc
-comment. The label was decoration end to end. **That is a finding about the tier system, not
-about the fixtures, and it is why R25-01's "descriptive only" defect could live undetected: no
-test could have caught it, because no test claimed any tier meant anything.**
-`biometric_is_refused_…` is the first test in this crate to assert on a tier's meaning.
+comment.
+
+**THIS PARAGRAPH IS SUPERSEDED — see "CORRECTED at D0A-R27-05" above.** It generalised a true
+statement about the state BEFORE round 25 into a false one about the state at round 27's base.
+Round 25 had already added two tier-semantic assertions, so `biometric_is_refused_…` is **not**
+the first test to assert on a tier's meaning, and the migration **flipped a live assertion**
+instead of costing no coverage. What survives: before round 25 there was no tier assertion at
+all, and that is why R25-01's "descriptive only" defect could not have been caught by any test
+that existed then.
 
 ### OPEN AFTER ROUND 26 — each stated so it cannot be read as settled
 

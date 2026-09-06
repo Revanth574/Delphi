@@ -10,6 +10,55 @@ what closes it. A row leaves only when a test proves it closed.
 
 ---
 
+## Opened 2026-09-06 — D0-A round 25 (verdict: **FAIL**, 4xP1 4xP2)
+
+**This round answered the convergence question, against both the operator and me.** Rounds 22-24
+had returned no defect in shipping product behaviour, and `298d4db` (round 21's remediation) was
+the last commit to change it. Round 25's prompt offered both readings — convergence, or scope
+exhaustion — with a measurement attached: across the round-21..24 prompts, **exactly one
+`runtime/src/**` file was named by filename** (`sandbox.rs`, once). The reviewer went to the
+unnamed files and returned **three P1 product defects**. The silence was blindness, not quality.
+Recorded as `DEFECT_CLASSES.md` class 49; the operator proposed the measurement and read it as
+possible convergence, and I preferred the same reading, which is exactly why the judgement had
+to be handed over.
+
+| § | ratified clause | status | finding | closes when |
+|---|---|---|---|---|
+| §3 preview = approval = sandbox | consent tiers are enforced | **CLOSED** at this commit | R25-01 — `required_tier` was bound into the digest, rendered in the preview and written to the audit entry, and **never consulted**. All four tiers took the identical logind → PAM → mint sequence, so a `Hardware` action was authorised by `pam_unix`'s password | a tier above `ENFORCED_TIER` is refused before store/preview; a positive control proves the enforced tier still passes |
+| §3 canonicalisation | the arbiter opens and hashes before preview | **CLOSED** at this commit | R25-02 — unbounded `read_to_end` on two AI-selected paths, with no type check. A FIFO blocks the ROOT daemon in `open(2)`; `/dev/zero` never ends; a large file exhausts memory — all **before** the pending action exists, so before any human gate | `O_NONBLOCK` open + `is_file()` + a derived 64 MiB ceiling + bounded read; FIFO leg proven by a `recv_timeout` that observes blocking |
+| §3 exact approval | what is approved is what executes | **CLOSED** at this commit | R25-03 — `argv: []` is representable in the canonical action and the digest but not in `execve`, so both transport shapes invent an `argv0`: synthesised `/proc/self/fd/N` with a helper, and bwrap's own with `--argv0` dropped | refused at canonicalisation AND the execute choke point (the R19-05 two-door reason); the RED reaches the `Ok(_)` arm, i.e. it executed |
+| §3 token lifetime | the consent window is bounded | **CLOSED** at this commit | R25-04 — the TTL compares Unix timestamps, so setting the system clock backwards keeps a consented token live indefinitely | a monotonic `granted_at` stamped by `PendingStore::grant` and checked at Present; the RED returns `Completed`, i.e. an expired action ran |
+| — (process) | root evidence is what it says it is | **OPEN — D0A-R24-01 REOPENED** | R25-05 — run 13's "forced freshness proven" rested on commands that computed **no hashes**: `\| tail -3` printed three artifact PATHS (and masked cargo's status, no `pipefail`), and the forced rebuild went to `/dev/null` | the next root run, under the §2b procedure that hashes the full enumerated set before and after a forced rebuild |
+
+**R25-05 is the finding that matters most, and it is worse than a missed check.** The operator
+had specifically asked that each hygiene check's output be captured separately, *because* the
+known failure mode is confirming a group. That was done. The output appeared. **And the output
+was of a command that could not perform the check** — so the watch item was satisfied in form and
+defeated in substance. Capturing each check separately does not help if a check's output cannot
+decide the thing it is captured for.
+
+What run 13 genuinely measured still stands: counts, 17/17 producer statuses, PAM before/after,
+stale sessions, helper digest, account, bwrap, free space. What it did not measure is "these
+binaries are this code".
+
+**Also closed this round:** R25-06 (the procedure hard-coded `root-run7` while telling the reader
+to substitute `N` — now one `RUN` variable with derived paths), R25-07 (PROGRESS's status block
+carried accumulated `PRIOR:` chains and held an old date, two different "latest round" claims and
+two count pairs at once — rewritten as a current snapshot, chronology relocated rather than
+deleted), R25-08 (the daemon entrypoint still described the flow as ending in `audit` while §7 is
+unwired — **and the class-48 predicate found a second site in `PROGRESS.md` that the finding had
+not named**, the fifth recurrence of that class and the second caught pre-commit).
+
+**One self-inflicted defect, recorded because the weaken caught it and nothing else would have.**
+`an_oversized_executable_is_refused_on_size` first asserted only `contains("ceiling")`, and it
+**PASSED under the weaken that removes the fstat guard** — because the bounded `take` catches the
+same file with a message that also says "ceiling". A PASS/PASS, worthless under Iron Law #15
+clause 2. The two guards are deliberately redundant in the product, so the test had to name which
+one fired. This is the second time in this arc that performing a weaken, rather than reasoning
+about it, was the only thing that found the flaw.
+
+---
+
 ## Opened 2026-08-12 — D0-A round 9 (verdict: **FAIL**, 6×P1 3×P2)
 
 Found by a scope pivot to `execute.rs` / `sandbox.rs` / `fdsec.rs` — paths last reviewed in June,

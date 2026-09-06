@@ -15,7 +15,9 @@
 //!    pidfd-pinned shell (fail-closed if it has no active session), **accepts** the
 //!    AI on the general socket, and runs the **service loop** (Propose →
 //!    canonicalize → preview → logind → PAM → mint → Present → execute the stored
-//!    object → audit).
+//!    object). **No audit step: §7 is unwired** — `RuntimeAuditEntry::record` has no
+//!    production caller (D0A-R25-08, and R24-03 for the same correction one layer down
+//!    in `service.rs`). See the open row in `docs/CONFORMANCE_REGISTER.md`.
 //!
 //! B1 services ONE action then exits (the spine); B2 loops and plugs in the real
 //! React-WRY shell + Brain. The shell/AI binaries are taken from `DELPHI_SHELL_BIN`

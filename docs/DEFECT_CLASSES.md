@@ -2750,3 +2750,46 @@ new one.
 | 44. Restore with an absent precondition | discipline + shape: the BACKUP's success is a precondition of the weaken (`cp … || exit`), the restore fails loudly (`cp … || exit`), and the diff confirms it — because at the exit-code level being watched, a `cp` from a nonexistent path is indistinguishable from a successful one | Discipline (mechanizable in every weaken script) |
 | 43. One error string, two processes | discipline: an assertion about a spawned process CARRIES that process's stderr in its failure message; suspect the CHILD's namespace before the PARENT's fd table when the string is `No such file or directory` | Discipline |
 | 42. Negative assertion resting on a removed default | assert the POSITIVE wherever one exists ("the narrowing is applied", not only "the widening is absent"); when an umbrella default is removed, find the assertions that relied on it by DELETING the new explicit thing and seeing what fails — `scratch/d0a-mutation-audit.sh` is that search, mechanised | Discipline + a mutation harness |
+
+## 49. A REGION THAT STOPS PRODUCING FINDINGS IS EITHER EXHAUSTED OR UNEXAMINED, AND SILENCE CANNOT TELL YOU WHICH  *(new — D0A-R25, the convergence question answered against both parties)*
+
+**The class.** Reviewers converge or they run out of places they know how to look, and **both
+present identically: findings stop arriving.** Treating the silence as evidence of quality is
+the error, because the discriminator is not *whether anything was found* — it is **whether
+anyone looked.**
+
+**The instance, and it cost four rounds.** Rounds 22, 23 and 24 returned no defect in shipping
+product behaviour; `298d4db` (round 21's remediation) was the last commit to change it. That
+was offered to round 25 as possible convergence, with an honest measurement attached: across
+the round-21..24 prompts, **exactly one `runtime/src/**` file was named by filename**
+(`sandbox.rs`, once; the other eight zero). The reviewer read the measurement, went to the
+unnamed files, and returned **three P1 product defects** — an unenforced consent tier, an
+unbounded read that stalls the root daemon before any human gate, and an empty argv that
+becomes a synthesised `argv0` at exec.
+
+So the quiet was **scope exhaustion**, and the measurement that looked like a caveat was
+actually the finding. Both parties had preferred the convergence reading, which is precisely
+why neither could be the one to settle it.
+
+**The discipline.**
+
+1. **Never infer coverage from an absence of findings.** "Nothing was found in X" is a claim
+   about the search, not about X, until you can say what searched it.
+2. **Measure attention, not just outcomes.** Counting which regions a review actually
+   addressed is cheap, mechanical, and answers the question the finding count cannot. Do it
+   *before* proposing that a surface has converged.
+3. **When you have a stake in the answer, hand the question over WITH the measurement** — and
+   state which reading you would prefer to be true. The preference is the reason the judgement
+   cannot be yours.
+4. **A region named in a prompt is not thereby reviewed, and a region unnamed is not thereby
+   unreviewed.** The count bounds what you *steered* toward. Only the reviewer can say what
+   they read — so ask, rather than concluding in either direction.
+
+**The RED-proof shape.** There is none at the code level; this is a review-process class. Its
+check is a command: enumerate the source files in the trust boundary, grep the last N review
+prompts for each, and report the ones at zero. A region at zero across several rounds is
+either genuinely closed by construction — say by what — or it is unexamined.
+
+**Related:** [45] (the totality claim) is the same disease in a single sentence; this is 45
+spread across a whole review. [41] (wrong altitude) is why the *measurement* must be
+mechanical: three grep sweeps in this arc returned confident false negatives.

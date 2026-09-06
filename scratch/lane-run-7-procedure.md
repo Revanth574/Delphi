@@ -2,8 +2,7 @@
 
 **This is the sanctioned procedure for ANY lane run, not a record of runs 7–8** (D0A-R24-02:
 it was still titled for them, so the reactivated runbook read as history rather than as the
-current process). Substitute the run number wherever `N` appears; `/tmp/root-runN.log` and
-`.status` are per-run.
+current process). Set `RUN` once in §0b; every path below derives from it (D0A-R25-06).
 
 ## STEP −1 — DERIVE AND COMMIT THE EXPECTATION, ALONE, BEFORE ANYTHING ELSE
 
@@ -36,10 +35,10 @@ specify what a runner that enforced it without losing those checks would have to
 > changed the suite again. `.githooks/runtime-test-count-baseline.root` is marked stale in
 > place.
 >
-> **RUN 8 is owed and uses this document at the CURRENT commit.** §3 and §4 were amended
-> after run 7 with the producer-status check and the expected-target gate (D0A-R18-04) — the
-> defect that amendment closes is one run 7 itself could have hidden, so the amendment is
-> recorded here rather than silently applied.
+> **RUN 8 has long since happened; runs 9-13 followed.** The note that used to sit here
+> read as though run 8 were next (D0A-R25-06). What it recorded is still true and is why §3
+> and §4 look as they do: they were amended after run 7 with the producer-status check and the
+> expected-target gate (D0A-R18-04), closing a defect run 7 itself could have hidden.
 
 > **THIS IS THE SANCTIONED PROCEDURE. A runner that superseded it was REVERTED (D0A-R23).**
 > `scripts/lane-run.sh` was built to close D0A-R22-01 — the expectation protocol's ordering
@@ -84,25 +83,31 @@ Expect `delphi-tool:x:997:972`. **The gid is 972, not 997** — D0A-R17-02 was e
 assumption that they coincide, and the check that missed it was looking at `Uid:` only. The
 two helper digests must MATCH; a mismatch is a stale install, not a profile difference.
 
-## 1. Build UNPRIVILEGED, then prove the binaries are this code
+## 0b. SET THE RUN NUMBER ONCE — every path below derives from it
+
+```bash
+export RUN=13                     # <- the only edit per run
+export LOG=/tmp/root-run$RUN.log
+export STATUS=/tmp/root-run$RUN.status
+```
+
+D0A-R25-06: the operative commands used to hard-code `root-run7` while the prose said to
+substitute `N`, so following the document as written parsed the WRONG run's evidence. One
+variable, derived paths, no literal run numbers below this line.
+
+## 1. Build UNPRIVILEGED (the freshness PROOF is §2b, after enumeration)
 
 `sudo -E cargo` does not work here (sudoers drops `-E`; root has no rustup toolchain).
 
 ```bash
 cd ~/Delphi && export CARGO_TARGET_DIR="$HOME/delphi-target"
-cargo test -p delphi-runtime --tests --no-run 2>&1 | tail -3
+set -o pipefail                   # D0A-R25-05: `| tail` reports TAIL's status, not cargo's
+cargo test -p delphi-runtime --tests --no-run 2>&1 | tail -3 ; echo "build rc=$?"
 ```
 
 **Do NOT check freshness by binary-mtime vs commit-time.** That rule mis-fired on
 2026-08-22 — the pre-commit hook builds *before* the commit object exists, so a correct
-binary always reads as stale. Force the question instead:
-
-```bash
-touch runtime/src/execute.rs && cargo test -p delphi-runtime --tests --no-run >/dev/null 2>&1
-```
-
-An unchanged set of hashes after a forced rebuild is the proof; unchanged hashes *without*
-one prove nothing.
+binary always reads as stale. Force the question instead.
 
 ## 2. Enumerate the targets — all 17, from cargo, not by hand
 
@@ -120,20 +125,42 @@ wc -l < /tmp/targets.txt        # REFUSE to proceed if this is not 17
 A count below 17 means the run would silently cover a subset — the exact defect
 `scripts/test-count.sh` exists to prevent, so it must not be committed here either.
 
+## 2b. Prove the binaries are this code
+
+**D0A-R25-05: THIS STEP MUST PRODUCE HASHES, AND UNTIL ROUND 25 IT DID NOT.** The text below
+this block used to say "an unchanged set of hashes after a forced rebuild is the proof" while
+the commands computed **no hashes at all** — the first printed artifact *paths* through
+`tail -3`, and the forced rebuild sent everything to `/dev/null`. Run 13 was recorded as
+"forced freshness proven" on the strength of that. It was not proven; it was asserted next to
+a command that could not check it. It runs HERE, after §2, because its input is the enumerated target list:
+
+```bash
+# Hash the enumerated set, force a rebuild, hash again. All 17, not the last three.
+sha256sum $(cat /tmp/targets.txt) | sort -k2 > /tmp/hashes-before.txt
+touch runtime/src/execute.rs
+cargo test -p delphi-runtime --tests --no-run 2>&1 | tail -3 ; echo "rebuild rc=$?"
+sha256sum $(cat /tmp/targets.txt) | sort -k2 > /tmp/hashes-after.txt
+diff /tmp/hashes-before.txt /tmp/hashes-after.txt && echo "FRESH: all $(wc -l < /tmp/targets.txt) executables identical after a forced rebuild"
+wc -l < /tmp/hashes-after.txt     # MUST equal the target count; a short list is a false green
+```
+
+`diff` returning 0 over the FULL enumerated set is the proof. A path listing is not a hash,
+and three paths are not seventeen.
+
 ## 3. The run — every target, serial, one log
 
 ```bash
-: > /tmp/root-run7.log ; : > /tmp/root-run7.status
+: > "$LOG" ; : > "$STATUS"
 while read -r b; do
-  echo "### $b" >> /tmp/root-run7.log
-  sudo "$b" --nocapture --test-threads=1 >> /tmp/root-run7.log 2>&1
-  printf '%s\t%s\n' "$?" "$b" >> /tmp/root-run7.status   # D0A-R18-04
+  echo "### $b" >> "$LOG"
+  sudo "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
+  printf '%s\t%s\n' "$?" "$b" >> "$STATUS"   # D0A-R18-04
 done < /tmp/targets.txt
 
 # Every producer's status, checked. A target that CRASHES before printing its summary
 # vanishes from the count entirely — the loop used to discard `$?` and the parse could not
 # see the gap, so a subset could become the "exact" baseline.
-awk -F'\t' '$1 != 0 {print "TARGET FAILED rc="$1" "$2; bad=1} END {exit bad}' /tmp/root-run7.status \
+awk -F'\t' '$1 != 0 {print "TARGET FAILED rc="$1" "$2; bad=1} END {exit bad}' "$STATUS" \
   && echo "all producers exited 0"
 ```
 
@@ -148,7 +175,7 @@ CLAUDE.md §6's fork+PAM carve-out makes the serial run the authoritative one fo
 
 ```bash
 DELPHI_TESTCOUNT_EXPECT_TARGETS=$(wc -l < /tmp/targets.txt) \
-  DELPHI_TESTCOUNT_LOG=/tmp/root-run7.log scripts/test-count.sh ; echo "rc=$?"
+  DELPHI_TESTCOUNT_LOG="$LOG" scripts/test-count.sh ; echo "rc=$?"
 ```
 
 **`DELPHI_TESTCOUNT_EXPECT_TARGETS` is not optional (D0A-R18-04).** Parse-only mode has no
@@ -177,8 +204,8 @@ Only from the extractor's own output. Never by subtraction.
 ## 5. The three checks, BY NAME
 
 ```bash
-grep -c '^test result: FAILED' /tmp/root-run7.log          # failures — expect 0
-grep -E '^test .+ \.\.\. (SKIP|DEFER)' /tmp/root-run7.log  # skips — print them, do not count only
+grep -c '^test result: FAILED' "$LOG"          # failures — expect 0
+grep -E '^test .+ \.\.\. (SKIP|DEFER)' "$LOG"  # skips — print them, do not count only
 scripts/check-stale-test-sessions.sh                       # leaks
 ```
 

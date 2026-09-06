@@ -1,21 +1,36 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 13 — THE FULL-HYGIENE RUN. It replaces the two-run split D0A-R24-01 found, where
-# run 11 carried the hygiene checks and run 12 carried counts-and-ordering and neither alone
-# was the lane record. This one covers both.
+# LANE RUN 13 — COUNTS + HYGIENE MINUS FRESHNESS. It was recorded as the full-hygiene run
+# closing D0A-R24-01. **D0A-R25-05 withdrew one of its checks, so D0A-R24-01 IS REOPENED.**
+#
+# What run 13 GENUINELY measured: the counts, the 17/17 producer statuses, the PAM stack
+# before and after, the stale-session sweep, the helper digest, the account, bwrap, free
+# space. Those stand.
+#
+# What it did NOT measure, despite the line that said it did: **"these binaries are this
+# code."** The procedure's §1 claimed "an unchanged set of hashes after a forced rebuild is
+# the proof" while its commands computed NO hashes — `| tail -3` printed three artifact
+# PATHS (and masked cargo's exit status, having no `pipefail`), and the forced rebuild went
+# to `/dev/null`. So the run may have executed binaries built from an earlier tree, and the
+# counts above inherit that doubt. The procedure now hashes the full enumerated set (§2b);
+# the next root run re-establishes the claim. This one cannot be repaired after the fact.
 #
 #   EXECUTED 177 / SKIPPED 5 / reported 182     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
 #   predicted 177/5 at feabc56, committed ALONE and BEFORE the run
 #
 # EVERY HYGIENE CHECK, CAPTURED SEPARATELY — the procedure's failure mode is a human
-# confirming the set rather than each member, so each is recorded with its own evidence:
+# confirming the set rather than each member, so each is recorded with its own evidence.
+# R25-05 is the sharper version of that failure: capturing each check separately does not
+# help if a check's OUTPUT cannot decide the thing it is captured for.
 #
 #   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
 #   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED
 #   bwrap            0.11.1
 #   free space       /run, target dir, /tmp      all above floor
-#   forced freshness identical executable set after `touch runtime/src/execute.rs` + rebuild
+#   forced freshness NOT MEASURED — withdrawn by D0A-R25-05; see the note above. The line
+#                    that stood here claimed an identical executable set from a command that
+#                    produced no hashes at all.
 #   PAM before       439c1d1521d86e4eb011a927aff659db
 #   PAM after        md5sum -c → OK              (class 16, the defect already paid for)
 #   stale sessions   none, checked before AND after

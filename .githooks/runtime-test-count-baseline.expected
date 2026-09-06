@@ -1,96 +1,98 @@
-# PREDICTION for the next ROOT lane run (run 14), committed ALONE and BEFORE the run.
+# PREDICTION for ROOT lane run 15, committed ALONE and BEFORE the run.
 #
 # STEP -1 of `scratch/lane-run-7-procedure.md`. The derivation is written out so it is
-# checkable independently of whether the number turns out to match — R19-06 and R20-07 are the
-# two runs whose FIGURE was right and whose EXPLANATION was reconstructed afterwards, which is
-# the failure this file exists to prevent.
+# checkable independently of whether the number matches. That is not decorative: R19-06 and
+# R20-07 are two runs whose FIGURE was right and whose EXPLANATION was reconstructed
+# afterwards, and D0A-R26-06 made it three — in the run-14 prediction, in this very file. The
+# number matching is not evidence the reasoning was right.
 #
 # ORDERING IS CONVENTION, NOT MECHANISM (D0A-R22-01, reopened). `git log` on this file versus
-# the result file is the only evidence that the prediction came first. It held for run 13.
+# the result file is the only evidence the prediction came first. It held for runs 13 and 14.
 #
 # ---------------------------------------------------------------------------------------
-# WHY RUN 14 IS OWED: D0A-R24-01 IS REOPENED.
+# WHY RUN 15 IS OWED
 #
-# Run 13 was recorded as the full-hygiene run closing R24-01. D0A-R25-05 withdrew one of its
-# checks: the procedure claimed "an unchanged set of hashes after a forced rebuild is the
-# proof" while its commands computed NO hashes — `| tail -3` printed three artifact PATHS (and
-# masked cargo's exit status, having no pipefail), and the forced rebuild went to /dev/null.
-# So run 13's counts carry an unproven premise: that the binaries executed were built from the
-# tree being measured. That cannot be repaired after the fact. Run 14 re-establishes it under
-# the corrected section 2b, which hashes the FULL enumerated set before and after a forced
-# rebuild and refuses a short list.
+# Run 14 closed D0A-R24-01 and its freshness check was real. But it ran at `af6dde0`, BEFORE
+# the round-26 remediation, which added five tests and changed four security-relevant paths:
+# the tier ceiling (Confirm, not Biometric), the deadline-bounded read, the CLOCK_BOOTTIME
+# consent window, and the configurable read ceiling. None of that has executed at root.
 #
 # ---------------------------------------------------------------------------------------
 # DERIVATION
 #
-# Base: run 13 measured EXECUTED 177 / SKIPPED 5 / reported 182 at root.
-#       The current unprivileged pair is EXECUTED 167 / SKIPPED 25 / reported 192 (measured
-#       2026-09-06 at 3b9ce08, and independently re-measured by the pre-commit hook at both
-#       3b9ce08 and e4a8f05 across all 17 targets).
+# Base: run 14 measured EXECUTED 187 / SKIPPED 5 / reported 192 at root (freshness MEASURED:
+#       sha256 over all 17 executables before and after a forced rebuild, `diff` empty).
+#       The current unprivileged pair is EXECUTED 172 / SKIPPED 25 / reported 197 (measured
+#       2026-09-06 at bd15ffb, re-measured by the pre-commit hook across all 17 targets).
 #
-# Delta since run 13: the round-25 remediation added TEN tests and removed none.
-# Each was checked for root-gating BY GREP of its body — a geteuid check, a SKIP branch, a
-# bwrap_available guard — not from memory:
+# Delta since run 14: the round-26 remediation added FIVE tests and removed none. Each was
+# checked for root-gating BY GREP of its body — geteuid, a SKIP branch, a bwrap_available
+# guard, a path-existence branch — not from memory:
 #
-#   canonicalize.rs  an_empty_argv_is_refused_during_canonicalization            no gate
-#   canonicalize.rs  a_fifo_executable_is_refused_promptly_...                   no gate
-#   canonicalize.rs  a_character_device_executable_is_refused_on_type            no gate
-#   canonicalize.rs  an_oversized_executable_is_refused_on_size                  no gate
-#   canonicalize.rs  a_real_large_executable_is_still_accepted                   SKIP branch *
-#   execute.rs       a_directly_built_action_with_an_empty_argv_..._at_execute   no gate
-#   service.rs       a_tier_the_daemon_cannot_enforce_is_denied_...              no gate
-#   service.rs       the_enforced_tier_passes_the_tier_check_and_reaches_gate    no gate
-#   service.rs       an_elapsed_consent_window_..._wall_clock_is_frozen_...      no gate
-#   service.rs       a_granted_entry_without_a_monotonic_instant_...             no gate
+#   service.rs       biometric_is_refused_..._no_biometric_factor            no gate
+#   store.rs         boot_secs_reads_the_boottime_clock_...                  no gate
+#   canonicalize.rs  a_read_that_does_not_return_is_refused_by_the_deadline  no gate
+#   canonicalize.rs  work_that_completes_within_the_deadline_is_not_refused  no gate
+#   canonicalize.rs  a_malformed_ceiling_is_refused_rather_than_defaulted    no gate
 #
-#   * The one SKIP branch gates on a PATH EXISTING, not on euid:
-#     `/usr/bin/coreutils` (root:root 0755, 11352352 bytes on this box). Root sees the same
-#     file, so it EXECUTES in both environments. This is the only one of the ten whose
-#     outcome could differ between lanes, and it does not.
+# ALL FIVE UNGATED — cleaner than run 14's derivation, which had one path-existence branch
+# (`/usr/bin/coreutils`) to reason about. Nothing here depends on euid, on a filesystem, or on
+# a facility root has differently.
 #
-# CORRECTED POST-HOC (D0A-R26-06). The paragraph that stood here said all four service tests
-# "use a socketpair and a stub SessionSource, reach a denial BEFORE any gate, PAM call or
-# spawn". **The number it supported was right and the explanation was wrong** — the R19-06 /
-# R20-07 shape, third occurrence, and this time inside the file whose whole purpose is that the
-# derivation be checkable independently of whether the number matches. What is actually true:
-#
-#   a_tier_the_daemon_cannot_enforce_…    socketpair + Seatless, via serve_one_action;
-#                                         denies at the TIER check, before the store
-#   the_enforced_tier_passes_…            socketpair + Seatless, via serve_one_action;
-#                                         passes the tier check, is STORED, then denies AT THE
-#                                         GATE — which is the point of it, and the opposite of
-#                                         "before any gate"
-#   an_elapsed_consent_window_…           NO socketpair, NO Seatless; calls
-#                                         present_and_execute directly
-#   a_granted_entry_without_…             NO socketpair, NO Seatless; calls
-#                                         present_and_execute directly
-#
-# The CONCLUSION survives — none of the four needs a privileged facility, so all four execute
-# at root — but it survives for two different reasons, not one. This annotation is added after
-# the run rather than rewritten silently: the file's protected property (prediction before
-# measurement) rests on commit order (af6dde0 precedes 53e2b5a), not on its wording, so a
-# labelled correction costs nothing and hiding the error would cost the record.
-#
-# So all ten execute at root:  177 + 10 = 187 EXECUTED.
-# None of them skips in either lane, so the root skip set is UNCHANGED at 5:
+# So:  187 + 5 = 192 EXECUTED.  The root skip set is UNCHANGED at 5:
 #   b1_daemon_binary                      needs --features insecure-test-seams
 #   an_unreadable_login_defs              this uid can read a 0000 file          (root-caused)
 #   a_regular_login_user_is_not_refused   running as root                        (root-caused)
 #   pidfd_refuses_a_recycled_pid_barrier  userns unavailable to root here        (root-caused)
 #   live_logind_query                     standing DEFER
 #
-# CONSISTENCY CHECK, because the two lanes must describe the SAME test set:
-#   unprivileged  167 + 25 = 192 reported
-#   root          187 +  5 = 192 reported
-# A run 14 whose `reported` is not 192 means the test SET changed, not the skip distribution —
-# a different defect from a count mismatch, and it must be diagnosed as such.
+# CONSISTENCY CHECK, because both lanes must describe the SAME test set:
+#   unprivileged  172 + 25 = 197 reported
+#   root          192 +  5 = 197 reported
+# A `reported` other than 197 means the test SET changed, not the skip distribution — a
+# different defect from a count mismatch, to be diagnosed as such.
 #
 # Root and unprivileged remain OVERLAPPING SETS, neither a superset: three of the five root
-# skips execute unprivileged. 187 > 167 is NOT a coverage claim and must not be read as one.
+# skips execute unprivileged. 192 > 172 is NOT a coverage claim.
 #
+# ---------------------------------------------------------------------------------------
+# THE ONE TEST WITH A TIMING-DERIVED TOLERANCE — named in advance so a failure is diagnosed
+# rather than re-run
+#
+# `boot_secs_reads_the_boottime_clock_and_does_not_go_backwards` asserts two CLOCK_BOOTTIME
+# reads differ by at most 1 second (the sampling gap). Under a heavily loaded serial root run
+# that tolerance is the only thing in the five that could fail for a reason unrelated to its
+# property. If it fails, check the elapsed wall time of the run before concluding anything
+# about the clock — and per Iron Law #15 clause 5, DEMONSTRATE the harness explanation rather
+# than assuming it.
+#
+# `a_read_that_does_not_return_is_refused_by_the_deadline` uses a 150 ms deadline against a
+# 60 s sleep — a 400x margin, in the direction where load makes it MORE likely to fire
+# correctly, so it is not in the same category.
+#
+# ---------------------------------------------------------------------------------------
+# RESIDUALS THIS RUN CARRIES BUT CANNOT CLOSE — recorded here because a residual kept only
+# beside the fix that created it gets read as part of that fix
+#
+# 1. THE SUSPEND DIVERGENCE IS UNMEASURED, NOT VERIFIED. R26-03 moved the consent window to
+#    CLOCK_BOOTTIME because CLOCK_MONOTONIC pauses across suspend. This box has never
+#    suspended (BOOTTIME - MONOTONIC = 0.000s), so NO assertion available on this lane
+#    distinguishes the two clocks, and the test that exists checks clock IDENTITY. A green run
+#    15 does NOT verify the suspend behaviour. Do not let the record imply otherwise.
+#
+# 2. THE PENDING STORE HAS NO CAP. The read ceiling bounds ONE proposal at 2x; nothing bounds
+#    accumulation. It is adjacent to what R26-04 just fixed, which is exactly how it will be
+#    mistaken for closed. Invisible today (B1 services one action and exits); live when B2
+#    loops.
+#
+# 3. `argv` IS EMPTINESS-CHECKED ONLY, while `env_delta` is NUL-checked at both doors. Raised
+#    in the round-26 prompt; the findings did not answer it. A question a reviewer declined to
+#    answer reads as settled unless it is recorded as unanswered. It is unanswered.
+#
+# ---------------------------------------------------------------------------------------
 # A MISMATCH IS A RESULT. Record which side was wrong. Do not adjust this derivation until it
 # agrees with the measurement.
 
-EXPECTED_EXECUTED=187
+EXPECTED_EXECUTED=192
 EXPECTED_SKIPPED=5
-EXPECTED_REPORTED=192
+EXPECTED_REPORTED=197

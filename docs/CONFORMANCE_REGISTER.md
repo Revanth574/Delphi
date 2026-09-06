@@ -201,8 +201,23 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**CURRENT ROOT RECORD: LANE RUN 14** — `EXECUTED 187 / SKIPPED 5 / reported 192`, freshness
-MEASURED. Everything below this line is the superseded history that led to it.
+**CURRENT ROOT RECORD: LANE RUN 15** — `EXECUTED 192 / SKIPPED 5 / reported 197`, freshness
+**ENFORCED** (D0A-R26-05: enumeration asserted at 17, both hash sides asserted equal to it,
+rebuild failure fatal — run 14's version printed those numbers and compared anyway). Predicted
+`192/5/197` at `0ad6556`, committed alone before the run, matched exactly. It is the first root
+execution of the round-26 remediation: the tier ceiling at `Confirm`, the deadline-bounded
+read, the `CLOCK_BOOTTIME` consent window and the configurable read ceiling had never run as
+root before it.
+
+**What run 15 does NOT establish** is in `OPEN AFTER ROUND 26` above and repeated in the lane
+record itself: the suspend divergence is unmeasured on a box that has never suspended, the
+pending store has no cap, and `argv` remains emptiness-checked only. A green root run is not
+evidence about any of the three.
+
+**Run 14 is SUPERSEDED but not in doubt** (`EXECUTED 187 / SKIPPED 5 / reported 192`,
+`af6dde0`): it closed D0A-R24-01 with the first freshness check that actually hashed anything.
+It is superseded only because it predates the round-26 remediation. Everything below this line
+is the history that led here.
 
 **LANE RUN 13 — SUPERSEDED BY RUN 14 (D0A-R26-07). `EXECUTED 177 / SKIPPED 5 / reported 182`, rc 0, 0 failures,
 17/17 producers exited 0, and EVERY HYGIENE CHECK PERFORMED WITH ITS OWN CAPTURED OUTPUT:**

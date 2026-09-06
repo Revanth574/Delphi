@@ -1,31 +1,38 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 14 — THE FULL-HYGIENE RUN, INCLUDING A FRESHNESS CHECK THAT ACTUALLY CHECKS.
-# **This closes D0A-R24-01**, which R25-05 had reopened. Measured 2026-09-06 at `af6dde0`.
+# LANE RUN 15 — the round-26 remediation's first root execution. Measured 2026-09-06 at
+# `0ad6556`.
 #
-#   EXECUTED 187 / SKIPPED 5 / reported 192     extractor rc=0
+#   EXECUTED 192 / SKIPPED 5 / reported 197     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
-#   predicted 187/5/192 at af6dde0, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#   predicted 192/5/197 at 0ad6556, committed ALONE and BEFORE the run — and MATCHED EXACTLY
 #
-# EVERY HYGIENE CHECK, CAPTURED SEPARATELY, WITH THE EVIDENCE THAT DECIDES IT. Capturing each
-# check separately is not sufficient on its own — R25-05 is the case where a check WAS
-# captured separately and its output still could not decide the thing it was captured for. So
-# each line below names what was actually compared, not that a step ran:
+# WHAT THIS RUN ADDS OVER RUN 14: run 14's freshness check was real, but it ran BEFORE the
+# round-26 remediation. Four security-relevant paths had never executed at root — the tier
+# ceiling at `Confirm`, the deadline-bounded read, the `CLOCK_BOOTTIME` consent window, and the
+# configurable read ceiling — plus the five tests that assert them. They have now.
+#
+# EVERY HYGIENE CHECK, WITH THE EVIDENCE THAT DECIDES IT (not merely that a step ran):
 #
 #   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
 #   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED, both printed
 #   bwrap            0.11.1
-#   free space       /run 1483M, target 4467M, /tmp 3710M — all above floor
-#   forced freshness MEASURED THIS TIME. `sha256sum` over the ENUMERATED set before and after
-#                    `touch runtime/src/execute.rs` + rebuild: before=17 after=17 lines, and
-#                    `diff` returned EMPTY. Both counts are printed because a short list on
-#                    either side is a false green, and the count is what distinguishes "all
-#                    17 identical" from "the three I happened to look at". Run 13's line said
-#                    "identical executable set" on the strength of `| tail -3`, which prints
-#                    PATHS and never hashes anything (D0A-R25-05).
+#   free space       /run 1484M, target 2297M, /tmp 3710M — all above floor, BUT SEE BELOW
+#   forced freshness ENFORCED, not printed (D0A-R26-05). `sha256sum` over the enumerated set
+#                    before and after `touch runtime/src/execute.rs` + rebuild; enumeration
+#                    asserted at 17, BOTH hash sides asserted equal to 17, rebuild failure
+#                    fatal, `diff` empty. Run 14's version printed the counts and compared
+#                    anyway — a failed rebuild would have compared two stale sets and said
+#                    FRESH. This one exits on each.
 #   PAM before       439c1d1521d86e4eb011a927aff659db
 #   PAM after        md5sum -c → OK              (class 16, the defect already paid for)
 #   stale sessions   none, checked before AND after
+#
+# ⚠ FREE SPACE IS TRENDING DOWN AND IS THE THINNEST MARGIN IN THIS RECORD.
+# `$CARGO_TARGET_DIR` read **4467M at run 14 and 2297M here — against a 2048M floor, i.e.
+# 249M of headroom.** It passed; it is recorded because the next run may not, and because
+# `/tmp` filling has already surfaced in this project as a BUILD error in an unrelated crate
+# (see `scripts/check-free-space.sh`'s own rationale). A run that dies this way misattributes.
 #
 # THE FIVE SKIPS, each quoting its own blocker from the log — a skip proves nothing, so the
 # list is read rather than the count:
@@ -35,28 +42,53 @@
 #   live_logind_query_path_works_or_documents_…       standing DEFER (no logind session)
 #   a_regular_login_user_is_not_refused_…             running as root
 #
-# THREE OF THE FIVE SKIP *BECAUSE* THE RUN IS PRIVILEGED and execute unprivileged. So root's
-# 187 and the unprivileged 167 are OVERLAPPING SETS, neither containing the other, and
-# "187 > 167" is not a coverage claim in either direction. The memberships are read from the
-# two skip LISTS; they are never computed from the two totals.
+# THREE OF THE FIVE SKIP *BECAUSE* THE RUN IS PRIVILEGED and execute unprivileged. Root's 192
+# and the unprivileged 172 are OVERLAPPING SETS, neither containing the other; "192 > 172" is
+# not a coverage claim in either direction. Membership is read from the two skip LISTS, never
+# computed from the two totals.
 #
-# BOTH LANES REPORT 192, which is the consistency check the expectation committed in advance:
-# same test set, different skip distribution. A reported total other than 192 would have meant
-# the SET changed — a different defect from a count mismatch.
+# BOTH LANES REPORT 197 — the consistency check committed in advance: same test set, different
+# skip distribution. A different total would have meant the SET changed, a distinct defect from
+# a count mismatch.
 #
-# ORDERING IS CONVENTION (D0A-R22-01, still reopened). `git log` on this file and on
-# `.expected` is the only evidence the prediction preceded the measurement, and it is evidence
-# only because af6dde0 contains that file alone. Nothing enforces it. This is the SECOND
-# consecutive run to hold under convention; that makes the failure non-guaranteed, not the
-# convention sufficient.
+# THE TEST NAMED IN ADVANCE AS TIMING-TOLERANT DID NOT FAIL. The run-15 expectation flagged
+# `boot_secs_reads_the_boottime_clock_and_does_not_go_backwards` — it tolerates a 1-second gap
+# between two clock reads, the only one of the five that could fail for a reason unrelated to
+# its property under a loaded serial run. Naming it in advance is what would have made a
+# failure a diagnosis instead of a re-run.
 #
-# SUPERSEDED — LANE RUN 13 (`EXECUTED 177 / SKIPPED 5 / reported 182`, at 40d7fb7). Its
-# counts, producer statuses, PAM integrity, stale-session sweep, helper digest, account, bwrap
-# and free space were genuinely measured and are not in doubt. Its FRESHNESS line was
-# withdrawn by D0A-R25-05 — the commands behind it computed no hashes — so "those binaries
-# were that code" was never established for run 13 and cannot be after the fact. Run 14
-# re-establishes it on the current tree rather than repairing run 13, which is why run 13 is
-# superseded rather than corrected. Runs 11 and 12 were superseded by run 13 before that:
-# run 11 carried hygiene, run 12 counts-and-ordering, and neither alone was the lane record.
-EXECUTED=187
+# ORDERING HELD UNDER CONVENTION FOR THE THIRD CONSECUTIVE RUN (D0A-R22-01, still reopened).
+# `0ad6556` contains the expectation file alone; the result follows. Three clean instances make
+# the failure less likely, NOT the convention sufficient — nothing enforces it.
+#
+# ---------------------------------------------------------------------------------------
+# WHAT A GREEN RUN 15 DOES **NOT** ESTABLISH — carried here because a residual recorded only
+# beside the fix that created it gets read as part of that fix
+#
+# 1. THE SUSPEND DIVERGENCE IS UNMEASURED, NOT VERIFIED. R26-03 moved the consent window from
+#    `Instant` (CLOCK_MONOTONIC, which PAUSES across suspend) to CLOCK_BOOTTIME. This box has
+#    never suspended — BOOTTIME - MONOTONIC = 0.000s — so **no assertion available on this lane
+#    distinguishes the two clocks.** The test that passed above checks clock IDENTITY. Do not
+#    read this run as verifying the suspend behaviour; it cannot.
+#
+# 2. THE PENDING STORE HAS NO CAP. The read ceiling bounds ONE proposal at 2x; nothing bounds
+#    accumulation across proposals. It sits ADJACENT to what R26-04 fixed — which got a
+#    derivation, a config knob and a test — and that adjacency is exactly how it will be
+#    mistaken for closed. Invisible while B1 services one action and exits; live when B2 loops.
+#
+# 3. `argv` IS EMPTINESS-CHECKED ONLY, while `env_delta` is NUL-checked at BOTH doors
+#    (D0A-R18-03 / R19-05). Raised in the round-26 prompt; the findings did not answer it. A
+#    question a reviewer declined to answer reads as settled unless it is recorded as
+#    unanswered. It is UNANSWERED.
+#
+# Also: the read deadline's timeout branch is proven on a sleeping closure, not a stalled
+# mount. That a real FUSE stall reaches it is a property of the filesystem, not of this code.
+#
+# ---------------------------------------------------------------------------------------
+# SUPERSEDED — LANE RUN 14 (`EXECUTED 187 / SKIPPED 5 / reported 192`, at `af6dde0`). Sound and
+# not in doubt: it closed D0A-R24-01 with the first freshness check that actually hashed
+# anything. Superseded only because it predates the round-26 remediation. Before it, run 13
+# (`177/5/182`) whose freshness line was WITHDRAWN by D0A-R25-05, and runs 11/12 which split
+# hygiene from counts.
+EXECUTED=192
 SKIPPED=5

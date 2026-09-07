@@ -1,116 +1,116 @@
-# PREDICTION for ROOT lane run 16, committed ALONE and BEFORE the run.
+# PREDICTION for ROOT lane run 17, committed ALONE and BEFORE the run.
 #
 # STEP -1 of `scratch/lane-run-7-procedure.md`. The derivation is written out so it is
-# checkable independently of whether the number matches — and that is not decorative: R19-06,
-# R20-07 and D0A-R26-06 are three runs whose FIGURE was right and whose EXPLANATION was wrong,
-# the last of them in THIS FILE. A matching number is not evidence the reasoning was sound.
+# checkable independently of whether the number matches. Not decorative: R19-06, R20-07 and
+# D0A-R26-06 are three runs whose FIGURE was right and whose EXPLANATION was wrong — the last
+# of them in this file. A matching number is not evidence the reasoning was sound.
 #
-# ORDERING IS CONVENTION, NOT MECHANISM (D0A-R22-01, reopened). `git log` on this file versus
-# the result file is the only evidence the prediction came first. Held for runs 13, 14, 15.
+# ORDERING IS CONVENTION, NOT MECHANISM (D0A-R22-01, reopened). Held for runs 13-16.
 #
 # ---------------------------------------------------------------------------------------
-# WHY RUN 16 IS OWED
+# WHY RUN 17 IS OWED
 #
-# Run 15 was clean and its freshness check was enforced. But it ran at `0ad6556`, BEFORE the
-# round-27 remediation, and none of the following has executed at root:
-#   * the ABSOLUTE frame deadline in `wire.rs` (D0A-R27-02) — a stalled or trickling peer
-#     could hold the ROOT daemon before consent. Found on the first round that named the file.
-#   * the AGGREGATE read budget replacing the per-object ceiling (D0A-R27-01), with the default
-#     now COMPUTED as `PRE_CONSENT_BUDGET_BYTES / PEAK_MULTIPLE_OF_BUDGET`.
-#   * `ceiling_from_var` rejecting a non-UTF-8 configured ceiling (D0A-R27-03).
-#   * argv NUL validation at both doors.
-#   * `consent_window_elapsed`, now the production expiry decision.
+# Run 16 was clean, and it was the first run whose membership was proven by identity. But it
+# ran at `09dc36b`, BEFORE the round-28 remediation, and none of this has executed at root:
+#   * `read_frame` / `read_frame_untrusted` SPLIT (D0A-R28-01) — the deadline moved out of the
+#     shared reader, where it had capped human consent at 30 s, to the daemon's call site.
+#   * the BOUNDED DAEMON EXIT (D0A-R28-02) — `reap_within` + grace + SIGKILL, replacing an
+#     unconditional `waitpid` on the untrusted AI. **This one is root-relevant in a way the
+#     others are not: it is in `delphi-runtimed`, whose only root exercise is
+#     `b1_daemon_binary_runs_the_assembled_flow` — which SKIPS on this lane.**
+#   * the acceptance-time deadline check (D0A-R28-03).
+#   * the program-fd seal regression tests (D0A-R28-06).
+#   * three digest-binding tests (env names, pending_id, timeout).
 #
 # ---------------------------------------------------------------------------------------
 # DERIVATION
 #
-# Base: run 15 measured EXECUTED 192 / SKIPPED 5 / reported 197 at root.
-#       The current unprivileged pair is EXECUTED 180 / SKIPPED 25 / reported 205 (measured
-#       2026-09-07 at b609ddf, re-measured by the pre-commit hook across all 17 targets).
+# Base: run 16 measured EXECUTED 200 / SKIPPED 5 / reported 205 at root, membership proven by
+#       identity (205 pairs each side, zero in either direction).
+#       Current unprivileged pair: EXECUTED 188 / SKIPPED 25 / reported 213 (measured
+#       2026-09-07 at 0cd1a34, re-measured by the pre-commit hook across all 17 targets).
 #
-# Delta since run 15: the round-27 remediation added EIGHT tests and removed none. One RENAME
-# is not an addition (`boot_secs_reads_the_boottime_clock_...` ->
-# `boot_secs_agrees_with_a_direct_boottime_read_and_reports_its_own_discriminating_power`).
-# Each was checked for root-gating BY GREP of its body — geteuid, a SKIP branch, a
-# bwrap_available guard, a path-existence branch:
+# Delta since run 16: the round-28 remediation added EIGHT tests and removed none. Each was
+# checked for root-gating BY GREP of its body — geteuid, a SKIP branch, a bwrap_available
+# guard, a path-existence branch:
 #
-#   canonicalize.rs  the_read_budget_is_spent_across_reads_not_reset_per_object    no gate
-#   canonicalize.rs  the_derived_ceiling_admits_the_largest_executables_...        no gate
-#   canonicalize.rs  a_non_utf8_configured_ceiling_is_refused_not_defaulted        no gate
-#   canonicalize.rs  an_argv_entry_with_an_embedded_nul_is_refused_...             no gate
-#   wire.rs          a_stalled_peer_cannot_hold_the_daemon_past_the_frame_deadline no gate
-#   wire.rs          a_trickling_peer_cannot_extend_the_frame_deadline_...         no gate
-#   wire.rs          a_complete_frame_within_the_deadline_is_still_accepted        no gate
-#   store.rs         the_consent_window_decision_is_exact_at_its_edges             no gate
+#   wire.rs     read_frame_does_not_bound_a_wait_on_a_cooperating_peer       no gate
+#   wire.rs     a_frame_whose_last_byte_arrives_after_the_deadline_is_...    no gate
+#   execute.rs  an_unsealed_program_fd_is_refused_even_when_its_digest_...   no gate
+#   execute.rs  a_partially_sealed_program_fd_is_refused                     no gate
+#   execute.rs  a_fully_sealed_program_fd_passes_the_seal_check              no gate
+#   action.rs   the_digest_binds_environment_variable_names_not_only_...     no gate
+#   action.rs   the_digest_binds_the_pending_id_so_a_token_cannot_cross_...  no gate
+#   action.rs   the_digest_binds_the_timeout_even_though_nothing_enforces... no gate
 #
-# ALL EIGHT UNGATED. Nothing here depends on euid, on a privileged facility, or on a file that
-# root sees differently. The four canonicalize tests use a tempdir; the three wire tests use a
-# `UnixStream::pair`; the store test is pure arithmetic.
+# So:  200 + 8 = 208 EXECUTED, skip set unchanged at 5, reported 213.
 #
-# So:  192 + 8 = 200 EXECUTED.  The root skip set is UNCHANGED at 5:
-#   b1_daemon_binary                      needs --features insecure-test-seams
-#   an_unreadable_login_defs              this uid can read a 0000 file          (root-caused)
-#   a_regular_login_user_is_not_refused   running as root                        (root-caused)
-#   pidfd_refuses_a_recycled_pid_barrier  userns unavailable to root here        (root-caused)
-#   live_logind_query                     standing DEFER
+# THREE OF THE EIGHT CALL `execute_approved`, so their ROOT behaviour differs from their
+# unprivileged behaviour — and the derivation has to say why the counts still hold:
+#   * the two REFUSAL tests assert `Err(UnsealedScript)`, and the seal check runs BEFORE any
+#     spawn or credential drop. Root cannot reach a different verdict.
+#   * `a_fully_sealed_program_fd_passes_the_seal_check` asserts only that the failure is NOT
+#     the seal error. At root the action proceeds further (real credential drop, real bwrap)
+#     and may end Ok or Err for sandbox reasons — **both satisfy a negative assertion**, which
+#     is exactly why it was written negatively.
 #
-# CONSISTENCY CHECK, because both lanes must describe the SAME test set:
-#   unprivileged  180 + 25 = 205 reported
-#   root          200 +  5 = 205 reported
+# CONSISTENCY CHECK: unprivileged 188 + 25 = 213; root 208 + 5 = 213.
+# **AND THE EQUALITY IS NOT THE EVIDENCE (D0A-R27-04).** §4b compares `(target, test-name)`
+# identities as counters. Run 16 established that check on a tree where nothing had changed;
+# **run 17 is the first where it could actually detect something**, because eight tests were
+# added between the runs. Expect 213 identities each side and zero in either direction — and if
+# a delta appears, it must be nameable as exactly these eight, by name, not by count.
 #
-# **AND THIS TIME THE EQUALITY IS NOT THE EVIDENCE (D0A-R27-04).** Equal totals cannot detect a
-# compensating removal and addition. Section 4b of the procedure compares `(target, test-name)`
-# IDENTITIES as counters between the root log and unprivileged `--list`; that comparison is
-# what the record must cite. A total of 205 on both sides is a necessary condition, not a proof.
-#
-# Root and unprivileged remain OVERLAPPING SETS, neither a superset: three of the five root
-# skips execute unprivileged. 200 > 180 is NOT a coverage claim.
+# Root and unprivileged remain OVERLAPPING SETS: three of the five root skips execute
+# unprivileged. 208 > 188 is NOT a coverage claim.
 #
 # ---------------------------------------------------------------------------------------
-# THE TESTS WITH TIMING TOLERANCES — named in advance so a failure is DIAGNOSED, not re-run
+# TIMING TOLERANCES — named in advance so a failure is DIAGNOSED, not re-run
 #
-# TWO of the eight are genuinely timing-dependent, both in `wire.rs`:
-#   a_stalled_peer_...     400 ms deadline, asserts elapsed < 5 s   (12x margin)
-#   a_trickling_peer_...   400 ms deadline, asserts elapsed < 5 s, with a writer thread
-#                          feeding one byte per 40 ms
-# The deadline is ABSOLUTE, so load makes it fire sooner rather than later — the margin is in
-# the safe direction. A failure here is far more likely to be a real regression (a per-read
-# timeout reintroduced, so progress buys time) than a slow machine. **Do not re-run to green.**
+# TWO of the eight are timing-dependent, both in `wire.rs`:
+#   read_frame_does_not_bound_...     a 900 ms writer delay; asserts the read SUCCEEDS
+#   a_frame_whose_last_byte_...       80 ms deadline, final byte at ~150 ms; asserts REFUSAL
 #
-# Also carrying a tolerance, from run 15's list:
-#   boot_secs_agrees_...   two clock reads within 1 s of each other
+# **These two fail in OPPOSITE directions under load, which is what makes them a pair.** A slow
+# machine cannot make both pass by accident: the first needs a wait NOT to be cut short, the
+# second needs a deadline to fire. If only one fails, read which — it says whether the deadline
+# is too eager or not eager enough. If BOTH fail, suspect the harness (Iron Law #15 clause 5),
+# and DEMONSTRATE that rather than assuming it.
 #
-# **A METHOD NOTE, because it happened while writing this derivation.** The grep that classifies
-# these flagged `the_consent_window_decision_is_exact_at_its_edges` as timing-dependent with 8
-# matches. It is PURE — the matches were the substring `elapsed` inside the function name
-# `consent_window_elapsed`. Same bare-word failure that made the decoration check miss
-# `timeout` (D0A-R27, self-corrected). Verified by reading the body. **The greps in this
-# protocol find candidates; reading decides.**
+# Carrying from run 16's list: `boot_secs_agrees_…` (1 s sampling gap) and the two round-27
+# deadline tests (400 ms absolute, `elapsed < 5 s`).
 #
 # ---------------------------------------------------------------------------------------
-# WHAT A GREEN RUN 16 WILL NOT ESTABLISH — carried because a residual kept beside the fix that
-# created it is read as part of that fix
+# THE MUTATION CAMPAIGN IS AN UNPRIVILEGED RESULT, AND THIS RUN DOES NOT CHANGE THAT
 #
-# 1. THE SUSPEND DIVERGENCE. Unmeasured, and now known to be worse than last recorded: a
-#    reviewer's mutation swapped production CLOCK_BOOTTIME for CLOCK_MONOTONIC and the clock
-#    test STILL PASSED, so on this lane it discriminates neither suspend behaviour nor clock
-#    identity. The test now PRINTS `BOOTTIME - MONOTONIC` so the transcript states its own
-#    discriminating power instead of a green implying it. **Expect that delta to read 0 on this
-#    box, and expect the message saying it proves nothing about clock selection.** Expiry
-#    coverage comes from `the_consent_window_decision_is_exact_at_its_edges`, which needs no
-#    clock at all.
-# 2. THE PENDING STORE HAS NO CAP. The read budget bounds ONE proposal; nothing bounds
-#    accumulation. B1's one-action exit limits it within a single invocation and establishes
-#    nothing about a B2 loop. Adjacent to what R26-04/R27-01 fixed, which is how it disappears.
-# 3. THE 30 s READ DEADLINE, the 1 GiB pre-consent budget and the 8 GiB workstation floor are
-#    engineering and deployment CHOICES, not demonstrated bounds. R27-01's defect was that the
-#    implementation did not honour even the chosen budget; the budget itself is still
-#    unvalidated.
+# `scripts/mutation-campaign.py` produced 14/14 valid experiments at `3593fa8` with
+# `euid=1000` recorded. **A green run 17 does not extend those results to root**, and nothing
+# in this lane run is a mutation campaign. The harness's own docstring now records what a root
+# campaign would require — build unprivileged, run the binaries under sudo, keep artifact
+# writes unprivileged, record the TESTS' euid rather than the harness's — so that gap is
+# written down rather than waiting to be discovered by someone assuming the unprivileged table
+# covers root.
+#
+# Concretely: the five root-gated tests have never been mutation-tested at all, and one of them
+# (`b1_daemon_binary_runs_the_assembled_flow`) is the ONLY exercise of the code R28-02 changed.
+#
+# ---------------------------------------------------------------------------------------
+# WHAT A GREEN RUN 17 WILL NOT ESTABLISH
+#
+# 1. R28-02's bounded exit is barely exercised. Its code lives in `delphi-runtimed`, whose only
+#    root test SKIPS on this lane for want of `--features insecure-test-seams`. A green run 17
+#    says almost nothing about it; the unprivileged suite says nothing at all.
+# 2. THE SUSPEND DIVERGENCE. Unmeasured; the clock test prints its own delta and states it
+#    cannot distinguish the clocks here.
+# 3. THE PENDING STORE HAS NO CAP, and the ABANDONED READ WORKER is unbounded for repeated
+#    service — 30 s is an engineering choice, not a demonstrated bound.
+# 4. `action.timeout` IS ENFORCED NOWHERE (R9-04). Round 28 closed its digest BINDING only, and
+#    the test name says so.
 #
 # ---------------------------------------------------------------------------------------
 # A MISMATCH IS A RESULT. Record which side was wrong. Do not adjust this derivation until it
 # agrees with the measurement.
 
-EXPECTED_EXECUTED=200
+EXPECTED_EXECUTED=208
 EXPECTED_SKIPPED=5
-EXPECTED_REPORTED=205
+EXPECTED_REPORTED=213

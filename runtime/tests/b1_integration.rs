@@ -1711,16 +1711,21 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     );
     // (4, cont.) Termination attributed to the AI BY NAME. DAEMON stream. This is what
     // distinguishes "bounded the right child" from "exited somehow".
+    // The literal comes from the PRODUCTION const, not from a copy in this file. The first
+    // version of this assertion used the pre-extraction wording, reconstructed from memory —
+    // it could never match, and it reported the property absent while the transcript showed it
+    // happening (D0A-R2-05's lesson, one module over).
     assert!(
-        daemon_log.contains("child did not exit within the grace period"),
+        daemon_log.contains(delphi_runtime::shutdown::TERMINATED_AFTER_GRACE),
         "the daemon did not log a grace-period termination at all.\nstdout:\n{stdout}"
     );
     assert!(
         daemon_log.lines().any(|l| {
-            l.contains("child did not exit within the grace period") && l.contains("ai")
+            l.contains(delphi_runtime::shutdown::TERMINATED_AFTER_GRACE)
+                && l.contains(r#"child="ai""#)
         }),
-        "a grace-period termination was logged but not attributed to the AI on the same \
-         line.\nstdout:\n{stdout}"
+        "a grace-period termination was logged but not attributed to the AI on the same line — \
+         which is what distinguishes 'bounded the right child' from 'exited somehow'.\nstdout:\n{stdout}"
     );
     assert!(
         out.status.success(),

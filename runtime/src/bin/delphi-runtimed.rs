@@ -576,12 +576,12 @@ fn main() -> Result<()> {
         match outcome {
             delphi_runtime::shutdown::ChildOutcome::Unreaped { kill_error } => tracing::error!(
                 child = what, ?kill_error,
-                "child NOT reaped after SIGKILL — likely uninterruptible sleep. Exiting with a \
-                 cleanup failure rather than reporting success (D0A-R29-05)"
+                "{} — exiting with a cleanup failure rather than reporting success \
+                 (D0A-R29-05)", delphi_runtime::shutdown::NOT_REAPED_AFTER_KILL
             ),
             delphi_runtime::shutdown::ChildOutcome::Terminated => tracing::warn!(
                 child = what,
-                "child outlived the grace period and was terminated (D0A-R28-02)"
+                "{}", delphi_runtime::shutdown::TERMINATED_AFTER_GRACE
             ),
             other => tracing::debug!(child = what, ?other, "child cleanup"),
         }

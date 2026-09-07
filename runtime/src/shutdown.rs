@@ -40,6 +40,23 @@ use nix::unistd::Pid;
 /// Poll interval while waiting for a corpse. Matches `launcher`'s.
 const POLL: Duration = Duration::from_millis(10);
 
+/// The daemon's log line when a child outlived its grace period and was terminated.
+///
+/// A `const` shared with the test that asserts it (the D0A-R2-05 pattern). The assembly test's
+/// attribution assertion was written against the message the code emitted BEFORE this module
+/// was extracted — "child did not exit within the grace period" — because it was reconstructed
+/// from memory rather than read from the source. The daemon actually said "child outlived the
+/// grace period and was terminated", so the assertion could never match, and the property it
+/// guards was demonstrated in the transcript while the test called it absent.
+///
+/// One construction site removes the possibility of the two drifting again.
+pub const TERMINATED_AFTER_GRACE: &str =
+    "child outlived the grace period and was terminated (D0A-R28-02)";
+
+/// The daemon's log line when a child was NOT reaped even after `SIGKILL`.
+pub const NOT_REAPED_AFTER_KILL: &str =
+    "child NOT reaped after SIGKILL — likely uninterruptible sleep";
+
 /// What became of one child.
 ///
 /// Distinguishing these is the point: the previous inline version discarded the `kill` result

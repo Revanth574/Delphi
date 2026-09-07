@@ -627,6 +627,50 @@ mod tests {
     /// The sequence length is held constant here on purpose — a differing length would change
     /// the digest through `seq`'s declared-count guard and the test would pass without the
     /// name ever mattering.
+    /// D0A-R28 — the digest binds `pending_id`, so a token cannot cross actions.
+    ///
+    /// Found NOT CAUGHT by the mutation campaign: hashing a constant instead of the id broke
+    /// no test. The reviewer's reasoning for keeping it bound is the assertion here — without
+    /// it a token minted for one action verifies against an otherwise identical action stored
+    /// under a DIFFERENT consumption-ledger key, so the one-shot ledger could be spent twice
+    /// on what is, to the digest, the same object.
+    #[test]
+    fn the_digest_binds_the_pending_id_so_a_token_cannot_cross_actions() {
+        let with_id = |id: &str| {
+            let mut a = sample();
+            a.pending_id = id.into();
+            canonical_action_digest(&a)
+        };
+        assert_ne!(
+            with_id("act-1"),
+            with_id("act-2"),
+            "two otherwise identical actions under different pending_ids hash the same — a \
+             token for one verifies against the other, under a different ledger key"
+        );
+        assert_eq!(with_id("act-1"), with_id("act-1"), "the digest must be deterministic");
+    }
+
+    /// D0A-R28 — the digest binds `timeout`.
+    ///
+    /// Also NOT CAUGHT by the campaign. **This closes the BINDING half only.** `action.timeout`
+    /// is enforced NOWHERE at execution — no consumer exists — which is open as R9-04 and is
+    /// not addressed by this test. Binding it means a human who approved a 30-second action
+    /// cannot have a 30-minute one substituted; it does not mean either bound is applied.
+    #[test]
+    fn the_digest_binds_the_timeout_even_though_nothing_enforces_it_yet() {
+        let with_timeout = |secs: u64| {
+            let mut a = sample();
+            a.timeout = Duration::from_secs(secs);
+            canonical_action_digest(&a)
+        };
+        assert_ne!(
+            with_timeout(30),
+            with_timeout(1800),
+            "two actions differing only in timeout hash identically — an approved 30s action \
+             could be presented as a 30-minute one (binding half of R9-04)"
+        );
+    }
+
     #[test]
     fn the_digest_binds_environment_variable_names_not_only_their_values() {
         let with_name = |name: &str| {

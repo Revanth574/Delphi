@@ -189,5 +189,10 @@
 #              reviewer's fourth mutation. Under a mutant that hashes a constant name, all NINE
 #              pre-existing action-module tests pass and only this one bites.
 # SKIPPED unchanged: all six run unprivileged.
-EXECUTED=186
+# 2026-09-07 (round-28, closing the campaign's two NOT CAUGHT): 186/25 -> 188/25. +2:
+#   `the_digest_binds_the_pending_id_so_a_token_cannot_cross_actions` and
+#   `the_digest_binds_the_timeout_even_though_nothing_enforces_it_yet`. Both were found NOT
+#   CAUGHT by scripts/mutation-campaign.py and both are BINDING tests only — the timeout one
+#   says so in its name, because action.timeout is enforced nowhere at execution (R9-04, open).
+EXECUTED=188
 SKIPPED=25

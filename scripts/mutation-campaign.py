@@ -10,38 +10,37 @@ The experiments may well have been real. The record could not show it — and fo
 whole discipline is that a claim must be checkable by someone who was not there, an
 unreproducible experiment is indistinguishable from one that never happened.
 
-**So the output of a mutation campaign is the ARTIFACT SET, not the table.** Per experiment
-this records:
+**So the output of a mutation campaign is the ARTIFACT SET, not the table.**
 
-  * the applied diff (the actual mutation, from `git diff` — not the intended one);
-  * the compile result;
-  * the privilege level and lane the suite ran at;
-  * the failing assertion text, when something failed;
-  * verification that the tree was restored afterwards.
+WHAT ROUND 29 FOUND IN THE FIRST VERSION OF THIS FILE, because the harness built to fix an
+evidence problem had three defects of its own:
 
-A PATCH-MISS or a compile error is an INVALID EXPERIMENT, reported as such and never as
-"NOT CAUGHT" — the two are indistinguishable in a bare table and opposite in meaning.
+* **D0A-R29-01 (P1) — an interrupted campaign could leave a security check REMOVED.** Mutation
+  and restoration were not enclosed in `try/finally`, and results were written only at the end.
+  An exception between the two left the mutant in the tree with no record. **And restoration
+  failure printed REFUSE and still exited 0**, because it never became an invalid outcome.
+  Now: `try/finally`, results appended incrementally as JSONL, and **the restore is VERIFIED
+  with `git diff --quiet` against the recorded commit rather than trusted from the write** — a
+  partial restore leaves a security check removed and reports success just as loudly as a
+  complete one.
+* **D0A-R29-02 (P2) — infrastructure failures were scored as detections.** Any nonzero `cargo
+  test` exit became CAUGHT: a build failure, a launch failure, `No space left on device`. A
+  crash may be mutation-induced, but it needs ATTRIBUTION rather than automatic credit. Now
+  classified, with full stdout/stderr retained per experiment.
+* **D0A-R29-03 (P2) — the clean-tree check excluded inputs that determine the result.** Only
+  `runtime/src` was checked, so modified integration tests, manifests, or `Cargo.lock` could
+  change the outcome while the metadata attributed everything to the recorded commit. And there
+  was **no baseline run** establishing that the reported failures were introduced by the
+  mutation at all. Both closed below.
 
-RUNNING THIS AT ROOT DOES NOT WORK YET, AND THE REASON IS WORTH WRITING DOWN RATHER THAN
-DISCOVERING (D0A-R28-05 follow-on). The artifacts record `euid` and state that other privilege
-levels are unsupported, which stops a reader assuming the unprivileged table covers root. But
-`sudo -E scripts/mutation-campaign.py` will NOT produce a root campaign, for the same reason the
-lane procedure builds unprivileged and then execs the binaries under sudo:
-
-  * `sudo -E cargo` does not work on this box — sudoers drops `-E`, and root has no rustup
-    toolchain. The single `cargo test` call below is therefore unrunnable as root.
-  * So a root campaign has to SPLIT what this conflates: apply the mutation, **build
-    unprivileged**, enumerate the test binaries, **run those binaries under sudo**, parse, then
-    restore. That is `scratch/lane-run-7-procedure.md` §1-§4 with a mutation wrapped around it.
-  * `git status` and every artifact write must stay UNPRIVILEGED. A campaign run as root leaves
-    root-owned artifacts and can leave root-owned files in the tree, which then fails the
-    dirty-tree guard in a way that looks like a different problem.
-  * The `euid` recorded here is the HARNESS's. A split campaign must record the euid the TESTS
-    ran at, which would differ from the harness's — conflating them is exactly the kind of
-    unchecked provenance this file exists to prevent.
-
-Until that split exists, **every result from this harness is an unprivileged result**, and the
-root-gated tests (5 on this lane) are not exercised by it at all.
+RUNNING THIS AT ROOT DOES NOT WORK YET, and the reason is written down rather than left to be
+discovered. `sudo -E cargo` does not work on this box (sudoers drops `-E`; root has no rustup
+toolchain), so the single `cargo test` call below is unrunnable as root. A root campaign must
+SPLIT what this conflates: apply the mutation, build UNPRIVILEGED, enumerate the binaries, run
+THOSE under sudo, parse, restore — `scratch/lane-run-7-procedure.md` §1-§4 with a mutation
+wrapped around it. Artifact writes must stay unprivileged, and the recorded euid must be the
+TESTS', not the harness's. Until that exists, **every result here is an unprivileged result**
+and the root-gated tests are not exercised at all.
 
 Usage:  scripts/mutation-campaign.py [--out DIR]
 """
@@ -53,7 +52,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,8 +60,29 @@ import time
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SRC = REPO / "runtime" / "src"
 
-# (label, file, anchor, replacement). The anchor must appear VERBATIM in the current source;
-# if it does not, the experiment is invalid and says so rather than reporting a result.
+# D0A-R29-03: everything whose modification could change a campaign's outcome. `runtime/src`
+# alone was not enough — an edited integration test, manifest or lockfile changes the result
+# while the metadata still attributes it to the recorded commit.
+INPUT_PATHS = [
+    "runtime/", "Cargo.toml", "Cargo.lock", ".cargo/", "delphi-hardening/",
+    # The harness itself. A campaign run from an uncommitted harness is no more reproducible
+    # than one run from an uncommitted tree — the same argument, applied to the instrument.
+    "scripts/mutation-campaign.py",
+]
+
+# Markers that mean the suite did not get to judge the mutation. A nonzero exit carrying any of
+# these is INFRASTRUCTURE, never a detection (D0A-R29-02).
+INFRA_MARKERS = (
+    "No space left on device",
+    "could not compile",
+    "error: linking with",
+    "Killed",
+    "Cannot allocate memory",
+    "Resource temporarily unavailable",
+    "error: could not execute process",
+    "Text file busy",
+)
+
 MUTATIONS: list[tuple[str, str, str, str]] = [
     ("argv: drop everything after argv[0]", "execute.rs",
      "    for arg in action.argv.iter().skip(1) {",
@@ -114,8 +133,57 @@ def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, **kw)
 
 
-def tree_is_clean() -> bool:
-    return sh(["git", "status", "--porcelain", "--", "runtime/src"]).stdout.strip() == ""
+def inputs_are_clean() -> tuple[bool, str]:
+    """D0A-R29-03: every input that could change the outcome, not just `runtime/src`."""
+    p = sh(["git", "status", "--porcelain", "--"] + INPUT_PATHS)
+    if p.returncode != 0:                     # a failed git command is not "clean"
+        return False, f"git status failed: {p.stderr.strip()}"
+    return p.stdout.strip() == "", p.stdout.strip()
+
+
+def file_matches_head(rel: str) -> bool:
+    """D0A-R29-01: VERIFY the restore rather than trusting the write.
+
+    A partial restore leaves a security check removed and reports success just as loudly as a
+    complete one, so the check is against the committed blob, not against our own bookkeeping.
+    """
+    return sh(["git", "diff", "--quiet", "HEAD", "--", rel]).returncode == 0
+
+
+def run_suite() -> tuple[str, dict]:
+    """Run the suite and CLASSIFY the outcome (D0A-R29-02).
+
+    Returns (outcome, evidence). A nonzero exit is not automatically a detection: a build
+    failure, a launch failure or a full disk all exit nonzero and none of them is a test
+    judging the mutation.
+    """
+    p = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests"])
+    ev = {
+        "exit": p.returncode,
+        "stdout": p.stdout,           # RETAINED WHOLE — the previous version kept a filtered
+        "stderr": p.stderr,           # excerpt and experiment 9's came out empty.
+    }
+    result_lines = re.findall(r"^test result: (\w+)\.", p.stdout, re.M)
+    ev["result_lines"] = len(result_lines)
+    ev["failing_tests"] = sorted(set(
+        re.findall(r"^\s{4}(\S+)$", p.stdout[p.stdout.find("failures:"):], re.M)
+    )) if "failures:" in p.stdout else []
+
+    blob = p.stdout + p.stderr
+    infra = [m for m in INFRA_MARKERS if m in blob]
+    if infra:
+        ev["infra_markers"] = infra
+        return "INFRASTRUCTURE", ev
+    if ev["result_lines"] == 0:
+        # Nothing reported a result: the suite did not get to judge anything.
+        return "INFRASTRUCTURE", ev
+    if p.returncode == 0:
+        return "NOT CAUGHT", ev
+    if not ev["failing_tests"]:
+        # Nonzero, tests ran, but no named failure — a crash or signal. It MAY be
+        # mutation-induced; it is not a test detecting the mutation, and it needs attribution.
+        return "UNATTRIBUTED FAILURE", ev
+    return "CAUGHT", ev
 
 
 def main() -> int:
@@ -123,90 +191,121 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     out = pathlib.Path(args.out or tempfile.mkdtemp(prefix="delphi-mutation-"))
-    out.mkdir(parents=True, exist_ok=True)
+    (out / "logs").mkdir(parents=True, exist_ok=True)
 
-    if not tree_is_clean():
-        print("REFUSE: runtime/src is dirty. A campaign that starts from uncommitted changes "
-              "cannot attribute a result to the mutation.", file=sys.stderr)
+    clean, dirt = inputs_are_clean()
+    if not clean:
+        print("REFUSE: campaign inputs are dirty. A campaign that starts from uncommitted "
+              "changes cannot attribute a result to its mutation.\n" + dirt, file=sys.stderr)
         return 2
 
-    euid = os.geteuid()
+    head = sh(["git", "rev-parse", "HEAD"]).stdout.strip()
     lane = {
-        "euid": euid,
-        "privileged": euid == 0,
-        "commit": sh(["git", "rev-parse", "HEAD"]).stdout.strip(),
+        "euid": os.geteuid(),
+        "privileged": os.geteuid() == 0,
+        "commit": head,
         "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "cargo": sh(["cargo", "--version"]).stdout.strip(),
+        "rustc": sh(["rustc", "--version"]).stdout.strip(),
+        "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR", "(unset — cargo default)"),
+        "inputs_checked": INPUT_PATHS,
     }
     (out / "lane.json").write_text(json.dumps(lane, indent=2) + "\n")
 
+    # D0A-R29-03: THE BASELINE. Without it, "the mutation caused these failures" is an
+    # inference from one observation. A red baseline invalidates the whole campaign.
+    print("baseline (unmutated) ...", end=" ", flush=True)
+    base_outcome, base_ev = run_suite()
+    (out / "logs" / "baseline.stdout").write_text(base_ev["stdout"])
+    (out / "logs" / "baseline.stderr").write_text(base_ev["stderr"])
+    (out / "baseline.json").write_text(json.dumps(
+        {k: v for k, v in base_ev.items() if k not in ("stdout", "stderr")}, indent=2) + "\n")
+    print(base_outcome, f"({base_ev['result_lines']} result lines)")
+    if base_outcome != "NOT CAUGHT":
+        print("REFUSE: the UNMUTATED suite is not green. Every result would be "
+              "unattributable.", file=sys.stderr)
+        return 2
+    baseline_targets = base_ev["result_lines"]
+
+    jsonl = (out / "results.jsonl").open("w")
     results = []
+    fatal = None
+
     for i, (label, fname, anchor, repl) in enumerate(MUTATIONS, 1):
+        rel = f"runtime/src/{fname}"
         path = SRC / fname
         original = path.read_text()
-        rec: dict = {"n": i, "label": label, "file": fname}
+        rec: dict = {"n": i, "label": label, "file": fname, "commit": head}
 
         if anchor not in original:
-            # INVALID, not "NOT CAUGHT". A bare table cannot tell these apart and they mean
-            # opposite things.
             rec["outcome"] = "INVALID: anchor not found in current source"
             rec["anchor"] = anchor
-            results.append(rec)
-            print(f"[{i:2}/{len(MUTATIONS)}] {label:<52} INVALID (anchor not found)")
-            continue
+        else:
+            # D0A-R29-01: the mutate/restore pair is transactional. Anything raised between
+            # them — including KeyboardInterrupt — still restores.
+            try:
+                path.write_text(original.replace(anchor, repl, 1))
+                rec["applied_diff"] = sh(["git", "diff", "--", rel]).stdout
+                build = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests",
+                            "--no-run"])
+                if build.returncode != 0:
+                    rec["outcome"] = "INVALID: mutant does not compile"
+                    rec["compile_stderr"] = build.stderr[-4000:]
+                else:
+                    rec["compiles"] = True
+                    outcome, ev = run_suite()
+                    (out / "logs" / f"{i:02d}.stdout").write_text(ev["stdout"])
+                    (out / "logs" / f"{i:02d}.stderr").write_text(ev["stderr"])
+                    rec["outcome"] = outcome
+                    rec["result_lines"] = ev["result_lines"]
+                    rec["failing_tests"] = ev["failing_tests"]
+                    rec["suite_exit"] = ev["exit"]
+                    if "infra_markers" in ev:
+                        rec["infra_markers"] = ev["infra_markers"]
+                    # Evidence the relevant tests actually RAN: a mutant that silently reduces
+                    # the reporting target count is not a clean detection.
+                    if ev["result_lines"] != baseline_targets:
+                        rec["target_count_drift"] = {
+                            "baseline": baseline_targets, "mutant": ev["result_lines"]}
+            finally:
+                path.write_text(original)
+                rec["restored_verified"] = file_matches_head(rel)
 
-        path.write_text(original.replace(anchor, repl, 1))
-        rec["applied_diff"] = sh(["git", "diff", "--", f"runtime/src/{fname}"]).stdout
-
-        build = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests", "--no-run", "-q"])
-        if build.returncode != 0:
-            rec["outcome"] = "INVALID: mutant does not compile"
-            rec["compile_stderr"] = build.stderr[-4000:]
-            path.write_text(original)
-            rec["restored"] = tree_is_clean()
-            results.append(rec)
-            print(f"[{i:2}/{len(MUTATIONS)}] {label:<52} INVALID (compile error)")
-            continue
-
-        rec["compiles"] = True
-        run = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests", "-q"])
-        rec["suite_exit"] = run.returncode
-        rec["outcome"] = "CAUGHT" if run.returncode != 0 else "NOT CAUGHT"
-        fails = re.findall(r"^\s{4}(\S+)$", run.stdout[run.stdout.find("failures:"):], re.M) \
-            if "failures:" in run.stdout else []
-        rec["failing_tests"] = sorted(set(fails))
-        # The assertion text is what makes a CAUGHT checkable — a test name alone does not say
-        # the test failed for the reason it names.
-        rec["assertion_excerpt"] = "\n".join(
-            l for l in run.stdout.splitlines() if "assertion" in l or "RED:" in l
-        )[:2000]
-
-        path.write_text(original)
-        rec["restored"] = tree_is_clean()
-        if not rec["restored"]:
-            print("REFUSE: tree not restored after mutation; stopping.", file=sys.stderr)
-            results.append(rec)
-            break
+            if not rec["restored_verified"]:
+                # FATAL, and it must not be possible to exit 0 from here (D0A-R29-01).
+                rec["outcome"] = "FATAL: restore not verified against HEAD"
+                fatal = rec
 
         results.append(rec)
-        print(f"[{i:2}/{len(MUTATIONS)}] {label:<52} {rec['outcome']:<11} "
-              f"{','.join(rec['failing_tests'][:2])[:40]}")
+        jsonl.write(json.dumps(rec) + "\n")
+        jsonl.flush()                     # incremental: an interrupt keeps what completed
+        os.fsync(jsonl.fileno())
+        print(f"[{i:2}/{len(MUTATIONS)}] {label:<52} {rec['outcome']:<22} "
+              f"{','.join(rec.get('failing_tests', []))[:36]}")
+        if fatal:
+            print(f"ABORT: {rel} does not match HEAD after restore. The tree may be carrying a "
+                  f"REMOVED SECURITY CHECK. Run: git checkout -- {rel}", file=sys.stderr)
+            break
 
-    (out / "results.json").write_text(json.dumps({"lane": lane, "results": results}, indent=2) + "\n")
+    jsonl.close()
+    (out / "results.json").write_text(json.dumps(
+        {"lane": lane, "baseline_targets": baseline_targets, "results": results}, indent=2) + "\n")
 
-    valid = [r for r in results if r["outcome"] in ("CAUGHT", "NOT CAUGHT")]
-    invalid = [r for r in results if r["outcome"].startswith("INVALID")]
+    by = {}
+    for r in results:
+        by[r["outcome"].split(":")[0]] = by.get(r["outcome"].split(":")[0], 0) + 1
     print(f"\nartifacts: {out}")
-    print(f"valid experiments: {len(valid)}/{len(MUTATIONS)}   invalid: {len(invalid)}")
-    print(f"lane: euid={euid} ({'ROOT' if euid == 0 else 'unprivileged'}) — "
-          f"claims about other privilege levels are NOT supported by this run")
-    if euid != 0:
+    print("outcomes:", ", ".join(f"{k}={v}" for k, v in sorted(by.items())))
+    print(f"lane: euid={lane['euid']} "
+          f"({'ROOT' if lane['privileged'] else 'unprivileged'}) — claims about other privilege "
+          f"levels are NOT supported by this run")
+    if not lane["privileged"]:
         print("      root-gated tests were NOT exercised; see the module docstring for what a "
-              "root campaign would require (build unprivileged, run the binaries under sudo)")
-    if invalid:
-        print("INVALID experiments (no result may be reported for these):")
-        for r in invalid:
-            print(f"  - {r['label']}: {r['outcome']}")
-    return 1 if invalid else 0
+              "root campaign would require")
+    if fatal:
+        return 3
+    return 1 if any(r["outcome"].startswith(("INVALID", "INFRASTRUCTURE", "UNATTRIBUTED"))
+                    for r in results) else 0
 
 
 if __name__ == "__main__":

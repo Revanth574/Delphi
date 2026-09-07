@@ -1,111 +1,111 @@
-# PREDICTION for ROOT lane run 17, committed ALONE and BEFORE the run.
+# PREDICTION for ROOT lane run 18, committed ALONE and BEFORE the run.
 #
 # STEP -1 of `scratch/lane-run-7-procedure.md`. The derivation is written out so it is
-# checkable independently of whether the number matches. Not decorative: R19-06, R20-07 and
-# D0A-R26-06 are three runs whose FIGURE was right and whose EXPLANATION was wrong — the last
-# of them in this file. A matching number is not evidence the reasoning was sound.
+# checkable independently of whether the number matches. R19-06, R20-07 and D0A-R26-06 are
+# three runs whose FIGURE was right and whose EXPLANATION was wrong — the last in this file.
 #
-# ORDERING IS CONVENTION, NOT MECHANISM (D0A-R22-01, reopened). Held for runs 13-16.
+# ORDERING IS CONVENTION, NOT MECHANISM (D0A-R22-01, reopened). Held for runs 13-17.
+#
+# =========================================================================================
+# THIS RUN'S PREDICTION IS THE SAME NUMBER AS RUN 17'S MEASUREMENT. READ THAT CAREFULLY.
+# =========================================================================================
+#
+#   EXPECTED 208 / 5 / 213   — IDENTICAL to run 17's measured 208 / 5 / 213.
+#
+# **So the count check has nothing to detect this round, and a matching number is nearly
+# uninformative.** The round-29 remediation changed CODE and added no tests: R29-04 RENAMED a
+# test rather than adding one, and R29-05, R29-06 and R29-08 are code fixes with no tests at
+# all. A green 208 therefore says the suite still passes on changed code — which is worth
+# having — and says nothing whatever about whether the changed code is covered.
+#
+# THE MEMBERSHIP CHECK HAS EXACTLY ONE THING TO SEE, and it is nameable in advance. Measured
+# by diffing `--list` at HEAD against run 17's log (both 213 identities):
+#
+#   in HEAD, not run 17:  wire::tests::read_frame_applies_no_deadline_to_a_cooperating_peer
+#   in run 17, not HEAD:  wire::tests::read_frame_does_not_bound_a_wait_on_a_cooperating_peer
+#
+# One rename, both directions, nothing else. **Within run 18 itself** the root log and the
+# unprivileged `--list` are taken from the same tree, so §4b must show 213 each side and ZERO
+# in either direction; the rename is a CROSS-RUN observation, recorded here so it is not
+# mistaken for a within-run mismatch.
 #
 # ---------------------------------------------------------------------------------------
-# WHY RUN 17 IS OWED
+# WHY RUN 18 IS OWED: THE CODE MOVED EVEN THOUGH THE COUNT DID NOT
 #
-# Run 16 was clean, and it was the first run whose membership was proven by identity. But it
-# ran at `09dc36b`, BEFORE the round-28 remediation, and none of this has executed at root:
-#   * `read_frame` / `read_frame_untrusted` SPLIT (D0A-R28-01) — the deadline moved out of the
-#     shared reader, where it had capped human consent at 30 s, to the daemon's call site.
-#   * the BOUNDED DAEMON EXIT (D0A-R28-02) — `reap_within` + grace + SIGKILL, replacing an
-#     unconditional `waitpid` on the untrusted AI. **This one is root-relevant in a way the
-#     others are not: it is in `delphi-runtimed`, whose only root exercise is
-#     `b1_daemon_binary_runs_the_assembled_flow` — which SKIPS on this lane.**
-#   * the acceptance-time deadline check (D0A-R28-03).
-#   * the program-fd seal regression tests (D0A-R28-06).
-#   * three digest-binding tests (env names, pending_id, timeout).
+#   * R29-04 — `read_frame` now takes its deadline from `client_deadline_policy()`. The
+#     production wrapper changed shape.
+#   * R29-05 — the daemon's exit path now tracks per-child terminal state, keeps the guard
+#     ARMED on cleanup failure, and RETURNS AN ERROR instead of success. **This changes what
+#     `delphi-runtimed` does on exit**, at root, where children are real.
+#   * R29-06 — `ChildGuard::reap_status` retries EINTR and disarms only after a terminal
+#     status. It guards forked children in root tests; its failure mode was a HUNG HARNESS.
+#   * R29-08 — `check-free-space.sh` now resolves cargo's target dir via `cargo metadata`.
+#     §0 of the procedure exercises it directly.
+#
+# ---------------------------------------------------------------------------------------
+# WHAT A GREEN RUN 18 WILL NOT ESTABLISH — stated BEFORE the run, because a green at 208 will
+# otherwise read as covering these. That over-read is exactly what the `b1_daemon_binary` skip
+# produced last round, and it is being pre-empted rather than corrected afterwards.
+#
+# 1. **R29-05 AND R29-06 SHIPPED WITHOUT TESTS OF THEIR OWN.** Recorded as owed, not counted.
+#    - R29-05's new path (a child unreaped after SIGKILL → guard stays armed → daemon returns
+#      an error) requires a child in uninterruptible sleep. **Nothing constructs one.**
+#    - R29-06's new path (EINTR during `waitpid` → retry) requires a signal delivered inside
+#      the wait window. **Nothing delivers one.** The reviewer reproduced it with a
+#      signal-injection probe; that probe is theirs, not in this tree.
+#    So both fixes will be *compiled and linked* by run 18 and *exercised* by nothing.
+#
+# 2. **R28-02'S COVERAGE GAP IS OPEN FOR A SECOND CONSECUTIVE ROUND.** The bounded daemon exit
+#    is still the most root-relevant change in the arc and still unexercised at root:
+#    `b1_daemon_binary_runs_the_assembled_flow` SKIPS here for want of
+#    `--features insecure-test-seams`, and even unskipped `delphi-minimal-ai` cooperates, so
+#    the SIGKILL branch is never taken. R29-05 has now MODIFIED that same untested path.
+#    **A change to untested code does not become tested by being changed.**
+#    The reviewer's answer, owed: extract the exit sequence so `main` calls the EXTRACTED
+#    implementation rather than a duplicate, covering a cooperating child (status preserved),
+#    a child synchronised past grace expiry, interrupted waits, signalling failure, post-kill
+#    reap timeout, already-reaped children, and each child independently — then assembly
+#    coverage that the daemon invokes the policy after terminal outcomes.
+#
+# 3. THE MUTATION CAMPAIGN IS UNPRIVILEGED-ONLY (`euid=1000`). Nothing in a lane run is a
+#    campaign. The five root-gated tests have never been mutation-tested.
+#
+# 4. THE SUSPEND DIVERGENCE is unmeasured; the clock test prints its own delta and says so.
+#
+# 5. `action.timeout` IS ENFORCED NOWHERE (R9-04); round 28 closed its digest binding only.
 #
 # ---------------------------------------------------------------------------------------
 # DERIVATION
 #
-# Base: run 16 measured EXECUTED 200 / SKIPPED 5 / reported 205 at root, membership proven by
-#       identity (205 pairs each side, zero in either direction).
+# Base: run 17 measured EXECUTED 208 / SKIPPED 5 / reported 213, membership proven by identity.
 #       Current unprivileged pair: EXECUTED 188 / SKIPPED 25 / reported 213 (measured
-#       2026-09-07 at 0cd1a34, re-measured by the pre-commit hook across all 17 targets).
+#       2026-09-07 at 93124b0, re-measured by the pre-commit hook across all 17 targets).
 #
-# Delta since run 16: the round-28 remediation added EIGHT tests and removed none. Each was
-# checked for root-gating BY GREP of its body — geteuid, a SKIP branch, a bwrap_available
-# guard, a path-existence branch:
+# Delta since run 17: **ZERO tests added or removed**; one rename (above). No test changed its
+# root-gating: no `geteuid` check, `SKIP` branch or `bwrap_available` guard was added or
+# removed by the round-29 remediation — verified by grepping the diff for those tokens.
 #
-#   wire.rs     read_frame_does_not_bound_a_wait_on_a_cooperating_peer       no gate
-#   wire.rs     a_frame_whose_last_byte_arrives_after_the_deadline_is_...    no gate
-#   execute.rs  an_unsealed_program_fd_is_refused_even_when_its_digest_...   no gate
-#   execute.rs  a_partially_sealed_program_fd_is_refused                     no gate
-#   execute.rs  a_fully_sealed_program_fd_passes_the_seal_check              no gate
-#   action.rs   the_digest_binds_environment_variable_names_not_only_...     no gate
-#   action.rs   the_digest_binds_the_pending_id_so_a_token_cannot_cross_...  no gate
-#   action.rs   the_digest_binds_the_timeout_even_though_nothing_enforces... no gate
-#
-# So:  200 + 8 = 208 EXECUTED, skip set unchanged at 5, reported 213.
-#
-# THREE OF THE EIGHT CALL `execute_approved`, so their ROOT behaviour differs from their
-# unprivileged behaviour — and the derivation has to say why the counts still hold:
-#   * the two REFUSAL tests assert `Err(UnsealedScript)`, and the seal check runs BEFORE any
-#     spawn or credential drop. Root cannot reach a different verdict.
-#   * `a_fully_sealed_program_fd_passes_the_seal_check` asserts only that the failure is NOT
-#     the seal error. At root the action proceeds further (real credential drop, real bwrap)
-#     and may end Ok or Err for sandbox reasons — **both satisfy a negative assertion**, which
-#     is exactly why it was written negatively.
-#
-# CONSISTENCY CHECK: unprivileged 188 + 25 = 213; root 208 + 5 = 213.
-# **AND THE EQUALITY IS NOT THE EVIDENCE (D0A-R27-04).** §4b compares `(target, test-name)`
-# identities as counters. Run 16 established that check on a tree where nothing had changed;
-# **run 17 is the first where it could actually detect something**, because eight tests were
-# added between the runs. Expect 213 identities each side and zero in either direction — and if
-# a delta appears, it must be nameable as exactly these eight, by name, not by count.
-#
-# Root and unprivileged remain OVERLAPPING SETS: three of the five root skips execute
-# unprivileged. 208 > 188 is NOT a coverage claim.
+# So: 208 EXECUTED, skip set unchanged at 5, reported 213.
+#   unprivileged  188 + 25 = 213
+#   root          208 +  5 = 213
+# Equal totals are NOT the evidence (D0A-R27-04); §4b's identity comparison is.
 #
 # ---------------------------------------------------------------------------------------
-# TIMING TOLERANCES — named in advance so a failure is DIAGNOSED, not re-run
+# TIMING TOLERANCES — carried forward, and one is now WEAKER on purpose
 #
-# TWO of the eight are timing-dependent, both in `wire.rs`:
-#   read_frame_does_not_bound_...     a 900 ms writer delay; asserts the read SUCCEEDS
-#   a_frame_whose_last_byte_...       80 ms deadline, final byte at ~150 ms; asserts REFUSAL
+#   read_frame_applies_no_deadline_...  its load-bearing assertion is now on the POLICY
+#                                       (`client_deadline_policy().is_none()`), which has NO
+#                                       timing dependence at all. Its 900 ms behavioural half
+#                                       remains and is the only part load can affect —
+#                                       deliberately, because D0A-R29-04 found that a timing
+#                                       assertion could only catch bounds shorter than its own
+#                                       sleep, and the real one was 30 s.
+#   a_frame_whose_last_byte_...         80 ms deadline, final byte ~150 ms; asserts REFUSAL
+#   a_stalled_ / a_trickling_           400 ms absolute deadline, `elapsed < 5 s`
+#   boot_secs_agrees_...                1 s sampling gap
 #
-# **These two fail in OPPOSITE directions under load, which is what makes them a pair.** A slow
-# machine cannot make both pass by accident: the first needs a wait NOT to be cut short, the
-# second needs a deadline to fire. If only one fails, read which — it says whether the deadline
-# is too eager or not eager enough. If BOTH fail, suspect the harness (Iron Law #15 clause 5),
-# and DEMONSTRATE that rather than assuming it.
-#
-# Carrying from run 16's list: `boot_secs_agrees_…` (1 s sampling gap) and the two round-27
-# deadline tests (400 ms absolute, `elapsed < 5 s`).
-#
-# ---------------------------------------------------------------------------------------
-# THE MUTATION CAMPAIGN IS AN UNPRIVILEGED RESULT, AND THIS RUN DOES NOT CHANGE THAT
-#
-# `scripts/mutation-campaign.py` produced 14/14 valid experiments at `3593fa8` with
-# `euid=1000` recorded. **A green run 17 does not extend those results to root**, and nothing
-# in this lane run is a mutation campaign. The harness's own docstring now records what a root
-# campaign would require — build unprivileged, run the binaries under sudo, keep artifact
-# writes unprivileged, record the TESTS' euid rather than the harness's — so that gap is
-# written down rather than waiting to be discovered by someone assuming the unprivileged table
-# covers root.
-#
-# Concretely: the five root-gated tests have never been mutation-tested at all, and one of them
-# (`b1_daemon_binary_runs_the_assembled_flow`) is the ONLY exercise of the code R28-02 changed.
-#
-# ---------------------------------------------------------------------------------------
-# WHAT A GREEN RUN 17 WILL NOT ESTABLISH
-#
-# 1. R28-02's bounded exit is barely exercised. Its code lives in `delphi-runtimed`, whose only
-#    root test SKIPS on this lane for want of `--features insecure-test-seams`. A green run 17
-#    says almost nothing about it; the unprivileged suite says nothing at all.
-# 2. THE SUSPEND DIVERGENCE. Unmeasured; the clock test prints its own delta and states it
-#    cannot distinguish the clocks here.
-# 3. THE PENDING STORE HAS NO CAP, and the ABANDONED READ WORKER is unbounded for repeated
-#    service — 30 s is an engineering choice, not a demonstrated bound.
-# 4. `action.timeout` IS ENFORCED NOWHERE (R9-04). Round 28 closed its digest BINDING only, and
-#    the test name says so.
+# The stall/trickle pair still fail in opposite directions under load, so a slow machine cannot
+# make both pass by accident.
 #
 # ---------------------------------------------------------------------------------------
 # A MISMATCH IS A RESULT. Record which side was wrong. Do not adjust this derivation until it

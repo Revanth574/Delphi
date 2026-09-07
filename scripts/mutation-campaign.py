@@ -22,8 +22,28 @@ this records:
 A PATCH-MISS or a compile error is an INVALID EXPERIMENT, reported as such and never as
 "NOT CAUGHT" — the two are indistinguishable in a bare table and opposite in meaning.
 
+RUNNING THIS AT ROOT DOES NOT WORK YET, AND THE REASON IS WORTH WRITING DOWN RATHER THAN
+DISCOVERING (D0A-R28-05 follow-on). The artifacts record `euid` and state that other privilege
+levels are unsupported, which stops a reader assuming the unprivileged table covers root. But
+`sudo -E scripts/mutation-campaign.py` will NOT produce a root campaign, for the same reason the
+lane procedure builds unprivileged and then execs the binaries under sudo:
+
+  * `sudo -E cargo` does not work on this box — sudoers drops `-E`, and root has no rustup
+    toolchain. The single `cargo test` call below is therefore unrunnable as root.
+  * So a root campaign has to SPLIT what this conflates: apply the mutation, **build
+    unprivileged**, enumerate the test binaries, **run those binaries under sudo**, parse, then
+    restore. That is `scratch/lane-run-7-procedure.md` §1-§4 with a mutation wrapped around it.
+  * `git status` and every artifact write must stay UNPRIVILEGED. A campaign run as root leaves
+    root-owned artifacts and can leave root-owned files in the tree, which then fails the
+    dirty-tree guard in a way that looks like a different problem.
+  * The `euid` recorded here is the HARNESS's. A split campaign must record the euid the TESTS
+    ran at, which would differ from the harness's — conflating them is exactly the kind of
+    unchecked provenance this file exists to prevent.
+
+Until that split exists, **every result from this harness is an unprivileged result**, and the
+root-gated tests (5 on this lane) are not exercised by it at all.
+
 Usage:  scripts/mutation-campaign.py [--out DIR]
-        sudo -E scripts/mutation-campaign.py --out DIR   (to make the privilege claim at root)
 """
 
 from __future__ import annotations
@@ -179,6 +199,9 @@ def main() -> int:
     print(f"valid experiments: {len(valid)}/{len(MUTATIONS)}   invalid: {len(invalid)}")
     print(f"lane: euid={euid} ({'ROOT' if euid == 0 else 'unprivileged'}) — "
           f"claims about other privilege levels are NOT supported by this run")
+    if euid != 0:
+        print("      root-gated tests were NOT exercised; see the module docstring for what a "
+              "root campaign would require (build unprivileged, run the binaries under sudo)")
     if invalid:
         print("INVALID experiments (no result may be reported for these):")
         for r in invalid:

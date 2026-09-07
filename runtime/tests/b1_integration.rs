@@ -1671,44 +1671,61 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
+    // WHICH STREAM CARRIES WHAT, measured rather than assumed — the first run of this test
+    // failed on exactly this. `tracing_subscriber::fmt()` writes to **stdout** by default
+    // (`delphi-runtimed.rs`), so every `tracing::{error,warn}!` the daemon emits — the seam
+    // report and the shutdown attribution — lands there. The FIXTURES use `eprintln!`, so
+    // their lines land on **stderr**. Asserting the daemon's own logging against stderr looked
+    // reasonable and could never match.
+    let daemon_log = stdout.as_ref();
+    let fixture_log = stderr.as_ref();
+
     // (4) THE PROPERTY. A kill at the deadline means the daemon did not bound its own wait —
     // which is exactly what an unbounded `waitpid` on a stubborn AI produces.
     assert!(
         !killed,
         "the daemon had to be KILLED at the deadline — it did not bound its wait on an AI that \
-         completed the protocol and stayed alive (D0A-R28-02).\nstderr:\n{stderr}"
+         completed the protocol and stayed alive (D0A-R28-02).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // (1) The bypass reported itself, so the outcome is tied to the mechanism.
+    // (1) The bypass reported itself, so the outcome is tied to the mechanism. DAEMON stream.
     assert!(
-        stderr.contains("INSECURE TEST SEAM ACTIVE"),
+        daemon_log.contains("INSECURE TEST SEAM ACTIVE"),
         "the daemon did not report the gate bypass engaging — without that this is outcome \
-         coverage, not assembly coverage.\nstderr:\n{stderr}"
+         coverage, not assembly coverage.\nstdout:\n{stdout}"
     );
-    // (3) The AI reached the stubborn state. If it died early, everything else is vacuous.
+    // (3) The AI reached the stubborn state. FIXTURE stream. If it died early, the rest is
+    // vacuous — the daemon would have had a cooperating child after all.
     assert!(
-        stderr.contains("STUBBORN: terminal response acknowledged, NOT exiting"),
+        fixture_log.contains("STUBBORN: terminal response acknowledged, NOT exiting"),
         "the AI never reached the stubborn state, so the daemon's clean exit proves \
          nothing.\nstderr:\n{stderr}"
     );
     assert!(
-        !stderr.contains("without being killed — the daemon did NOT bound its wait"),
+        !fixture_log.contains("without being killed — the daemon did NOT bound its wait"),
         "the stubborn AI slept to completion — it was never terminated.\nstderr:\n{stderr}"
     );
     // (2) A specific terminal outcome, not merely "it ended".
     assert!(
         stdout.contains("DELPHI_RUNTIMED_OUTCOME Completed"),
-        "expected a Completed terminal outcome.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "expected a Completed terminal outcome.\nstdout:\n{stdout}"
     );
-    // (4, cont.) Termination attributed to the AI by name, and the shell cleaned up too.
+    // (4, cont.) Termination attributed to the AI BY NAME. DAEMON stream. This is what
+    // distinguishes "bounded the right child" from "exited somehow".
     assert!(
-        stderr.contains("child did not exit within the grace period") && stderr.contains("ai"),
-        "the daemon did not attribute the grace-period termination to the AI — the log is what \
-         distinguishes 'bounded the right child' from 'exited somehow'.\nstderr:\n{stderr}"
+        daemon_log.contains("child did not exit within the grace period"),
+        "the daemon did not log a grace-period termination at all.\nstdout:\n{stdout}"
+    );
+    assert!(
+        daemon_log.lines().any(|l| {
+            l.contains("child did not exit within the grace period") && l.contains("ai")
+        }),
+        "a grace-period termination was logged but not attributed to the AI on the same \
+         line.\nstdout:\n{stdout}"
     );
     assert!(
         out.status.success(),
         "the daemon reported a cleanup failure; a terminated-and-reaped child is CLEAN \
-         cleanup (D0A-R29-05).\nstderr:\n{stderr}"
+         cleanup (D0A-R29-05).\nstdout:\n{stdout}"
     );
     // The action still ran: bounding the AI must not break the flow it was serving.
     let marker = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();

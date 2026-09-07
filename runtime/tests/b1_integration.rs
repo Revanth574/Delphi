@@ -1593,6 +1593,128 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
+/// **D0A-R30 decision A — ASSEMBLY COVERAGE for the bounded daemon exit (D0A-R28-02).**
+///
+/// # What this proves that the extraction's unit tests cannot
+///
+/// `runtime/src/shutdown.rs` proves the POLICY is correct. `the_daemon_delegates_shutdown_and_
+/// does_not_reap_by_hand` proves `main` CONTAINS a call to it — but that guard is an
+/// `include_str!` source read, so it proves the token is present, not that the branch is
+/// TAKEN. This test is the missing half: the daemon, running as the real binary, actually
+/// exercising the policy against an AI that refuses to exit.
+///
+/// # The five assertions, and why each is load-bearing
+///
+/// 1. **The bypass POSITIVELY REPORTED itself.** Without this the test is outcome coverage:
+///    an untrusted AI staying alive and a daemon exiting anyway could both be true for reasons
+///    unrelated to the fix. The report ties the outcome to the mechanism that produced it.
+/// 2. **A specific terminal outcome occurred** — `Completed`, not merely "the daemon ended".
+/// 3. **The AI acknowledged the terminal response AND remained alive past grace.** If it died
+///    early the daemon's clean exit means nothing, so this is checked from the AI's own stderr
+///    rather than assumed from the fixture's name.
+/// 4. **The daemon attributed termination to that AI, cleaned up the shell, and exited within
+///    the bound** — `!killed` is the whole property: `DaemonGuard` kills at its deadline, and a
+///    kill means the daemon did NOT bound its own wait.
+/// 5. **Removing the shutdown call makes this test fail.** It needs no special construction:
+///    with a stubborn AI and no bounded exit, `main` blocks in `waitpid` forever, the guard
+///    kills it at the deadline, and `!killed` fails. That is the RED the delegation guard could
+///    not provide, and it is why this test — not that one — is the assembly evidence.
+///
+/// **Scope, stated so a green cannot be over-read:** this runs a binary built with
+/// `insecure-test-seams`, whose logind gate is bypassable. It certifies the SHUTDOWN ASSEMBLY
+/// and **nothing about the production logind gate**, which remains blocked on a seated lane.
+/// Those are separate obligations and this closes only the first.
+#[test]
+fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
+    if !cfg!(feature = "insecure-test-seams") {
+        eprintln!(
+            "SKIP b1_daemon_bounds_an_ai...: requires `--features insecure-test-seams` (the \
+             gate-bypass seam AND the stubborn-AI fixture are both feature-gated). Run: \
+             `cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration`"
+        );
+        return;
+    }
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP b1_daemon_bounds_an_ai...: requires root");
+        return;
+    }
+    if !bwrap_available() {
+        eprintln!("SKIP b1_daemon_bounds_an_ai...: requires bwrap + unprivileged userns");
+        return;
+    }
+    let setup = Setup::new("stubborn");
+    let _stage_tmp = tempfile::Builder::new()
+        .prefix("delphi-r30asm-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("tempdir");
+    let stage = _stage_tmp.path().to_path_buf();
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &stage, "mshell");
+    // THE ONLY DIFFERENCE FROM b1_daemon_binary_runs_the_assembled_flow. Same protocol, same
+    // helpers; it just does not exit. Any behavioural difference is attributable to that.
+    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-stubborn-ai"), &stage, "sai");
+    let result = stage.join("result");
+    let exe = write_marker_exe(&stage, &result);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_delphi-runtimed"));
+    cmd.args(["--session", &setup.user])
+        .env("DELPHI_SHELL_BIN", &shell_bin)
+        .env("DELPHI_AI_BIN", &ai_bin)
+        .env(delphi_runtime::scaffold_env::PASSWORD, PASSWORD)
+        .env(delphi_runtime::scaffold_env::AI_EXE, &exe)
+        .env(delphi_runtime::scaffold_env::AI_ARG, "STUBBORN-FLOW")
+        .env(delphi_runtime::scaffold_env::AI_BIND_RW, &stage)
+        .env("DELPHI_SHELL_VT", "tty1")
+        .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1");
+
+    let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // (4) THE PROPERTY. A kill at the deadline means the daemon did not bound its own wait —
+    // which is exactly what an unbounded `waitpid` on a stubborn AI produces.
+    assert!(
+        !killed,
+        "the daemon had to be KILLED at the deadline — it did not bound its wait on an AI that \
+         completed the protocol and stayed alive (D0A-R28-02).\nstderr:\n{stderr}"
+    );
+    // (1) The bypass reported itself, so the outcome is tied to the mechanism.
+    assert!(
+        stderr.contains("INSECURE TEST SEAM ACTIVE"),
+        "the daemon did not report the gate bypass engaging — without that this is outcome \
+         coverage, not assembly coverage.\nstderr:\n{stderr}"
+    );
+    // (3) The AI reached the stubborn state. If it died early, everything else is vacuous.
+    assert!(
+        stderr.contains("STUBBORN: terminal response acknowledged, NOT exiting"),
+        "the AI never reached the stubborn state, so the daemon's clean exit proves \
+         nothing.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("without being killed — the daemon did NOT bound its wait"),
+        "the stubborn AI slept to completion — it was never terminated.\nstderr:\n{stderr}"
+    );
+    // (2) A specific terminal outcome, not merely "it ended".
+    assert!(
+        stdout.contains("DELPHI_RUNTIMED_OUTCOME Completed"),
+        "expected a Completed terminal outcome.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // (4, cont.) Termination attributed to the AI by name, and the shell cleaned up too.
+    assert!(
+        stderr.contains("child did not exit within the grace period") && stderr.contains("ai"),
+        "the daemon did not attribute the grace-period termination to the AI — the log is what \
+         distinguishes 'bounded the right child' from 'exited somehow'.\nstderr:\n{stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "the daemon reported a cleanup failure; a terminated-and-reaped child is CLEAN \
+         cleanup (D0A-R29-05).\nstderr:\n{stderr}"
+    );
+    // The action still ran: bounding the AI must not break the flow it was serving.
+    let marker = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();
+    assert_eq!(marker, "STUBBORN-FLOW", "the action did not execute via delphi-runtimed's main");
+}
+
 #[test]
 fn b1_daemon_binary_runs_the_assembled_flow() {
     // FEATURE PRECONDITION — this test runs the REAL daemon BINARY, whose production logind gate

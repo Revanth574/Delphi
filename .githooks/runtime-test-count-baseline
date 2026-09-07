@@ -216,5 +216,11 @@
 #   known dead and known reapable: `an_already_dead_childs_exit_code_survives_shutdown` and
 #   `a_child_that_died_of_a_signal_is_not_reported_as_a_clean_exit`. Both FAIL under the weaken.
 # SKIPPED unchanged.
+# 2026-09-07 (D0A-R30 decision A, assembly coverage): 198/25 -> 198/26. EXECUTED unchanged;
+#   SKIPPED +1. `b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive` needs BOTH
+#   `--features insecure-test-seams` AND root, so on the default lane it SKIPS — legibly, naming
+#   the exact command. **A SKIP IS NOT COVERAGE** (DEFECT_CLASSES 10): this test contributes
+#   nothing until run under both conditions, which no current lane does. That is the point of
+#   recording it here rather than counting it as progress.
 EXECUTED=198
-SKIPPED=25
+SKIPPED=26

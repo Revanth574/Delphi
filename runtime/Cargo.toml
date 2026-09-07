@@ -33,6 +33,13 @@ path = "src/bin/delphi-minimal-ai.rs"
 # D0A-R5-10: a DISTINCT path, so a non-feature build cannot clobber it. `required-features`
 # keeps it out of any production build entirely.
 [[bin]]
+# D0A-R30 decision A: the uncooperative AI. Feature-gated and never built in production — an
+# AI that ignores termination is a test instrument, not a component.
+name = "delphi-stubborn-ai"
+path = "src/bin/delphi-stubborn-ai.rs"
+required-features = ["insecure-test-seams"]
+
+[[bin]]
 name = "delphi-surface-shell"
 path = "src/bin/delphi-surface-shell.rs"
 required-features = ["insecure-test-seams"]

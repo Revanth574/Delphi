@@ -439,35 +439,40 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**CURRENT ROOT RECORD: LANE RUN 18** — `EXECUTED 208 / SKIPPED 5 / reported 213` at
-`3582db6`, predicted and matched exactly. **Identical counts to run 17, on a different tree** —
-the first time the figure and the tree have come apart, and the reason a lane record names its
-commit rather than its number.
+**CURRENT ROOT RECORD: LANE RUN 19** — `EXECUTED 216 / SKIPPED 5 / reported 221` at
+`c10810f`, predicted and matched exactly; membership 221 identities each side, zero in either
+direction. **The first root execution of the daemon's shutdown policy**, closing a gap that
+stood three rounds (D0A-R28-02 → R29-05 → run 18) in which the code was compiled, linked and
+run *past* rather than *through*. All eight `shutdown::tests` are quoted by name in the
+transcript.
 
-**The number is nearly uninformative this round, and the expectation said so BEFORE the run.**
-Round 29 changed code and added no tests (R29-04 renamed one; R29-05/06/08 are code fixes), so
-the count check had nothing to detect and the membership check had nothing new within the run.
-A green says the suite still passes on changed code; it says nothing about whether the changed
-code is covered.
+**Both predictions about what the run could show held, and both LIMIT the claim rather than
+extending it:**
 
-**What run 18 compiled and linked but did not exercise** — predicted, then confirmed:
-R29-05's unreaped-child path needs a child in uninterruptible sleep and nothing constructs one;
-R29-06's EINTR retry needs a signal inside the `waitpid` window and nothing delivers one. Both
-run past, never through. **And D0A-R28-02's gap is open for a SECOND consecutive round with
-R29-05 having now modified that same untested path — a change to untested code does not become
-tested by being changed.**
+- **The delegation guard passed at root and that adds nothing.** It uses `include_str!` — a
+  compile-time source read — so it executes no process and touches no privilege. What it
+  establishes in either lane is real (and it *caught* `ChildReaper::Drop` as a second copy on
+  its first run), but **nothing here shows `main`'s branch is TAKEN at root after a terminal
+  outcome.** That is assembly coverage, still owed; `b1_daemon_binary` still skips.
+- **The per-child attribution cases passed IDENTICALLY, which is not root COVERING them.** They
+  spawn and reap their own children, which needs no privilege, so sameness was the prediction
+  and is the expected outcome. Root's extra power is over processes that are *not* its children
+  — the case the test does not construct, and the case where the pid-1 fixture would have
+  mattered.
 
-### A claim of mine this run falsified
+**A safety change was made BEFORE this run, not after.** `a_pid_that_is_not_our_child` named
+**pid 1**; the kill is unreachable so it passed, but unprivileged a stray `kill(1, SIGKILL)` is
+`EPERM` and **at root it is init**. Changed to `pid_max` at `0cf555e`. The extraction had
+already produced one reachable `kill(Pid::from_raw(0), SIGKILL)` — it SIGKILLed the test runner
+— so the reasoning that called the kill unreachable had just been demonstrated fallible. **A
+test should not stake a machine on its own correctness.**
 
-I reported the lane consumes **~0.5 GiB per run** and raised it as an operational item in the
-round-29 prompt. Readings: run 16 `3903M`, run 17 `3397M` (−506M), **run 18 `3377M` (−20M)**.
+**The corrected disk model held a second time:** run 17 `3397M` → run 18 `3377M` (−20M) → run 19
+`3375M` (**−2M**). The "~0.5 GiB per lane run" figure rested on a −506M reading that spanned
+fourteen mutation-campaign rebuilds. Lane runs are cheap; campaigns are the expensive operation.
 
-**Run 18 consumed 20M.** The −506M spanned the round-28 work including **fourteen full rebuilds
-from the mutation campaign** — I attributed campaign cost to lane runs from two readings. The
-reviewer had said precisely this at R29 (*"two free-space readings do not isolate per-lane
-consumption from intervening builds and mutation campaigns"*); I recorded the caution and
-carried the figure forward anyway. **Measure peak demand by OPERATION, not by wall-clock between
-runs** — a campaign is 14 mutants × a full rebuild and is the expensive one.
+**Run 18 is SUPERSEDED** (`208/5/213`, `3582db6`): sound, superseded because run 19 covers eight
+more tests.
 
 **Run 17 is SUPERSEDED on TREE, not on figure** (`208/5/213`, `c3cca14`): sound, and its counts
 are still correct — it simply predates the round-29 code changes.

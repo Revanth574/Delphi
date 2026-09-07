@@ -1,72 +1,71 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 18 — the round-29 remediation's first root execution. Measured 2026-09-07 at
-# `3582db6`.
+# LANE RUN 19 — **the first root execution of the daemon's shutdown policy.** Measured
+# 2026-09-07 at `c10810f`.
 #
-#   EXECUTED 208 / SKIPPED 5 / reported 213     extractor rc=0
+#   EXECUTED 216 / SKIPPED 5 / reported 221     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
-#   predicted 208/5/213 at 3582db6, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#   predicted 216/5/221 at c10810f, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#   membership: root 221 identities / unpriv 221, ZERO in either direction, rc 0
+#
+# All eight `shutdown::tests` ran at root and are quoted by name in the transcript:
+#   a_child_that_outlives_the_grace_period_is_killed_and_reaped              ok
+#   a_cooperating_child_is_reaped_within_grace_with_its_status_preserved     ok
+#   a_pid_that_is_not_our_child_terminates_the_policy_promptly               ok
+#   an_already_reaped_child_is_reported_gone_without_waiting                 ok
+#   children_are_shut_down_independently_and_each_outcome_is_attributed      ok
+#   non_positive_pids_are_refused_rather_than_signalling_a_group             ok
+#   only_an_unreaped_child_counts_as_failed_cleanup                          ok
+#   the_daemon_delegates_shutdown_and_does_not_reap_by_hand                  ok
+#
+# That closes a gap that stood for THREE rounds (D0A-R28-02 → R29-05 → run 18), in which the
+# policy was compiled, linked, and run PAST rather than THROUGH.
 #
 # =========================================================================================
-# READ THIS BEFORE READING THE NUMBER: **THE NUMBER IS NEARLY UNINFORMATIVE THIS RUN.**
+# THE TWO PREDICTIONS ABOUT WHAT THIS RUN COULD SHOW — BOTH HELD, AND BOTH LIMIT THE CLAIM
 # =========================================================================================
 #
-# It is IDENTICAL to run 17's, because the round-29 remediation changed CODE and added no
-# tests — R29-04 renamed a test; R29-05, R29-06 and R29-08 are code fixes with no tests at all.
-# **So the count check had nothing to detect and the membership check had nothing new within
-# the run.** A green here says the suite still passes on changed code, which is worth having,
-# and says nothing about whether the changed code is covered. This was written into the
-# expectation BEFORE the run rather than discovered after.
+# **1. THE DELEGATION GUARD PASSED AT ROOT AND THAT ADDS NOTHING.** Said before the run, and
+# it is the honest reading rather than a hedge:
+# `the_daemon_delegates_shutdown_and_does_not_reap_by_hand` uses `include_str!` — it reads
+# `bin/delphi-runtimed.rs` **at compile time** and asserts on its text. It executes no process
+# and touches no privilege, so running it as root re-checks a string already checked.
 #
-#   MEMBERSHIP: root 213 identities / unpriv 213, ZERO in either direction, rc 0.
-#   The ONE cross-run change was named in advance and is accounted for:
-#     in run 18, not run 17:  wire::tests::read_frame_applies_no_deadline_to_a_cooperating_peer
-#     in run 17, not run 18:  wire::tests::read_frame_does_not_bound_a_wait_on_a_cooperating_peer
-#   One rename, both directions. Within-run both sides come from the same tree, so zero is the
-#   correct within-run result and is NOT evidence the rename was noticed.
+# What it establishes in either lane is real and was earned: `main` calls `shutdown_all` and
+# carries no second copy of the policy. It **caught one** on its first run — `ChildReaper::Drop`
+# had its own kill-and-bounded-reap, now routed through the same implementation with a ZERO
+# grace, so the two paths differ in an ARGUMENT rather than in code.
 #
-# ---------------------------------------------------------------------------------------
-# WHAT THIS RUN COMPILED AND LINKED BUT DID NOT EXERCISE — predicted, then confirmed
+# **What run 19 does NOT show is that `main`'s branch is TAKEN at root after a terminal
+# outcome.** That is ASSEMBLY coverage, it is owed, and the only root exercise of that binary —
+# `b1_daemon_binary_runs_the_assembled_flow` — still SKIPS for want of
+# `--features insecure-test-seams`. Do not read a green delegation guard as evidence about the
+# root call site.
 #
-# 1. **R29-05's new exit path.** A child unreaped after SIGKILL → guard stays ARMED → the
-#    daemon returns an ERROR instead of success. Reaching it needs a child in uninterruptible
-#    sleep. **Nothing in this tree constructs one.**
-# 2. **R29-06's new retry path.** EINTR inside `waitpid` → retry rather than panic with the
-#    guard already disarmed. Reaching it needs a signal delivered inside the wait window.
-#    **Nothing in this tree delivers one.** The reviewer reproduced it with a signal-injection
-#    probe that is theirs, not ours.
+# **2. THE PER-CHILD ATTRIBUTION CASES PASSED *IDENTICALLY*, WHICH IS NOT THE SAME AS ROOT
+# *COVERING* THEM.** `children_are_shut_down_independently_and_each_outcome_is_attributed`
+# spawns its OWN children (`sh -c exit 0`, `sleep 120`) and reaps them, and **reaping or
+# signalling your own children requires no privilege** — so root was predicted to behave exactly
+# as unprivileged, and did.
 #
-# Both were compiled, linked, and run past — never through. Recorded as OWED, not counted.
-#
-# 3. **D0A-R28-02'S COVERAGE GAP IS OPEN FOR A SECOND CONSECUTIVE ROUND**, and R29-05 has now
-#    MODIFIED that same untested path. **A change to untested code does not become tested by
-#    being changed.** `b1_daemon_binary_runs_the_assembled_flow` still SKIPS here for want of
-#    `--features insecure-test-seams`, and even unskipped `delphi-minimal-ai` cooperates, so
-#    the SIGKILL branch is never taken. The owed answer is the reviewer's: extract the exit
-#    sequence so `main` calls the EXTRACTED implementation rather than a duplicate, covering a
-#    cooperating child, a child synchronised past grace expiry, interrupted waits, signalling
-#    failure, post-kill reap timeout, already-reaped children, and each child independently —
-#    then assembly coverage that the daemon invokes the policy after terminal outcomes.
+# The correct record is therefore **IDENTICAL, not COVERED**. Root's extra power is over
+# processes that are NOT its children, which is precisely the case this test does not construct
+# — and precisely the case where the pid-1 fixture would have mattered. A difference here would
+# have been a result worth stopping for; sameness is the expected outcome and carries no extra
+# assurance.
 #
 # ---------------------------------------------------------------------------------------
-# A CLAIM OF MINE THAT THIS RUN FALSIFIED — recorded because it was carried into a prompt
+# A SAFETY CHANGE MADE BEFORE THIS RUN, NOT AFTER IT
 #
-# I told the operator the lane consumes **~0.5 GiB per run** and raised it as an operational
-# item. The readings:
+# `a_pid_that_is_not_our_child` named **pid 1**. The kill is unreachable (`already_gone(1)`
+# returns `ECHILD` first), so it passed — but the CONSEQUENCE of that reasoning being wrong is
+# not lane-independent: unprivileged a stray `kill(1, SIGKILL)` is `EPERM`; **at root it is
+# init.** Changed to `pid_max` with a liveness precondition at `0cf555e`, before the run.
 #
-#     run 16   3903M
-#     run 17   3397M    (-506M)
-#     run 18   3377M    (-20M)
-#
-# **Run 18 consumed 20M.** The -506M did not measure a lane run: it spanned the round-28 work,
-# including **fourteen full rebuilds from the mutation campaign**. I attributed campaign cost to
-# lane runs from two readings.
-#
-# The reviewer said exactly this at D0A-R29 — *"two free-space readings do not isolate per-lane
-# consumption from intervening builds and mutation campaigns"* — and I recorded the caution
-# while still carrying the per-run figure forward. The next data point settled it. **Measure
-# peak demand by OPERATION (lane run vs campaign vs clean build), not by wall-clock between
-# runs.** A mutation campaign is the expensive one: 14 mutants x a full rebuild each.
+# The extraction had ALREADY produced one reachable `kill(Pid::from_raw(0), SIGKILL)` through a
+# guard that covered only the wait side — it SIGKILLed the test runner (exit 137). That is why
+# the change was made in advance rather than trusted: **a test should not stake a machine on its
+# own correctness**, and this suite had just demonstrated it could be wrong about exactly this.
 #
 # ---------------------------------------------------------------------------------------
 # EVERY HYGIENE CHECK, WITH THE EVIDENCE THAT DECIDES IT
@@ -74,32 +73,46 @@
 #   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
 #   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED, both printed
 #   bwrap            0.11.1
-#   free space       /run 1483M, target 3377M, /tmp 3585M — all above floor. NOTE: the lane
-#                    exports CARGO_TARGET_DIR, so §0 took the env-var path; D0A-R29-08's fix
-#                    (resolving cargo's default via `cargo metadata`) is what protects a build
-#                    run OUTSIDE this procedure, and is not exercised here.
+#   free space       /run 1483M, target 3375M, /tmp 3710M — all above floor
 #   forced freshness ENFORCED: enumeration asserted at 17, BOTH hash sides asserted equal to
 #                    17, rebuild failure fatal, `diff` empty.
 #   PAM before       439c1d1521d86e4eb011a927aff659db
 #   PAM after        md5sum -c → OK              (class 16, the defect already paid for)
 #   stale sessions   none, checked before AND after
 #
+# **THE CORRECTED DISK MODEL HELD A SECOND TIME.** Run 17 3397M → run 18 3377M (−20M) → run 19
+# 3375M (**−2M**). The "~0.5 GiB per lane run" figure I reported and carried into a prompt was
+# wrong: the −506M it rested on spanned fourteen mutation-campaign rebuilds. Lane runs are
+# cheap; campaigns are the expensive operation. Measure by OPERATION, not by wall-clock between
+# runs.
+#
 # THE FIVE SKIPS, each quoting its own blocker: b1_daemon_binary (needs --features
 # insecure-test-seams), an_unreadable_login_defs (this uid can read a 0000 file),
 # pidfd_refuses_a_recycled_pid_barrier (no user namespaces), live_logind_query (standing DEFER),
 # a_regular_login_user_is_not_refused (running as root). Three skip BECAUSE the run is
-# privileged, so root's 208 and the unprivileged 188 are OVERLAPPING SETS.
+# privileged, so root's 216 and the unprivileged 196 are OVERLAPPING SETS.
 #
-# The clock test again reported its own powerlessness: `BOOTTIME - MONOTONIC = 0s`.
-#
-# ORDERING HELD UNDER CONVENTION FOR THE SIXTH CONSECUTIVE RUN (D0A-R22-01, still reopened).
-# Six historical successes; not enforcement of the seventh.
+# ORDERING HELD UNDER CONVENTION FOR THE SEVENTH CONSECUTIVE RUN (D0A-R22-01, still reopened).
 #
 # ---------------------------------------------------------------------------------------
-# SUPERSEDED — LANE RUN 17 (`208/5/213`, at `c3cca14`). Identical counts, different tree: run
-# 17 predates the round-29 code changes. Superseded on TREE, not on figure — the first time
-# these have come apart, and the reason a lane record names its commit rather than its number.
-# Before it: run 16 (`200/5/205`), run 15 (`192/5/197`), run 14 (`187/5/192`, closed
-# D0A-R24-01), run 13 (`177/5/182`, freshness WITHDRAWN by D0A-R25-05).
-EXECUTED=208
+# WHAT A GREEN RUN 19 STILL DOES NOT ESTABLISH
+#
+# 1. **Assembly coverage** of the daemon's exit path (above) — owed, and the reviewer named it
+#    separately from the extraction.
+# 2. **R29-05's `Unreaped` branch** needs a child in uninterruptible sleep; nothing constructs
+#    one. `only_an_unreaped_child_counts_as_failed_cleanup` constructs the VALUE, not the
+#    CONDITION.
+# 3. **R29-06's EINTR retry** needs a signal delivered inside the `waitpid` window; nothing
+#    delivers one.
+# 4. The mutation campaign is unprivileged-only; the five root-gated tests have never been
+#    mutation-tested.
+# 5. The suspend divergence is unmeasured; `action.timeout` is enforced nowhere (R9-04).
+#
+# ---------------------------------------------------------------------------------------
+# SUPERSEDED — LANE RUN 18 (`208/5/213`, at `3582db6`). Sound; superseded because run 19 covers
+# eight more tests including the first root execution of the shutdown policy. Before it: run 17
+# (`208/5/213` at `c3cca14` — same figure, different tree), run 16 (`200/5/205`), run 15
+# (`192/5/197`), run 14 (`187/5/192`, closed D0A-R24-01), run 13 (`177/5/182`, freshness
+# WITHDRAWN by D0A-R25-05).
+EXECUTED=216
 SKIPPED=5

@@ -354,28 +354,29 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**CURRENT ROOT RECORD: LANE RUN 16** — `EXECUTED 200 / SKIPPED 5 / reported 205`, predicted
-`200/5/205` at `09dc36b` and matched exactly. First root execution of the round-27 remediation:
-the absolute frame deadline in `wire.rs`, the aggregate read budget, `ceiling_from_var`, argv
-NUL validation and `consent_window_elapsed` had none of them run as root before it.
+**CURRENT ROOT RECORD: LANE RUN 17** — `EXECUTED 208 / SKIPPED 5 / reported 213`, predicted
+`208/5/213` at `c3cca14` and matched exactly. First root execution of the round-28 remediation.
 
-**Its membership is proven by IDENTITY, not inferred from equal totals (D0A-R27-04):** `root
-205 identities / unpriv 205`, **zero in either direction**, `membership rc=0`. Note 205 rather
-than 200 — membership covers the whole set, executed *and* skipped; the 200/5 split is the
-count check. Runs 14 and 15 asserted set equality from matching totals; that inference was
-true, but equal cardinality cannot detect a compensating removal and addition, so the evidence
-did not establish the claim. Run 16 is the first where it does.
+**The membership check did real work for the first time.** Run 16 introduced it on a tree where
+nothing had changed between the lanes, so it could not have been wrong there. **Eight tests
+landed between the runs**, giving run 17 a genuine delta to be right or wrong about: `root 213
+identities / unpriv 213`, zero in either direction, `rc 0`. Agreement on every identity.
 
-**The clock test reported its own powerlessness**, which was the point of changing it:
-`BOOTTIME - MONOTONIC = 0s … this test CANNOT distinguish them and a green proves nothing
-about clock selection.` The prior disclosure claimed the test "checks clock IDENTITY"; a
-reviewer's mutation showed it checks neither. The transcript now states the limit rather than
-letting green imply its absence.
+**And the item this run does NOT establish was predicted before it, not noticed after.**
+R28-02's bounded daemon exit — `reap_within` + grace + SIGKILL replacing an unconditional
+`waitpid` on the untrusted AI — lives in `delphi-runtimed`, whose only root exercise is
+`b1_daemon_binary_runs_the_assembled_flow`, and **that test SKIPS on this lane**. So the most
+root-relevant change in the round-28 remediation was not run at root, and the unprivileged
+suite does not reach it either.
 
-**What run 16 does NOT establish** is unchanged and listed in the lane record: the suspend
-divergence (unmeasured on a lane that has never suspended), the uncapped pending store, and
-the fact that the 30 s deadline and the 1 GiB / 8 GiB budget are choices rather than
-demonstrated bounds.
+**The mutation campaign remains an unprivileged result** (`euid=1000` at `3593fa8`). Nothing in
+a lane run is a campaign. The five root-gated tests have never been mutation-tested at all —
+and one of them is the only exercise of the code above. `scripts/mutation-campaign.py`'s
+docstring records what a root campaign would require, so the gap is written down rather than
+waiting to be discovered by someone assuming the unprivileged table covers root.
+
+**Run 16 is SUPERSEDED but not in doubt** (`200/5/205`, `09dc36b`): the first run whose
+membership was proven by identity. Superseded only because it predates round 28.
 
 **Run 15 is SUPERSEDED but not in doubt** (`192/5/197`, `0ad6556`): sound, superseded only
 because it predates the round-27 remediation.

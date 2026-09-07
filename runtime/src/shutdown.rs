@@ -256,12 +256,34 @@ mod tests {
 
     /// CASE 4 — a pid that is not ours: signalling cannot succeed and shutdown still returns.
     ///
-    /// pid 1 is never our child, so `waitpid` gives `ECHILD` immediately. The property is that
-    /// the policy TERMINATES rather than blocking or panicking on a pid it cannot own.
+    /// # This test used pid 1, and that was safe unprivileged and reckless at root
+    ///
+    /// `already_gone(1)` returns `ECHILD` before the `kill` is reached, so the signal is
+    /// unreachable and the test passed. But the CONSEQUENCE of being wrong is not
+    /// lane-independent: unprivileged, a stray `kill(1, SIGKILL)` fails `EPERM` and nothing
+    /// happens; **as root it is permitted, and pid 1 is init.** Lane run 19 is the first time
+    /// this suite runs where that mistake ends the machine rather than the test.
+    ///
+    /// So the fixture is now a pid that CANNOT be live: `pid_max`, which the kernel documents
+    /// as one greater than the maximum allocatable pid. `waitpid` still gives `ECHILD` — the
+    /// property under test is unchanged — while a stray signal would be `ESRCH` at any
+    /// privilege level. **Changed BEFORE the root run, not after it**, because the reasoning
+    /// that says the kill is unreachable is the same reasoning that would have to be wrong for
+    /// it to matter, and a test should not stake a machine on its own correctness.
     #[test]
     fn a_pid_that_is_not_our_child_terminates_the_policy_promptly() {
+        let pid_max: i32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(4_194_304);
+        // PRECONDITION: it must not exist. `kill(pid, 0)` probes without signalling.
+        assert!(
+            nix::sys::signal::kill(Pid::from_raw(pid_max), None).is_err(),
+            "fixture pid {pid_max} is LIVE — pick another; this test must never name a real \
+             process, least of all at root"
+        );
         let started = Instant::now();
-        let out = shutdown_child(1, Duration::from_millis(100), Duration::from_millis(100));
+        let out = shutdown_child(pid_max, Duration::from_millis(100), Duration::from_millis(100));
         assert_eq!(out, ChildOutcome::AlreadyGone);
         assert!(started.elapsed() < Duration::from_secs(2));
     }

@@ -52,6 +52,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -68,10 +69,31 @@ INPUT_PATHS = [
     # The harness itself. A campaign run from an uncommitted harness is no more reproducible
     # than one run from an uncommitted tree — the same argument, applied to the instrument.
     "scripts/mutation-campaign.py",
+    # D0A-R30-03: inputs the SUITE consumes that are not under `runtime/`. A probe modified the
+    # installer PAM fixture and `inputs_are_clean()` still returned true, so a result could be
+    # attributed to a commit whose inputs were not the ones used.
+    "installer/pam/delphi-runtime",       # embedded by b1_integration.rs
+    "scripts/check-stale-test-sessions.sh",  # executed by the test helper
 ]
+
+# **THIS LIST IS NOT PROVEN COMPLETE, and saying so is the point.** Adding entries after each
+# discovery is exactly the class-48 shape (the fix scoped to the named instance). The sound
+# construction is an ISOLATED CHECKOUT of the captured commit, which makes the closure question
+# disappear rather than answering it — recorded as owed. Until then this is a best-effort
+# allowlist and a campaign's attribution is only as good as it.
 
 # Markers that mean the suite did not get to judge the mutation. A nonzero exit carrying any of
 # these is INFRASTRUCTURE, never a detection (D0A-R29-02).
+# D0A-R30-04: a NAMED failing test is not automatically a detection. The project's own
+# precondition diagnostics fail loudly, name a test, and mean "the environment was wrong" —
+# not "the mutation was caught". Classifying those as CAUGHT credits the mutation for an
+# infrastructure failure, and a green baseline does not exclude one arising later.
+PRECONDITION_MARKERS = (
+    "PRECONDITION FAILED",
+    "PRECONDITION failure",
+    "STALE SESSION FROM A PREVIOUS RUN",
+)
+
 INFRA_MARKERS = (
     "No space left on device",
     "could not compile",
@@ -129,6 +151,47 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
 ]
 
 
+# D0A-R30-01: `try/finally` unwinds PYTHON. It does not run when the process is TERMINATED.
+# A SIGTERM during a mutant compilation left the modified source in place and `results.jsonl`
+# empty — exit -15, a security check removed from the tree, and no record that anything had
+# been attempted. `finally` was necessary and not sufficient.
+#
+# Two things close it. (1) Catchable termination signals are handled: restore, journal, exit
+# non-zero. (2) The in-progress experiment is journalled BEFORE the mutation is written, so an
+# UNCATCHABLE kill still leaves evidence naming the file that may be dirty. There is no handler
+# for SIGKILL by construction — hence the journal.
+_IN_FLIGHT: dict = {}
+
+
+def _restore_in_flight(reason: str) -> None:
+    """Put back whatever is currently mutated. Safe to call twice."""
+    path = _IN_FLIGHT.get("path")
+    original = _IN_FLIGHT.get("original")
+    if path is not None and original is not None:
+        try:
+            pathlib.Path(path).write_text(original)
+            print(f"\nRESTORED {path} after {reason}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 - last-resort path; report and continue
+            print(f"\nFAILED TO RESTORE {path} after {reason}: {e}\n"
+                  f"THE TREE MAY BE CARRYING A REMOVED SECURITY CHECK. Run: "
+                  f"git checkout -- {_IN_FLIGHT.get('rel', path)}", file=sys.stderr)
+    _IN_FLIGHT.clear()
+
+
+def _on_signal(signum, _frame):
+    _restore_in_flight(f"signal {signal.Signals(signum).name}")
+    # 128+n is the shell's convention for death by signal, and this exit is a FAILURE.
+    sys.exit(128 + signum)
+
+
+def _install_signal_handlers() -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass  # not on the main thread, or unsupported — the journal still covers us
+
+
 def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, **kw)
 
@@ -141,13 +204,16 @@ def inputs_are_clean() -> tuple[bool, str]:
     return p.stdout.strip() == "", p.stdout.strip()
 
 
-def file_matches_head(rel: str) -> bool:
-    """D0A-R29-01: VERIFY the restore rather than trusting the write.
+def file_matches_commit(sha: str, rel: str) -> bool:
+    """D0A-R29-01: VERIFY the restore rather than trusting the write. D0A-R30-01: against the
+    CAPTURED commit, not `HEAD`.
 
     A partial restore leaves a security check removed and reports success just as loudly as a
-    complete one, so the check is against the committed blob, not against our own bookkeeping.
+    complete one, so the check is against the committed blob rather than our own bookkeeping.
+    And it must be the blob the campaign RECORDED: `HEAD` is mutable, so a commit landing
+    mid-campaign would silently redefine what "restored" means.
     """
-    return sh(["git", "diff", "--quiet", "HEAD", "--", rel]).returncode == 0
+    return sh(["git", "diff", "--quiet", sha, "--", rel]).returncode == 0
 
 
 def run_suite() -> tuple[str, dict]:
@@ -174,6 +240,11 @@ def run_suite() -> tuple[str, dict]:
     if infra:
         ev["infra_markers"] = infra
         return "INFRASTRUCTURE", ev
+    precond = [m for m in PRECONDITION_MARKERS if m in blob]
+    if precond:
+        # A named failing test whose failure is a PRECONDITION, not a detection (D0A-R30-04).
+        ev["precondition_markers"] = precond
+        return "PRECONDITION FAILURE", ev
     if ev["result_lines"] == 0:
         # Nothing reported a result: the suite did not get to judge anything.
         return "INFRASTRUCTURE", ev
@@ -192,6 +263,8 @@ def main() -> int:
     args = ap.parse_args()
     out = pathlib.Path(args.out or tempfile.mkdtemp(prefix="delphi-mutation-"))
     (out / "logs").mkdir(parents=True, exist_ok=True)
+
+    _install_signal_handlers()
 
     clean, dirt = inputs_are_clean()
     if not clean:
@@ -244,13 +317,23 @@ def main() -> int:
             # D0A-R29-01: the mutate/restore pair is transactional. Anything raised between
             # them — including KeyboardInterrupt — still restores.
             try:
+                # JOURNAL BEFORE MUTATING (D0A-R30-01). If the process is killed uncatchably
+                # from here on, this line is the only evidence that `rel` may be dirty.
+                jsonl.write(json.dumps(
+                    {"n": i, "label": label, "file": fname, "commit": head,
+                     "outcome": "IN PROGRESS: mutation about to be written", "rel": rel}) + "\n")
+                jsonl.flush()
+                os.fsync(jsonl.fileno())
+                _IN_FLIGHT.update({"path": str(path), "original": original, "rel": rel})
                 path.write_text(original.replace(anchor, repl, 1))
                 rec["applied_diff"] = sh(["git", "diff", "--", rel]).stdout
                 build = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests",
                             "--no-run"])
                 if build.returncode != 0:
                     rec["outcome"] = "INVALID: mutant does not compile"
-                    rec["compile_stderr"] = build.stderr[-4000:]
+                    (out / "logs" / f"{i:02d}.build.stderr").write_text(build.stderr)
+                    (out / "logs" / f"{i:02d}.build.stdout").write_text(build.stdout)
+                    rec["compile_stderr_head"] = build.stderr[:1200]
                 else:
                     rec["compiles"] = True
                     outcome, ev = run_suite()
@@ -269,11 +352,12 @@ def main() -> int:
                             "baseline": baseline_targets, "mutant": ev["result_lines"]}
             finally:
                 path.write_text(original)
-                rec["restored_verified"] = file_matches_head(rel)
+                _IN_FLIGHT.clear()
+                rec["restored_verified"] = file_matches_commit(head, rel)
 
             if not rec["restored_verified"]:
                 # FATAL, and it must not be possible to exit 0 from here (D0A-R29-01).
-                rec["outcome"] = "FATAL: restore not verified against HEAD"
+                rec["outcome"] = "FATAL: restore not verified against the captured commit"
                 fatal = rec
 
         results.append(rec)
@@ -304,7 +388,7 @@ def main() -> int:
               "root campaign would require")
     if fatal:
         return 3
-    return 1 if any(r["outcome"].startswith(("INVALID", "INFRASTRUCTURE", "UNATTRIBUTED"))
+    return 1 if any(r["outcome"].startswith(("INVALID", "INFRASTRUCTURE", "UNATTRIBUTED", "PRECONDITION", "IN PROGRESS"))
                     for r in results) else 0
 
 

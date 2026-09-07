@@ -1,0 +1,9 @@
+stale-session precondition classification: CAUGHT
+dirty installer fixture admitted: True
+SIGTERM returncode: -15
+source restored after SIGTERM: False
+JSONL after SIGTERM: ''
+self-test with always-false restore verifier: exit 0
+  [OK ] crash, no named    -> UNATTRIBUTED FAILURE   (want UNATTRIBUTED FAILURE)
+  [FAIL] clean file matches HEAD
+  [FAIL] restored file matches HEAD again

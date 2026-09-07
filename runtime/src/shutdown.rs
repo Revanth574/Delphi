@@ -350,20 +350,22 @@ mod tests {
 
     /// CASE 4 — a pid that is not ours: signalling cannot succeed and shutdown still returns.
     ///
-    /// # This test used pid 1, and that was safe unprivileged and reckless at root
+    /// # This test used pid 1. Changing it was right; the stated reason was partly wrong
     ///
-    /// `already_gone(1)` returns `ECHILD` before the `kill` is reached, so the signal is
-    /// unreachable and the test passed. But the CONSEQUENCE of being wrong is not
-    /// lane-independent: unprivileged, a stray `kill(1, SIGKILL)` fails `EPERM` and nothing
-    /// happens; **as root it is permitted, and pid 1 is init.** Lane run 19 is the first time
-    /// this suite runs where that mistake ends the machine rather than the test.
+    /// `already_gone(1)` returned `ECHILD` before the `kill` was reached, so the signal was
+    /// unreachable and the test passed. The fixture was still changed to a pid that CANNOT be
+    /// live, and that stands: **naming an unrelated system process in a fixture is a hazard
+    /// whatever the privilege level**, and this suite had just demonstrated it could be wrong
+    /// about which paths are reachable (the `pid <= 0` hole that SIGKILLed the test runner).
     ///
-    /// So the fixture is now a pid that CANNOT be live: `pid_max`, which the kernel documents
-    /// as one greater than the maximum allocatable pid. `waitpid` still gives `ECHILD` — the
-    /// property under test is unchanged — while a stray signal would be `ESRCH` at any
-    /// privilege level. **Changed BEFORE the root run, not after it**, because the reasoning
-    /// that says the kill is unreachable is the same reasoning that would have to be wrong for
-    /// it to matter, and a test should not stake a machine on its own correctness.
+    /// **But the justification recorded at the time claimed that `kill(1, SIGKILL)` at root
+    /// ends init. It does not** (D0A-R30-06). Linux gives PID 1 special protection: a signal
+    /// PID 1 has installed no handler for is not delivered to it, SIGKILL included. The
+    /// dramatic version of the hazard was invented and then written down as fact.
+    ///
+    /// The real reasons are duller and sufficient: a fixture should not name a process it does
+    /// not own, and `pid_max` makes a stray signal `ESRCH` at any privilege level while
+    /// `waitpid` still yields `ECHILD`, so the property under test is unchanged.
     #[test]
     fn a_pid_that_is_not_our_child_terminates_the_policy_promptly() {
         let pid_max: i32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")

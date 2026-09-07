@@ -48,24 +48,37 @@
 # signalling your own children requires no privilege** — so root was predicted to behave exactly
 # as unprivileged, and did.
 #
-# The correct record is therefore **IDENTICAL, not COVERED**. Root's extra power is over
-# processes that are NOT its children, which is precisely the case this test does not construct
-# — and precisely the case where the pid-1 fixture would have mattered. A difference here would
-# have been a result worth stopping for; sameness is the expected outcome and carries no extra
-# assurance.
+# The correct record is therefore **IDENTICAL, not COVERED**. These fixtures establish
+# SAME-CREDENTIAL child cleanup and nothing wider: root's extra signalling power is over
+# processes with different credentials, which is what production's PRIVILEGE-DROPPED children
+# are and what no fixture here constructs. A difference would have been a result worth stopping
+# for; sameness is the expected outcome and carries no extra assurance.
 #
 # ---------------------------------------------------------------------------------------
-# A SAFETY CHANGE MADE BEFORE THIS RUN, NOT AFTER IT
+# A SAFETY CHANGE MADE BEFORE THIS RUN — AND ITS JUSTIFICATION WAS PARTLY WRONG (D0A-R30-06)
 #
-# `a_pid_that_is_not_our_child` named **pid 1**. The kill is unreachable (`already_gone(1)`
-# returns `ECHILD` first), so it passed — but the CONSEQUENCE of that reasoning being wrong is
-# not lane-independent: unprivileged a stray `kill(1, SIGKILL)` is `EPERM`; **at root it is
-# init.** Changed to `pid_max` with a liveness precondition at `0cf555e`, before the run.
+# `a_pid_that_is_not_our_child` named **pid 1** and was changed to `pid_max` at `0cf555e`
+# before this run. **Keeping unrelated system processes out of fixtures is right and the change
+# stands.** The REASONING recorded for it was not:
 #
-# The extraction had ALREADY produced one reachable `kill(Pid::from_raw(0), SIGKILL)` through a
-# guard that covered only the wait side — it SIGKILLed the test runner (exit 137). That is why
-# the change was made in advance rather than trusted: **a test should not stake a machine on its
-# own correctness**, and this suite had just demonstrated it could be wrong about exactly this.
+#   * IT SAID `kill(1, SIGKILL)` AT ROOT ENDS INIT. **It does not.** Linux gives PID 1 special
+#     protection: a signal with no handler installed by PID 1 is not delivered to it, SIGKILL
+#     included. The dramatic version of the hazard was invented, and it was written into a
+#     document that exists to be trusted, unchecked, by me — and left standing by the operator.
+#   * IT CONFUSED WAIT ELIGIBILITY WITH SIGNAL PERMISSION. Parenthood governs whether you may
+#     `wait` for a process. It does not grant permission to signal one; that depends on
+#     credentials and capabilities. The lane note reasoned from the wrong relation.
+#
+# **What the fixtures actually establish, stated at the right strength:** same-credential child
+# cleanup. Every child here is spawned by the test process with its own credentials, so the
+# result generalises to that case and no further. **Production's children are
+# PRIVILEGE-DROPPED** (`delphi-drop`), which is a materially different signalling relationship
+# and one these fixtures do not exercise at all. That gap closes through ASSEMBLY testing, not
+# through running the same fixtures at root.
+#
+# This correction is recorded rather than the sentence quietly edited, because a false claim
+# about a SAFETY property in the lane record is worse than the same claim anywhere else: the
+# record is what a later reader trusts instead of re-deriving.
 #
 # ---------------------------------------------------------------------------------------
 # EVERY HYGIENE CHECK, WITH THE EVIDENCE THAT DECIDES IT

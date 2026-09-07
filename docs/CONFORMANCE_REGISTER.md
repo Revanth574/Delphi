@@ -460,16 +460,29 @@ extending it:**
   — the case the test does not construct, and the case where the pid-1 fixture would have
   mattered.
 
-**A safety change was made BEFORE this run, not after.** `a_pid_that_is_not_our_child` named
-**pid 1**; the kill is unreachable so it passed, but unprivileged a stray `kill(1, SIGKILL)` is
-`EPERM` and **at root it is init**. Changed to `pid_max` at `0cf555e`. The extraction had
-already produced one reachable `kill(Pid::from_raw(0), SIGKILL)` — it SIGKILLed the test runner
-— so the reasoning that called the kill unreachable had just been demonstrated fallible. **A
-test should not stake a machine on its own correctness.**
+**A safety change was made BEFORE this run — and its justification was partly wrong
+(D0A-R30-06).** `a_pid_that_is_not_our_child` named **pid 1**; the kill is unreachable so it
+passed, and the fixture was changed to `pid_max` at `0cf555e`. **The change stands. The stated
+reason does not:** the note claimed `kill(1, SIGKILL)` at root ends init. **It does not** —
+Linux gives PID 1 special protection against signals it has installed no handler for, SIGKILL
+included. The dramatic hazard was invented and then written down as fact, by me, in a document
+that exists to be trusted, and left standing by the operator.
 
-**The corrected disk model held a second time:** run 17 `3397M` → run 18 `3377M` (−20M) → run 19
-`3375M` (**−2M**). The "~0.5 GiB per lane run" figure rested on a −506M reading that spanned
-fourteen mutation-campaign rebuilds. Lane runs are cheap; campaigns are the expensive operation.
+The real reasons are duller and sufficient: **a fixture should not name a process it does not
+own**, and the extraction had just produced one reachable `kill(Pid::from_raw(0), SIGKILL)` that
+SIGKILLed the test runner — so its reachability reasoning had been demonstrated fallible. The
+note also **confused wait eligibility with signal permission**: parenthood governs whether you
+may `wait` for a process, not whether you may signal it, which depends on credentials and
+capabilities.
+
+**The disk readings, stated at the strength they support and no further (D0A-R30-06's
+sibling correction):** run 17 `3397M` → run 18 `3377M` (−20M) → run 19 `3375M` (−2M). That
+refutes "~0.5 GiB per lane run" — the figure rested on a −506M reading spanning fourteen
+mutation-campaign rebuilds. **It does not establish a general cost model.** "Lane runs are
+cheap; campaigns are expensive" is a plausible explanation these three net readings cannot
+distinguish from others, which is the same inference error one level down (classes 41/45).
+What is measured: three net free-space changes. What is owed if a model is wanted: per-operation
+measurement.
 
 **Run 18 is SUPERSEDED** (`208/5/213`, `3582db6`): sound, superseded because run 19 covers eight
 more tests.

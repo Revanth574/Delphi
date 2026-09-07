@@ -194,5 +194,16 @@
 #   `the_digest_binds_the_timeout_even_though_nothing_enforces_it_yet`. Both were found NOT
 #   CAUGHT by scripts/mutation-campaign.py and both are BINDING tests only — the timeout one
 #   says so in its name, because action.timeout is enforced nowhere at execution (R9-04, open).
-EXECUTED=188
+# 2026-09-07 (D0A-R30, the R28-02 extraction): 188/25 -> 196/25. +8 EXECUTED, all in the new
+#   `shutdown` module, which finally covers the daemon exit policy that had been compiled and
+#   linked but never executed for THREE rounds (R28-02 -> R29-05 -> run 18).
+#   The reviewer's named cases: a cooperating child WITH ITS EXIT STATUS PRESERVED; a child that
+#   outlives grace (the SIGKILL branch nothing had ever taken); an already-reaped child;
+#   a pid that is not ours; both children INDEPENDENTLY with per-child attribution; the
+#   is_clean boundary; and the non-positive-pid guard.
+#   PLUS `the_daemon_delegates_shutdown_and_does_not_reap_by_hand`, which enforces the
+#   extraction's one condition — main must call THIS code, not a copy. It FAILED on first run
+#   and caught a real second implementation inside ChildReaper::Drop.
+# SKIPPED unchanged: all eight run unprivileged.
+EXECUTED=196
 SKIPPED=25

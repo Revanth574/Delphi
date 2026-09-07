@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use nix::unistd::{Pid, User};
+use nix::unistd::User;
 
 use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
 use delphi_runtime::execute::ConsumptionLedger;
@@ -58,21 +58,26 @@ impl Drop for ChildReaper {
         if !self.armed {
             return;
         }
-        for pid in [self.shell, self.ai] {
-            // D0A-R5-01's lesson: never signal a non-positive pid — kill(-1) reaches every
-            // process this root daemon may signal, kill(0) takes the process group.
-            if pid > 0 {
-                // SAFETY: signalling children this process created.
-                unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
-                // D0A-R6-03: BOUNDED. An unbounded `waitpid` after SIGKILL wedges the daemon
-                // forever on a child in uninterruptible sleep — the very failure R5-03 added
-                // this guard to prevent, reintroduced inside it. The launcher already had the
-                // bounded implementation and the reasoning; this shares it rather than writing
-                // a second one that could drift.
-                if !delphi_runtime::reap_within(pid, Duration::from_secs(5)) {
-                    tracing::error!(pid, "child did not reap within 5s — leaked UNREAPED rather \
-                                          than wedging the daemon");
-                }
+        // D0A-R30: this used to kill-and-reap BY HAND, which made it a SECOND implementation of
+        // the shutdown policy. `shutdown_all` with a ZERO grace expresses exactly the error-path
+        // semantics — no politeness, SIGKILL immediately, then a bounded reap — so the two
+        // paths differ in their GRACE ARGUMENT rather than in their code.
+        //
+        // That matters beyond tidiness: the extraction's whole value is that `main` runs the
+        // implementation the tests exercise, and a second copy here would have kept half the
+        // daemon's cleanup untested while the extraction looked complete. The non-positive-pid
+        // guard (D0A-R5-01, D0A-R7-07) now lives in one place instead of two.
+        for (what, outcome) in delphi_runtime::shutdown::shutdown_all(
+            &[("shell", self.shell), ("ai", self.ai)],
+            Duration::ZERO,
+            Duration::from_secs(5),
+        ) {
+            if !outcome.is_clean() {
+                tracing::error!(
+                    child = what, ?outcome,
+                    "child did not reap on the error path — leaked UNREAPED rather than wedging \
+                     the daemon (D0A-R6-03)"
+                );
             }
         }
         tracing::error!(
@@ -556,34 +561,37 @@ fn main() -> Result<()> {
     // diagnostic AND a non-zero exit, and the guard is disarmed ONLY for children actually
     // reaped. The waits stay bounded — restoring an unbounded wait to obtain certainty is the
     // defect R28-02 closed.
-    let grace = std::time::Duration::from_secs(5);
-    let mut unreaped: Vec<&str> = Vec::new();
-    for (what, pid) in [("shell", children.shell_pid), ("ai", children.ai_pid)] {
-        if delphi_runtime::launcher::reap_within(pid, grace) {
-            continue;
-        }
-        tracing::warn!(
-            child = what, pid, grace_secs = grace.as_secs(),
-            "child did not exit within the grace period after the action completed; \
-             terminating (D0A-R28-02)"
-        );
-        if let Err(e) = nix::sys::signal::kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL)
-        {
-            // ESRCH means it is already gone, which the reap below confirms; anything else is
-            // a real signalling failure and must not be silent.
-            tracing::warn!(child = what, pid, error = %e, "SIGKILL failed");
-        }
-        if !delphi_runtime::launcher::reap_within(pid, std::time::Duration::from_secs(2)) {
-            tracing::error!(
-                child = what, pid,
-                "child NOT reaped after SIGKILL — it is likely in uninterruptible sleep. The \
-                 daemon is exiting with a cleanup failure rather than reporting success \
-                 (D0A-R29-05)"
-            );
-            unreaped.push(what);
+    // D0A-R28-02 / R29-05, EXTRACTED at D0A-R30 so it can be tested (`shutdown::shutdown_all`).
+    // The policy lived here for two rounds and was never exercised: its only root test SKIPS on
+    // the dev lane, and even unskipped the minimal AI cooperates so the SIGKILL branch is never
+    // taken. `shutdown.rs` owns it now and `runtime/src/shutdown.rs`'s
+    // `the_daemon_delegates_shutdown_and_does_not_reap_by_hand` enforces that this file keeps
+    // no second copy — a duplicate is what makes an extraction look done.
+    let outcomes = delphi_runtime::shutdown::shutdown_all(
+        &[("shell", children.shell_pid), ("ai", children.ai_pid)],
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(2),
+    );
+    for (what, outcome) in &outcomes {
+        match outcome {
+            delphi_runtime::shutdown::ChildOutcome::Unreaped { kill_error } => tracing::error!(
+                child = what, ?kill_error,
+                "child NOT reaped after SIGKILL — likely uninterruptible sleep. Exiting with a \
+                 cleanup failure rather than reporting success (D0A-R29-05)"
+            ),
+            delphi_runtime::shutdown::ChildOutcome::Terminated => tracing::warn!(
+                child = what,
+                "child outlived the grace period and was terminated (D0A-R28-02)"
+            ),
+            other => tracing::debug!(child = what, ?other, "child cleanup"),
         }
     }
-    if unreaped.is_empty() {
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| !o.is_clean())
+        .map(|(what, _)| *what)
+        .collect();
+    if failed.is_empty() {
         reaper.armed = false;
         Ok(())
     } else {
@@ -591,7 +599,7 @@ fn main() -> Result<()> {
         // reapable between here and process exit.
         Err(anyhow::anyhow!(
             "cleanup failed: {} not reaped after SIGKILL (D0A-R29-05)",
-            unreaped.join(", ")
+            failed.join(", ")
         ))
     }
 }

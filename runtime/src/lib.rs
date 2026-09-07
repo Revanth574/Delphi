@@ -63,6 +63,7 @@ pub mod readiness;
 pub mod sandbox;
 pub mod scaffold_env;
 pub mod service;
+pub mod shutdown;
 pub mod store;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_child_guard;

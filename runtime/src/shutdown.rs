@@ -252,23 +252,77 @@ mod tests {
             .id() as i32
     }
 
+    /// Is `pid` gone — neither alive nor a reapable zombie?
+    ///
+    /// D0A-R31-02: the unit tests asserted only the RETURNED OUTCOME, so an implementation that
+    /// returned `Terminated` at grace expiry **without signalling or reaping anything** passed
+    /// all ten of them and left the sleepers alive. The outcome is what the policy CLAIMS; this
+    /// is what actually happened to the process.
+    ///
+    /// `kill(pid, 0)` probes for existence without signalling. `ESRCH` means no such process —
+    /// and because the caller reaped it, not even a zombie remains.
+    fn is_fully_gone(pid: i32) -> bool {
+        nix::sys::signal::kill(Pid::from_raw(pid), None) == Err(nix::errno::Errno::ESRCH)
+    }
+
     /// Block until `pid` is terminal WITHOUT consuming its status (`waitid(WNOWAIT)`).
     ///
     /// This is what makes the two tests below deterministic rather than racy: the child is
-    /// KNOWN dead and KNOWN still reapable when `shutdown_child` is called, which is exactly
-    /// the state D0A-R30-02 mishandled and exactly the state a spawn-then-call test reaches
-    /// only by luck.
+    /// KNOWN dead and KNOWN still reapable when `shutdown_child` is called, which is the state
+    /// D0A-R30-02 mishandled and the state a spawn-then-call test reaches only by luck.
+    ///
+    /// # D0A-R31-05: the return value was DISCARDED, so the barrier could silently not exist
+    ///
+    /// The first version ignored `waitid`'s result. A reviewer's linker-injection probe made it
+    /// return `-1`/`EINTR` — establishing no barrier at all — and **both tests still passed**,
+    /// having quietly reverted to the scheduling dependence they were written to remove. A
+    /// precondition that can vanish without anything noticing is not a precondition.
+    ///
+    /// So: `EINTR` is retried, any other failure PANICS rather than proceeding, and the
+    /// observation itself is checked — `si_pid` must be the child and `si_code` must report a
+    /// terminal transition (`CLD_EXITED`, `CLD_KILLED`, `CLD_DUMPED`) rather than a stop or a
+    /// continue, which are live-child events.
     fn await_terminal_without_reaping(pid: i32) {
-        // SAFETY: `waitid` writes a `siginfo_t` this frame owns and fully initialises; WNOWAIT
-        // leaves the child reapable so the code under test still sees a terminal status.
-        unsafe {
-            let mut si: nix::libc::siginfo_t = std::mem::zeroed();
-            nix::libc::waitid(
-                nix::libc::P_PID,
-                pid as nix::libc::id_t,
-                &mut si,
-                nix::libc::WEXITED | nix::libc::WNOWAIT,
+        loop {
+            // SAFETY: `waitid` writes a `siginfo_t` this frame owns and zero-initialises;
+            // WNOWAIT leaves the child reapable so the code under test still sees a terminal
+            // status. The return value is CHECKED below (D0A-R31-05).
+            let (rc, si) = unsafe {
+                let mut si: nix::libc::siginfo_t = std::mem::zeroed();
+                let rc = nix::libc::waitid(
+                    nix::libc::P_PID,
+                    pid as nix::libc::id_t,
+                    &mut si,
+                    nix::libc::WEXITED | nix::libc::WNOWAIT,
+                );
+                (rc, si)
+            };
+            if rc == -1 {
+                let e = nix::errno::Errno::last();
+                assert_eq!(
+                    e,
+                    nix::errno::Errno::EINTR,
+                    "waitid failed with {e} — no terminal barrier was established, so the test \
+                     below would silently revert to a scheduling race (D0A-R31-05)"
+                );
+                continue;
+            }
+            // SAFETY: `si_pid()` / `si_code` read fields the kernel filled on success.
+            let (got_pid, code) = unsafe { (si.si_pid(), si.si_code) };
+            assert_eq!(
+                got_pid, pid,
+                "waitid reported pid {got_pid}, not the child {pid} — the barrier is on the \
+                 wrong process (D0A-R31-05)"
             );
+            assert!(
+                matches!(
+                    code,
+                    nix::libc::CLD_EXITED | nix::libc::CLD_KILLED | nix::libc::CLD_DUMPED
+                ),
+                "waitid returned si_code {code}, which is not a terminal transition — a stop or \
+                 continue is a LIVE child and establishes no barrier (D0A-R31-05)"
+            );
+            return;
         }
     }
 
@@ -345,6 +399,14 @@ mod tests {
         let out = shutdown_child(pid, Duration::from_millis(150), Duration::from_secs(3));
         assert_eq!(out, ChildOutcome::Terminated, "an uncooperative child must be terminated");
         assert!(out.is_clean(), "terminated-and-reaped IS clean cleanup");
+        // D0A-R31-02: THE OUTCOME IS A CLAIM; THIS IS THE FACT. An implementation returning
+        // `Terminated` at grace expiry without signalling or reaping passed this test before
+        // this line existed, leaving the sleeper alive.
+        assert!(
+            is_fully_gone(pid),
+            "shutdown_child reported Terminated but pid {pid} is still present — the outcome \
+             was asserted and the process was not (D0A-R31-02)"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "shutdown must be BOUNDED — an unbounded wait here is the wedge R28-02 closed"
@@ -440,6 +502,9 @@ mod tests {
         assert_eq!(outcomes[1].0, "stubborn");
         assert_eq!(outcomes[1].1, ChildOutcome::Terminated);
         assert!(outcomes.iter().all(|(_, o)| o.is_clean()));
+        // D0A-R31-02: both children are actually GONE, not merely reported clean.
+        assert!(is_fully_gone(cooperative), "the cooperative child was not reaped");
+        assert!(is_fully_gone(stubborn), "the stubborn child was reported Terminated but lives");
     }
 
     /// `is_clean` is the predicate `main` branches on, so its boundary is asserted directly.

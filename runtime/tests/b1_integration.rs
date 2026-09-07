@@ -469,7 +469,7 @@ impl DaemonGuard {
 
     /// Wait to a deadline, then take the output. A kill is reported by the caller's assertion;
     /// the REAPING has already happened either way.
-    fn wait(mut self) -> (std::process::Output, bool) {
+    fn wait(mut self) -> DaemonRun {
         let child = self.child.take().expect("child present");
         let child_pid = child.id();
         // D0A-R4-11: LONGER than the daemon's own 120 s accept bound, deliberately. At 45 s the
@@ -512,6 +512,10 @@ impl DaemonGuard {
         // pipe write ends, so `wait_with_output()` would wait for an EOF no living descendant
         // sends. Killing the GROUP is safe here and only here: the leader is exited-but-unreaped
         // (or still alive), so the identity has not been released.
+        // D0A-R31-02: SAMPLE BEFORE INTERVENING. Past this line the guard supplies whatever
+        // cleanup the daemon did not, and no later observation can tell the two apart.
+        #[allow(clippy::cast_possible_wrap)]
+        let survivors_before_guard = live_group_members(child.id() as i32, child.id() as i32);
         Self::kill_group(child.id());
         // D0A-R8-04: `wait_with_output` is unbounded — a surviving descendant holding the pipe
         // wedges it, which is R5-04's mechanism. Only `wait_for_line` got the bound; this
@@ -534,7 +538,7 @@ impl DaemonGuard {
         };
         drop(collector);
         Self::sweep(&self.session_user);
-        (out, killed)
+        DaemonRun { output: out, killed, survivors_before_guard }
     }
 
     /// Kill anything still running under this test's own session user. Scoped by user, so it
@@ -1593,6 +1597,74 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
+/// A daemon run, with **who was still alive when the guard was about to intervene**.
+///
+/// D0A-R31-02: `wait()` returned `(Output, killed)`, and `killed` says only whether the daemon
+/// hit the guard's deadline. The guard then calls `kill_group` **unconditionally**, so it
+/// supplies the cleanup the daemon may not have performed — and a counterfeit daemon that left
+/// its child alive passed every assertion in the assembly test with `killed == false`.
+///
+/// The three outcomes the test must tell apart, which two values cannot:
+///
+/// | outcome | observation |
+/// |---|---|
+/// | the DAEMON cleaned up | `survivors_before_guard` is EMPTY |
+/// | the daemon did not and the GUARD did | `survivors_before_guard` is non-empty — **the run proves nothing about the daemon** |
+/// | neither | non-empty, and still alive afterwards |
+struct DaemonRun {
+    output: std::process::Output,
+    /// The daemon had to be killed at the guard's deadline.
+    killed: bool,
+    /// Live (non-zombie) members of the daemon's process group, excluding the leader, sampled
+    /// **immediately before** the guard's emergency `kill_group`.
+    ///
+    /// Non-empty is not a diagnostic to log — it **invalidates** any claim about the daemon's
+    /// own cleanup, because from that point the harness is doing the work.
+    survivors_before_guard: Vec<(i32, char)>,
+}
+
+/// Live members of process group `pgid`, excluding `leader`, as `(pid, state)`.
+///
+/// Zombies are EXCLUDED: after the daemon exits, anything it killed but did not reap is
+/// reparented and collected by init, so a `Z` here is a race with that rather than a child the
+/// daemon failed to terminate. The stubborn AI sleeps for an hour, so a child the daemon did
+/// NOT kill appears unambiguously as `S`.
+fn live_group_members(pgid: i32, leader: i32) -> Vec<(i32, char)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid == leader {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // `comm` may contain spaces and parentheses, so fields are read after the LAST ')'.
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // After comm: [0]=state [1]=ppid [2]=pgrp
+        let (Some(state), Some(pgrp)) = (fields.first(), fields.get(2)) else {
+            continue;
+        };
+        let st = state.chars().next().unwrap_or('?');
+        if st == 'Z' {
+            continue;
+        }
+        if pgrp.parse::<i32>() == Ok(pgid) {
+            out.push((pid, st));
+        }
+    }
+    out
+}
+
 /// Strip ANSI SGR escapes from captured output before matching against it.
 ///
 /// **D0A-R30: the fourth assertion in a row that I got wrong by reading a DISPLAY instead of
@@ -1731,7 +1803,8 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
         .env("DELPHI_SHELL_VT", "tty1")
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1");
 
-    let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
+    let run = DaemonGuard::spawn(cmd, &setup.user).wait();
+    let (out, killed, survivors) = (run.output, run.killed, run.survivors_before_guard);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1746,6 +1819,26 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     let daemon_log = strip_ansi(&stdout);
     let fixture_log = strip_ansi(&stderr);
 
+    // (0) **THE INVALIDATING OBSERVATION (D0A-R31-02), CHECKED FIRST.**
+    //
+    // Everything below reads either the daemon's own log or the fact that it beat the guard's
+    // deadline. Neither can distinguish "the daemon cleaned up" from "the daemon did not and
+    // the GUARD did", because `wait()` calls `kill_group` unconditionally. A counterfeit daemon
+    // that reported termination and left its child alive passed all nine of the assertions
+    // below with `killed == false`.
+    //
+    // So this is not a diagnostic to log — a survivor means the harness performed the cleanup
+    // and **the run proves nothing about the daemon**. The test must fail rather than pass with
+    // a note, which is the difference between recording an intervention and being invalidated
+    // by one.
+    assert!(
+        survivors.is_empty(),
+        "the daemon left {} process(es) of its own group ALIVE, and the guard was about to kill \
+         them: {survivors:?}. The daemon did NOT perform the cleanup this test claims to \
+         observe — every assertion below would pass anyway, because they read the daemon's own \
+         log and its exit timing (D0A-R31-02).\nstdout:\n{stdout}",
+        survivors.len()
+    );
     // (4) THE PROPERTY. A kill at the deadline means the daemon did not bound its own wait —
     // which is exactly what an unbounded `waitpid` on a stubborn AI produces.
     assert!(
@@ -1867,7 +1960,8 @@ fn b1_daemon_binary_runs_the_assembled_flow() {
         // insecure-test-seams in the lane); WSL has no real logind session.
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1")
     ;
-    let (out, killed) = DaemonGuard::spawn(cmd, &setup.user).wait();
+    let run = DaemonGuard::spawn(cmd, &setup.user).wait();
+    let (out, killed) = (run.output, run.killed);
     assert!(!killed, "the daemon had to be KILLED at the deadline — the orphan condition");
 
     let marker = std::fs::read_to_string(&result).unwrap_or_default().trim().to_string();

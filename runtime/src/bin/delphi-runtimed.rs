@@ -549,25 +549,51 @@ fn main() -> Result<()> {
     // Bounded now, and the reaper stays ARMED across the wait so a child that outlives the
     // grace period is killed rather than left. Grace over kill-immediately because the ordinary
     // case is a child already exiting, and SIGKILLing it would lose its exit status.
+    // D0A-R29-05: the results of `kill` and the post-kill reap were DISCARDED and the guard
+    // was disarmed unconditionally, so a child stuck in uninterruptible sleep left the daemon
+    // reporting success while contradicting the claim that cleanup stays armed until children
+    // are reaped. Each child's terminal state is now tracked, an unreaped child is a loud
+    // diagnostic AND a non-zero exit, and the guard is disarmed ONLY for children actually
+    // reaped. The waits stay bounded — restoring an unbounded wait to obtain certainty is the
+    // defect R28-02 closed.
     let grace = std::time::Duration::from_secs(5);
+    let mut unreaped: Vec<&str> = Vec::new();
     for (what, pid) in [("shell", children.shell_pid), ("ai", children.ai_pid)] {
-        if !delphi_runtime::launcher::reap_within(pid, grace) {
-            tracing::warn!(
-                child = what,
-                pid,
-                grace_secs = grace.as_secs(),
-                "child did not exit within the grace period after the action completed; \
-                 terminating (D0A-R28-02)"
+        if delphi_runtime::launcher::reap_within(pid, grace) {
+            continue;
+        }
+        tracing::warn!(
+            child = what, pid, grace_secs = grace.as_secs(),
+            "child did not exit within the grace period after the action completed; \
+             terminating (D0A-R28-02)"
+        );
+        if let Err(e) = nix::sys::signal::kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL)
+        {
+            // ESRCH means it is already gone, which the reap below confirms; anything else is
+            // a real signalling failure and must not be silent.
+            tracing::warn!(child = what, pid, error = %e, "SIGKILL failed");
+        }
+        if !delphi_runtime::launcher::reap_within(pid, std::time::Duration::from_secs(2)) {
+            tracing::error!(
+                child = what, pid,
+                "child NOT reaped after SIGKILL — it is likely in uninterruptible sleep. The \
+                 daemon is exiting with a cleanup failure rather than reporting success \
+                 (D0A-R29-05)"
             );
-            let _ = nix::sys::signal::kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
-            // Bounded again: a SIGKILLed child is reaped promptly or it is unreapable (a
-            // zombie whose parent we are, or an already-gone pid), and blocking would
-            // reintroduce the defect this closes.
-            let _ = delphi_runtime::launcher::reap_within(pid, std::time::Duration::from_secs(2));
+            unreaped.push(what);
         }
     }
-    reaper.armed = false;
-    Ok(())
+    if unreaped.is_empty() {
+        reaper.armed = false;
+        Ok(())
+    } else {
+        // The guard stays ARMED: its drop is the last chance for a child that becomes
+        // reapable between here and process exit.
+        Err(anyhow::anyhow!(
+            "cleanup failed: {} not reaped after SIGKILL (D0A-R29-05)",
+            unreaped.join(", ")
+        ))
+    }
 }
 
 /// Where the shell's logind verdict is read from — **fail-closed**, re-read at every gate

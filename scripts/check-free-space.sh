@@ -25,12 +25,33 @@ set -uo pipefail
 # holds protoc scratch and test bundles, a cargo target dir holds gigabytes of objects.
 declare -A FLOOR_MB=( ["/run"]=64 ["/tmp"]=512 )
 
+# D0A-R29-08: ASK CARGO WHERE IT WILL WRITE. This used to read $CARGO_TARGET_DIR and then
+# fall back to grepping `.cargo/config.toml` for `target-dir` — a pin CLAUDE.md §6 records as
+# REMOVED on 2026-08-15 because it was a machine-specific absolute path. So in the DEFAULT
+# configuration (env var unset, no pin) the grep found nothing, no target filesystem was added,
+# and this script checked only /run and /tmp and printed "All checked filesystems above their
+# floors". Reproduced: it returned success while cargo's real target directory went unexamined.
+#
+# That is the worst shape available for this particular guard, because its whole purpose is to
+# stop a full filesystem being MISATTRIBUTED to a compiler error in an unrelated crate. A guard
+# that silently checks nothing does not merely fail to help — it supplies false assurance in
+# exactly the situation it exists for. The free-space trend recorded across lane runs 15-17 was
+# therefore measured by the lane procedure's own `export CARGO_TARGET_DIR`, not by this check;
+# anyone building outside that procedure had no protection at all.
+#
+# `cargo metadata` resolves the env var, any config pin, and the built-in default, so it
+# answers the question actually being asked.
 target_dir="${CARGO_TARGET_DIR:-}"
+if [ -z "$target_dir" ] && command -v cargo >/dev/null 2>&1; then
+    target_dir=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null)
+fi
 if [ -z "$target_dir" ]; then
-    # Mirror .cargo/config.toml's build.target-dir when the env var is unset, so the check
-    # looks where cargo will actually write rather than where we assume it will.
-    target_dir=$(grep -oE '^target-dir *= *"[^"]+"' .cargo/config.toml 2>/dev/null \
-        | sed 's/.*"\(.*\)"/\1/' | head -1)
+    # Last resort: cargo's documented default, relative to this repository. Better an assumed
+    # path that gets checked than no target check at all — the failure this guard exists for
+    # does not care why the path was not resolved.
+    target_dir="$(cd "$(dirname "$0")/.." && pwd)/target"
+    echo "NOTE: could not resolve cargo's target directory; assuming $target_dir" >&2
 fi
 [ -n "$target_dir" ] && FLOOR_MB["$target_dir"]=2048
 [ -n "${TMPDIR:-}" ] && [ "${TMPDIR%/}" != "/tmp" ] && FLOOR_MB["${TMPDIR%/}"]=512

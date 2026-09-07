@@ -10,6 +10,70 @@ what closes it. A row leaves only when a test proves it closed.
 
 ---
 
+## Opened 2026-09-07 — D0-A round 29 (verdict: **FAIL**, 1xP1 7xP2)
+
+**The harness I built to fix an evidence problem had three defects of its own** — the "new,
+load-bearing, reviewed by nobody" risk the round-29 prompt flagged, realised. And **the
+free-space guard I had pointed at as the operational protection checks nothing in the default
+configuration.**
+
+| § | ratified clause | status | finding | closes when |
+|---|---|---|---|---|
+| — (method) | a campaign cannot damage what it measures | **CLOSED** | **R29-01 (P1)** — mutation and restoration were not in `try/finally` and results were written only at the end, so an interrupt left a **removed security check** in the tree with no record. A detected restore failure printed REFUSE and **still exited 0** | transactional; JSONL flushed+fsynced per experiment; **restore VERIFIED with `git diff --quiet HEAD`** rather than trusted from the write, because a partial restore reports success just as loudly |
+| — (method) | a detection is a test detecting something | **CLOSED** | R29-02 — any nonzero `cargo test` exit became CAUGHT, including a build failure, a launch failure and `No space left on device` | classified INFRASTRUCTURE / UNATTRIBUTED FAILURE / CAUGHT / NOT CAUGHT; full stdout+stderr retained (the old filter left experiment 9's evidence empty) |
+| — (method) | the recorded commit explains the result | **CLOSED** | R29-03 — the clean check covered only `runtime/src`, and there was **no baseline run** proving the failures came from the mutation | inputs widened to every path that can change an outcome **including the harness itself**; a green unmutated baseline is now a precondition; build config recorded |
+| §4 the legitimate path works | the regression test catches the regression | **CLOSED** | **R29-04 — the test did not catch what it claimed.** The shipped bound was **30 s**; the test's delay was **900 ms**, which does not trip it, so it would have PASSED against the defect. The weaken bit only because it installed a **500 ms** bound chosen so 900 ms would trip it — a defect constructed to be demonstrable | the deadline policy is injectable and the assertion is on `client_deadline_policy()` being `None`, which catches **any** finite bound. Weaken with the REAL 30 s value now fails it |
+| §4 cleanup is honest | a failed reap is not success | **CLOSED** | R29-05 — `kill` and the post-kill reap results were discarded and the guard disarmed unconditionally, so a child in uninterruptible sleep left the daemon reporting success | per-child terminal state; unreaped children are a loud diagnostic **and** a non-zero exit; the guard stays ARMED when cleanup failed |
+| — (test infra) | a guard cannot leak what it guards | **CLOSED** | R29-06 — `ChildGuard::reap_status` disarmed **before** `waitpid`, so an EINTR panicked with the guard already off and `Drop` did nothing. In tests whose children inherit capture pipes that turns a failure into a hung harness | EINTR and non-terminal statuses retried; disarm only after a terminal status |
+| — (record) | a correction corrects | **CLOSED** | **R29-07 — the same claim was wrong a THIRD time, inside its own correction table** | see below |
+| — (operational) | the free-space guard guards | **CLOSED** | **R29-08** — with `CARGO_TARGET_DIR` unset it checked only `/run` and `/tmp` and returned success, because its fallback grepped a `.cargo/config.toml` pin that CLAUDE.md §6 records as **removed in 2026-08-15** | `cargo metadata` resolves the effective target directory including the default; reproduced fixed in both configurations |
+
+### R29-08 is the one to weight hardest
+
+Not because it is the most severe, but because of **what it was doing while broken**. Three
+messages before it was found, this guard was cited as the operational protection against a full
+filesystem being misattributed to a compiler error in an unrelated crate. In the default
+configuration it checked `/run` and `/tmp`, never looked at cargo's actual target directory, and
+printed *"All checked filesystems above their floors."*
+
+**So that sentence has been true and uninformative every time it was read**, except where the
+lane procedure happened to `export CARGO_TARGET_DIR`. The free-space trend recorded across runs
+15-17 was measured **by the procedure's export, not by the guard** — and anyone building outside
+that procedure had no protection at all. A guard that silently checks nothing does not merely
+fail to help; it supplies false assurance in precisely the situation it exists for.
+
+### R29-07 — and why the fix is to stop making the claim
+
+The table introduced by R27-05 as *"what is actually true"* **repeated the overstatement it was
+written to fix**, and R28's narrowing then contradicted it from six lines below without editing
+it. Three attempts, each fixing the sentence in front of it.
+
+**That is not a wording problem.** The claim is a **universal negative about an entire
+codebase's history** — *"no test ever asserted…"* — and a universal negative cannot be
+established by the kind of looking anyone actually does. You can show the tests you examined
+lacked something; you cannot show none existed without enumerating all of them.
+
+**The durable fix is to state only what was measured and let a reader conclude.** Checkable at
+`53e2b5a`: `required_tier` appeared in construction, digest binding and preview rendering; the
+two tests naming it asserted that *changing* it changes the digest and the preview; no test
+asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
+negative does not, and should not have been written.
+
+### OWED, not closed — the R28-02 coverage gap
+
+The reviewer's answer: extraction **is** the right first step **provided `main` calls the
+extracted production implementation** rather than a duplicated approximation. The cases named:
+a cooperating child (status preserved); a child synchronised to survive grace expiry (requiring
+termination and reap); interrupted waits; signalling failure; post-kill reap timeout;
+already-reaped children; each child independently. Then assembly coverage that the daemon
+invokes the policy after terminal outcomes — for which a feature-enabled integration test is
+useful evidence about the assembly while **not** certifying the production logind gate.
+
+**R29-05 and R29-06 shipped without tests of their own**, and that is the same gap one level
+down. Both are in the extraction's scope and are owed with it.
+
+---
+
 ## Opened 2026-09-07 — D0-A round 28 (verdict: **FAIL**, 2xP1 4xP2)
 
 **Two of the six are defects I introduced last round, and one is that the evidence I handed
@@ -187,7 +251,7 @@ operator requested and I had not checked — recorded here rather than quietly a
 
 | phase | state of tier assertions |
 |---|---|
-| **Before round 25** | **None.** No test asserted that any tier had any consequence. This part of the old claim survives, and it is why R25-01's "descriptive only" defect was undetectable: a defect is findable only against an assertion, and there was none to violate |
+| **Before round 25** | **No tier-specific AUTHORIZATION-BOUNDARY assertion existed.** Tier consequences WERE asserted — `required_tier binds` (digest) and `tier rendered` (preview) both predate round 25. **What was absent is any assertion about what a tier is worth at the gate.** R25-01's "descriptive only" defect was therefore **not detected by the tests that existed** — which is a statement about those tests, not about discoverability: review found it |
 | **Round 25** | Created the **first two** — but encoded the **WRONG boundary**, asserting `Biometric` enforceable when the shipped stack is `pam_unix` alone |
 | **Round 26** | **Inverted one of them.** `Biometric` moved from *passes* to *refused*; the control was rewritten to `Confirm` |
 
@@ -204,6 +268,27 @@ preview consequences of the tier were already asserted), and "not detected by th
 not "impossible to discover", since review did find it. The
 generalisation drawn from it — *look for fields that are constructed, bound and rendered but
 never decided on* — also survives, and produced its own findings (see round 27).
+
+### R29-07 — the same claim was wrong for a THIRD time, inside its own correction
+
+The table above is where R27-05's correction *stated what is actually true*. **It repeated the
+overstatement it was written to fix**: "No test asserted that any tier had any consequence" and
+"undetectable" both survived into it, and D0A-R28's narrowing then contradicted the table from
+six lines below without editing the table.
+
+Three attempts, each fixing the sentence in front of it and leaving the same overstatement one
+level up. **That is no longer plausibly a wording problem.** The claim's *shape* invites
+overreach: it is a universal negative about an entire codebase's history ("no test ever
+asserted…"), and a universal negative cannot be established by the kind of looking anyone
+actually does — you can show that the tests you examined lacked something; you cannot show that
+none existed anywhere without enumerating all of them.
+
+**So the durable fix is to state only what was MEASURED and let a reader draw the conclusion.**
+What was measured, and is checkable at `53e2b5a`: `required_tier` appeared in construction,
+digest binding and preview rendering; the two tests naming it asserted that *changing* it
+changes the digest and the preview; no test asserted a gate outcome for any tier. Every
+narrower claim above follows from that; the universal negative does not, and should not have
+been written.
 
 ### The migration itself
 

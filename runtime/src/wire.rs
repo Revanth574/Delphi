@@ -100,7 +100,16 @@ pub fn arm_frame_liveness(s: &std::os::unix::net::UnixStream) -> Result<(), Runt
 /// [`RuntimeError::Protocol`] if the length prefix is missing, the declared length exceeds
 /// [`MAX_FRAME`], the body is short, or the protobuf decode fails.
 pub fn read_frame<M: Message + Default>(r: &mut impl Read) -> Result<M, RuntimeError> {
-    read_frame_by(r, None)
+    read_frame_by(r, client_deadline_policy())
+}
+
+/// The deadline policy `read_frame` applies to a COOPERATING peer: **none**.
+///
+/// A function rather than a literal `None` so a test can exercise the production wrapper's own
+/// policy rather than a hand-built approximation of it (D0A-R29-04). See
+/// `read_frame_applies_no_deadline_to_a_cooperating_peer`.
+fn client_deadline_policy() -> Option<Instant> {
+    None
 }
 
 /// Read one frame from an **UNTRUSTED** peer, bounded by [`FRAME_DEADLINE`] (D0A-R27-02).
@@ -252,22 +261,45 @@ mod tests {
         let _ = writer.join();
     }
 
-    /// D0A-R28-01 — a frame that arrives AFTER a long human consent is still accepted.
+    /// D0A-R28-01 / **corrected at D0A-R29-04** — `read_frame` applies NO deadline to a
+    /// cooperating peer.
     ///
-    /// **This is the test that would have caught the regression.** D0A-R27-02 put the frame
-    /// deadline in the shared `read_frame`, and `delphi-minimal-ai` waits for `Granted`
-    /// through it — a wait whose length is *a human deciding whether to authenticate*. So a
-    /// daemon-side hardening became a 30-second cap on human consent: it broke the legitimate
-    /// path in order to close an attack path, which is the worse failure of the two.
+    /// # The previous version of this test did not catch the regression it claimed to
     ///
-    /// The deadline now lives at the call site that knows its peer is untrusted
-    /// (`read_frame_untrusted`, used by the daemon), and `read_frame` waits.
+    /// R28-01's regression was a **30-second** absolute bound in the shared reader, which
+    /// capped *a human deciding whether to authenticate*. The test written to catch it used a
+    /// **900 ms** delay — and 900 ms does not trip a 30-second deadline, so **it would have
+    /// PASSED against the shipping defect.** Its weaken appeared to bite only because the
+    /// weaken installed a 500 ms deadline, a value chosen so the 900 ms delay would trip it.
+    /// The RED demonstrated a defect constructed to be demonstrable, not the one that shipped.
+    /// Both the commit message and the baseline called it "the test that would have caught the
+    /// regression". That was false.
     ///
-    /// The delay here is short because the property is "does not impose a bound", which any
-    /// delay past a hypothetical bound demonstrates; a 31-second test would only make the
-    /// suite slower without making the claim stronger.
+    /// # Why this version is not just "sleep longer"
+    ///
+    /// **A test whose delay must exceed the production bound is a test that takes at least
+    /// that long**, and the next person will reach for a fast one and reintroduce the same
+    /// hole. So the assertion is on the POLICY rather than on a race against it:
+    /// `client_deadline_policy()` is what the production `read_frame` passes, and asserting it
+    /// is `None` catches ANY finite bound — 500 ms, 30 s, or an hour — where a timing test
+    /// catches only bounds shorter than its own sleep.
+    ///
+    /// The behavioural half is kept as well, with a delay that exceeds the socket's 250 ms
+    /// polling timeout, which is what a *liveness* mistake would trip.
     #[test]
-    fn read_frame_does_not_bound_a_wait_on_a_cooperating_peer() {
+    fn read_frame_applies_no_deadline_to_a_cooperating_peer() {
+        // THE PROPERTY, checked against the production wrapper's own policy rather than a
+        // reconstruction of it. Any finite deadline here is the R28-01 regression.
+        assert!(
+            client_deadline_policy().is_none(),
+            "read_frame imposed a deadline on a COOPERATING peer. That wait is a human \
+             deciding whether to authenticate, and there is no defensible number of seconds \
+             to cap it at (D0A-R28-01). A timing test cannot catch this — the shipped bound \
+             was 30s and no reasonable test sleeps that long (D0A-R29-04)."
+        );
+
+        // And the behavioural half: a delay past the socket's 250 ms polling timeout, which is
+        // what a liveness error trips.
         let (mut client, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
         arm_frame_liveness(&client).expect("arm");
         let msg = pb::DaemonToAi {
@@ -278,14 +310,13 @@ mod tests {
         };
         let sender = msg.clone();
         let writer = std::thread::spawn(move || {
-            // The human is thinking. Longer than any per-read timeout in force.
             std::thread::sleep(Duration::from_millis(900));
             let mut p = &peer;
             write_frame(&mut p, &sender).expect("write Granted");
             std::thread::sleep(Duration::from_millis(50));
         });
-        let got: pb::DaemonToAi = read_frame(&mut client)
-            .expect("a client waiting on human consent must not be timed out by the daemon's bound");
+        let got: pb::DaemonToAi =
+            read_frame(&mut client).expect("a cooperating peer's frame must still arrive");
         assert_eq!(got, msg);
         let _ = writer.join();
     }

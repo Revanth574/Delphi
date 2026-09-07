@@ -48,12 +48,37 @@ impl ChildGuard {
     /// Reap now and disarm, for a test that needs the child's exit status.
     ///
     /// Returns the exit code, or `-signal` if it died of one.
+    /// D0A-R29-06: **disarm only after a TERMINAL status.** This used to disarm first, so an
+    /// EINTR from `waitpid` panicked with the guard already disabled and `Drop` did nothing —
+    /// leaking the child. In tests whose children inherit the capture pipes, that turns a
+    /// failure into a HUNG HARNESS, which is the exact scenario this guard exists to prevent.
+    /// A signal-injection probe reproduced it: `panicked=true, child after drop=StillAlive`.
+    ///
+    /// `EINTR` is retried rather than treated as terminal — it says nothing about the child.
+    /// Non-terminal statuses (`Stopped`, `Continued`, `PtraceEvent`) are also retried, for the
+    /// D0-R4-02 reason: counting a stopped child as reaped let one escape with its PAM session.
     pub fn reap_status(mut self) -> i32 {
-        self.armed = false;
-        match nix::sys::wait::waitpid(self.pid, None) {
-            Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
-            Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => -(sig as i32),
-            other => panic!("unexpected wait status for {}: {other:?}", self.pid),
+        loop {
+            match nix::sys::wait::waitpid(self.pid, None) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                    self.armed = false;
+                    return code;
+                }
+                Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                    self.armed = false;
+                    return -(sig as i32);
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                // A live child changing state is not a reap. Keep waiting, keep the guard
+                // ARMED so a panic below still cleans up.
+                Ok(nix::sys::wait::WaitStatus::Stopped(..))
+                | Ok(nix::sys::wait::WaitStatus::Continued(_)) => continue,
+                other => panic!(
+                    "unexpected wait status for {}: {other:?} (guard remains ARMED, so Drop \
+                     will still clean up — D0A-R29-06)",
+                    self.pid
+                ),
+            }
         }
     }
 }

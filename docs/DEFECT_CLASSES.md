@@ -2843,3 +2843,89 @@ scoped to the named instance) is the mechanism this defeated — note that 48's 
 caught three sites the findings did not name, so the tool was working and the wrapper was not.
 [45] (the totality claim) is what the filtered output then licenses: "no remaining sites" stated
 from a search whose results were partly discarded.
+
+## 51. A FALSE CLAIM IN A DOCUMENT WHOSE FUNCTION IS TO BE TRUSTED PROPAGATES BY DESIGN  *(new — D0A-R30-06, a safety claim nobody re-derived because the record exists so they need not)*
+
+**The class.** A wrong statement in code is checked by the next person who reads the code, because
+reading code means re-deriving it. A wrong statement in a **record** is not, because the record's
+entire purpose is that readers *stop* deriving. **The error therefore propagates by design rather
+than by accident**, and it propagates fastest in exactly the documents written to be most
+trustworthy: lane records, conformance registers, safety rationales.
+
+**The instance.** `.githooks/runtime-test-count-baseline.root` recorded that a test fixture had
+named pid 1 and that `kill(1, SIGKILL)` **at root ends init** — offered as the justification for
+changing the fixture. **It does not.** Linux gives PID 1 special protection: a signal PID 1 has
+installed no handler for is never delivered, SIGKILL included. The dramatic hazard was invented
+in the writing and set down as fact.
+
+The same note also **confused wait eligibility with signal permission** — parenthood governs
+whether you may `wait` for a process, not whether you may signal it, which depends on credentials
+and capabilities. Both errors sat in the document a later reader consults *instead of* working it
+out, written by the author and left standing by the operator who had asked for the fixture change.
+
+**Why it is not class 45.** A totality claim overstates the reach of something real. This states
+something that is simply not true, in a venue that suppresses checking. The severity comes from
+the venue, not the size of the error.
+
+**The discipline.**
+
+1. **A safety claim in a record owes a citation or a measurement**, at the same standard as a
+   test assertion. "At root this kills init" is a claim about a syscall; it takes one probe.
+2. **State the DULL reason when it suffices.** The fixture change was right for an unglamorous
+   reason — *a fixture should not name a process it does not own*. Reaching for the dramatic
+   version is the tell: a justification that sounds alarming is one nobody wants to be the person
+   who checked.
+3. **Correct in place, visibly.** The wrong sentence stays, struck, with the correction beside
+   it. Silently editing a record that others may have already read propagates the error a second
+   time.
+4. **The author's confidence is not evidence, and neither is the reader's assent.** Two people
+   passed this claim without checking. Agreement between parties who share an incentive to move
+   on is not verification (see [49]).
+
+**The RED-proof shape.** For a claim about system behaviour: a probe that would fail if the claim
+were false, retained. For a claim about the tree: a command whose output is quoted. A record
+sentence with neither is an assertion, and this project's own rule is that an unverifiable
+assertion is indistinguishable from a fabrication.
+
+**Related:** [45] (the totality claim). [12] Iron Law — *verify, don't fabricate* — of which this
+is the special case where the fabrication lands where verification is least likely.
+
+## 52. AN ASSERTION WRITTEN FROM A RENDERED DISPLAY CANNOT MATCH THE BYTES  *(new — D0A-R30, four instances in one arc, the last invisible in its own failure output)*
+
+**The class.** Test assertions get written by reading a transcript. **A transcript is a
+RENDERING** — escape sequences become formatting, streams are interleaved, and text the program
+never emitted appears while bytes it did emit vanish. An assertion built from that reads the
+world through a lossy channel and can be unsatisfiable no matter how correct its intent.
+
+**Four instances, one arc, escalating in subtlety:**
+
+| # | what was read | what was true |
+|---|---|---|
+| 1 | the daemon's log looked like the fixtures' | `tracing_subscriber::fmt()` writes to **stdout**; fixtures use `eprintln!` → **stderr**. The assertion searched the wrong stream |
+| 2 | the message text, from memory of the pre-extraction code | the extracted module emitted different wording. The test reported the property **absent while the transcript showed it happening** |
+| 3 | `child="ai"` in the terminal | the bytes are `\x1b[3mchild\x1b[0m\x1b[2m=\x1b[0m"ai"`. **A terminal renders the escapes as italics**, so display and bytes differ invisibly |
+| 4 | the failure message, to diagnose #3 | the panic prints the same escapes **back through the same terminal**, so the evidence re-hides the defect |
+
+Instance 4 is what makes this a class rather than three mistakes. **The diagnostic channel has the
+same lossiness as the original**, so looking harder at the output cannot find it. Only leaving the
+rendering — `cat -v`, a hex dump, a byte-level assertion — can.
+
+**The discipline.**
+
+1. **Assert against a shared CONSTANT, never a transcribed literal.** If production and test read
+   the same `const`, wording cannot drift (instance 2; the D0A-R2-05 pattern).
+2. **Normalise before matching, and TEST the normaliser** against bytes you measured, with a
+   discriminator proving the raw form does *not* match — otherwise a no-op passes (instance 3).
+3. **Print the NORMALISED form in failure messages.** A panic that re-renders is instance 4.
+4. **Name which stream carries what**, measured from the writer's configuration rather than from
+   where you last saw a line (instance 1).
+5. **When a predicate is correct in isolation but fails in situ, stop reasoning and dump bytes.**
+   Three of the four cost a privileged run each, and each was resolved in one command once the
+   rendering was removed.
+
+**The RED-proof shape.** Feed the normaliser the exact captured bytes and assert the *raw* form
+fails to match. A normaliser tested only on already-clean input is a no-op with a green test.
+
+**Related:** [41] (wrong altitude) — the sibling in searching rather than asserting. [50] (the
+filter is not the mechanism) — there post-processing discarded a true result; here rendering
+manufactures a false one.

@@ -1,27 +1,72 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 17 — the round-28 remediation's first root execution. Measured 2026-09-07 at
-# `c3cca14`.
+# LANE RUN 18 — the round-29 remediation's first root execution. Measured 2026-09-07 at
+# `3582db6`.
 #
 #   EXECUTED 208 / SKIPPED 5 / reported 213     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
-#   predicted 208/5/213 at c3cca14, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#   predicted 208/5/213 at 3582db6, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#
+# =========================================================================================
+# READ THIS BEFORE READING THE NUMBER: **THE NUMBER IS NEARLY UNINFORMATIVE THIS RUN.**
+# =========================================================================================
+#
+# It is IDENTICAL to run 17's, because the round-29 remediation changed CODE and added no
+# tests — R29-04 renamed a test; R29-05, R29-06 and R29-08 are code fixes with no tests at all.
+# **So the count check had nothing to detect and the membership check had nothing new within
+# the run.** A green here says the suite still passes on changed code, which is worth having,
+# and says nothing about whether the changed code is covered. This was written into the
+# expectation BEFORE the run rather than discovered after.
+#
+#   MEMBERSHIP: root 213 identities / unpriv 213, ZERO in either direction, rc 0.
+#   The ONE cross-run change was named in advance and is accounted for:
+#     in run 18, not run 17:  wire::tests::read_frame_applies_no_deadline_to_a_cooperating_peer
+#     in run 17, not run 18:  wire::tests::read_frame_does_not_bound_a_wait_on_a_cooperating_peer
+#   One rename, both directions. Within-run both sides come from the same tree, so zero is the
+#   correct within-run result and is NOT evidence the rename was noticed.
 #
 # ---------------------------------------------------------------------------------------
-# THE MEMBERSHIP CHECK DID REAL WORK FOR THE FIRST TIME
+# WHAT THIS RUN COMPILED AND LINKED BUT DID NOT EXERCISE — predicted, then confirmed
 #
-#   root 213 identities / unpriv 213
-#   IN ROOT NOT UNPRIV: 0
-#   IN UNPRIV NOT ROOT: 0          membership rc=0
+# 1. **R29-05's new exit path.** A child unreaped after SIGKILL → guard stays ARMED → the
+#    daemon returns an ERROR instead of success. Reaching it needs a child in uninterruptible
+#    sleep. **Nothing in this tree constructs one.**
+# 2. **R29-06's new retry path.** EINTR inside `waitpid` → retry rather than panic with the
+#    guard already disarmed. Reaching it needs a signal delivered inside the wait window.
+#    **Nothing in this tree delivers one.** The reviewer reproduced it with a signal-injection
+#    probe that is theirs, not ours.
 #
-# Run 16 introduced this check (D0A-R27-04) on a tree where **nothing had changed between the
-# lanes** — it could not have been wrong there. **Eight tests were added between run 16 and run
-# 17**, so this is the first run where the comparison had a genuine delta to be right or wrong
-# about, and it agreed on every identity.
+# Both were compiled, linked, and run past — never through. Recorded as OWED, not counted.
 #
-# 213, not 208: membership covers the whole set, executed AND skipped. The 200/5-style split is
-# what the COUNT check answers. Two different questions, and conflating them is roughly the
-# error D0A-R27-04 was about.
+# 3. **D0A-R28-02'S COVERAGE GAP IS OPEN FOR A SECOND CONSECUTIVE ROUND**, and R29-05 has now
+#    MODIFIED that same untested path. **A change to untested code does not become tested by
+#    being changed.** `b1_daemon_binary_runs_the_assembled_flow` still SKIPS here for want of
+#    `--features insecure-test-seams`, and even unskipped `delphi-minimal-ai` cooperates, so
+#    the SIGKILL branch is never taken. The owed answer is the reviewer's: extract the exit
+#    sequence so `main` calls the EXTRACTED implementation rather than a duplicate, covering a
+#    cooperating child, a child synchronised past grace expiry, interrupted waits, signalling
+#    failure, post-kill reap timeout, already-reaped children, and each child independently —
+#    then assembly coverage that the daemon invokes the policy after terminal outcomes.
+#
+# ---------------------------------------------------------------------------------------
+# A CLAIM OF MINE THAT THIS RUN FALSIFIED — recorded because it was carried into a prompt
+#
+# I told the operator the lane consumes **~0.5 GiB per run** and raised it as an operational
+# item. The readings:
+#
+#     run 16   3903M
+#     run 17   3397M    (-506M)
+#     run 18   3377M    (-20M)
+#
+# **Run 18 consumed 20M.** The -506M did not measure a lane run: it spanned the round-28 work,
+# including **fourteen full rebuilds from the mutation campaign**. I attributed campaign cost to
+# lane runs from two readings.
+#
+# The reviewer said exactly this at D0A-R29 — *"two free-space readings do not isolate per-lane
+# consumption from intervening builds and mutation campaigns"* — and I recorded the caution
+# while still carrying the per-run figure forward. The next data point settled it. **Measure
+# peak demand by OPERATION (lane run vs campaign vs clean build), not by wall-clock between
+# runs.** A mutation campaign is the expensive one: 14 mutants x a full rebuild each.
 #
 # ---------------------------------------------------------------------------------------
 # EVERY HYGIENE CHECK, WITH THE EVIDENCE THAT DECIDES IT
@@ -29,63 +74,32 @@
 #   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
 #   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED, both printed
 #   bwrap            0.11.1
-#   free space       /run 1483M, target 3397M, /tmp 3609M — all above floor. Down ~506M from
-#                    run 16's 3903M; the target dir loses roughly half a gigabyte per run to
-#                    incremental artifacts, so it will want clearing again in a few runs. Noted
-#                    as a trend, not a problem: the floor is 2048M.
-#   forced freshness ENFORCED (D0A-R26-05): enumeration asserted at 17, BOTH hash sides
-#                    asserted equal to 17, rebuild failure fatal, `diff` empty.
+#   free space       /run 1483M, target 3377M, /tmp 3585M — all above floor. NOTE: the lane
+#                    exports CARGO_TARGET_DIR, so §0 took the env-var path; D0A-R29-08's fix
+#                    (resolving cargo's default via `cargo metadata`) is what protects a build
+#                    run OUTSIDE this procedure, and is not exercised here.
+#   forced freshness ENFORCED: enumeration asserted at 17, BOTH hash sides asserted equal to
+#                    17, rebuild failure fatal, `diff` empty.
 #   PAM before       439c1d1521d86e4eb011a927aff659db
 #   PAM after        md5sum -c → OK              (class 16, the defect already paid for)
 #   stale sessions   none, checked before AND after
 #
-# THE FIVE SKIPS, each quoting its own blocker from the log:
-#   b1_daemon_binary_runs_the_assembled_flow          needs --features insecure-test-seams
-#   an_unreadable_login_defs_refuses_…                this uid can read a 0000 file
-#   pidfd_refuses_a_recycled_pid_barrier              user namespaces unavailable here
-#   live_logind_query_path_works_or_documents_…       standing DEFER (no logind session)
-#   a_regular_login_user_is_not_refused_…             running as root
+# THE FIVE SKIPS, each quoting its own blocker: b1_daemon_binary (needs --features
+# insecure-test-seams), an_unreadable_login_defs (this uid can read a 0000 file),
+# pidfd_refuses_a_recycled_pid_barrier (no user namespaces), live_logind_query (standing DEFER),
+# a_regular_login_user_is_not_refused (running as root). Three skip BECAUSE the run is
+# privileged, so root's 208 and the unprivileged 188 are OVERLAPPING SETS.
 #
-# Three of the five skip *because* the run is privileged and execute unprivileged, so root's
-# 208 and the unprivileged 188 are OVERLAPPING SETS, neither containing the other.
+# The clock test again reported its own powerlessness: `BOOTTIME - MONOTONIC = 0s`.
 #
-# The clock test again reported its own powerlessness: `BOOTTIME - MONOTONIC = 0s … this test
-# CANNOT distinguish them and a green proves nothing about clock selection.`
-#
-# ORDERING HELD UNDER CONVENTION FOR THE FIFTH CONSECUTIVE RUN (D0A-R22-01, still reopened).
-# `c3cca14` contains the expectation alone. Five clean instances are five historical successes;
-# they are not enforcement of the sixth, and nothing prevents the next one from being written
-# after the fact.
+# ORDERING HELD UNDER CONVENTION FOR THE SIXTH CONSECUTIVE RUN (D0A-R22-01, still reopened).
+# Six historical successes; not enforcement of the seventh.
 #
 # ---------------------------------------------------------------------------------------
-# WHAT A GREEN RUN 17 DOES **NOT** ESTABLISH — the first item is specific to this run
-#
-# 1. **R28-02's BOUNDED DAEMON EXIT IS BARELY EXERCISED BY THIS RUN.** The fix — `reap_within`
-#    + grace + SIGKILL replacing an unconditional `waitpid` on the UNTRUSTED AI — lives in
-#    `delphi-runtimed`, whose only root exercise is `b1_daemon_binary_runs_the_assembled_flow`,
-#    and that test **SKIPS on this lane** for want of `--features insecure-test-seams`. So the
-#    single most root-relevant change in the round-28 remediation was not run at root here. The
-#    unprivileged suite does not reach it either. This was predicted in the expectation before
-#    the run, not noticed afterwards.
-# 2. **THE MUTATION CAMPAIGN REMAINS AN UNPRIVILEGED RESULT.** `scripts/mutation-campaign.py`
-#    produced 14/14 valid experiments at `3593fa8` with `euid=1000` recorded. Nothing in this
-#    lane run is a campaign, and a green run 17 does not extend those results to root. The five
-#    root-gated tests above have **never been mutation-tested at all** — and one of them is the
-#    only exercise of the code in item 1. What a root campaign would require is written in the
-#    harness's own docstring: build unprivileged, run the binaries under sudo, keep artifact
-#    writes unprivileged, record the TESTS' euid rather than the harness's.
-# 3. THE SUSPEND DIVERGENCE. Unmeasured; see the DISCRIMINATION line above.
-# 4. THE PENDING STORE HAS NO CAP, and the ABANDONED READ WORKER is unbounded for repeated
-#    service — 30 s is an engineering choice, not a demonstrated bound.
-# 5. `action.timeout` IS ENFORCED NOWHERE at execution (R9-04). Round 28 closed its digest
-#    BINDING only, and the test name says so.
-#
-# ---------------------------------------------------------------------------------------
-# SUPERSEDED — LANE RUN 16 (`EXECUTED 200 / SKIPPED 5 / reported 205`, at `09dc36b`). Sound and
-# not in doubt: it was the first run whose membership was proven by identity rather than
-# inferred from equal totals. Superseded only because it predates the round-28 remediation.
-# Before it: run 15 (`192/5/197`), run 14 (`187/5/192`, closed D0A-R24-01 with the first
-# freshness check that hashed anything), run 13 (`177/5/182`, freshness WITHDRAWN by
-# D0A-R25-05), and runs 11/12 which split hygiene from counts.
+# SUPERSEDED — LANE RUN 17 (`208/5/213`, at `c3cca14`). Identical counts, different tree: run
+# 17 predates the round-29 code changes. Superseded on TREE, not on figure — the first time
+# these have come apart, and the reason a lane record names its commit rather than its number.
+# Before it: run 16 (`200/5/205`), run 15 (`192/5/197`), run 14 (`187/5/192`, closed
+# D0A-R24-01), run 13 (`177/5/182`, freshness WITHDRAWN by D0A-R25-05).
 EXECUTED=208
 SKIPPED=5

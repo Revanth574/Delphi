@@ -439,26 +439,38 @@ them. A future round comparing 128 to 157 would be reading a lane difference as 
 
 ### THE ROOT FIGURE — recorded from the tool, and RE-recorded when run 7's proved stale
 
-**CURRENT ROOT RECORD: LANE RUN 17** — `EXECUTED 208 / SKIPPED 5 / reported 213`, predicted
-`208/5/213` at `c3cca14` and matched exactly. First root execution of the round-28 remediation.
+**CURRENT ROOT RECORD: LANE RUN 18** — `EXECUTED 208 / SKIPPED 5 / reported 213` at
+`3582db6`, predicted and matched exactly. **Identical counts to run 17, on a different tree** —
+the first time the figure and the tree have come apart, and the reason a lane record names its
+commit rather than its number.
 
-**The membership check did real work for the first time.** Run 16 introduced it on a tree where
-nothing had changed between the lanes, so it could not have been wrong there. **Eight tests
-landed between the runs**, giving run 17 a genuine delta to be right or wrong about: `root 213
-identities / unpriv 213`, zero in either direction, `rc 0`. Agreement on every identity.
+**The number is nearly uninformative this round, and the expectation said so BEFORE the run.**
+Round 29 changed code and added no tests (R29-04 renamed one; R29-05/06/08 are code fixes), so
+the count check had nothing to detect and the membership check had nothing new within the run.
+A green says the suite still passes on changed code; it says nothing about whether the changed
+code is covered.
 
-**And the item this run does NOT establish was predicted before it, not noticed after.**
-R28-02's bounded daemon exit — `reap_within` + grace + SIGKILL replacing an unconditional
-`waitpid` on the untrusted AI — lives in `delphi-runtimed`, whose only root exercise is
-`b1_daemon_binary_runs_the_assembled_flow`, and **that test SKIPS on this lane**. So the most
-root-relevant change in the round-28 remediation was not run at root, and the unprivileged
-suite does not reach it either.
+**What run 18 compiled and linked but did not exercise** — predicted, then confirmed:
+R29-05's unreaped-child path needs a child in uninterruptible sleep and nothing constructs one;
+R29-06's EINTR retry needs a signal inside the `waitpid` window and nothing delivers one. Both
+run past, never through. **And D0A-R28-02's gap is open for a SECOND consecutive round with
+R29-05 having now modified that same untested path — a change to untested code does not become
+tested by being changed.**
 
-**The mutation campaign remains an unprivileged result** (`euid=1000` at `3593fa8`). Nothing in
-a lane run is a campaign. The five root-gated tests have never been mutation-tested at all —
-and one of them is the only exercise of the code above. `scripts/mutation-campaign.py`'s
-docstring records what a root campaign would require, so the gap is written down rather than
-waiting to be discovered by someone assuming the unprivileged table covers root.
+### A claim of mine this run falsified
+
+I reported the lane consumes **~0.5 GiB per run** and raised it as an operational item in the
+round-29 prompt. Readings: run 16 `3903M`, run 17 `3397M` (−506M), **run 18 `3377M` (−20M)**.
+
+**Run 18 consumed 20M.** The −506M spanned the round-28 work including **fourteen full rebuilds
+from the mutation campaign** — I attributed campaign cost to lane runs from two readings. The
+reviewer had said precisely this at R29 (*"two free-space readings do not isolate per-lane
+consumption from intervening builds and mutation campaigns"*); I recorded the caution and
+carried the figure forward anyway. **Measure peak demand by OPERATION, not by wall-clock between
+runs** — a campaign is 14 mutants × a full rebuild and is the expensive one.
+
+**Run 17 is SUPERSEDED on TREE, not on figure** (`208/5/213`, `c3cca14`): sound, and its counts
+are still correct — it simply predates the round-29 code changes.
 
 **Run 16 is SUPERSEDED but not in doubt** (`200/5/205`, `09dc36b`): the first run whose
 membership was proven by identity. Superseded only because it predates round 28.

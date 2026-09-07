@@ -59,29 +59,45 @@ two tests naming it asserted that *changing* it changes the digest and the previ
 asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
 negative does not, and should not have been written.
 
-### D0A-R28-02 IS CLOSED — assembly coverage, decision A, demonstrated at root
+### D0A-R28-02 — **NOT CLOSED. The row below overstated its own evidence (D0A-R31-02).**
 
-`b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive` **passes** with all eight
-assertions, against the real `delphi-runtimed` binary at root, driven by `delphi-stubborn-ai` —
-a feature-gated fixture that speaks the identical protocol through the identical helpers and
-then **refuses to exit**. That is the branch `delphi-minimal-ai` could never reach, because it
-cooperates, which is why the policy sat compiled and unexercised for three rounds.
+**This section recorded the finding as CLOSED. It is not, and the correction is filed ahead of
+the six fixes it sits with, because a false claim in this document is class 51 — written in the
+same round, violated in the same round's record.** A record exists so readers stop deriving; an
+overstated closure here propagates by design.
 
-The daemon's own log carries the property with its timing:
+**What the root run actually establishes, which is real and is more than existed three rounds
+ago:** the daemon **reached its termination-reporting branch and exited before the guard's
+deadline**, against an AI that completed the protocol and refused to exit. The log carries it:
 
 ```
 20:12:02.361  INFO  served one action outcome=Completed
 20:12:07.395  WARN  child outlived the grace period and was terminated (D0A-R28-02) child="ai"
 ```
 
-**5.03 seconds** — the grace expiring, `SIGKILL`, the termination attributed to the AI by name.
-The fifth assertion needs no special construction: without the bounded exit, `main` blocks in
-`waitpid`, `DaemonGuard` kills at the deadline, and `!killed` fails.
+**What it does NOT establish: that the daemon cleaned the child up.**
+`DaemonGuard::wait()` calls `Self::kill_group(child.id())` **unconditionally** after its deadline
+loop, so **the harness supplies the kill whether or not the daemon performed one.** The test then
+asserts on what the daemon *logged* plus `!killed` — and `!killed` measures only that the daemon
+hit the deadline, not that it exited *through* the policy. A counterfeit daemon that leaves its
+child alive **passes all nine assertions with `killed=false`** (reviewer probe, retained in
+`scratch/d0a-round31-review/`).
 
-**Scope, encoded in the test body rather than a comment:** it runs a binary built with
-`insecure-test-seams`, whose logind gate is bypassable. It certifies the **shutdown assembly**
-and **nothing about the production logind gate**, which remains blocked on a seated lane. Those
-were always separate obligations; this closes the first.
+**THE WORRY WAS STATED IN ADVANCE AND CONFIRMED.** The round-31 prompt asked, of this test:
+*"Is `!killed` sufficient for the fifth assertion? It proves the daemon exited before the
+guard's deadline. Does it prove the daemon exited through the policy?"* The answer was the
+second. Recording that the question was asked before the verdict is not credit — the test
+shipped anyway, and the operator was told the fifth assertion was what made this assembly
+coverage rather than outcome coverage. **It is not, and both of us said otherwise.**
+
+**Nine assertions, not eight.** The count was stated as eight here and in three commit messages;
+the body has 8 `assert!` plus 1 `assert_eq!`.
+
+**Closes when:** the test observes child identities and terminal state **before** the guard can
+intervene, records guard intervention separately as invalidating the daemon-cleanup claim, and
+carries a weaken that skips signalling/reaping while preserving the reported outcome — which
+must fail. Tracked with **D0A-R31-05**, since a barrier built on an unchecked `waitid` can vanish
+silently and take the determinism with it.
 
 ### The cost, stated plainly: FOUR root runs, THREE lost to my own assertions
 
@@ -100,9 +116,11 @@ Recorded as `DEFECT_CLASSES.md` **class 52**. The fourth instance is what makes 
 failure output re-renders the escapes through the same terminal, so **the diagnostic channel has
 the same lossiness as the original** and looking harder cannot find it. Only `cat -v` could.
 
-Three privileged runs is the honest price of a test written by reading transcripts. The fixes
-are structural — a shared `const` so wording cannot drift, a tested `strip_ansi`, named streams
-— so they close the class rather than the instances.
+Three privileged runs is the honest price of a test written by reading transcripts. **"The fixes
+are structural" was also overstated (D0A-R31):** a shared `const`, a tested `strip_ansi` and
+named streams are structural, but **the failure messages still print raw `{stdout}` / `{stderr}`
+— the exact diagnostic re-rendering class 52 prescribes against, left in place by the change
+that wrote class 52.**
 
 ### Also recorded, not fixed
 

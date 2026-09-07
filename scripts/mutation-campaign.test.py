@@ -10,12 +10,15 @@ security check is covered — so its own failure modes need REDs.
 
 # D0A-R30-05: THE PREVIOUS VERSION OF THIS FILE COULD PRINT `[FAIL]` AND EXIT 0
 
-Two of its checks only *printed* their verdict; neither updated the exit status. Replacing
-`file_matches_head` with an always-false verifier produced two `[FAIL]` lines and **exit 0**.
+**TWO** of its checks only *printed* their verdict without updating the exit status; the others
+did decide. Replacing `file_matches_head` with an always-false verifier produced two `[FAIL]`
+lines and **exit 0**.
 
-That is the precise defect class this project exists to catch, shipped inside the guard built to
-catch it — and every campaign result since it landed rested on a self-test that could not fail.
-**Every check below is now an assertion.** There is no reporting path that does not also decide.
+**The claim first written here — "a self-test that could not fail" — was itself an overstatement
+(D0A-R31).** It could fail, and did, for most of what it checked; two specific checks were
+inert. Saying the whole thing was inert is the same shape as the defect: a statement about
+coverage that is broader than what was measured. **Every check below is now an assertion**, and
+there is no reporting path that does not also decide.
 
 Run: `python3 scripts/mutation-campaign.test.py`  (exit 0 = all guards hold)
 """

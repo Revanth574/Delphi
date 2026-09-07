@@ -1593,6 +1593,70 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
+/// Strip ANSI SGR escapes from captured output before matching against it.
+///
+/// **D0A-R30: the fourth assertion in a row that I got wrong by reading a DISPLAY instead of
+/// BYTES.** `tracing_subscriber::fmt()` renders structured field names with SGR escapes even
+/// when stdout is a pipe, so the daemon's `child = "ai"` field is really
+/// `\x1b[3mchild\x1b[0m\x1b[2m=\x1b[0m"ai"`. A terminal renders those as italics and the
+/// transcript looks exactly like `child="ai"` — so an assertion written from the transcript can
+/// never match, and the mismatch is invisible in the failure output because the panic message
+/// prints the same escapes back through the same terminal.
+///
+/// Measured with `cat -v` against a probe using the daemon's own subscriber init, not inferred.
+/// The message TEXT carries no internal escapes, which is why a `contains(MESSAGE)` assertion
+/// passed while the field one could not.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI ... final-byte. Consume through the terminator rather than guessing a length.
+        if chars.next() == Some('[') {
+            for t in chars.by_ref() {
+                if ('@'..='~').contains(&t) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// D0A-R30 — `strip_ansi` against the bytes tracing ACTUALLY emits.
+///
+/// The input here is not invented: it is the exact line captured with `cat -v` from a probe
+/// using `delphi-runtimed`'s own subscriber init. A helper that makes other assertions possible
+/// is load-bearing, and this arc has now produced four assertions that could not match because
+/// they were written from a rendered display.
+#[test]
+fn strip_ansi_recovers_the_field_text_tracing_actually_emits() {
+    // \x1b[3mchild\x1b[0m\x1b[2m=\x1b[0m"ai"  — italic name, dim equals, quoted value.
+    let raw = "child outlived the grace period and was terminated (D0A-R28-02) \
+               \u{1b}[3mchild\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"ai\"";
+    let clean = strip_ansi(raw);
+    assert!(
+        clean.contains(r#"child="ai""#),
+        "the field did not survive stripping: {clean:?}"
+    );
+    assert!(
+        clean.contains(delphi_runtime::shutdown::TERMINATED_AFTER_GRACE),
+        "the message did not survive stripping: {clean:?}"
+    );
+    // THE DISCRIMINATOR: the raw form must NOT match, or stripping is doing nothing and this
+    // test would pass against a no-op helper.
+    assert!(
+        !raw.contains(r#"child="ai""#),
+        "the raw bytes already matched — the fixture is not the escaped form and this test \
+         proves nothing"
+    );
+    // A line with no escapes must pass through unchanged.
+    assert_eq!(strip_ansi("plain child=\"ai\""), "plain child=\"ai\"");
+}
+
 /// **D0A-R30 decision A — ASSEMBLY COVERAGE for the bounded daemon exit (D0A-R28-02).**
 ///
 /// # What this proves that the extraction's unit tests cannot
@@ -1677,8 +1741,10 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     // report and the shutdown attribution — lands there. The FIXTURES use `eprintln!`, so
     // their lines land on **stderr**. Asserting the daemon's own logging against stderr looked
     // reasonable and could never match.
-    let daemon_log = stdout.as_ref();
-    let fixture_log = stderr.as_ref();
+    // ANSI-STRIPPED: tracing renders field names with SGR escapes even to a pipe, so matching
+    // raw bytes against a transcript-derived literal cannot work. See `strip_ansi`.
+    let daemon_log = strip_ansi(&stdout);
+    let fixture_log = strip_ansi(&stderr);
 
     // (4) THE PROPERTY. A kill at the deadline means the daemon did not bound its own wait —
     // which is exactly what an unbounded `waitpid` on a stubborn AI produces.

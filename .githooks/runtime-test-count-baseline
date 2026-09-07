@@ -222,5 +222,13 @@
 #   the exact command. **A SKIP IS NOT COVERAGE** (DEFECT_CLASSES 10): this test contributes
 #   nothing until run under both conditions, which no current lane does. That is the point of
 #   recording it here rather than counting it as progress.
-EXECUTED=198
+# 2026-09-07 (D0A-R30, the ANSI finding): 198/26 -> 199/26. +1 EXECUTED:
+#   `strip_ansi_recovers_the_field_text_tracing_actually_emits`. It exists because the assembly
+#   test's field assertion could not match: tracing renders `child = "ai"` as
+#   \x1b[3mchild\x1b[0m\x1b[2m=\x1b[0m"ai" EVEN TO A PIPE, and a terminal displays that as
+#   plain `child="ai"`. Four assertions in this arc have now failed because they were written
+#   from a RENDERED DISPLAY rather than from bytes. The helper's fixture is the exact line
+#   captured with `cat -v`, and the test asserts the RAW form does NOT match — otherwise it
+#   would pass against a no-op stripper.
+EXECUTED=199
 SKIPPED=26

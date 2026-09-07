@@ -72,43 +72,64 @@ impl ChildOutcome {
     }
 }
 
+/// What a bounded wait actually learned. **Distinct outcomes, because collapsing them is what
+/// D0A-R30-02 was** — see [`shutdown_child`].
+#[derive(Debug)]
+enum Waited {
+    /// The child reached a terminal state and THIS call consumed it.
+    Terminal(WaitStatus),
+    /// `ECHILD` — there was nothing outstanding. Someone else reaped it, or it was never ours.
+    /// **Not an exit status, and must never be fabricated into one.**
+    Absent,
+    /// Still alive when the deadline passed.
+    Timeout,
+    /// The wait itself failed.
+    Failed,
+}
+
 /// Reap `pid` within `timeout`, **preserving the terminal status**.
 ///
-/// `launcher::reap_within` answers only "is it gone", which is all its caller needs. Shutdown
-/// needs the status as well, so a cooperating child's exit code survives the policy.
+/// # D0A-R30-02: this is the ONLY status-consuming wait, and that is the fix
 ///
-/// `EINTR` is retried against the same deadline — it says nothing about the child (D0A-R29-06
-/// is the same lesson one layer up). Non-terminal statuses (`Stopped`, `Continued`) are
-/// **not** reaps: counting a stopped child as gone let one escape with its PAM session
+/// There used to be two. A separate `already_gone()` helper called `waitpid(WNOHANG)` purely to
+/// classify — but `waitpid` **CONSUMES** a terminal status, so for a child that had already
+/// exited it reaped the corpse, **discarded the status**, and returned "not gone". The real
+/// wait then received `ECHILD`, which was fabricated into `Exited(pid, 0)`.
+///
+/// Measured, deterministically, by establishing the terminal state with `waitid(WNOWAIT)` first:
+/// an `exit 7` child returned `Exited { code: 0 }` and a **SIGTERM death** also returned
+/// `Exited { code: 0 }`. The one property the extraction was built to preserve — a cooperating
+/// child's exit status — was destroyed by the classifier standing in front of it.
+///
+/// `a_cooperating_child_is_reaped_within_grace_with_its_status_preserved` passed anyway,
+/// because the child is usually still running when the classifier looks. **It passed on
+/// scheduling, not on correctness** (Iron Law #15 clause 2: green from a test that never bit).
+///
+/// `EINTR` is retried against the same deadline. Non-terminal statuses (`Stopped`, `Continued`)
+/// are not reaps — counting a stopped child as gone let one escape with its PAM session
 /// (D0-R4-02).
-fn reap_status_within(pid: i32, timeout: Duration) -> Option<WaitStatus> {
+fn wait_within(pid: i32, timeout: Duration) -> Waited {
     if pid <= 0 {
         // D0A-R7-07: `waitpid` reads 0 as "any child in my process group" and -1 as ANY child.
-        return None;
+        return Waited::Failed;
     }
     let deadline = Instant::now() + timeout;
     loop {
         match nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
-            Ok(s @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => return Some(s),
-            Err(nix::errno::Errno::ECHILD) => return Some(WaitStatus::Exited(Pid::from_raw(pid), 0)),
+            Ok(s @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                return Waited::Terminal(s)
+            }
+            Err(nix::errno::Errno::ECHILD) => return Waited::Absent,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return None,
+            Err(_) => return Waited::Failed,
             Ok(_) => {
                 if Instant::now() >= deadline {
-                    return None;
+                    return Waited::Timeout;
                 }
                 std::thread::sleep(POLL);
             }
         }
     }
-}
-
-/// Whether `pid` is still a live child of ours (used only to classify `AlreadyGone`).
-fn already_gone(pid: i32) -> bool {
-    matches!(
-        nix::sys::wait::waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)),
-        Err(nix::errno::Errno::ECHILD)
-    )
 }
 
 /// Shut one child down: wait `grace`, then `SIGKILL`, then wait `post_kill`.
@@ -126,15 +147,12 @@ fn already_gone(pid: i32) -> bool {
 /// ```
 #[must_use]
 pub fn shutdown_child(pid: i32, grace: Duration, post_kill: Duration) -> ChildOutcome {
-    // D0A-R7-07, AND THIS GUARD WAS MISSING FROM THE FIRST DRAFT OF THIS FUNCTION. `kill(0, ..)`
-    // signals THE ENTIRE PROCESS GROUP and `kill(-1, ..)` signals every process the caller may
-    // signal. The reaper below guards `pid <= 0` and returns `None`, which then fell straight
-    // through to the `kill` — so a non-positive pid took the "outlived its grace" branch and
-    // killed the group. `non_positive_pids_are_refused_rather_than_signalling_a_group`
-    // demonstrated it by SIGKILLing the test runner itself (exit 137) on its first run.
-    //
-    // The lesson is the one D0A-R7-07 already recorded and this code re-learned: a guard on the
-    // WAIT side is not a guard on the SIGNAL side. They are separate reachable arguments.
+    // D0A-R7-07, AND THIS GUARD WAS MISSING FROM THE FIRST DRAFT. `kill(0, ..)` signals THE
+    // ENTIRE PROCESS GROUP and `kill(-1, ..)` every signallable process. The wait side guarded
+    // `pid <= 0` and fell straight through to the `kill` —
+    // `non_positive_pids_are_refused_rather_than_signalling_a_group` demonstrated it by
+    // SIGKILLing the test runner (exit 137). A guard on the WAIT side is not a guard on the
+    // SIGNAL side; they are separate reachable arguments.
     if pid <= 0 {
         return ChildOutcome::Unreaped {
             kill_error: Some(format!(
@@ -143,27 +161,33 @@ pub fn shutdown_child(pid: i32, grace: Duration, post_kill: Duration) -> ChildOu
             )),
         };
     }
-    if already_gone(pid) {
-        return ChildOutcome::AlreadyGone;
-    }
-    if let Some(status) = reap_status_within(pid, grace) {
-        return match status {
-            WaitStatus::Exited(_, code) => ChildOutcome::Exited { code },
-            WaitStatus::Signaled(_, sig, _) => ChildOutcome::Signaled { signal: sig as i32 },
-            _ => ChildOutcome::AlreadyGone,
-        };
+    // ONE status-consuming wait (D0A-R30-02). No classifier in front of it.
+    match wait_within(pid, grace) {
+        Waited::Terminal(WaitStatus::Exited(_, code)) => return ChildOutcome::Exited { code },
+        Waited::Terminal(WaitStatus::Signaled(_, sig, _)) => {
+            return ChildOutcome::Signaled { signal: sig as i32 }
+        }
+        Waited::Terminal(_) => return ChildOutcome::AlreadyGone,
+        Waited::Absent => return ChildOutcome::AlreadyGone,
+        Waited::Failed => {
+            return ChildOutcome::Unreaped {
+                kill_error: Some(format!("wait on pid {pid} failed")),
+            }
+        }
+        Waited::Timeout => {}
     }
     // Outlived the grace period.
     let kill_error = match kill(Pid::from_raw(pid), Signal::SIGKILL) {
         Ok(()) => None,
-        // ESRCH means it died between the reap attempt and the signal — not a failure.
+        // ESRCH means it died between the wait and the signal — not a failure.
         Err(nix::errno::Errno::ESRCH) => None,
         Err(e) => Some(e.to_string()),
     };
-    if reap_status_within(pid, post_kill).is_some() {
-        ChildOutcome::Terminated
-    } else {
-        ChildOutcome::Unreaped { kill_error }
+    match wait_within(pid, post_kill) {
+        // Gone one way or another. `Absent` here means someone else reaped it; either way the
+        // child is not outstanding, which is what cleanup owes.
+        Waited::Terminal(_) | Waited::Absent => ChildOutcome::Terminated,
+        Waited::Timeout | Waited::Failed => ChildOutcome::Unreaped { kill_error },
     }
 }
 
@@ -209,6 +233,76 @@ mod tests {
             .spawn()
             .expect("spawn")
             .id() as i32
+    }
+
+    /// Block until `pid` is terminal WITHOUT consuming its status (`waitid(WNOWAIT)`).
+    ///
+    /// This is what makes the two tests below deterministic rather than racy: the child is
+    /// KNOWN dead and KNOWN still reapable when `shutdown_child` is called, which is exactly
+    /// the state D0A-R30-02 mishandled and exactly the state a spawn-then-call test reaches
+    /// only by luck.
+    fn await_terminal_without_reaping(pid: i32) {
+        // SAFETY: `waitid` writes a `siginfo_t` this frame owns and fully initialises; WNOWAIT
+        // leaves the child reapable so the code under test still sees a terminal status.
+        unsafe {
+            let mut si: nix::libc::siginfo_t = std::mem::zeroed();
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                pid as nix::libc::id_t,
+                &mut si,
+                nix::libc::WEXITED | nix::libc::WNOWAIT,
+            );
+        }
+    }
+
+    /// D0A-R30-02 — an ALREADY-DEAD child's exit code survives, deterministically.
+    ///
+    /// The previous version of this property spawned a child and called `shutdown_child`
+    /// immediately, so the child was usually still RUNNING and the defect was skipped. Here the
+    /// child is established terminal-but-unreaped first, which is the state that broke:
+    /// `already_gone()`'s classifying `waitpid` consumed the status, discarded it, and the real
+    /// wait then turned `ECHILD` into `Exited { code: 0 }`.
+    ///
+    /// Measured against the pre-fix module: `exit 7` → `Exited { code: 0 }`.
+    #[test]
+    fn an_already_dead_childs_exit_code_survives_shutdown() {
+        let pid = quick_exit(7);
+        await_terminal_without_reaping(pid);
+        assert_eq!(
+            shutdown_child(pid, Duration::from_secs(2), Duration::from_secs(2)),
+            ChildOutcome::Exited { code: 7 },
+            "the exit status was destroyed by a classifier in front of the real wait — the one \
+             property this module exists to preserve (D0A-R30-02)"
+        );
+    }
+
+    /// D0A-R30-02 — a child that DIED OF A SIGNAL is not reported as a clean exit.
+    ///
+    /// The sharper half: the pre-fix module returned `Exited { code: 0 }` for a SIGTERM death,
+    /// so a killed child and a successful one were the same event. A shutdown policy that
+    /// cannot tell those apart cannot report anything useful about cleanup.
+    #[test]
+    fn a_child_that_died_of_a_signal_is_not_reported_as_a_clean_exit() {
+        let pid = Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .id() as i32;
+        await_terminal_without_reaping(pid);
+        match shutdown_child(pid, Duration::from_secs(2), Duration::from_secs(2)) {
+            ChildOutcome::Signaled { signal } => assert_eq!(
+                signal,
+                nix::libc::SIGTERM,
+                "reported the wrong signal"
+            ),
+            other => panic!(
+                "a SIGTERM death reported as {other:?} — pre-fix this was Exited{{code:0}}, \
+                 making a killed child indistinguishable from a successful one (D0A-R30-02)"
+            ),
+        }
     }
 
     /// CASE 1 — a cooperating child is reaped within grace AND ITS EXIT STATUS SURVIVES.

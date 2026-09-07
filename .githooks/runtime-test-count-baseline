@@ -205,5 +205,16 @@
 #   extraction's one condition — main must call THIS code, not a copy. It FAILED on first run
 #   and caught a real second implementation inside ChildReaper::Drop.
 # SKIPPED unchanged: all eight run unprivileged.
-EXECUTED=196
+# 2026-09-07 (D0A-R30-02): 196/25 -> 198/25. +2, and they exist because the module's HEADLINE
+#   property was false. `already_gone()` called a classifying waitpid that CONSUMED the terminal
+#   status, discarded it, and reported "not gone"; the real wait then fabricated ECHILD into
+#   Exited{code:0}. An exit-7 child AND a SIGTERM death both reported Exited{code:0}.
+#   `a_cooperating_child_is_reaped_within_grace_with_its_status_preserved` passed anyway because
+#   the child is usually still RUNNING when the classifier looks — green on scheduling, not on
+#   correctness, and it STILL PASSES under the weaken that reinstates the defect.
+#   The two new tests establish the terminal state with waitid(WNOWAIT) first, so the child is
+#   known dead and known reapable: `an_already_dead_childs_exit_code_survives_shutdown` and
+#   `a_child_that_died_of_a_signal_is_not_reported_as_a_clean_exit`. Both FAIL under the weaken.
+# SKIPPED unchanged.
+EXECUTED=198
 SKIPPED=25

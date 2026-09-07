@@ -10,6 +10,68 @@ what closes it. A row leaves only when a test proves it closed.
 
 ---
 
+## Opened 2026-09-07 — D0-A round 28 (verdict: **FAIL**, 2xP1 4xP2)
+
+**Two of the six are defects I introduced last round, and one is that the evidence I handed
+over could not substantiate the claim it carried.** The entrypoint finding is pre-existing and
+surfaced only because the prompt asked for that audit — class 49 again.
+
+| § | ratified clause | status | finding | closes when |
+|---|---|---|---|---|
+| §4 the legitimate path works | consent may take as long as a human takes | **CLOSED** at this commit | **R28-01 — a regression I introduced.** R27-02 put the frame deadline in the SHARED `read_frame`; `delphi-minimal-ai` waits for `Granted` through it, and that wait is *a human deciding whether to authenticate*. A daemon-side hardening became a 30-second cap on consent — breaking the legitimate path to close an attack path | `read_frame` reverts to undeadlined; the daemon opts in via `read_frame_untrusted`. **The bound lives at the call site that knows its peer is untrusted, because a shared utility cannot know which side of that line its caller is on** |
+| §4 the daemon cannot be held | an untrusted peer cannot pin the boundary | **CLOSED** at this commit | R28-02 — the exit path did unconditional blocking `waitpid` on both children, one of them the **untrusted AI**. An AI that takes its terminal response and does not exit holds the root daemon forever, so "B1 services one action and exits" depended on the AI's cooperation | bounded `reap_within` + grace + SIGKILL + bounded reap; the reaper stays ARMED across the wait |
+| §4 an absolute deadline is absolute | a late frame is refused | **CLOSED** at this commit | R28-03 — the deadline was checked at the loop head only, so when the final read completed the buffer the function returned `Ok` without re-examining the clock | checked at acceptance too; RED reaches the `Ok` arm at 150 ms into an 80 ms deadline |
+| §3 comments state what the code does | — | **CLOSED** at this commit | **R28-04 — a false claim I wrote one round after R27-05, the same shape.** The argv NUL comment said the refusal happens "BEFORE the ledger consumes the one-shot approval"; `execute_approved` consumes at the top and this runs ~430 lines later. The semantics were right (consume-on-attempt); only the claim was wrong | corrected at both sites; the class-48 sweep found the sibling claim in `canonicalize.rs` |
+| §3 sealing is verified | the program-fd seal check is tested | **CLOSED** at this commit | R28-06 — removing `require_exec_sealed` broke no test while its sibling `require_fully_sealed` was covered. **And I overstated it**: I wrote that an unsealed matching-digest fd "passes today"; the reviewer probed it and got `UnsealedScript`. The check works; nothing asserted it | three tests asserting the SPECIFIC refusal. Re-running the mutation is now CAUGHT — and the RED is stronger than the finding: without the check both fds **reach exec** |
+| — (method) | a claim is checkable by someone who was not there | **CLOSED** at this commit | **R28-05 — see below** | `scripts/mutation-campaign.py` produces an artifact set; the overclaims are withdrawn |
+
+### R28-05 — the finding to take hardest, harder than the two false claims
+
+Those were wrong statements. **This is that the evidence trail could not substantiate the table
+I handed over.** The retained harness reported PATCH-MISS for the `pending_id` row it claimed a
+result for; the successful run had happened in an **unretained shell heredoc**; and "no test at
+**any privilege level**" was asserted from unprivileged runs only.
+
+The experiments were real. **The record could not show it — and for a project whose entire
+discipline is that a claim must be checkable by someone who was not there, an unreproducible
+experiment is indistinguishable from one that never happened.**
+
+**The fix is not "retain more" as a habit. It is that a mutation campaign's output is the
+ARTIFACT SET, not the table.** `scripts/mutation-campaign.py` records, per experiment: the
+**applied** diff (from `git diff`, not the intended one), the compile result, the privilege
+level and commit, the failing assertion text, and verification that the tree was restored. A
+PATCH-MISS or compile error is reported as **INVALID**, never as "NOT CAUGHT" — a bare table
+cannot tell those apart and they mean opposite things. It refuses to start on a dirty tree,
+which it did on first use.
+
+**Re-run at `3593fa8`: 14/14 valid, 0 invalid, 12 CAUGHT, 2 NOT CAUGHT** (`pending_id`,
+`timeout` — both now closed by binding tests). Artifacts carry `euid=1000` and the explicit note
+that claims about other privilege levels are not supported by that run.
+
+**WITHDRAWN, because the artifacts do not support them:** "all twelve fields mutated"
+(the `pending_id` experiment in the retained harness was invalid), "misclassified none" (an
+unsubstantiated comparison), and "no test at any privilege level" (unprivileged only).
+
+### The tier claim, narrowed a SECOND time (R28-07 in the reviewer's answers)
+
+R27-05 replaced *"no test ever asserted that any tier meant anything"* with a three-phase
+account. **That was still too broad.** Pre-round-25 tests already asserted **digest and preview**
+consequences of the tier — `required_tier binds` and `tier rendered` both predate round 25.
+
+The accurate claim is narrower on two axes:
+
+- **Scope:** no **AUTHORIZATION-BOUNDARY** assertion existed before round 25. Digest and preview
+  consequences did.
+- **Strength:** "undetectable" means **"not detected by the tests that existed"**, not
+  "impossible to discover" — review would have found it, and eventually did.
+
+**That this claim needed narrowing twice is itself the record worth keeping.** Each correction
+fixed the sentence in front of it and left the same overstatement one level up: the first
+narrowed *when* the assertions appeared without checking *what kind* they were. A claim that
+survives one correction is not thereby correct.
+
+---
+
 ## Opened 2026-09-07 — D0-A round 27 (verdict: **FAIL**, 2xP1 3xP2)
 
 **The prompt asked for a defect in `wire.rs` — the untrusted-input parser six rounds had never
@@ -136,7 +198,10 @@ decorative label. Round 26 established the first assertion that `Biometric` **is
 enforceable; it did not establish the first tier-semantic assertion.
 
 **What survives the correction:** the pre-round-25 vacuum is real, and it is still the reason
-R25-01's defect could not have been caught by any test that existed at the time. The
+R25-01's defect was not detected by the tests that existed. **NARROWED AGAIN at D0A-R28** — on
+two axes: it is specifically no AUTHORIZATION-BOUNDARY assertion that existed (digest and
+preview consequences of the tier were already asserted), and "not detected by those tests" is
+not "impossible to discover", since review did find it. The
 generalisation drawn from it — *look for fields that are constructed, bound and rendered but
 never decided on* — also survives, and produced its own findings (see round 27).
 
@@ -155,8 +220,9 @@ statement about the state BEFORE round 25 into a false one about the state at ro
 Round 25 had already added two tier-semantic assertions, so `biometric_is_refused_…` is **not**
 the first test to assert on a tier's meaning, and the migration **flipped a live assertion**
 instead of costing no coverage. What survives: before round 25 there was no tier assertion at
-all, and that is why R25-01's "descriptive only" defect could not have been caught by any test
-that existed then.
+all — **narrowed at D0A-R28 to AUTHORIZATION-BOUNDARY assertions**, since `required_tier binds`
+and `tier rendered` both predate round 25 — and that is why R25-01's "descriptive only" defect
+was not detected by the tests that existed. Not "could not have been caught": review found it.
 
 ### OPEN AFTER ROUND 26 — each stated so it cannot be read as settled
 

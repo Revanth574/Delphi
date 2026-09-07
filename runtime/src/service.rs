@@ -304,8 +304,11 @@ pub fn accept_requester(listener: &UnixListener, expected_uid: u32) -> Result<Un
 /// (`Hardware` denied as unenforceable; `Biometric` passing the tier check), so the migration
 /// **flipped a live assertion** rather than filling a vacuum — the control asserted *Biometric
 /// passes* and now asserts *Confirm passes*. What is true, and is why R25-01's defect was
-/// undetectable, is that NO tier assertion existed before round 25. See
-/// `docs/CONFORMANCE_REGISTER.md` for the three-phase account.
+/// not DETECTED by the tests that existed, is that no AUTHORIZATION-BOUNDARY assertion existed
+/// before round 25 — narrowed twice (D0A-R27-05, then D0A-R28), because digest and preview
+/// consequences of the tier WERE asserted before it, and "not detected" is not "impossible to
+/// discover". See `docs/CONFORMANCE_REGISTER.md` for the account and for why a claim that
+/// survives one correction is not thereby correct.
 const ENFORCED_TIER: RequiredTier = RequiredTier::Confirm;
 
 /// Service exactly one action over an accepted AI connection (the §4 flow).

@@ -397,9 +397,13 @@ pub fn canonicalize(
     // only for emptiness. The reviewer established the exec side FAILS CLOSED — `Command`
     // returns InvalidInput ("nul byte found in provided data") and never splits the argument —
     // so this is NOT the env-smuggling shape. What it changes is WHEN the refusal happens: an
-    // action carrying a NUL is unexecutable, and without this check it is previewed,
-    // consented to by a human, minted a token, and CONSUMES the one-shot approval before
-    // failing to spawn. Refusing here means nobody authenticates for an action that cannot run.
+    // action carrying a NUL is unexecutable, and without THIS check it is previewed, consented
+    // to by a human, minted a token, and CONSUMES the one-shot approval before failing to
+    // spawn. Refusing here means nobody authenticates for an action that cannot run.
+    //
+    // D0A-R28-04: this claim is true of the check HERE and was wrongly repeated beside the
+    // execute-side one, which runs AFTER `ledger.consume`. Only canonicalization precedes
+    // consent; the choke-point check is a typed refusal, not an approval saver.
     if let Some(bad) = proposal.argv.iter().find(|a| a.contains('\0')) {
         return Err(RuntimeError::Protocol(format!(
             "argv entry `{}` contains an embedded NUL, which execve cannot represent. Refused \

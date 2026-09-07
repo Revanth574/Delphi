@@ -54,7 +54,7 @@ use crate::logind::{session_passes_gate, SessionSource};
 use crate::pam::authenticate_over_channel;
 use crate::store::{PendingState, PendingStore};
 use crate::token::{mint, ApprovalToken, MintingKey};
-use crate::wire::{pb, read_frame, write_frame};
+use crate::wire::{pb, read_frame, read_frame_untrusted, write_frame};
 use crate::RuntimeError;
 
 /// Largest private-channel datagram (preview + 32-byte digest prefix).
@@ -318,7 +318,7 @@ const ENFORCED_TIER: RequiredTier = RequiredTier::Confirm;
 pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Outcome, RuntimeError> {
     // Steps 1-3 (see the module header): canonicalize, refuse an unpresentable preview,
     // then store the ONE object and reply `Pending`.
-    let propose = match read_frame::<pb::AiToDaemon>(ai)?.msg {
+    let propose = match read_frame_untrusted::<pb::AiToDaemon>(ai)?.msg {
         Some(pb::ai_to_daemon::Msg::Propose(p)) => p,
         other => return Err(RuntimeError::Protocol(format!("expected Propose, got {other:?}"))),
     };
@@ -403,7 +403,7 @@ pub fn serve_one_action(ai: &mut UnixStream, ctx: &mut ServiceCtx) -> Result<Out
     write_frame(ai, &granted_msg(&id, &token.to_wire()))?;
 
     // Step 7. Present{pending_id, token} — NO action data. Execute the STORED object.
-    let present = match read_frame::<pb::AiToDaemon>(ai)?.msg {
+    let present = match read_frame_untrusted::<pb::AiToDaemon>(ai)?.msg {
         Some(pb::ai_to_daemon::Msg::Present(p)) => p,
         other => return Err(RuntimeError::Protocol(format!("expected Present, got {other:?}"))),
     };

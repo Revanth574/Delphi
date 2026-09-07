@@ -31,7 +31,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use nix::sys::wait::waitpid;
 use nix::unistd::{Pid, User};
 
 use delphi_runtime::anchor::DEFAULT_RUNTIME_BASE;
@@ -529,15 +528,45 @@ fn main() -> Result<()> {
     // channel, so releasing the channel here is sound.)
     // The success path owns the children from here: the terminal contract below deliberately
     // lets the shell run to its own exit, so the guard must not pre-empt it.
-    reaper.armed = false;
+    //
+    // D0A-R28-02: the disarm MOVED to after the bounded reap below. Disarming here meant that
+    // if the daemon left this function by any path while a child was still alive, nothing
+    // cleaned it up — and the unbounded waits that followed could not be left by any path at
+    // all. Cleanup stays armed until the children are actually reaped.
     drop(children.daemon_channel);
 
-    // NOTE (lifecycle, lane-dependent): blocking on the shell fits the ONE-SHOT minimal
-    // shell (which exits after mint-confirm, or on the EOF above at denial). The real
-    // LONG-LIVED WRY host does not exit per action — the daemon must not block on it; that
-    // is the lane-dependent half's B2 service loop, where the real host actually runs.
-    let _ = waitpid(Pid::from_raw(children.shell_pid), None);
-    let _ = waitpid(Pid::from_raw(children.ai_pid), None);
+    // NOTE (lifecycle, lane-dependent): waiting on the shell fits the ONE-SHOT minimal shell
+    // (which exits after mint-confirm, or on the EOF above at denial). The real LONG-LIVED WRY
+    // host does not exit per action — the daemon must not block on it; that is the
+    // lane-dependent half's B2 service loop, where the real host actually runs.
+    //
+    // D0A-R28-02: BOTH WAITS WERE UNBOUNDED, AND ONE OF THEM IS ON AN UNTRUSTED PEER. The AI
+    // is untrusted by construction (`docs/TRUST_MODEL.md` §2) — it can take its terminal
+    // response and simply not exit, and the ROOT daemon then blocks here forever. "B1 services
+    // one action and exits" was therefore a property that depended on the AI's cooperation,
+    // which is exactly the thing this boundary refuses to depend on anywhere else.
+    //
+    // Bounded now, and the reaper stays ARMED across the wait so a child that outlives the
+    // grace period is killed rather than left. Grace over kill-immediately because the ordinary
+    // case is a child already exiting, and SIGKILLing it would lose its exit status.
+    let grace = std::time::Duration::from_secs(5);
+    for (what, pid) in [("shell", children.shell_pid), ("ai", children.ai_pid)] {
+        if !delphi_runtime::launcher::reap_within(pid, grace) {
+            tracing::warn!(
+                child = what,
+                pid,
+                grace_secs = grace.as_secs(),
+                "child did not exit within the grace period after the action completed; \
+                 terminating (D0A-R28-02)"
+            );
+            let _ = nix::sys::signal::kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+            // Bounded again: a SIGKILLed child is reaped promptly or it is unreapable (a
+            // zombie whose parent we are, or an already-gone pid), and blocking would
+            // reintroduce the defect this closes.
+            let _ = delphi_runtime::launcher::reap_within(pid, std::time::Duration::from_secs(2));
+        }
+    }
+    reaper.armed = false;
     Ok(())
 }
 

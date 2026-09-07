@@ -522,12 +522,23 @@ fn run_fd_pinned(action: &PendingAction) -> Result<Output, RuntimeError> {
     }
     // D0A-R27: the same NUL validation `env_delta` has had since R19-05, at the same choke
     // point and for the same reason — the public fields mean canonicalization is not the only
-    // builder. `Command` would refuse this anyway (fail-closed), so what this buys is the
-    // refusal happening BEFORE the ledger consumes the one-shot approval.
+    // builder. `Command` would refuse this anyway (fail-closed), so what this buys is a typed
+    // refusal that names the field instead of an opaque spawn error.
+    //
+    // **D0A-R28-04 — WHAT THIS DOES NOT BUY, because the comment here claimed it did.** It said
+    // the refusal happens "BEFORE the ledger consumes the one-shot approval". It does not:
+    // `execute_approved` consumes at the top (see `ledger.consume`, ~430 lines above), and this
+    // runs inside `run_fd_pinned` afterwards. A NUL-carrying action presented here consumes its
+    // approval and THEN is refused — which is the documented one-shot rule ("one-shot, not
+    // one-success": a spawn failure still consumes), so the SEMANTICS were right and only the
+    // claim was wrong. The refusal that genuinely precedes consent is the canonicalization-side
+    // one, which rejects at proposal time before a human is ever asked.
     if let Some(bad) = action.argv.iter().find(|a| a.contains('\0')) {
         return Err(RuntimeError::Protocol(format!(
-            "argv entry `{}` contains an embedded NUL — refused at the execute choke point \
-             before the approval is consumed (D0A-R27)",
+            "argv entry `{}` contains an embedded NUL, which execve cannot represent — refused \
+             at the execute choke point. NOTE: the one-shot approval is already consumed by \
+             this point (consume-on-attempt); the refusal that precedes consent is the one at \
+             canonicalization (D0A-R27, D0A-R28-04)",
             bad.escape_debug()
         )));
     }
@@ -1854,6 +1865,92 @@ pub(crate) mod tests {
             matches!(second, Err(RuntimeError::AlreadyConsumed)),
             "RED: a second execution with the same approval must be DENIED — one PAM approval \
              authorizes ONE execution, not repeated execution within the token TTL"
+        );
+    }
+
+    /// D0A-R28-06 — the PROGRAM fd's seal check has its own regression test.
+    ///
+    /// **How this was found, and why it matters.** A mutation campaign removing
+    /// `require_exec_sealed` broke NO test, while removing its sibling `require_fully_sealed`
+    /// (the SCRIPT memfd) was caught immediately. Two adjacent checks, one covered and one not
+    /// — so this was one specific untested check rather than a thin region.
+    ///
+    /// **Not a shipping bypass.** The reviewer probed a matching-digest / unsealed-memfd action
+    /// against the shipping code and got `UnsealedScript`: the check WORKS, it simply had
+    /// nothing asserting that it does. A prior version of this claim said such an action
+    /// "passes today" — that was an exploit asserted without being run, and it was wrong.
+    ///
+    /// The check is load-bearing for one that IS tested: `execute.rs` says of the digest
+    /// comparison ten lines below it, "hashing here is race-free ONLY BECAUSE the fd is
+    /// sealed". So the untested check is the stated precondition for the tested one.
+    ///
+    /// Asserts the SPECIFIC refusal, not merely an error — a test satisfied by any downstream
+    /// failure would go green again the moment some later check happened to catch the case,
+    /// which is how a guard becomes decorative without anything turning red.
+    #[test]
+    fn an_unsealed_program_fd_is_refused_even_when_its_digest_matches() {
+        let env = Env::new("r2806-unsealed-prog");
+        let content = b"\x7fELF not-really, but content the digest will match";
+        let mut action = build_action(b"#!/bin/sh\n:\n", &env.out_dir);
+
+        // The program fd is UNSEALED, and the digest is the true hash of its bytes — so the
+        // digest check CANNOT be what refuses this. Only the seal check can.
+        action.executable_fd = unsealed_memfd(content);
+        action.executable_digest = sha256(content);
+        action.script = None;
+
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+        let res = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+        assert!(
+            matches!(res, Err(RuntimeError::UnsealedScript)),
+            "RED: an UNSEALED program fd must be refused by the seal check specifically. Its \
+             bytes can be mutated after the digest was taken, which is precisely what makes \
+             hashing-at-exec race-free only for a SEALED fd. got {res:?}"
+        );
+    }
+
+    /// D0A-R28-06 — a PARTIALLY sealed program fd is refused too.
+    ///
+    /// `F_SEAL_WRITE` alone leaves the fd `ftruncate`-able, so its content LENGTH is still
+    /// mutable after the digest. The exec check requires the full [`EXEC_SEALS`] set, and a
+    /// subset must not satisfy it — the same property `partial_seal_write_only_is_refused`
+    /// asserts for the script memfd.
+    #[test]
+    fn a_partially_sealed_program_fd_is_refused() {
+        let env = Env::new("r2806-partial-prog");
+        let content = b"\x7fELF partial-seal case";
+        let mut action = build_action(b"#!/bin/sh\n:\n", &env.out_dir);
+        action.executable_fd = write_sealed_only_memfd(content);
+        action.executable_digest = sha256(content);
+        action.script = None;
+
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+        let res = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+        assert!(
+            matches!(res, Err(RuntimeError::UnsealedScript)),
+            "RED: a WRITE-ONLY-sealed program fd is still ftruncate-able, so its length can \
+             change after the digest — the full EXEC_SEALS set is required. got {res:?}"
+        );
+    }
+
+    /// D0A-R28-06 — the POSITIVE CONTROL: a properly sealed program fd is NOT refused here.
+    ///
+    /// Without it the two refusals above are satisfied by a guard that rejects everything.
+    /// This asserts only that the failure is not the SEAL check — the action may still fail
+    /// later for sandbox reasons in this environment, which is not what is under test.
+    #[test]
+    fn a_fully_sealed_program_fd_passes_the_seal_check() {
+        let env = Env::new("r2806-sealed-prog");
+        let action = build_action(b"#!/bin/sh\n:\n", &env.out_dir);
+        let key = MintingKey::from_bytes(KEY);
+        let token = mint(&key, &canonical_action_digest(&action), NOW);
+        let res = execute_approved(&action, &token, &key, NOW, &mut ConsumptionLedger::new());
+        assert!(
+            !matches!(res, Err(RuntimeError::UnsealedScript)),
+            "a correctly sealed program snapshot was refused by the SEAL check — the guard \
+             rejects everything and the two tests above prove nothing. got {res:?}"
         );
     }
 

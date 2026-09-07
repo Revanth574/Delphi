@@ -77,33 +77,54 @@ pub fn arm_frame_liveness(s: &std::os::unix::net::UnixStream) -> Result<(), Runt
         .map_err(|e| RuntimeError::Protocol(format!("set_read_timeout: {e}")))
 }
 
-/// Read one `u32`-length-prefixed protobuf frame into `M`, bounded in TIME as well as SIZE.
+/// Read one `u32`-length-prefixed protobuf frame into `M`. **No deadline** — blocks until the
+/// peer completes the frame.
 ///
-/// # Why the deadline exists (D0A-R27-02)
+/// # WHICH SIDE OF THE TRUST LINE ARE YOU ON? (D0A-R28-01)
 ///
-/// `MAX_FRAME` bounds how many bytes a frame may declare; **it bounds nothing about how long
-/// they take to arrive.** Both reads here are on a blocking stream, and the daemon's only
-/// other timeout covers `accept` — so an authorised requester could connect, send a single
-/// prefix byte (or a valid prefix and a short body), and hold the connection. The ROOT daemon
-/// then blocks **before canonicalization and before consent**, where neither the filesystem
-/// read deadline nor the gate can help. The same shape applies to the wait for `Present`.
+/// **Use this when you are waiting on a COOPERATING peer**, where an unbounded wait is the
+/// correct behaviour: a client waiting for `Granted` is waiting for **a human to authenticate**,
+/// and there is no defensible number of seconds to cap that at.
 ///
-/// This was found in `wire.rs`, a file six consecutive review rounds never named.
+/// **Use [`read_frame_untrusted`] when the peer is untrusted** — the daemon reading from the AI
+/// socket. That is where a stall is an attack rather than a person thinking.
+///
+/// D0A-R27-02 put the deadline HERE, in the shared utility, which was wrong in a specific and
+/// instructive way: a shared reader **cannot know which side of that line its caller is on**.
+/// The result was that a daemon-side hardening became a 30-second cap on human consent —
+/// breaking the legitimate path to close an attack path, which is the worse failure of the two.
+/// The bound now lives at the call site that knows the peer is untrusted.
 ///
 /// # Errors
 ///
-/// [`RuntimeError::Protocol`] if the deadline elapses, the length prefix is missing, the
-/// declared length exceeds [`MAX_FRAME`], the body is short, or the protobuf decode fails (EOF
-/// on a clean channel close surfaces as a read error too — the caller treats it as the peer
-/// hanging up).
+/// [`RuntimeError::Protocol`] if the length prefix is missing, the declared length exceeds
+/// [`MAX_FRAME`], the body is short, or the protobuf decode fails.
 pub fn read_frame<M: Message + Default>(r: &mut impl Read) -> Result<M, RuntimeError> {
-    read_frame_by(r, Instant::now() + FRAME_DEADLINE)
+    read_frame_by(r, None)
+}
+
+/// Read one frame from an **UNTRUSTED** peer, bounded by [`FRAME_DEADLINE`] (D0A-R27-02).
+///
+/// `MAX_FRAME` bounds how many bytes a frame may declare; it bounds nothing about how long they
+/// take to arrive. Without this, an authorised requester could connect, send a single prefix
+/// byte, and hold the ROOT daemon **before canonicalization and before consent**, where neither
+/// the filesystem read deadline nor the gate can help.
+///
+/// The deadline is ABSOLUTE across the whole frame. A per-read timeout is reset by every byte,
+/// so a peer trickling one byte per interval never stalls and holds the daemon forever — which
+/// is why [`arm_frame_liveness`] is necessary but not sufficient.
+///
+/// # Errors
+///
+/// As [`read_frame`], plus [`RuntimeError::Protocol`] when the deadline elapses.
+pub fn read_frame_untrusted<M: Message + Default>(r: &mut impl Read) -> Result<M, RuntimeError> {
+    read_frame_by(r, Some(Instant::now() + FRAME_DEADLINE))
 }
 
 /// [`read_frame`] against a caller-supplied absolute deadline (the seam tests use).
 pub fn read_frame_by<M: Message + Default>(
     r: &mut impl Read,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<M, RuntimeError> {
     let mut len_buf = [0u8; 4];
     read_exact_by(r, &mut len_buf, deadline, "frame length")?;
@@ -132,12 +153,12 @@ pub fn read_frame_by<M: Message + Default>(
 fn read_exact_by(
     r: &mut impl Read,
     buf: &mut [u8],
-    deadline: Instant,
+    deadline: Option<Instant>,
     what: &str,
 ) -> Result<(), RuntimeError> {
     let mut filled = 0usize;
     while filled < buf.len() {
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(RuntimeError::Protocol(format!(
                 "{what}: deadline elapsed with {filled} of {} bytes received — a peer that \
                  stalls or trickles cannot hold the root daemon before consent (D0A-R27-02)",
@@ -163,6 +184,19 @@ fn read_exact_by(
             Err(e) => return Err(RuntimeError::Protocol(format!("{what} read: {e}"))),
         }
     }
+    // D0A-R28-03: CHECK AGAIN AFTER THE FILLING READ. The check at the loop head is not
+    // enough — when the final read completes the buffer, the loop condition is false and the
+    // function returned Ok having never re-examined the clock. So a frame whose last byte
+    // arrived past the deadline was ACCEPTED, and the overrun was bounded only incidentally by
+    // the socket's own read timeout. An absolute acceptance deadline has to be checked at
+    // acceptance.
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(RuntimeError::Protocol(format!(
+            "{what}: the frame completed AFTER the deadline ({} bytes) — an absolute deadline \
+             is checked at acceptance, not only before each read (D0A-R28-03)",
+            buf.len()
+        )));
+    }
     Ok(())
 }
 
@@ -170,6 +204,91 @@ fn read_exact_by(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// D0A-R28-03 — a frame whose FINAL byte arrives after the deadline is refused.
+    ///
+    /// The deadline was checked at the loop head only: when the last read completed the
+    /// buffer, the loop condition went false and the function returned `Ok` without ever
+    /// re-examining the clock. So a late frame was ACCEPTED, and the overrun was bounded only
+    /// incidentally by the socket's read timeout — not by the absolute deadline that was
+    /// claimed. An acceptance deadline has to be checked at acceptance.
+    #[test]
+    fn a_frame_whose_last_byte_arrives_after_the_deadline_is_refused() {
+        let (mut daemon, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        arm_frame_liveness(&daemon).expect("arm");
+        let msg = pb::AiToDaemon {
+            msg: Some(pb::ai_to_daemon::Msg::Present(pb::Present {
+                pending_id: "act-1".into(),
+                token: "1000:abcd".into(),
+            })),
+        };
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &msg).expect("encode");
+        let writer = std::thread::spawn(move || {
+            let mut p = &peer;
+            // Everything but the last byte immediately, so the read loop is fed and the
+            // deadline is not tripped at the loop head...
+            let _ = p.write_all(&encoded[..encoded.len() - 1]);
+            let _ = p.flush();
+            // ...then the final byte, late.
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = p.write_all(&encoded[encoded.len() - 1..]);
+            let _ = p.flush();
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let r: Result<pb::AiToDaemon, _> =
+            read_frame_by(&mut daemon, Some(Instant::now() + Duration::from_millis(80)));
+        match r {
+            Err(RuntimeError::Protocol(m)) => assert!(
+                m.contains("deadline"),
+                "refused, but not by the deadline: {m}"
+            ),
+            Err(other) => panic!("refused with the wrong variant: {other}"),
+            Ok(_) => panic!(
+                "a frame completed 150 ms into an 80 ms deadline was ACCEPTED — the deadline is \
+                 checked before reads but not at acceptance (D0A-R28-03)"
+            ),
+        }
+        let _ = writer.join();
+    }
+
+    /// D0A-R28-01 — a frame that arrives AFTER a long human consent is still accepted.
+    ///
+    /// **This is the test that would have caught the regression.** D0A-R27-02 put the frame
+    /// deadline in the shared `read_frame`, and `delphi-minimal-ai` waits for `Granted`
+    /// through it — a wait whose length is *a human deciding whether to authenticate*. So a
+    /// daemon-side hardening became a 30-second cap on human consent: it broke the legitimate
+    /// path in order to close an attack path, which is the worse failure of the two.
+    ///
+    /// The deadline now lives at the call site that knows its peer is untrusted
+    /// (`read_frame_untrusted`, used by the daemon), and `read_frame` waits.
+    ///
+    /// The delay here is short because the property is "does not impose a bound", which any
+    /// delay past a hypothetical bound demonstrates; a 31-second test would only make the
+    /// suite slower without making the claim stronger.
+    #[test]
+    fn read_frame_does_not_bound_a_wait_on_a_cooperating_peer() {
+        let (mut client, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        arm_frame_liveness(&client).expect("arm");
+        let msg = pb::DaemonToAi {
+            msg: Some(pb::daemon_to_ai::Msg::Granted(pb::Granted {
+                pending_id: "act-1".into(),
+                token: "1000:abcd".into(),
+            })),
+        };
+        let sender = msg.clone();
+        let writer = std::thread::spawn(move || {
+            // The human is thinking. Longer than any per-read timeout in force.
+            std::thread::sleep(Duration::from_millis(900));
+            let mut p = &peer;
+            write_frame(&mut p, &sender).expect("write Granted");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let got: pb::DaemonToAi = read_frame(&mut client)
+            .expect("a client waiting on human consent must not be timed out by the daemon's bound");
+        assert_eq!(got, msg);
+        let _ = writer.join();
+    }
 
     /// D0A-R27-02 — a peer that sends part of a frame and stops cannot hold the daemon.
     ///
@@ -186,7 +305,7 @@ mod tests {
         }
         let started = Instant::now();
         let r: Result<pb::AiToDaemon, _> =
-            read_frame_by(&mut daemon, Instant::now() + Duration::from_millis(400));
+            read_frame_by(&mut daemon, Some(Instant::now() + Duration::from_millis(400)));
         match r {
             Err(RuntimeError::Protocol(m)) => assert!(
                 m.contains("deadline elapsed"),
@@ -224,7 +343,7 @@ mod tests {
         });
         let started = Instant::now();
         let r: Result<pb::AiToDaemon, _> =
-            read_frame_by(&mut daemon, Instant::now() + Duration::from_millis(400));
+            read_frame_by(&mut daemon, Some(Instant::now() + Duration::from_millis(400)));
         let elapsed = started.elapsed();
         match r {
             Err(RuntimeError::Protocol(m)) => assert!(
@@ -261,7 +380,7 @@ mod tests {
             write_frame(&mut p, &msg).expect("write");
         }
         let got: pb::AiToDaemon =
-            read_frame_by(&mut daemon, Instant::now() + Duration::from_secs(5))
+            read_frame_by(&mut daemon, Some(Instant::now() + Duration::from_secs(5)))
                 .expect("a complete frame must still be accepted");
         assert_eq!(got, msg, "round trip under the deadline");
         drop(peer);

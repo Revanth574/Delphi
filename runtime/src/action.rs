@@ -616,6 +616,35 @@ mod tests {
 
     /// RUNTIME-1D-04: the preview renders EVERY behaviour-affecting field — changing
     /// any one changes the rendered preview (so the human inspects what execs).
+    /// D0A-R28 (the reviewer's fourth mutation) — the digest binds environment variable NAMES,
+    /// not only their values and count.
+    ///
+    /// **Found by mutation, not by inspection.** Replacing `k.as_bytes()` with a constant in
+    /// the digest left every test in this module passing: two actions differing only in a
+    /// variable's NAME hashed identically, so a token approved for `PATH=/safe` would verify
+    /// against `LD_PRELOAD=/safe`. Values and sequence length were covered; names were not.
+    ///
+    /// The sequence length is held constant here on purpose — a differing length would change
+    /// the digest through `seq`'s declared-count guard and the test would pass without the
+    /// name ever mattering.
+    #[test]
+    fn the_digest_binds_environment_variable_names_not_only_their_values() {
+        let with_name = |name: &str| {
+            let mut a = sample();
+            a.env_delta = vec![(name.into(), "same-value".into())];
+            canonical_action_digest(&a)
+        };
+        assert_ne!(
+            with_name("PATH"),
+            with_name("LD_PRELOAD"),
+            "two actions differing ONLY in an environment variable's NAME hash identically — a \
+             token approved for one would verify against the other"
+        );
+        // Same name, same value, same length => same digest (the control: this is not just
+        // asserting that any two digests differ).
+        assert_eq!(with_name("PATH"), with_name("PATH"), "the digest must be deterministic");
+    }
+
     #[test]
     fn preview_renders_every_behavior_affecting_field() {
         let base = preview(&sample());

@@ -170,5 +170,24 @@
 # now PRINTS the BOOTTIME-MONOTONIC delta so a reader can see whether the run had any
 # discriminating power rather than inferring it from green.
 # SKIPPED unchanged: all eight run unprivileged.
-EXECUTED=180
+# 2026-09-07 (round-28 remediation): 180/25 -> 186/25. +6 EXECUTED, all additions:
+#   R28-01 (1) `read_frame_does_not_bound_a_wait_on_a_cooperating_peer` — THE TEST THAT WOULD
+#              HAVE CAUGHT THE REGRESSION. R27-02 put the frame deadline in the shared
+#              `read_frame`, and the AI waits for `Granted` through it — a wait whose length is
+#              a HUMAN DECIDING. A daemon-side hardening became a 30 s cap on consent.
+#              Weaken-proven: restoring the deadline to the shared reader fails ONLY this test
+#              while the stall and trickle protections still pass.
+#   R28-03 (1) `a_frame_whose_last_byte_arrives_after_the_deadline_is_refused` — the deadline
+#              was checked at the loop head only, so a frame completed late was ACCEPTED.
+#   R28-06 (3) `an_unsealed_program_fd_is_refused_even_when_its_digest_matches`,
+#              `a_partially_sealed_program_fd_is_refused`, and
+#              `a_fully_sealed_program_fd_passes_the_seal_check` (positive control). Under the
+#              mutant that removes `require_exec_sealed`, the first two now FAIL — and they fail
+#              with the fds having REACHED EXEC, which is stronger than the coverage gap the
+#              finding described.
+#   R28 env (1) `the_digest_binds_environment_variable_names_not_only_their_values` — the
+#              reviewer's fourth mutation. Under a mutant that hashes a constant name, all NINE
+#              pre-existing action-module tests pass and only this one bites.
+# SKIPPED unchanged: all six run unprivileged.
+EXECUTED=186
 SKIPPED=25

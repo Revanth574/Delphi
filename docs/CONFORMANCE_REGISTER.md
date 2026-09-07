@@ -59,20 +59,57 @@ two tests naming it asserted that *changing* it changes the digest and the previ
 asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
 negative does not, and should not have been written.
 
-### OWED, not closed — the R28-02 coverage gap
+### D0A-R28-02 IS CLOSED — assembly coverage, decision A, demonstrated at root
 
-The reviewer's answer: extraction **is** the right first step **provided `main` calls the
-extracted production implementation** rather than a duplicated approximation. The cases named:
-a cooperating child (status preserved); a child synchronised to survive grace expiry (requiring
-termination and reap); interrupted waits; signalling failure; post-kill reap timeout;
-already-reaped children; each child independently. Then assembly coverage that the daemon
-invokes the policy after terminal outcomes — for which a feature-enabled integration test is
-useful evidence about the assembly while **not** certifying the production logind gate.
+`b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive` **passes** with all eight
+assertions, against the real `delphi-runtimed` binary at root, driven by `delphi-stubborn-ai` —
+a feature-gated fixture that speaks the identical protocol through the identical helpers and
+then **refuses to exit**. That is the branch `delphi-minimal-ai` could never reach, because it
+cooperates, which is why the policy sat compiled and unexercised for three rounds.
 
-**R29-05 and R29-06 shipped without tests of their own**, and that is the same gap one level
-down. Both are in the extraction's scope and are owed with it.
+The daemon's own log carries the property with its timing:
 
----
+```
+20:12:02.361  INFO  served one action outcome=Completed
+20:12:07.395  WARN  child outlived the grace period and was terminated (D0A-R28-02) child="ai"
+```
+
+**5.03 seconds** — the grace expiring, `SIGKILL`, the termination attributed to the AI by name.
+The fifth assertion needs no special construction: without the bounded exit, `main` blocks in
+`waitpid`, `DaemonGuard` kills at the deadline, and `!killed` fails.
+
+**Scope, encoded in the test body rather than a comment:** it runs a binary built with
+`insecure-test-seams`, whose logind gate is bypassable. It certifies the **shutdown assembly**
+and **nothing about the production logind gate**, which remains blocked on a seated lane. Those
+were always separate obligations; this closes the first.
+
+### The cost, stated plainly: FOUR root runs, THREE lost to my own assertions
+
+**The product property was demonstrated on run one.** `!killed` is asserted first and passed
+immediately — the daemon bounded its wait against a stubborn AI the very first time it was
+asked. Everything after was my test being wrong about the world:
+
+| run | outcome | cause |
+|---|---|---|
+| 1 | FAIL | asserted the daemon's log against **stderr**; `tracing` writes to stdout |
+| 2 | FAIL | asserted the **pre-extraction message text**, reconstructed from memory |
+| 3 | FAIL | asserted `child="ai"` against bytes containing **ANSI escapes** |
+| 4 | **PASS** | — |
+
+Recorded as `DEFECT_CLASSES.md` **class 52**. The fourth instance is what makes it a class: the
+failure output re-renders the escapes through the same terminal, so **the diagnostic channel has
+the same lossiness as the original** and looking harder cannot find it. Only `cat -v` could.
+
+Three privileged runs is the honest price of a test written by reading transcripts. The fixes
+are structural — a shared `const` so wording cannot drift, a tested `strip_ansi`, named streams
+— so they close the class rather than the instances.
+
+### Also recorded, not fixed
+
+The daemon emits **ANSI escapes to a non-terminal stdout**, which in production is journald.
+Escapes in a system log are noise and can confuse downstream parsing; `.with_ansi(…)` gated on
+`IsTerminal` would address it. Nobody raised it and it is a product question, so it is handed to
+the reviewer rather than changed unilaterally.
 
 ## Opened 2026-09-07 — D0-A round 28 (verdict: **FAIL**, 2xP1 4xP2)
 

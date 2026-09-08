@@ -1,0 +1,15 @@
+
+thread 'main' (106560) panicked at /tmp/r31-assembly-probe-jtgtq5fa/probe.rs:245:5:
+the daemon left 1 process(es) of its own group ALIVE, and the guard was about to kill them: [(106562, 'S')]. The daemon did NOT perform the cleanup this test claims to observe — every assertion below would pass anyway, because they read the daemon's own log and its exit timing (D0A-R31-02).
+stdout:
+INSECURE TEST SEAM ACTIVE
+DELPHI_RUNTIMED_OUTCOME Completed
+child outlived the grace period and was terminated (D0A-R28-02) child="ai"
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+mode=ordinary all assembly assertions passed=false killed=false survivors=[(106562, 'S')]
+child alive at counterfeit daemon exit: true
+child status after guard teardown: Signaled(Pid(106562), SIGKILL, false)
+mode=bad all assembly assertions passed=true killed=false survivors=[]
+child alive at counterfeit daemon exit: true
+child status after guard teardown: Signaled(Pid(106566), SIGKILL, false)

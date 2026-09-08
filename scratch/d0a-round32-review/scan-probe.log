@@ -1,0 +1,3 @@
+name=b'ordinary'; alive=True; stat_comm=b'105796 (ordinary'; scan=[(105796, 'S')]
+name=b'bad\xffname'; alive=True; stat_comm=b'105798 (bad\xffname'; scan=[]
+exact zombie fixture group states: [('105800', 'S'), ('105801', 'S'), ('105803', 'S')]; zombies=0

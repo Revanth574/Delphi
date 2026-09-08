@@ -1,0 +1,20 @@
+MUTANT: only _kill_active_child_group is a no-op
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign has a live process group to collect
+  [OK ] signal: the campaign exits non-zero after SIGTERM
+  [OK ] signal: the WORKING TREE source is untouched
+  [OK ] signal: the working tree still matches the commit
+  [OK ] signal: no descendants survive the cancelled campaign
+  [OK ] signal: no isolated checkout is left behind
+REAL SIGNAL GUARD PASSED with no cancellation kill
+LONG GRANDCHILD FIXTURE, same no-op killer:
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign has a live process group to collect
+  [OK ] signal: the campaign exits non-zero after SIGTERM
+  [OK ] signal: the WORKING TREE source is untouched
+  [OK ] signal: the working tree still matches the commit
+  [OK ] signal: no descendants survive the cancelled campaign
+  [OK ] signal: no isolated checkout is left behind
+REAL SIGNAL GUARD PASSED with live adopted descendants (pid,pgid): [(106440, 106439), (106445, 106444)]
+DIRTY INSTRUMENT: exit=0; mutations=0; attributed_to_commit=True; dirty_warning=True
+BASELINE FAILURE: exit=2; worktree_still_exists=True; still_registered=True

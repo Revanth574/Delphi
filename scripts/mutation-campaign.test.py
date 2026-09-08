@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -67,6 +70,14 @@ def guard_classification() -> None:
             "stale-session script text": (
                 "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
                 "STALE SESSION FROM A PREVIOUS RUN — a PRECONDITION failure, not a code regression.",
+                101, "PRECONDITION FAILURE"),
+            # D0A-R31-06: the reviewer's case — the checker could not be LAUNCHED, so the
+            # environment is UNKNOWN. It has a named failing test and no infra substring, and
+            # was therefore scored CAUGHT: an infrastructure failure credited to the mutation.
+            "checker-launch failure": (
+                "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
+                "DELPHI_PRECONDITION_FAILED: could not run scripts/check-stale-test-sessions.sh: "
+                "Permission denied (os error 13) — the environment is UNKNOWN, not clean",
                 101, "PRECONDITION FAILURE"),
             "crash, no named test": ("test result: FAILED. 1 failed\n", "", 101,
                                      "UNATTRIBUTED FAILURE"),
@@ -122,8 +133,9 @@ def guard_signal_restores() -> None:
         mc._restore_in_flight("test")
         check("signal: the handler RESTORES the mutated file", victim.read_text() == "ORIGINAL")
         check("signal: in-flight state is cleared afterwards", mc._IN_FLIGHT == {})
-    check("signal: handlers are installed for SIGTERM/SIGINT/SIGHUP",
-          callable(getattr(mc, "_install_signal_handlers", None)))
+    # D0A-R31-04: the callable() check that used to live here proved nothing — a no-op
+    # `_install_signal_handlers` passed it. The real property is exercised by
+    # `guard_real_signal_during_a_real_campaign`, which sends an actual signal.
 
 
 def guard_input_closure() -> None:
@@ -132,6 +144,116 @@ def guard_input_closure() -> None:
                      "scripts/mutation-campaign.py", "Cargo.lock"):
         check(f"inputs: {required} is watched", required in mc.INPUT_PATHS)
 
+
+def guard_real_signal_during_a_real_campaign() -> None:
+    """D0A-R31-04 — the four properties cancellation owes, driven by a REAL signal.
+
+    # What this replaces, and why that mattered
+
+    The previous guard asserted that `_install_signal_handlers` is **callable**, and the checks
+    around it invoked `_restore_in_flight` directly. Neither established that handlers were
+    installed or that a signal reaches them: **replacing `_install_signal_handlers` with a no-op
+    still passed all 31 guards.** A guard that tests a function's existence rather than its
+    effect is the same shape as asserting an outcome the harness itself supplies (D0A-R31-02).
+
+    This runs the actual campaign as a subprocess, waits until the journal shows a mutation IN
+    PROGRESS — synchronising on real state rather than sleeping — sends it a real SIGTERM, and
+    asserts all four properties. **Any one failing fails the guard.**
+
+    `DELPHI_MUTATION_TEST_CMD` substitutes a fast command for cargo. The property under test is
+    signal handling, not compilation, and a guard that takes minutes is a guard nobody runs.
+    """
+    import time
+
+    out = pathlib.Path(tempfile.mkdtemp(prefix="delphi-r3104-"))
+    victim = REPO / "runtime" / "src" / "shutdown.rs"
+    before = victim.read_text()
+    sha = mc.sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+
+    env = dict(os.environ)
+    # Green baseline, then slow enough to be caught mid-mutation.
+    env["DELPHI_MUTATION_TEST_CMD"] = 'sh -c "echo \'test result: ok. 1 passed\'; sleep 6"'
+    proc = subprocess.Popen(
+        [sys.executable, str(REPO / "scripts" / "mutation-campaign.py"), "--out", str(out)],
+        cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        journal = out / "results.jsonl"
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if journal.exists() and "IN PROGRESS" in journal.read_text():
+                break
+            if proc.poll() is not None:
+                raise AssertionError(
+                    f"the campaign exited before any mutation was in flight:\n"
+                    f"{proc.stdout.read()}\n{proc.stderr.read()}"
+                )
+            time.sleep(0.2)
+        else:
+            raise AssertionError("no mutation reached IN PROGRESS within 90s")
+
+        # (3) JOURNAL STATE — recorded BEFORE the mutation was written, so an uncatchable kill
+        # still names the file at risk.
+        check("signal: the journal records a mutation IN PROGRESS before the signal",
+              "IN PROGRESS" in journal.read_text())
+
+        descendants_before = subprocess.run(
+            ["pgrep", "-g", str(proc.pid)], capture_output=True, text=True).stdout.split()
+        check("signal: the campaign has a live process group to collect",
+              len(descendants_before) >= 1, f"group members: {descendants_before}")
+
+        os.kill(proc.pid, signal.SIGTERM)      # A REAL SIGNAL to the real campaign.
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError(
+                "the campaign did not exit within 30s of SIGTERM — cancellation blocked, which "
+                "is what happened when it waited on a child it had not been told to stop"
+            ) from None
+
+        # (4) EXIT STATUS — a cancelled campaign is a FAILURE, not a quiet success.
+        check("signal: the campaign exits non-zero after SIGTERM", proc.returncode != 0,
+              f"exit was {proc.returncode}")
+        # (1) SOURCE PROTECTION — the working tree, which nothing should have written to.
+        check("signal: the WORKING TREE source is untouched", victim.read_text() == before)
+        check("signal: the working tree still matches the commit",
+              mc.file_matches_commit_in_repo(sha, "runtime/src/shutdown.rs"))
+        # (2) PROCESS CLEANUP — no descendants, and no abandoned worktree.
+        time.sleep(0.5)
+        left = subprocess.run(["pgrep", "-g", str(proc.pid)],
+                              capture_output=True, text=True).stdout.split()
+        check("signal: no descendants survive the cancelled campaign", not left,
+              f"survivors: {left}")
+        worktrees = mc.sh(["git", "worktree", "list"]).stdout
+        check("signal: no isolated checkout is left behind",
+              "delphi-mutation-wt-" not in worktrees, worktrees)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        victim.write_text(before)
+        mc.sh(["git", "worktree", "prune"])
+        shutil.rmtree(out, ignore_errors=True)
+
+def guard_precondition_token_is_emitted_not_just_matched() -> None:
+    """D0A-R31-06 — the classifier and the emitters agree on ONE token.
+
+    Matching prose meant each new phrasing was a new instance to discover (class 48 by
+    construction). A token only helps if the places that fail actually carry it, so this checks
+    both ends rather than the classifier alone.
+    """
+    token = mc.PRECONDITION_TOKEN
+    guard_src = (REPO / "runtime" / "src" / "test_child_guard.rs").read_text()
+    check("precondition: the runtime defines the token",
+          f'PRECONDITION_TOKEN: &str = "{token}"' in guard_src)
+    check("precondition: the checker-LAUNCH failure carries it",
+          "{PRECONDITION_TOKEN}: could not run" in guard_src,
+          "this is the site the reviewer showed being scored as a detection")
+    check("precondition: the live-session failure carries it",
+          "{PRECONDITION_TOKEN}: before this test ran" in guard_src)
+    sh_src = (REPO / "scripts" / "check-stale-test-sessions.sh").read_text()
+    check("precondition: the shell checker carries it", token in sh_src)
 
 def guard_isolation() -> None:
     """D0A-R31-01 — mutations happen in an ISOLATED CHECKOUT, never the working tree.
@@ -270,6 +392,8 @@ def main() -> int:
     guard_restore_verification()
     guard_signal_restores()
     guard_input_closure()
+    guard_real_signal_during_a_real_campaign()
+    guard_precondition_token_is_emitted_not_just_matched()
     guard_isolation()
     guard_sigkill_leaves_working_tree_intact()
     guard_cancellation_kills_descendants()

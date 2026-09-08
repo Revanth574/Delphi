@@ -70,6 +70,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -106,7 +107,16 @@ INPUT_PATHS = [
 # precondition diagnostics fail loudly, name a test, and mean "the environment was wrong" —
 # not "the mutation was caught". Classifying those as CAUGHT credits the mutation for an
 # infrastructure failure, and a green baseline does not exclude one arising later.
+# D0A-R31-06: ONE machine-readable token, emitted by every precondition site
+# (`test_child_guard::PRECONDITION_TOKEN`, `check-stale-test-sessions.sh`). The prose entries
+# below it are LEGACY — they matched some phrasings and missed others, notably a failure to
+# LAUNCH the stale-session checker ("could not run …"), which was therefore scored as a
+# detection. Matching prose means every new phrasing is a new instance to discover, which is
+# class 48 by construction.
+PRECONDITION_TOKEN = "DELPHI_PRECONDITION_FAILED"
 PRECONDITION_MARKERS = (
+    PRECONDITION_TOKEN,
+    # Legacy phrasings, retained so an older binary in the tree is still classified correctly.
     "PRECONDITION FAILED",
     "PRECONDITION failure",
     "STALE SESSION FROM A PREVIOUS RUN",
@@ -265,6 +275,26 @@ def _kill_active_child_group() -> None:
     _ACTIVE_CHILD.clear()
 
 
+def suite_cmd(no_run: bool) -> list[str]:
+    """The build/test command, overridable ONLY so the signal guard can run (D0A-R31-04).
+
+    `DELPHI_MUTATION_TEST_CMD` replaces the cargo invocation. It exists because the property the
+    guard tests is SIGNAL HANDLING — does cancellation protect the tree and collect the group —
+    and a real cargo build makes that test take minutes, so it would not be run.
+    Substituting the command narrows the measurement without weakening it: every asserted
+    property still fails if violated (Iron Law #15 clause 3).
+
+    It is read from the environment of the HARNESS, never from a mutated tree, and a campaign
+    that uses it records the fact in `lane.json` so no result can silently claim to be a real
+    build.
+    """
+    override = os.environ.get("DELPHI_MUTATION_TEST_CMD")
+    if override:
+        return shlex.split(override)
+    base = ["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests"]
+    return base + ["--no-run"] if no_run else base
+
+
 def sh(cmd: list[str], cwd: pathlib.Path | None = None, **kw) -> subprocess.CompletedProcess:
     """Run in the main repo by default; pass `cwd` to run inside the isolated checkout.
 
@@ -320,7 +350,7 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     failure, a launch failure or a full disk all exit nonzero and none of them is a test
     judging the mutation.
     """
-    p = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests"], cwd=cwd)
+    p = sh(suite_cmd(no_run=False), cwd=cwd)
     ev = {
         "exit": p.returncode,
         "stdout": p.stdout,           # RETAINED WHOLE — the previous version kept a filtered
@@ -386,6 +416,7 @@ def main() -> int:
         "commit": head,
         "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "cargo": sh(["cargo", "--version"]).stdout.strip(),
+        "suite_cmd_override": os.environ.get("DELPHI_MUTATION_TEST_CMD"),
         "rustc": sh(["rustc", "--version"]).stdout.strip(),
         "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR", "(unset — cargo default)"),
         "inputs_checked": INPUT_PATHS,
@@ -434,8 +465,7 @@ def main() -> int:
                 _IN_FLIGHT.update({"path": str(path), "original": original, "rel": rel})
                 path.write_text(original.replace(anchor, repl, 1))
                 rec["applied_diff"] = sh(["git", "diff", "--", rel], cwd=work).stdout
-                build = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests",
-                            "--no-run"], cwd=work)
+                build = sh(suite_cmd(no_run=True), cwd=work)
                 if build.returncode != 0:
                     rec["outcome"] = "INVALID: mutant does not compile"
                     (out / "logs" / f"{i:02d}.build.stderr").write_text(build.stderr)

@@ -39,6 +39,18 @@ pub struct ChildGuard {
     armed: bool,
 }
 
+/// The machine-readable marker every PRECONDITION failure carries (D0A-R31-06).
+///
+/// A precondition failure means **the environment was wrong**, not that a mutation was caught
+/// or a regression found. The mutation campaign classified these by matching PROSE — a list
+/// that missed "could not run <script>", so a failure to even LAUNCH the stale-session checker
+/// was scored as a detection. An indefinitely-extended prose list is class 48 by construction:
+/// each new phrasing is a new instance to discover.
+///
+/// One token, emitted by every site, matched by the classifier. New precondition messages are
+/// covered the moment they carry it.
+pub const PRECONDITION_TOKEN: &str = "DELPHI_PRECONDITION_FAILED";
+
 impl ChildGuard {
     /// Guard `pid` until this value drops.
     pub fn arm(pid: Pid) -> Self {
@@ -118,11 +130,14 @@ pub fn assert_no_stale_session_on(vt: &str) {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/check-stale-test-sessions.sh");
     let out = match std::process::Command::new(script).args(["--vt", vt]).output() {
         Ok(o) => o,
-        Err(e) => panic!("could not run {script}: {e} — the environment is UNKNOWN, not clean"),
+        Err(e) => panic!(
+            "{PRECONDITION_TOKEN}: could not run {script}: {e} — the environment is UNKNOWN, \
+             not clean"
+        ),
     };
     assert!(
         out.status.success(),
-        "PRECONDITION FAILED before this test ran — a session is live on {vt}. \
+        "{PRECONDITION_TOKEN}: before this test ran — a session is live on {vt}. \
          DO NOT assume a PREVIOUS test left it (D0A-R4-07): a daemon spawned by THIS run \
          can create one and outlive the test that spawned it. Check `ps -ef | grep \
          delphi-runtimed` for a live ROOT daemon before blaming an earlier test — four \

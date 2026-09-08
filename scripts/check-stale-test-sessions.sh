@@ -99,7 +99,7 @@ if [ -z "$hits" ]; then
     exit 0
 fi
 
-echo "STALE SESSION FROM A PREVIOUS RUN — a PRECONDITION failure, not a code regression."
+echo "DELPHI_PRECONDITION_FAILED: STALE SESSION FROM A PREVIOUS RUN — a PRECONDITION failure, not a code regression."
 echo "Left in place, every launch fails VirtualTerminalAlreadyTaken at pam_open_session,"
 echo "and the message names neither the cause nor the test that caused it."
 echo

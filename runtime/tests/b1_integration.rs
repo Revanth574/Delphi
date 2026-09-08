@@ -1961,9 +1961,21 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     let probe = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(140);
         let mut seen: Vec<(i32, char, String)> = Vec::new();
+        // EVERYTHING the probe observed, not only the matches. A control that reports "no
+        // match" cannot distinguish the two failures that matter: the group was EMPTY
+        // throughout (the AI is not in the daemon's group at all — a finding about the
+        // architecture, and about the argument the register rests on), or the group had
+        // members NONE of which were the AI (a `comm` mismatch or a missed window — a finding
+        // about this probe). Retaining the census is what separates them.
+        let mut census: Vec<(i32, char, String)> = Vec::new();
+        let mut samples: usize = 0;
         while std::time::Instant::now() < deadline {
+            samples += 1;
             for (pid, state) in live_group_members(daemon_pid, daemon_pid) {
                 let c = comm_of(pid);
+                if !census.iter().any(|(p, _, _)| *p == pid) {
+                    census.push((pid, state, c.clone()));
+                }
                 // `comm` is truncated to 15 bytes by the kernel, so compare on that prefix.
                 let want: String = probe_comm.chars().take(15).collect();
                 if c == want && !seen.iter().any(|(p, _, _)| *p == pid) {
@@ -1971,15 +1983,15 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
                 }
             }
             if !seen.is_empty() {
-                return seen;
+                return (seen, census, samples);
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        seen
+        (seen, census, samples)
     });
 
     let run = guard.wait();
-    let ai_seen_live = probe.join().expect("probe thread");
+    let (ai_seen_live, probe_census, probe_samples) = probe.join().expect("probe thread");
     let (out, killed, survivors) = (run.output, run.killed, run.survivors_before_guard);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2004,11 +2016,22 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     assert!(
         !ai_seen_live.is_empty(),
         "POSITIVE CONTROL FAILED: the scanner never saw the AI (comm {ai_comm:?}) alive in the \
-         daemon's process group {daemon_pid} at any point during the run. The empty \
-         `survivors_before_guard` is therefore VACUOUS for the assembly case — it does not \
-         distinguish `the daemon cleaned up` from `the scan cannot reach the daemon's children`. \
-         The fixture demonstration transfers only if this holds.\n\
-         daemon log:\n{daemon_log}\nfixture log:\n{fixture_log}"
+         daemon's process group {daemon_pid} at any point during the run, across \
+         {probe_samples} samples. The empty `survivors_before_guard` is therefore VACUOUS for \
+         the assembly case — it does not distinguish `the daemon cleaned up` from `the scan \
+         cannot reach the daemon's children`.\n\
+         \n\
+         WHICH FAILURE THIS IS, decided by the census rather than by argument:\n\
+         * census EMPTY -> the daemon's group never contained ANY member the scan could see. \
+           That is about the assembly, not this probe, and it contradicts the reasoning the \
+           register rests on (neither launcher.rs nor execute.rs calls setsid/setpgid).\n\
+         * census NON-EMPTY but no {ai_comm:?} -> the scan reaches the group and the AI was \
+           not identified in it: a comm mismatch, or a window this probe missed. That is a \
+           defect in the control, not evidence about the daemon.\n\
+         \n\
+         census ({} distinct pids): {probe_census:?}\n\
+         daemon log:\n{daemon_log}\nfixture log:\n{fixture_log}",
+        probe_census.len()
     );
 
     // (0) **THE INVALIDATING OBSERVATION (D0A-R31-02), CHECKED FIRST.**

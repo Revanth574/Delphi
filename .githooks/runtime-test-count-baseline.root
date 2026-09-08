@@ -1,7 +1,114 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 19 — **the first root execution of the daemon's shutdown policy.** Measured
-# 2026-09-07 at `c10810f`.
+# LANE RUN 20 — **the assembly positive control PASSED on its first root execution.**
+# Measured 2026-09-08 at `fc22117`.
+#
+#   EXECUTED 221 / SKIPPED 6 / reported 227     extractor rc=0
+#   producers: 17/17 exited 0                   failures: 0
+#   predicted 221/6/227, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#   membership: root 227 identities / unpriv 227, ZERO in either direction, rc 0
+#
+# =========================================================================================
+# TWO PROCESS FAILURES FIRST, BECAUSE THE RESULT IS GOOD AND THAT IS WHEN THEY GET BURIED
+# =========================================================================================
+#
+# **1. THE FREE-SPACE PRECONDITION FIRED AND THE RUN PROCEEDED ANYWAY.**
+#
+#   /home/revanth-aditya/delphi-target   1089M   floor 2048M   *** SHORT ***
+#   "SHORT ON SPACE ... This is a PRECONDITION failure, not a build or test failure"
+#
+# The guard did exactly what it was built for and its refusal was overridden. Nothing
+# observable went wrong — 17/17 producers exited 0, freshness proved, counts matched — so this
+# is NOT a claim that the evidence is tainted. It is the record that the run STARTED FROM A
+# STATE THE PROCEDURE REFUSES, and the whole point of that guard (D0A-R29-08) is that its
+# failure mode surfaces far away wearing someone else's name. A run that begins by overriding
+# its own precondition has spent the guard's value whether or not it got away with it.
+# **Free space before run 21.** Part B's feature build consumed more still.
+#
+# **2. MY HANDOVER DROPPED §4b, THE MEMBERSHIP CHECK.**
+#
+# I assembled the operator's command sequence from the procedure and omitted the identity
+# membership check — the step that exists because equal totals are not equal test sets
+# (D0A-R27-04). Run 19 carried it; run 20's sequence did not.
+#
+# **This is the defect that got `scripts/lane-run.sh` REVERTED at D0A-R23-05** — a runner that
+# dropped checks the procedure performs, sold as an upgrade. I did the same thing by hand, one
+# check instead of five, in the very session that quoted that reversion. It was closed after
+# the fact (the log and target list were still on disk; 227/227, zero either direction, rc 0)
+# and the result is sound — but it was closed AFTER, which is not the same as run.
+#
+# =========================================================================================
+# PART B — THE POSITIVE CONTROL, AND WHAT ITS PASS ACTUALLY BUYS
+# =========================================================================================
+#
+#   test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... ok
+#   test result: ok. 1 passed; 0 failed; 18 filtered out; finished in 6.20s
+#
+# The control asserts FIRST, before the observation it validates, so a pass means the scanner
+# saw the real AI **alive, by `comm`, in the daemon's own process group, during the run**.
+# Outcome 1 of the three named before the run.
+#
+# **What this settles:** the fixture demonstration TRANSFERS. `live_group_members` was shown
+# to work against a child spawned by the test process with `.process_group(0)`; the open
+# question was whether that says anything about a real daemon, a fork/exec'd child and a pgid
+# inherited across `execve`. It does. The reasoning the closure rested on — that neither
+# `launcher.rs` nor `execute.rs` calls `setsid`/`setpgid` — is now MEASURED rather than argued,
+# and an empty `survivors_before_guard` is therefore a real observation about the daemon.
+#
+# **What it does NOT settle, unchanged:** the run observes CLEANUP, not REAPING. R29-05's
+# `Unreaped` branch stays UNCONSTRUCTED. The binary is built with `insecure-test-seams`, so the
+# logind gate is bypassable and nothing here certifies the production gate.
+#
+# **The honest shape of this evidence:** a passing control CONFIRMS an argument rather than
+# overturning one, which is the weaker of the two outcomes on offer. The failure would have
+# been worth more — it would have withdrawn a closure that has now been restated twice. That it
+# passed is a fact about the code, not a vindication of how the claim was made.
+#
+# A benign transcript line was traced rather than waved off: `userdel: user 'db1stubborn3942'
+# does not exist` is `Setup::new`'s UNCONDITIONAL pre-clean on a clean path. `leader_is_shell.rs`
+# already guards that exact noise with an existence check and documents why (expected-error
+# noise buries the real failures beside it); `b1_integration.rs` did not — class 48, the fix
+# scoped to the file where it was noticed. Guarded now.
+#
+# ---------------------------------------------------------------------------------------
+# THE SIX SKIPS, each quoting its own blocker. Five are run 19's; the sixth is NEW and was
+# PREDICTED — the assembly test checks the FEATURE first, so the featureless lane skips it,
+# which is why run 20 needed a separate Part B at all:
+#   b1_daemon_binary_runs_the_assembled_flow        needs --features insecure-test-seams
+#   b1_daemon_bounds_an_ai_...                      needs --features insecure-test-seams  (NEW)
+#   an_unreadable_login_defs_refuses_...            this uid can read a 0000 file
+#   logind::tests::pidfd_refuses_a_recycled_pid     user namespaces unavailable
+#   live_logind_query_path_works_or_documents_...   DEFER: no logind session
+#   a_regular_login_user_is_not_refused_...         running as root
+#
+# EVERY HYGIENE CHECK, WITH THE EVIDENCE THAT DECIDES IT
+#   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
+#   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED, both printed
+#   bwrap            0.11.1
+#   free space       *** SHORT *** — see process failure 1 above
+#   forced freshness ENFORCED: enumeration asserted at 17, both hash sides asserted equal to
+#                    17, rebuild failure fatal, `diff` empty
+#   PAM before/after 439c1d15… -> `md5sum -c` OK   (class 16, already paid for once)
+#   stale sessions   none, before and after
+#
+# ORDERING HELD UNDER CONVENTION FOR THE EIGHTH CONSECUTIVE RUN (D0A-R22-01, still reopened).
+#
+# ---------------------------------------------------------------------------------------
+# WHAT A GREEN RUN 20 STILL DOES NOT ESTABLISH
+#
+# 1. Reaping. The control proves the scan can SEE a live child; the empty sample proves none
+#    remained. Neither observes the daemon reaping one.
+# 2. R29-05's `Unreaped` — still UNCONSTRUCTED; nothing puts a child in uninterruptible sleep.
+# 3. The production logind gate — Part B runs a seam-built binary; blocked on a seated lane.
+# 4. The mutation campaign is unprivileged-only; the six root-gated tests are un-mutated.
+# 5. The suspend divergence is unmeasured; `action.timeout` is enforced nowhere (R9-04).
+#
+# ---------------------------------------------------------------------------------------
+# SUPERSEDED — LANE RUN 19 (`216/5/221` at `c10810f`) — the first root execution of the daemon's
+# shutdown policy. Sound; superseded because run 20 covers five more tests and adds the
+# assembly control. Its full record follows.
+#
+# LANE RUN 19 detail:
 #
 #   EXECUTED 216 / SKIPPED 5 / reported 221     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
@@ -127,5 +234,5 @@
 # (`208/5/213` at `c3cca14` — same figure, different tree), run 16 (`200/5/205`), run 15
 # (`192/5/197`), run 14 (`187/5/192`, closed D0A-R24-01), run 13 (`177/5/182`, freshness
 # WITHDRAWN by D0A-R25-05).
-EXECUTED=216
-SKIPPED=5
+EXECUTED=221
+SKIPPED=6

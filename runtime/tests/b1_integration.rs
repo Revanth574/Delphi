@@ -126,7 +126,14 @@ impl Setup {
         // future test from silently omitting it: every test goes through `Setup::new`.
         delphi_runtime::test_child_guard::assert_no_stale_session_on(test_vt().as_pam_tty());
         let user = format!("db1{tag}{}", std::process::id() % 10_000);
-        let _ = Command::new("userdel").arg(&user).status();
+        // GUARD on existence, as `leader_is_shell.rs` already does: an unconditional `userdel`
+        // prints `userdel: user '...' does not exist` on the CLEAN path, and expected-error
+        // noise buries the real failures it sits beside. Run 20's assembly transcript carried
+        // exactly that line next to the result it was there to certify. Class 48 — the guard
+        // was written in the file where the noise was noticed and not in its sibling.
+        if nix::unistd::User::from_name(&user).ok().flatten().is_some() {
+            let _ = Command::new("userdel").arg(&user).status();
+        }
         assert!(Command::new("useradd").args(["-M", "-s", "/usr/sbin/nologin", &user]).status().unwrap().success());
         let mut ch = Command::new("chpasswd").stdin(Stdio::piped()).spawn().unwrap();
         ch.stdin.take().unwrap().write_all(format!("{user}:{PASSWORD}").as_bytes()).unwrap();

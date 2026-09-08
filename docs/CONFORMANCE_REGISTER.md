@@ -79,8 +79,14 @@ D0A-R31 and is restored here only with the observation that discriminates.
 
 **WHAT RUN 5 OBSERVED, in the reviewer's words rather than mine (D0A-R32):**
 
-> **No live group members remained before harness intervention; daemon reaping was not
-> observed.**
+> **The scanner was proven capable of seeing the daemon's own fork/exec'd child in its
+> inherited process group, and no live group members remained before harness intervention;
+> daemon reaping was not observed.**
+
+The first clause is new at **lane run 20** and is the only part of this row that strengthened.
+The wording was fixed *before* the run, in the committed expectation, so it is not a claim
+shaped to fit a result — a pass bought exactly this sentence and nothing else, and a failure
+would have withdrawn the closure rather than the test.
 
 That is the whole claim. The previous wording — *"the daemon cleaned up"* — was called
 ambiguous, and it was: it invites a reader to conclude the daemon **reaped**, which this run
@@ -101,6 +107,15 @@ zombie exclusion hides only the killed-but-already-collected case, not every `Un
 The operator let the stronger version stand without checking it, and neither of us verified a
 claim about what a check cannot see — which is harder to falsify than a claim about what it can,
 and therefore the kind that needs checking most.
+
+**The vacuity question is now MEASURED in the assembly, not argued (lane run 20).** The
+fixture showed the scan finding a child spawned by the test process with `.process_group(0)`;
+whether that transferred to a real daemon with a fork/exec'd child and a pgid inherited across
+`execve` was reasoning — that neither `launcher.rs` nor `execute.rs` calls `setsid`/`setpgid`.
+A positive control now asserts, **before** the observation it validates, that the scanner saw
+the real AI alive by `comm` in the daemon's group. It passed on its first root execution.
+Note the shape of that evidence honestly: a passing control CONFIRMS the argument rather than
+overturning it, which is the weaker of the two outcomes that were on offer.
 
 **The zombie half now bites (D0A-R32-03 fixed).** The fixture constructs a real zombie — a
 child reaped by nobody, held terminal with a *checked* `waitid(WNOWAIT)`, and its `Z` state read

@@ -236,5 +236,14 @@
 #   NON-empty one is reachable. It is — DaemonGuard uses `.process_group(0)` and neither
 #   launcher.rs nor execute.rs calls setsid/setpgid, so the daemon's children inherit its pgid —
 #   but that was an ARGUMENT, and this demonstrates it instead.
-EXECUTED=200
+#
+# +1 (200 -> 201): `reap_status_retries_a_waitpid_interrupted_by_a_signal`. D0A-R29-06's EINTR
+# retry shipped WITHOUT a test and the `shutdown.rs` extraction did not move the function, so
+# it sat uncovered for three rounds while the only demonstration lived in the reviewer's
+# unretained probe. The condition is now constructed in-suite: a SIGUSR1 handler installed
+# WITHOUT SA_RESTART (with it, the kernel restarts `waitpid` and EINTR never reaches the code),
+# `pthread_kill` aimed at the blocked thread rather than the process. RED-proven: deleting
+# `Err(EINTR) => continue` fails 10/10 with `unexpected wait status: Err(EINTR)`; restored it
+# passes 30/30 under DEFAULT parallel settings, per the timing-shaped rule in CLAUDE.md §6.
+EXECUTED=201
 SKIPPED=26

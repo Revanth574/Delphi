@@ -467,6 +467,17 @@ impl DaemonGuard {
         Self { child: Some(child), session_user: session_user.to_owned(), identity: Identity::Held }
     }
 
+    /// The daemon's pid, and therefore its pgid — it leads its own group (`.process_group(0)`).
+    ///
+    /// Needed because [`Self::wait`] blocks and CONSUMES the guard, so the only way to observe
+    /// the running assembly is a probe started before it (D0A-R32-01, the positive control).
+    fn pid(&self) -> i32 {
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            self.child.as_ref().expect("child present").id() as i32
+        }
+    }
+
     /// Wait to a deadline, then take the output. A kill is reported by the caller's assertion;
     /// the REAPING has already happened either way.
     fn wait(mut self) -> DaemonRun {
@@ -1597,6 +1608,16 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
+/// `comm` for a pid, as BYTES rendered lossily — never as a UTF-8 decode that can fail closed.
+///
+/// Same reasoning as `live_group_members` (D0A-R32-01): `comm` is arbitrary bytes chosen by the
+/// process, so a strict decode lets a process hide from an identity check by being named badly.
+fn comm_of(pid: i32) -> String {
+    std::fs::read(format!("/proc/{pid}/comm"))
+        .map(|b| String::from_utf8_lossy(&b).trim_end().to_owned())
+        .unwrap_or_default()
+}
+
 /// D0A-R31-02 — `live_group_members` finds a live survivor, reports unknowns, and skips a
 /// **DEMONSTRATED** zombie.
 ///
@@ -1914,7 +1935,51 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
         .env("DELPHI_SHELL_VT", "tty1")
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1");
 
-    let run = DaemonGuard::spawn(cmd, &setup.user).wait();
+    // ── THE POSITIVE CONTROL (D0A-R32-01) ───────────────────────────────────────────────
+    // `survivors_before_guard` being EMPTY is the observation this test rests on. The fixture
+    // `live_group_members_finds_a_survivor_…` shows the scanner works against a child spawned
+    // by the TEST PROCESS with `.process_group(0)`. The reviewer's question was whether that
+    // transfers: the assembly case is a real daemon, a fork/exec'd child, and a pgid inherited
+    // across `execve`. It was an ARGUMENT — `launcher.rs` and `execute.rs` call neither
+    // `setsid` nor `setpgid` — and this measures it instead.
+    //
+    // The probe polls the daemon's group WHILE IT RUNS and records whether the real AI was
+    // ever seen there. If it never is, an empty sample at shutdown proves nothing about the
+    // assembly, and this test's central assertion is vacuous for the case it actually covers.
+    //
+    // Identified by `comm` rather than by a pid the fixture reports: the AI is privilege-
+    // dropped, and a fixture that announces its own identity is the harness supplying the
+    // observation again (D0A-R31-02).
+    let guard = DaemonGuard::spawn(cmd, &setup.user);
+    let daemon_pid = guard.pid();
+    let ai_comm = std::path::Path::new(&ai_bin)
+        .file_name()
+        .expect("ai binary name")
+        .to_string_lossy()
+        .into_owned();
+    let probe_comm = ai_comm.clone();
+    let probe = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(140);
+        let mut seen: Vec<(i32, char, String)> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (pid, state) in live_group_members(daemon_pid, daemon_pid) {
+                let c = comm_of(pid);
+                // `comm` is truncated to 15 bytes by the kernel, so compare on that prefix.
+                let want: String = probe_comm.chars().take(15).collect();
+                if c == want && !seen.iter().any(|(p, _, _)| *p == pid) {
+                    seen.push((pid, state, c));
+                }
+            }
+            if !seen.is_empty() {
+                return seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        seen
+    });
+
+    let run = guard.wait();
+    let ai_seen_live = probe.join().expect("probe thread");
     let (out, killed, survivors) = (run.output, run.killed, run.survivors_before_guard);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1929,6 +1994,22 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     // raw bytes against a transcript-derived literal cannot work. See `strip_ansi`.
     let daemon_log = strip_ansi(&stdout);
     let fixture_log = strip_ansi(&stderr);
+
+    // (0a) **THE CONTROL, CHECKED BEFORE THE OBSERVATION IT VALIDATES (D0A-R32-01).**
+    //
+    // If the scanner cannot see the real AI in the daemon's group, then the empty sample below
+    // is not evidence of the daemon cleaning up — it is a scan that was never going to find
+    // anything. This is the same discipline as (0): the check that could invalidate the run
+    // comes first, and fails the test rather than logging a caveat.
+    assert!(
+        !ai_seen_live.is_empty(),
+        "POSITIVE CONTROL FAILED: the scanner never saw the AI (comm {ai_comm:?}) alive in the \
+         daemon's process group {daemon_pid} at any point during the run. The empty \
+         `survivors_before_guard` is therefore VACUOUS for the assembly case — it does not \
+         distinguish `the daemon cleaned up` from `the scan cannot reach the daemon's children`. \
+         The fixture demonstration transfers only if this holds.\n\
+         daemon log:\n{daemon_log}\nfixture log:\n{fixture_log}"
+    );
 
     // (0) **THE INVALIDATING OBSERVATION (D0A-R31-02), CHECKED FIRST.**
     //

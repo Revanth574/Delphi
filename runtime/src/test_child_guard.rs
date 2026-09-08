@@ -235,3 +235,89 @@ mod leak_report_tests {
         assert!(busy.contains("LEAKED") && busy.contains("delphi-b1-Yo7srF"), "{busy}");
     }
 }
+
+#[cfg(test)]
+mod eintr_tests {
+    use super::ChildGuard;
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    use nix::unistd::Pid;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    static DELIVERED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Async-signal-safe: one relaxed atomic add and nothing else.
+    extern "C" fn on_usr1(_: nix::libc::c_int) {
+        DELIVERED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// D0A-R29-06 shipped the EINTR retry WITHOUT a test, and the extraction of `shutdown.rs`
+    /// did not move this function, so it stayed uncovered for three rounds. The reviewer
+    /// reproduced the pre-fix failure with an external probe; by this project's own rule an
+    /// unretained probe is not coverage, so the condition is constructed here.
+    ///
+    /// **How the interruption is made to happen rather than hoped for:** the handler is
+    /// installed with `SaFlags::empty()` — SA_RESTART deliberately ABSENT, because with it the
+    /// kernel restarts `waitpid` transparently and `EINTR` never reaches the code under test.
+    /// Signals are then delivered with `pthread_kill` to *this* thread, the one blocked in
+    /// `waitpid`, rather than to the process, where any thread could take them.
+    ///
+    /// **What proves the condition was reached, rather than merely that the test passed:** the
+    /// weaken. Deleting `Err(EINTR) => continue` makes this test panic in the catch-all arm. If
+    /// no interruption occurred, deleting the retry would change nothing and the weaken would
+    /// pass — so the RED is the evidence, not the green.
+    #[test]
+    fn reap_status_retries_a_waitpid_interrupted_by_a_signal() {
+        let act = SigAction::new(SigHandler::Handler(on_usr1), SaFlags::empty(), SigSet::empty());
+        // SAFETY: installing a handler that only performs one relaxed atomic increment. The
+        // previous disposition is restored before the test returns.
+        let previous = unsafe { sigaction(Signal::SIGUSR1, &act) }.expect("install SIGUSR1");
+
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 1; exit 7")
+            .spawn()
+            .expect("spawn the child to be reaped");
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = Pid::from_raw(child.id() as i32);
+        // The guard owns the reap from here; `Child` must not also wait for it.
+        std::mem::forget(child);
+        let guard = ChildGuard::arm(pid);
+
+        let before = DELIVERED.load(Ordering::Relaxed);
+        // `libc` directly rather than `nix::sys::pthread`, which would need a nix feature
+        // added to the crate's dependencies for a test-only call. `pthread_t` is an integer
+        // handle and is Send.
+        // SAFETY: `pthread_self` takes no arguments and cannot fail.
+        let target = unsafe { nix::libc::pthread_self() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_tx = Arc::clone(&stop);
+        let hammer = std::thread::spawn(move || {
+            while !stop_tx.load(Ordering::Relaxed) {
+                // SAFETY: signalling a thread of this process that is live for the whole
+                // loop — `hammer` is joined before the test returns.
+                unsafe { nix::libc::pthread_kill(target, nix::libc::SIGUSR1) };
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        let code = guard.reap_status();
+
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().expect("hammer thread");
+        // SAFETY: restoring the disposition captured above, before any other test observes it.
+        unsafe { sigaction(Signal::SIGUSR1, &previous) }.expect("restore SIGUSR1");
+
+        assert_eq!(
+            code, 7,
+            "the child's real exit status must survive the interruptions; EINTR says nothing \
+             about the child and must not be reported as its outcome (D0A-R29-06)"
+        );
+        assert!(
+            DELIVERED.load(Ordering::Relaxed) > before,
+            "no SIGUSR1 was delivered at all, so this run exercised nothing — the test would \
+             pass with the retry deleted, which is the PASS/PASS case Iron Law 15 clause 2 \
+             calls worthless"
+        );
+    }
+}

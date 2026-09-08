@@ -59,7 +59,7 @@ two tests naming it asserted that *changing* it changes the digest and the previ
 asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
 negative does not, and should not have been written.
 
-### D0A-R28-02 — **CLOSED**, on evidence that separates the daemon's work from the harness's
+### D0A-R28-02 — **CLOSED**, and the row says exactly what was observed
 
 The assembly test passes at root **with the survivor check as its first assertion**
 (D0A-R31-02): `DaemonGuard::wait()` now samples the live members of the daemon's process group
@@ -77,18 +77,33 @@ second: a counterfeit daemon leaving its child alive passed all nine assertions 
 `killed == false`, because the harness supplied the cleanup. That claim was withdrawn at
 D0A-R31 and is restored here only with the observation that discriminates.
 
-**The vacuity question was checked, not assumed.** An empty sample is evidence only if a
-non-empty one is reachable — it is, because `DaemonGuard::spawn` uses `.process_group(0)` so the
-daemon leads its own group, and neither `launcher.rs` nor `execute.rs` calls `setsid`/`setpgid`,
-so its forked children inherit that pgid. That was an argument until
-`live_group_members_finds_a_survivor_and_ignores_zombies` demonstrated the scan finding a live
-child and skipping a zombie.
+**WHAT RUN 5 OBSERVED, in the reviewer's words rather than mine (D0A-R32):**
 
-**The residual, stated because the assertion cannot see it:** zombies are excluded, so a daemon
-that **killed a child but did not reap it** is indistinguishable here from one that did both —
-after the daemon exits, init collects the corpse either way. That is precisely R29-05's
-`Unreaped` branch, which remains uncovered, and it is the reason this row says *cleaned up*
-rather than *reaped*.
+> **No live group members remained before harness intervention; daemon reaping was not
+> observed.**
+
+That is the whole claim. The previous wording — *"the daemon cleaned up"* — was called
+ambiguous, and it was: it invites a reader to conclude the daemon **reaped**, which this run
+does not show.
+
+**THE VACUITY CHECK WAS HALF-VACUOUS, and I called it the difference between this closure and
+the last one.** It has two halves:
+
+- **the survivor half HOLDS** — `live_group_members` does find a live child, so an empty sample
+  is a real observation rather than a scan that never finds anything;
+- **the zombie half PROVED NOTHING** (D0A-R32-03). The fixture's `: &` short-lived child was
+  reaped by the shell before observation, so no zombie ever existed. The reviewer ran the test
+  **30/30 with the zombie exclusion deleted and it still passed.**
+
+**And my statement of the residual was too strong (D0A-R32).** I wrote that zombie exclusion
+makes `Unreaped` invisible. It does not: **a live D-state child IS included by the scanner**, so
+zombie exclusion hides only the killed-but-already-collected case, not every `Unreaped` outcome.
+The operator let the stronger version stand without checking it, and neither of us verified a
+claim about what a check cannot see — which is harder to falsify than a claim about what it can,
+and therefore the kind that needs checking most.
+
+**Still true and still owed:** R29-05's `Unreaped` branch is UNCONSTRUCTED, and this row does
+not observe reaping.
 
 **Scope unchanged:** the test runs a binary built with `insecure-test-seams`, whose logind gate
 is bypassable. It certifies the **shutdown assembly** and **nothing about the production logind

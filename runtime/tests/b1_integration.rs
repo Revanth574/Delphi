@@ -1597,6 +1597,55 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
+/// D0A-R31-02 — `live_group_members` actually finds a survivor, and skips zombies.
+///
+/// **The vacuity check the survivor assertion needs.** `survivors_before_guard` being empty is
+/// only evidence if a non-empty result is reachable. It is: `DaemonGuard::spawn` uses
+/// `.process_group(0)` so the daemon leads its own group, and neither `launcher.rs` nor
+/// `execute.rs` calls `setsid`/`setpgid`, so its forked children inherit that pgid. This test
+/// demonstrates the scan rather than leaving that argument unexercised.
+///
+/// **The residual, stated because the assertion cannot see it:** zombies are excluded, so a
+/// daemon that KILLED a child but did not REAP it is indistinguishable here from one that did
+/// both — the corpse is collected by init after the daemon exits either way. That is R29-05's
+/// branch, and it remains uncovered.
+#[test]
+fn live_group_members_finds_a_survivor_and_ignores_zombies() {
+    // A leader in its own group with one live child and one zombie.
+    use std::os::unix::process::CommandExt as _;
+    let mut leader = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60 & : & sleep 60")
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn leader");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    #[allow(clippy::cast_possible_wrap)]
+    let pgid = leader.id() as i32;
+    let found = live_group_members(pgid, pgid);
+    assert!(
+        !found.is_empty(),
+        "the scan found NO members of a group that has live children — an empty \
+         `survivors_before_guard` would then be vacuous, not evidence (D0A-R31-02)"
+    );
+    assert!(
+        found.iter().all(|(_, st)| *st != 'Z'),
+        "a zombie was counted as a survivor: {found:?}"
+    );
+    assert!(
+        found.iter().all(|(pid, _)| *pid != pgid),
+        "the leader must be excluded, it is the daemon itself: {found:?}"
+    );
+
+    let _ = leader.kill();
+    let _ = leader.wait();
+    // Sweep the group so the test leaks nothing.
+    unsafe { nix::libc::kill(-pgid, nix::libc::SIGKILL) };
+}
+
 /// A daemon run, with **who was still alive when the guard was about to intervene**.
 ///
 /// D0A-R31-02: `wait()` returned `(Output, killed)`, and `killed` says only whether the daemon

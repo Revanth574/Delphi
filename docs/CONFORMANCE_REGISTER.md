@@ -59,45 +59,40 @@ two tests naming it asserted that *changing* it changes the digest and the previ
 asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
 negative does not, and should not have been written.
 
-### D0A-R28-02 — **NOT CLOSED. The row below overstated its own evidence (D0A-R31-02).**
+### D0A-R28-02 — **CLOSED**, on evidence that separates the daemon's work from the harness's
 
-**This section recorded the finding as CLOSED. It is not, and the correction is filed ahead of
-the six fixes it sits with, because a false claim in this document is class 51 — written in the
-same round, violated in the same round's record.** A record exists so readers stop deriving; an
-overstated closure here propagates by design.
+The assembly test passes at root **with the survivor check as its first assertion**
+(D0A-R31-02): `DaemonGuard::wait()` now samples the live members of the daemon's process group
+**immediately before** its unconditional `kill_group`, and a non-empty sample **fails the test**
+rather than being logged. So the run distinguishes the three outcomes two values could not:
 
-**What the root run actually establishes, which is real and is more than existed three rounds
-ago:** the daemon **reached its termination-reporting branch and exited before the guard's
-deadline**, against an AI that completed the protocol and refused to exit. The log carries it:
+| outcome | observation |
+|---|---|
+| **the DAEMON cleaned up** | `survivors_before_guard` EMPTY — **this is what run 5 observed** |
+| the daemon did not and the GUARD did | non-empty; the run would prove nothing about the daemon |
+| neither | non-empty, still alive after |
 
-```
-20:12:02.361  INFO  served one action outcome=Completed
-20:12:07.395  WARN  child outlived the grace period and was terminated (D0A-R28-02) child="ai"
-```
+Previously this row claimed CLOSED on evidence that could not tell the first case from the
+second: a counterfeit daemon leaving its child alive passed all nine assertions with
+`killed == false`, because the harness supplied the cleanup. That claim was withdrawn at
+D0A-R31 and is restored here only with the observation that discriminates.
 
-**What it does NOT establish: that the daemon cleaned the child up.**
-`DaemonGuard::wait()` calls `Self::kill_group(child.id())` **unconditionally** after its deadline
-loop, so **the harness supplies the kill whether or not the daemon performed one.** The test then
-asserts on what the daemon *logged* plus `!killed` — and `!killed` measures only that the daemon
-hit the deadline, not that it exited *through* the policy. A counterfeit daemon that leaves its
-child alive **passes all nine assertions with `killed=false`** (reviewer probe, retained in
-`scratch/d0a-round31-review/`).
+**The vacuity question was checked, not assumed.** An empty sample is evidence only if a
+non-empty one is reachable — it is, because `DaemonGuard::spawn` uses `.process_group(0)` so the
+daemon leads its own group, and neither `launcher.rs` nor `execute.rs` calls `setsid`/`setpgid`,
+so its forked children inherit that pgid. That was an argument until
+`live_group_members_finds_a_survivor_and_ignores_zombies` demonstrated the scan finding a live
+child and skipping a zombie.
 
-**THE WORRY WAS STATED IN ADVANCE AND CONFIRMED.** The round-31 prompt asked, of this test:
-*"Is `!killed` sufficient for the fifth assertion? It proves the daemon exited before the
-guard's deadline. Does it prove the daemon exited through the policy?"* The answer was the
-second. Recording that the question was asked before the verdict is not credit — the test
-shipped anyway, and the operator was told the fifth assertion was what made this assembly
-coverage rather than outcome coverage. **It is not, and both of us said otherwise.**
+**The residual, stated because the assertion cannot see it:** zombies are excluded, so a daemon
+that **killed a child but did not reap it** is indistinguishable here from one that did both —
+after the daemon exits, init collects the corpse either way. That is precisely R29-05's
+`Unreaped` branch, which remains uncovered, and it is the reason this row says *cleaned up*
+rather than *reaped*.
 
-**Nine assertions, not eight.** The count was stated as eight here and in three commit messages;
-the body has 8 `assert!` plus 1 `assert_eq!`.
-
-**Closes when:** the test observes child identities and terminal state **before** the guard can
-intervene, records guard intervention separately as invalidating the daemon-cleanup claim, and
-carries a weaken that skips signalling/reaping while preserving the reported outcome — which
-must fail. Tracked with **D0A-R31-05**, since a barrier built on an unchecked `waitid` can vanish
-silently and take the determinism with it.
+**Scope unchanged:** the test runs a binary built with `insecure-test-seams`, whose logind gate
+is bypassable. It certifies the **shutdown assembly** and **nothing about the production logind
+gate**, which stays blocked on a seated lane.
 
 ### The cost, stated plainly: FOUR root runs, THREE lost to my own assertions
 
@@ -110,7 +105,8 @@ asked. Everything after was my test being wrong about the world:
 | 1 | FAIL | asserted the daemon's log against **stderr**; `tracing` writes to stdout |
 | 2 | FAIL | asserted the **pre-extraction message text**, reconstructed from memory |
 | 3 | FAIL | asserted `child="ai"` against bytes containing **ANSI escapes** |
-| 4 | **PASS** | — |
+| 4 | PASS | — but on assertions the harness could satisfy (D0A-R31-02) |
+| 5 | **PASS** | with the survivor check first — the daemon's own cleanup observed |
 
 Recorded as `DEFECT_CLASSES.md` **class 52**. The fourth instance is what makes it a class: the
 failure output re-renders the escapes through the same terminal, so **the diagnostic channel has

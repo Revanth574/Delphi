@@ -102,6 +102,12 @@ The operator let the stronger version stand without checking it, and neither of 
 claim about what a check cannot see — which is harder to falsify than a claim about what it can,
 and therefore the kind that needs checking most.
 
+**The zombie half now bites (D0A-R32-03 fixed).** The fixture constructs a real zombie — a
+child reaped by nobody, held terminal with a *checked* `waitid(WNOWAIT)`, and its `Z` state read
+back from `/proc` **before** the scan runs. Deleting the exclusion now fails **10/10** where the
+old fixture failed **0/30**. A fixture that cannot exhibit the condition it names is not a
+fixture, and the only reason this one looked like evidence is that nobody weakened it.
+
 **Still true and still owed:** R29-05's `Unreaped` branch is UNCONSTRUCTED, and this row does
 not observe reaping.
 

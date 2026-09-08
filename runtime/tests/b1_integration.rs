@@ -1597,52 +1597,91 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
-/// D0A-R31-02 — `live_group_members` actually finds a survivor, and skips zombies.
+/// D0A-R31-02 — `live_group_members` finds a live survivor, reports unknowns, and skips a
+/// **DEMONSTRATED** zombie.
 ///
-/// **The vacuity check the survivor assertion needs.** `survivors_before_guard` being empty is
-/// only evidence if a non-empty result is reachable. It is: `DaemonGuard::spawn` uses
-/// `.process_group(0)` so the daemon leads its own group, and neither `launcher.rs` nor
-/// `execute.rs` calls `setsid`/`setpgid`, so its forked children inherit that pgid. This test
-/// demonstrates the scan rather than leaving that argument unexercised.
+/// # The vacuity check the survivor assertion needs
 ///
-/// **The residual, stated because the assertion cannot see it:** zombies are excluded, so a
-/// daemon that KILLED a child but did not REAP it is indistinguishable here from one that did
-/// both — the corpse is collected by init after the daemon exits either way. That is R29-05's
-/// branch, and it remains uncovered.
+/// `survivors_before_guard` being empty is evidence only if a non-empty result is reachable.
+///
+/// # D0A-R32-03: the previous zombie half PROVED NOTHING
+///
+/// It used `: &` for the corpse — a short-lived background job the shell reaps before anything
+/// observes it, so **no zombie ever existed**. The reviewer ran that test 30/30 with the zombie
+/// exclusion DELETED and it passed every time. Half of the check I had called the difference
+/// between this closure and the previous one was inert.
+///
+/// The zombie is now CONSTRUCTED and CONFIRMED: a child is left terminal-but-unreaped, its
+/// state is read from `/proc` and asserted to be `Z` **before** the scan runs, and the scan is
+/// then asserted not to contain that specific pid. A fixture that cannot show the condition it
+/// names is not a fixture.
 #[test]
-fn live_group_members_finds_a_survivor_and_ignores_zombies() {
-    // A leader in its own group with one live child and one zombie.
+fn live_group_members_finds_a_survivor_reports_unknowns_and_skips_a_real_zombie() {
     use std::os::unix::process::CommandExt as _;
+
+    // A leader in its own group with one long-lived child.
     let mut leader = Command::new("sh")
         .arg("-c")
-        .arg("sleep 60 & : & sleep 60")
+        .arg("sleep 60 & sleep 60")
         .process_group(0)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn leader");
-    std::thread::sleep(std::time::Duration::from_millis(400));
-
     #[allow(clippy::cast_possible_wrap)]
     let pgid = leader.id() as i32;
+
+    // A zombie WE own, in our own group: exited and deliberately NOT reaped.
+    let mut corpse = Command::new("true").spawn().expect("spawn corpse");
+    #[allow(clippy::cast_possible_wrap)]
+    let corpse_pid = corpse.id() as i32;
+    // Wait for it to become terminal WITHOUT consuming the status, so it stays a zombie.
+    // SAFETY: `waitid` writes a `siginfo_t` this frame owns; WNOWAIT leaves it reapable.
+    let rc = unsafe {
+        let mut si: nix::libc::siginfo_t = std::mem::zeroed();
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            corpse_pid as nix::libc::id_t,
+            &mut si,
+            nix::libc::WEXITED | nix::libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid failed; no zombie was established (D0A-R32-03)");
+    // CONFIRM the condition from /proc rather than assuming it.
+    let stat = std::fs::read(format!("/proc/{corpse_pid}/stat")).expect("corpse stat");
+    let close = stat.iter().rposition(|&b| b == b')').expect("comm close");
+    let state = String::from_utf8_lossy(&stat[close + 1..])
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.chars().next())
+        .expect("state field");
+    assert_eq!(state, 'Z', "the corpse is in state {state}, not a zombie (D0A-R32-03)");
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
     let found = live_group_members(pgid, pgid);
     assert!(
         !found.is_empty(),
-        "the scan found NO members of a group that has live children — an empty \
+        "the scan found NO members of a group with live children — an empty \
          `survivors_before_guard` would then be vacuous, not evidence (D0A-R31-02)"
-    );
-    assert!(
-        found.iter().all(|(_, st)| *st != 'Z'),
-        "a zombie was counted as a survivor: {found:?}"
     );
     assert!(
         found.iter().all(|(pid, _)| *pid != pgid),
         "the leader must be excluded, it is the daemon itself: {found:?}"
     );
 
+    // THE ZOMBIE HALF, now against a zombie that demonstrably exists. It is in OUR group, so
+    // scan our own pgid to reach it.
+    let our_pgid = nix::unistd::getpgrp().as_raw();
+    let ours = live_group_members(our_pgid, -1);
+    assert!(
+        ours.iter().all(|(pid, _)| *pid != corpse_pid),
+        "a CONFIRMED zombie (pid {corpse_pid}) was counted as a survivor: {ours:?}"
+    );
+
     let _ = leader.kill();
     let _ = leader.wait();
-    // Sweep the group so the test leaks nothing.
+    let _ = corpse.wait();
+    // SAFETY: sweeping the group this test created.
     unsafe { nix::libc::kill(-pgid, nix::libc::SIGKILL) };
 }
 
@@ -1674,33 +1713,56 @@ struct DaemonRun {
 
 /// Live members of process group `pgid`, excluding `leader`, as `(pid, state)`.
 ///
-/// Zombies are EXCLUDED: after the daemon exits, anything it killed but did not reap is
-/// reparented and collected by init, so a `Z` here is a race with that rather than a child the
-/// daemon failed to terminate. The stubborn AI sleeps for an hour, so a child the daemon did
-/// NOT kill appears unambiguously as `S`.
+/// # D0A-R32-01: this read `/proc/<pid>/stat` as UTF-8 and SKIPPED failures
+///
+/// `comm` is an arbitrary byte string — whatever `execve` was handed, truncated to 15 bytes. A
+/// child whose name is not valid UTF-8 made `read_to_string` fail, the `else { continue }`
+/// dropped it, and **a live survivor vanished from the scan**. The counterfeit daemon would
+/// then pass the assembly assertions again with the guard supplying the kill — the exact defect
+/// this scanner exists to catch, reachable by naming a process badly.
+///
+/// So: bytes, not `String`. And **an observation error is not absence** — an entry that cannot
+/// be read is reported as `?` rather than omitted, because "I could not tell" and "nothing was
+/// there" are opposite answers and the caller treats any non-empty result as disqualifying.
+///
+/// Zombies are EXCLUDED: after the daemon exits, anything killed-but-unreaped is reparented and
+/// collected by init, so a `Z` is a race with that rather than a child the daemon failed to
+/// terminate. **A live `D`-state child is INCLUDED** — uninterruptible sleep is not death, and
+/// D0A-R32 corrected the register where I claimed zombie exclusion hides every `Unreaped`
+/// outcome. It hides only the already-collected case.
 fn live_group_members(pgid: i32, leader: i32) -> Vec<(i32, char)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
+        // Cannot enumerate at all: one unknown, never an empty (= clean) answer.
+        return vec![(-1, '?')];
     };
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
-            continue;
+            continue; // not a pid directory
         };
         if pid == leader {
             continue;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let raw = match std::fs::read(format!("/proc/{pid}/stat")) {
+            Ok(b) => b,
+            // The process genuinely went away between readdir and read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                out.push((pid, '?'));
+                continue;
+            }
+        };
+        // `comm` is parenthesised and may contain spaces AND parens: fields follow the LAST ')'.
+        let Some(close) = raw.iter().rposition(|&b| b == b')') else {
+            out.push((pid, '?'));
             continue;
         };
-        // `comm` may contain spaces and parentheses, so fields are read after the LAST ')'.
-        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
-            continue;
-        };
+        let rest = String::from_utf8_lossy(&raw[close + 1..]);
         let fields: Vec<&str> = rest.split_whitespace().collect();
         // After comm: [0]=state [1]=ppid [2]=pgrp
         let (Some(state), Some(pgrp)) = (fields.first(), fields.get(2)) else {
+            out.push((pid, '?'));
             continue;
         };
         let st = state.chars().next().unwrap_or('?');

@@ -66,11 +66,13 @@ Usage:  scripts/mutation-campaign.py [--out DIR]
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -197,6 +199,9 @@ def make_isolated_checkout(sha: str) -> pathlib.Path:
     """A checkout of `sha` that is NOT a copy of the working tree (D0A-R31-01)."""
     d = pathlib.Path(tempfile.mkdtemp(prefix="delphi-mutation-wt-"))
     target = d / "tree"
+    # Record the PARENT before the `git worktree add` can fail — a failed add still leaves the
+    # mkdtemp behind, and cleanup keyed on success collects nothing (D0A-R32-05).
+    _WORKTREE["parent"] = str(d)
     r = sh(["git", "worktree", "add", "--detach", str(target), sha])
     if r.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {r.stderr.strip()}")
@@ -205,10 +210,20 @@ def make_isolated_checkout(sha: str) -> pathlib.Path:
 
 
 def remove_isolated_checkout() -> None:
+    """Collect BOTH resources: the git registration and the mkdtemp that holds it.
+
+    D0A-R32-05: this used to remove only the worktree, so every run leaked its `mkdtemp`
+    parent. Thirty-eight had accumulated in `/tmp` before anyone looked, and the guard did not
+    see them because it read `git worktree list` — which `remove` had faithfully cleaned. The
+    resource the harness CREATED and the resource git KNOWS ABOUT are not the same resource.
+    """
     path = _WORKTREE.get("path")
-    if not path:
-        return
-    sh(["git", "worktree", "remove", "--force", path])
+    if path:
+        sh(["git", "worktree", "remove", "--force", path])
+        sh(["git", "worktree", "prune"])
+    parent = _WORKTREE.get("parent")
+    if parent:
+        shutil.rmtree(parent, ignore_errors=True)
     _WORKTREE.clear()
 
 
@@ -262,6 +277,11 @@ def _install_signal_handlers() -> None:
 # here, and cancellation kills that whole group before anything else. `cargo` spawns `rustc`
 # descendants; signalling the leader alone leaves them compiling.
 _ACTIVE_CHILD: dict = {}
+# Where to publish the live worker's identity, so a guard can assert about the RIGHT group
+# (D0A-R32-02). `sh()` gives every child its own session, so the campaign's own process group
+# never contains the build — a guard that watched the campaign's group was checking a group the
+# work was never in, and passed with the group killer replaced by a no-op.
+_WORKER_PUBLISH: dict = {}
 
 
 def _kill_active_child_group() -> None:
@@ -295,7 +315,8 @@ def suite_cmd(no_run: bool) -> list[str]:
     return base + ["--no-run"] if no_run else base
 
 
-def sh(cmd: list[str], cwd: pathlib.Path | None = None, **kw) -> subprocess.CompletedProcess:
+def sh(cmd: list[str], cwd: pathlib.Path | None = None, publish: bool = False,
+       **kw) -> subprocess.CompletedProcess:
     """Run in the main repo by default; pass `cwd` to run inside the isolated checkout.
 
     The child leads its own session so cancellation can collect its descendants (D0A-R31-03).
@@ -305,11 +326,58 @@ def sh(cmd: list[str], cwd: pathlib.Path | None = None, **kw) -> subprocess.Comp
         text=True, start_new_session=True, **kw
     ) as proc:
         _ACTIVE_CHILD["pid"] = proc.pid
+        # PUBLISH the identity under test. pid == pgid because the child leads a new session.
+        # PUBLISH ONLY THE SUITE. Publishing on every `sh()` made the last writer a fast
+        # `git diff`, so a guard reading this file could name a process that had already
+        # exited — the identity was right in kind and wrong in instance (D0A-R32-02).
+        pub = _WORKER_PUBLISH.get("path") if publish else None
+        if pub:
+            try:
+                pathlib.Path(pub).write_text(json.dumps({"pid": proc.pid, "pgid": proc.pid,
+                                                         "cmd": cmd}) + "\n")
+            except OSError:
+                pass
         try:
             out, err = proc.communicate()
         finally:
             _ACTIVE_CHILD.clear()
         return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+# The INSTRUMENT — the file the Python interpreter is actually executing. It is separate from
+# the product inputs above because the isolated checkout does NOT dissolve its dirtiness:
+# `git worktree` moves the SOURCE under test to the captured commit, but the harness keeps
+# running from the working tree, mutation inventory and classifier included (D0A-R32-04).
+INSTRUMENT_PATH = "scripts/mutation-campaign.py"
+
+
+def instrument_identity() -> dict:
+    """Identify the instrument SEPARATELY from the product commit.
+
+    A campaign attributes its findings to a commit. That attribution covers the code under test;
+    it does not cover the tool, which is why the digest of the executing bytes is recorded
+    rather than inferred from the commit (D0A-R32-04).
+    """
+    raw = pathlib.Path(__file__).read_bytes()
+    return {
+        "path": INSTRUMENT_PATH,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
+
+
+def instrument_is_clean() -> tuple[bool, str]:
+    """D0A-R32-04: is the EXECUTING harness committed?
+
+    Refusal, not a warning. The alternative — re-exec the captured harness out of the isolated
+    checkout — was rejected deliberately: it would mean the harness a developer is editing and
+    debugging is not the harness that runs, which trades a loud, obvious stop for a silent
+    divergence between what you changed and what produced the evidence.
+    """
+    p = sh(["git", "status", "--porcelain", "--", INSTRUMENT_PATH])
+    if p.returncode != 0:
+        return False, f"git status failed: {p.stderr.strip()}"
+    return p.stdout.strip() == "", p.stdout.strip()
 
 
 def inputs_are_clean() -> tuple[bool, str]:
@@ -350,7 +418,7 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     failure, a launch failure or a full disk all exit nonzero and none of them is a test
     judging the mutation.
     """
-    p = sh(suite_cmd(no_run=False), cwd=cwd)
+    p = sh(suite_cmd(no_run=False), cwd=cwd, publish=True)
     ev = {
         "exit": p.returncode,
         "stdout": p.stdout,           # RETAINED WHOLE — the previous version kept a filtered
@@ -385,11 +453,30 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
 
 
 def main() -> int:
+    """Lifetime-wide collection of the isolated checkout (D0A-R32-05).
+
+    `remove_isolated_checkout()` at the bottom of `_main` covers the normal path only. The
+    baseline refusal returns early, and any ordinary exception unwinds past it — both leaving a
+    complete checkout registered and its `mkdtemp` on disk. The signal handler was covered; the
+    two ordinary exits were not, which is the more common way a campaign ends.
+    """
+    try:
+        return _main()
+    finally:
+        remove_isolated_checkout()
+
+
+def _main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--instrument-dirty-ok", action="store_true",
+        help="run with an uncommitted harness. The executing bytes are RETAINED verbatim in "
+             "the artifacts, which is what keeps the run reproducible; the default is refusal.")
     args = ap.parse_args()
     out = pathlib.Path(args.out or tempfile.mkdtemp(prefix="delphi-mutation-"))
     (out / "logs").mkdir(parents=True, exist_ok=True)
+    _WORKER_PUBLISH["path"] = str(out / "worker.json")
 
     _install_signal_handlers()
 
@@ -400,6 +487,33 @@ def main() -> int:
     # — the attribution question the refusal existed to answer is dissolved by construction.
     # It still warns, because campaigning committed code while holding uncommitted changes is
     # usually not what was meant.
+    # D0A-R32-04: THE INSTRUMENT IS CHECKED FIRST, AND ITS DIRTINESS IS FATAL. Refused before
+    # the checkout exists, so a refusal has nothing to collect.
+    instrument = instrument_identity()
+    inst_clean, inst_dirt = instrument_is_clean()
+    if not inst_clean and args.instrument_dirty_ok:
+        # The reviewer's third option, taken deliberately: local harness changes are allowed
+        # ONLY if their exact bytes are retained, so the run stays reproducible from artifacts
+        # alone rather than from a commit that never contained this instrument. Retention is
+        # the condition, not a formality — the file is copied before anything else happens.
+        (out / "instrument.py").write_bytes(pathlib.Path(__file__).read_bytes())
+        instrument["dirty"] = True
+        instrument["retained_as"] = str(out / "instrument.py")
+        instrument["git_status"] = inst_dirt
+        print(f"WARNING: running an UNCOMMITTED harness. Its exact bytes are retained at\n"
+              f"         {out / 'instrument.py'}  (sha256 {instrument['sha256'][:16]}…)\n"
+              f"         Results are attributable to THAT file, not to {head[:12]}.",
+              file=sys.stderr)
+    elif not inst_clean:
+        print(f"REFUSE: the executing harness ({INSTRUMENT_PATH}) has uncommitted changes.\n"
+              f"        The isolated checkout moves the SOURCE UNDER TEST to {head[:12]}, but\n"
+              f"        this file keeps running from your working tree — its mutation\n"
+              f"        inventory and classifier included. Results would be attributed to a\n"
+              f"        commit that did not produce them.\n"
+              f"        sha256 {instrument['sha256'][:16]}…  status: {inst_dirt}\n"
+              f"        Commit or stash the harness, then re-run.", file=sys.stderr)
+        return 2
+
     clean, dirt = inputs_are_clean()
     if not clean:
         print("NOTE: your working tree has uncommitted changes. The campaign runs against an\n"
@@ -420,6 +534,7 @@ def main() -> int:
         "rustc": sh(["rustc", "--version"]).stdout.strip(),
         "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR", "(unset — cargo default)"),
         "inputs_checked": INPUT_PATHS,
+        "instrument": instrument,          # D0A-R32-04, identified separately from `commit`
     }
     (out / "lane.json").write_text(json.dumps(lane, indent=2) + "\n")
 

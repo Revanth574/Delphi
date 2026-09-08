@@ -26,6 +26,7 @@ Run: `python3 scripts/mutation-campaign.test.py`  (exit 0 = all guards hold)
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import os
 import shutil
@@ -174,7 +175,8 @@ def guard_real_signal_during_a_real_campaign() -> None:
     # Green baseline, then slow enough to be caught mid-mutation.
     env["DELPHI_MUTATION_TEST_CMD"] = 'sh -c "echo \'test result: ok. 1 passed\'; sleep 6"'
     proc = subprocess.Popen(
-        [sys.executable, str(REPO / "scripts" / "mutation-campaign.py"), "--out", str(out)],
+        [sys.executable, str(REPO / "scripts" / "mutation-campaign.py"), "--out", str(out),
+         "--instrument-dirty-ok"],
         cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True,
     )
@@ -198,12 +200,56 @@ def guard_real_signal_during_a_real_campaign() -> None:
         check("signal: the journal records a mutation IN PROGRESS before the signal",
               "IN PROGRESS" in journal.read_text())
 
-        descendants_before = subprocess.run(
-            ["pgrep", "-g", str(proc.pid)], capture_output=True, text=True).stdout.split()
-        check("signal: the campaign has a live process group to collect",
-              len(descendants_before) >= 1, f"group members: {descendants_before}")
+        # D0A-R32-02: assert about the WORKER's group, which is where the build actually is.
+        # The previous version watched the CAMPAIGN's group — but `sh()` gives every child its
+        # own session, so the build was never in it and the check passed with the group killer
+        # replaced by a no-op. A guard aimed at the wrong identity is indistinguishable from one
+        # that works.
+        worker_file = out / "worker.json"
+        check("signal: the campaign publishes the live worker's identity", worker_file.exists(),
+              "nothing to aim the cancellation assertion at")
+        # Synchronise on a LIVE worker, not merely on the journal. The journal says a mutation
+        # is in flight; it does not say the suite process for that mutation has started, and
+        # the file still names the BASELINE run — which has exited — until it does. Waiting for
+        # the published identity to be alive lands on the mutation's own suite run.
+        deadline = time.monotonic() + 30
+        worker, alive_before = None, []
+        while time.monotonic() < deadline:
+            try:
+                worker = json.loads(worker_file.read_text())
+            except (OSError, ValueError):
+                time.sleep(0.05)
+                continue
+            alive_before = subprocess.run(
+                ["pgrep", "-g", str(worker["pgid"])], capture_output=True, text=True
+            ).stdout.split()
+            if alive_before:
+                break
+            time.sleep(0.05)
+        check("signal: the WORKER's group is alive before cancellation",
+              len(alive_before) >= 1, f"worker {worker} group members: {alive_before}")
+        wpgid = worker["pgid"]
 
         os.kill(proc.pid, signal.SIGTERM)      # A REAL SIGNAL to the real campaign.
+
+        # (2a) PROMPT WORKER CLEANUP — sampled HERE, before `proc.wait()`, because waiting is
+        # what erases the difference. D0A-R32-02, second layer: aiming the guard at the worker's
+        # identity was necessary and not sufficient. Measured with the killer disabled, the
+        # worker group is alive at +0.2/+0.5/+1.0s and gone by +3.0s on its own, while
+        # `proc.wait()` returns only after ~3s — so a check placed after the wait passes in both
+        # worlds. Same shape as R31-02's survivor sample: observe before the intervention.
+        deadline = time.monotonic() + 1.5
+        left_prompt = subprocess.run(["pgrep", "-g", str(wpgid)],
+                                     capture_output=True, text=True).stdout.split()
+        while left_prompt and time.monotonic() < deadline:
+            time.sleep(0.05)
+            left_prompt = subprocess.run(["pgrep", "-g", str(wpgid)],
+                                         capture_output=True, text=True).stdout.split()
+        check("signal: the WORKER's group dies PROMPTLY, before the campaign is waited on",
+              not left_prompt,
+              f"worker group {wpgid} still had {left_prompt} 1.5s after SIGTERM; with the "
+              f"killer disabled it survives this window and only exits on its own at ~3s")
+
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -222,13 +268,25 @@ def guard_real_signal_during_a_real_campaign() -> None:
               mc.file_matches_commit_in_repo(sha, "runtime/src/shutdown.rs"))
         # (2) PROCESS CLEANUP — no descendants, and no abandoned worktree.
         time.sleep(0.5)
-        left = subprocess.run(["pgrep", "-g", str(proc.pid)],
+        left = subprocess.run(["pgrep", "-g", str(wpgid)],
                               capture_output=True, text=True).stdout.split()
-        check("signal: no descendants survive the cancelled campaign", not left,
-              f"survivors: {left}")
+        # Retained, but it is the WEAK half: by this point both worlds look the same. Kept
+        # because a survivor here would still be a defect; not counted as the discriminator.
+        check("signal: the WORKER's group is still gone once the campaign has exited", not left,
+              f"survivors in worker group {wpgid}: {left}")
+        left_campaign = subprocess.run(["pgrep", "-g", str(proc.pid)],
+                                       capture_output=True, text=True).stdout.split()
+        check("signal: nothing survives in the campaign's own group either", not left_campaign,
+              f"survivors: {left_campaign}")
         worktrees = mc.sh(["git", "worktree", "list"]).stdout
         check("signal: no isolated checkout is left behind",
               "delphi-mutation-wt-" not in worktrees, worktrees)
+        # D0A-R32-05: `git worktree list` is NOT the resource. `remove` cleans the registration
+        # and leaves the `mkdtemp` that held it, so this guard passed while 38 directories
+        # accumulated in /tmp. Check what the harness actually created.
+        leaked = sorted(pathlib.Path(tempfile.gettempdir()).glob("delphi-mutation-wt-*"))
+        check("signal: no mkdtemp parent is left behind either",
+              not leaked, f"leaked directories: {[str(x) for x in leaked]}")
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -360,6 +418,110 @@ def guard_cancellation_kills_descendants() -> None:
     check("cancel: the WHOLE group is gone, grandchild included", not after,
           f"{len(after)} process(es) survived: {after}")
 
+def guard_dirty_instrument_is_refused() -> None:
+    """D0A-R32-04 — the EXECUTING harness must be committed, and it is identified separately.
+
+    The isolated checkout moves the source under test to the captured commit. It does not move
+    the Python that is running: the interpreter keeps executing the working tree's harness,
+    mutation inventory and classifier included. The reviewer demonstrated the consequence — an
+    uncommitted `MUTATIONS = []` produced exit 0 and an empty campaign attributed to the
+    original commit, under a message stating the changes were NOT included.
+
+    Refusal was chosen over re-exec'ing the captured harness: re-exec means the harness you are
+    editing is not the harness that runs, trading a loud stop for a silent divergence.
+    """
+    inst = REPO / "scripts" / "mutation-campaign.py"
+    before = inst.read_bytes()
+    out = pathlib.Path(tempfile.mkdtemp(prefix="delphi-r3204-"))
+    try:
+        inst.write_bytes(before + b"\n# dirty instrument (D0A-R32-04 guard)\n")
+        env = dict(os.environ)
+        env["DELPHI_MUTATION_TEST_CMD"] = "true"
+        r = subprocess.run([sys.executable, str(inst), "--out", str(out)],
+                           cwd=REPO, env=env, capture_output=True, text=True, timeout=300)
+        check("instrument: a dirty harness is REFUSED, not warned about", r.returncode == 2,
+              f"exit was {r.returncode}")
+        # EXIT 2 ALONE DOES NOT DISCRIMINATE, and this was found by weakening: with the
+        # refusal turned into a warning the campaign proceeds, the stub baseline is not green,
+        # and the BASELINE refusal returns 2 as well. The same exit code from a different
+        # mechanism — the shape D0A-R32-02 named, reproduced inside the guard written for
+        # D0A-R32-04. The campaign body's first artifact is what separates them.
+        check("instrument: the campaign BODY never ran (no lane.json was written)",
+              not (out / "lane.json").exists(),
+              "lane.json exists, so the refusal did not stop the campaign — it continued and "
+              "some later check produced the exit code")
+        check("instrument: no isolated checkout was even created",
+              "isolated checkout:" not in r.stdout, r.stdout[-300:])
+        check("instrument: the refusal names the harness",
+              "scripts/mutation-campaign.py" in r.stderr, r.stderr[-300:])
+        check("instrument: the refusal explains that the checkout does not cover it",
+              "keeps running from your working tree" in r.stderr, r.stderr[-300:])
+        check("instrument: a refused run leaves no checkout behind",
+              not sorted(pathlib.Path(tempfile.gettempdir()).glob("delphi-mutation-wt-*")),
+              "a refusal should have nothing to collect")
+    finally:
+        inst.write_bytes(before)
+        shutil.rmtree(out, ignore_errors=True)
+    # And with the instrument clean again, its identity is RECORDED rather than inferred.
+    ident = mc.instrument_identity()
+    import hashlib as _h
+    check("instrument: the recorded digest is of the executing bytes",
+          ident["sha256"] == _h.sha256(inst.read_bytes()).hexdigest(), ident["sha256"][:16])
+
+
+def guard_checkout_collected_on_every_exit_path() -> None:
+    """D0A-R32-05 — the checkout is collected on the ORDINARY exits, not only on signals.
+
+    `remove_isolated_checkout()` sat at the bottom of `main`, so the baseline refusal's early
+    return and any exception unwound straight past it. Thirty-eight abandoned `mkdtemp` parents
+    had accumulated in `/tmp` before anyone looked — and the guard did not see them, because it
+    read `git worktree list`, which `git worktree remove` had faithfully cleaned.
+    """
+    def residue() -> tuple[list[str], str]:
+        dirs = [str(x) for x in
+                sorted(pathlib.Path(tempfile.gettempdir()).glob("delphi-mutation-wt-*"))]
+        return dirs, mc.sh(["git", "worktree", "list"]).stdout
+
+    # (a) BASELINE REFUSAL — a red baseline returns 2 before the campaign body.
+    out = pathlib.Path(tempfile.mkdtemp(prefix="delphi-r3205-"))
+    env = dict(os.environ)
+    env["DELPHI_MUTATION_TEST_CMD"] = "false"
+    r = subprocess.run([sys.executable, str(REPO / "scripts" / "mutation-campaign.py"),
+                        "--out", str(out), "--instrument-dirty-ok"], cwd=REPO, env=env, capture_output=True,
+                       text=True, timeout=300)
+    check("lifetime: a red baseline refuses", r.returncode == 2, f"exit was {r.returncode}")
+    dirs, wt = residue()
+    check("lifetime: the baseline refusal leaves no mkdtemp parent", not dirs, str(dirs))
+    check("lifetime: the baseline refusal leaves no registered worktree",
+          "delphi-mutation-wt-" not in wt, wt)
+    shutil.rmtree(out, ignore_errors=True)
+
+    # (b) AN ORDINARY EXCEPTION — the path the reviewer named alongside the refusal. Raised
+    # from inside the campaign body, AFTER the checkout exists, so the `finally` is what
+    # collects it.
+    sha = mc.sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+    original = mc._main
+
+    def _boom() -> int:
+        mc.make_isolated_checkout(sha)
+        raise RuntimeError("ordinary exception inside the campaign body")
+
+    mc._main = _boom
+    raised = False
+    try:
+        mc.main()
+    except RuntimeError:
+        raised = True
+    finally:
+        mc._main = original
+    check("lifetime: the exception propagates (it is not swallowed)", raised)
+    dirs, wt = residue()
+    check("lifetime: an ORDINARY EXCEPTION still collects the mkdtemp parent", not dirs,
+          str(dirs))
+    check("lifetime: an ORDINARY EXCEPTION still collects the worktree",
+          "delphi-mutation-wt-" not in wt, wt)
+
+
 def guard_dirty_refusal() -> None:
     """The refusal that fired on the harness's own first run."""
     rel = "installer/pam/delphi-runtime"
@@ -398,6 +560,8 @@ def main() -> int:
     guard_sigkill_leaves_working_tree_intact()
     guard_cancellation_kills_descendants()
     guard_dirty_refusal()
+    guard_dirty_instrument_is_refused()
+    guard_checkout_collected_on_every_exit_path()
     print(f"\n{len(CHECKS)} guards held")
     return 0
 

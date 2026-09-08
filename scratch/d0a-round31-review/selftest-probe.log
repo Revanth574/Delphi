@@ -1,0 +1,38 @@
+
+RESTORED /tmp/tmp523y23b5/victim.rs after test
+MUTATION: signal installer replaced with a no-op
+mutation-campaign harness guards
+  [OK ] classify: disk full -> INFRASTRUCTURE
+  [OK ] classify: disk full retains full output
+  [OK ] classify: build failure -> INFRASTRUCTURE
+  [OK ] classify: build failure retains full output
+  [OK ] classify: no result lines -> INFRASTRUCTURE
+  [OK ] classify: no result lines retains full output
+  [OK ] classify: stale session precondition -> PRECONDITION FAILURE
+  [OK ] classify: stale session precondition retains full output
+  [OK ] classify: stale-session script text -> PRECONDITION FAILURE
+  [OK ] classify: stale-session script text retains full output
+  [OK ] classify: crash, no named test -> UNATTRIBUTED FAILURE
+  [OK ] classify: crash, no named test retains full output
+  [OK ] classify: real detection -> CAUGHT
+  [OK ] classify: real detection retains full output
+  [OK ] classify: clean green -> NOT CAUGHT
+  [OK ] classify: clean green retains full output
+  [OK ] restore: a clean file matches the captured commit
+  [OK ] restore: a TAMPERED file does NOT match (a partial restore is caught)
+  [OK ] restore: the restored file matches again
+  [OK ] restore: verification is against a SHA, not mutable HEAD
+  [OK ] signal: the mutant is present before the handler runs
+  [OK ] signal: the handler RESTORES the mutated file
+  [OK ] signal: in-flight state is cleared afterwards
+  [OK ] signal: handlers are installed for SIGTERM/SIGINT/SIGHUP
+  [OK ] inputs: installer/pam/delphi-runtime is watched
+  [OK ] inputs: scripts/check-stale-test-sessions.sh is watched
+  [OK ] inputs: scripts/mutation-campaign.py is watched
+  [OK ] inputs: Cargo.lock is watched
+  [OK ] dirty: a modified installer fixture makes inputs UNCLEAN
+  [OK ] dirty: the refusal names the offending path
+  [OK ] dirty: the restored fixture is no longer listed as dirty
+
+31 guards held
+selftest return: 0

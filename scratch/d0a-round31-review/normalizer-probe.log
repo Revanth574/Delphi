@@ -1,0 +1,4 @@
+complete SGR: "\u{1b}[3mchild\u{1b}[0m=\"ai\"" -> "child=\"ai\""
+non-CSI escape: "ab\u{1b}Xcd" -> "abcd"
+OSC title: "\u{1b}]0;hidden-title\u{7}visible" -> "0;hidden-title\u{7}visible"
+incomplete CSI crossing newline: "message\u{1b}[\nxchild=\"ai\"" -> "messagechild=\"ai\""

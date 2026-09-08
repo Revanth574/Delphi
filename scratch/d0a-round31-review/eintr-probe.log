@@ -1,0 +1,36 @@
+warning: direct cast of function item into an integer
+  --> /tmp/r31-eintr-_tpa8kuu/probe.rs:66:33
+   |
+66 |         sa.sa_sigaction=handler as usize;
+   |                                 ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+66 |         sa.sa_sigaction=handler as *const () as usize;
+   |                                 ++++++++++++
+
+warning: 1 warning emitted
+
+REVISION 2c7dee0
+
+thread 'main' (59400) panicked at /tmp/r31-eintr-_tpa8kuu/probe.rs:27:22:
+unexpected wait status for 59401: Err(EINTR)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+observed_waitpid_EINTR=1, panicked=true, reap_return=None, child_after_guard=Ok(StillAlive)
+warning: direct cast of function item into an integer
+  --> /tmp/r31-eintr-_tpa8kuu/probe.rs:91:33
+   |
+91 |         sa.sa_sigaction=handler as usize;
+   |                                 ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+91 |         sa.sa_sigaction=handler as *const () as usize;
+   |                                 ++++++++++++
+
+warning: 1 warning emitted
+
+REVISION 63af7f7
+observed_waitpid_EINTR=81, panicked=false, reap_return=Some(0), child_after_guard=Err(ECHILD)

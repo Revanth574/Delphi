@@ -33,6 +33,24 @@ evidence problem had three defects of its own:
   was **no baseline run** establishing that the reported failures were introduced by the
   mutation at all. Both closed below.
 
+**D0A-R31-01: THE JOURNAL RECORDS DAMAGE; IT DOES NOT PREVENT IT.** R30-01 added signal
+handlers and a journal-before-mutate, and I accepted that as covering the uncatchable case. It
+does not: a reviewer's SIGKILL reproduction left the source MUTATED, with the journal correctly
+saying so. Evidence of a removed security check is not the same as not removing it.
+
+**Mutations now happen in an ISOLATED CHECKOUT of the captured commit** (`git worktree add
+--detach`), never in the working tree. Three consequences:
+
+* **A SIGKILL cannot damage the working checkout**, because nothing writes to it. The worst case
+  is an abandoned worktree, which the journal names and `git worktree remove --force` collects.
+* **It is a checkout of the SHA, not a COPY OF THE TREE.** A copy would inherit uncommitted
+  state and reintroduce the attribution problem the clean-tree guard exists to prevent — while
+  hiding it, since the guard inspects the working tree and the campaign would be elsewhere.
+* **The input-closure question dissolves rather than being answered** (D0A-R30-03). The inputs
+  ARE the commit. The dirty-tree check therefore becomes a WARNING: uncommitted work no longer
+  affects the result, but a campaign of committed code while you have uncommitted changes is
+  probably not what you meant.
+
 RUNNING THIS AT ROOT DOES NOT WORK YET, and the reason is written down rather than left to be
 discovered. `sudo -E cargo` does not work on this box (sudoers drops `-E`; root has no rustup
 toolchain), so the single `cargo test` call below is unrunnable as root. A root campaign must
@@ -161,24 +179,55 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
 # UNCATCHABLE kill still leaves evidence naming the file that may be dirty. There is no handler
 # for SIGKILL by construction — hence the journal.
 _IN_FLIGHT: dict = {}
+# The isolated checkout, so the signal handler can name it. Never the working tree.
+_WORKTREE: dict = {}
+
+
+def make_isolated_checkout(sha: str) -> pathlib.Path:
+    """A checkout of `sha` that is NOT a copy of the working tree (D0A-R31-01)."""
+    d = pathlib.Path(tempfile.mkdtemp(prefix="delphi-mutation-wt-"))
+    target = d / "tree"
+    r = sh(["git", "worktree", "add", "--detach", str(target), sha])
+    if r.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {r.stderr.strip()}")
+    _WORKTREE["path"] = str(target)
+    return target
+
+
+def remove_isolated_checkout() -> None:
+    path = _WORKTREE.get("path")
+    if not path:
+        return
+    sh(["git", "worktree", "remove", "--force", path])
+    _WORKTREE.clear()
 
 
 def _restore_in_flight(reason: str) -> None:
-    """Put back whatever is currently mutated. Safe to call twice."""
+    """Put back whatever is mutated, then drop the isolated checkout. Safe to call twice.
+
+    D0A-R31-01: everything here operates on the ISOLATED checkout. The working tree is never
+    written to, so even total failure of this function cannot leave a removed security check in
+    the repository the developer is using.
+    """
     path = _IN_FLIGHT.get("path")
     original = _IN_FLIGHT.get("original")
     if path is not None and original is not None:
         try:
             pathlib.Path(path).write_text(original)
-            print(f"\nRESTORED {path} after {reason}", file=sys.stderr)
+            print(f"\nRESTORED {path} (isolated checkout) after {reason}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001 - last-resort path; report and continue
             print(f"\nFAILED TO RESTORE {path} after {reason}: {e}\n"
-                  f"THE TREE MAY BE CARRYING A REMOVED SECURITY CHECK. Run: "
-                  f"git checkout -- {_IN_FLIGHT.get('rel', path)}", file=sys.stderr)
+                  f"This is the ISOLATED checkout, not your working tree. Collect it with: "
+                  f"git worktree remove --force {_WORKTREE.get('path', '<worktree>')}",
+                  file=sys.stderr)
     _IN_FLIGHT.clear()
+    remove_isolated_checkout()
 
 
 def _on_signal(signum, _frame):
+    # ORDER MATTERS (D0A-R31-03): stop the build FIRST. Restoring while `cargo` still runs
+    # races it, and exiting while it runs blocks Python's teardown on a child it is waiting for.
+    _kill_active_child_group()
     _restore_in_flight(f"signal {signal.Signals(signum).name}")
     # 128+n is the shell's convention for death by signal, and this exit is a FAILURE.
     sys.exit(128 + signum)
@@ -192,8 +241,45 @@ def _install_signal_handlers() -> None:
             pass  # not on the main thread, or unsupported — the journal still covers us
 
 
-def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, **kw)
+# D0A-R31-03: the harness must OWN the subprocess tree it starts.
+#
+# Cancellation used to restore source and exit while leaving the build running. Worse, it could
+# not even finish exiting: the signal handler ran, and Python's own teardown then BLOCKED
+# waiting for the cargo child it had never been told to stop — measured, a SIGTERM'd campaign
+# hung with its isolated checkout uncollected until `timeout` gave up (exit 124).
+#
+# So every child gets its OWN SESSION (`start_new_session=True`), the live one is registered
+# here, and cancellation kills that whole group before anything else. `cargo` spawns `rustc`
+# descendants; signalling the leader alone leaves them compiling.
+_ACTIVE_CHILD: dict = {}
+
+
+def _kill_active_child_group() -> None:
+    pid = _ACTIVE_CHILD.get("pid")
+    if not pid:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)   # the whole session, not just the leader
+    except (ProcessLookupError, PermissionError):
+        pass
+    _ACTIVE_CHILD.clear()
+
+
+def sh(cmd: list[str], cwd: pathlib.Path | None = None, **kw) -> subprocess.CompletedProcess:
+    """Run in the main repo by default; pass `cwd` to run inside the isolated checkout.
+
+    The child leads its own session so cancellation can collect its descendants (D0A-R31-03).
+    """
+    with subprocess.Popen(
+        cmd, cwd=cwd or REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True, **kw
+    ) as proc:
+        _ACTIVE_CHILD["pid"] = proc.pid
+        try:
+            out, err = proc.communicate()
+        finally:
+            _ACTIVE_CHILD.clear()
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def inputs_are_clean() -> tuple[bool, str]:
@@ -202,6 +288,15 @@ def inputs_are_clean() -> tuple[bool, str]:
     if p.returncode != 0:                     # a failed git command is not "clean"
         return False, f"git status failed: {p.stderr.strip()}"
     return p.stdout.strip() == "", p.stdout.strip()
+
+
+def file_matches_commit_in_repo(sha: str, rel: str) -> bool:
+    """Like [`file_matches_commit`] but always against the MAIN working tree.
+
+    Needed because the isolation guard asks about the working tree precisely while an isolated
+    checkout exists, which is when `file_matches_commit` is looking somewhere else.
+    """
+    return sh(["git", "diff", "--quiet", sha, "--", rel]).returncode == 0
 
 
 def file_matches_commit(sha: str, rel: str) -> bool:
@@ -213,17 +308,19 @@ def file_matches_commit(sha: str, rel: str) -> bool:
     And it must be the blob the campaign RECORDED: `HEAD` is mutable, so a commit landing
     mid-campaign would silently redefine what "restored" means.
     """
-    return sh(["git", "diff", "--quiet", sha, "--", rel]).returncode == 0
+    return sh(["git", "diff", "--quiet", sha, "--", rel],
+              cwd=pathlib.Path(_WORKTREE["path"]) if _WORKTREE.get("path") else None
+              ).returncode == 0
 
 
-def run_suite() -> tuple[str, dict]:
+def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     """Run the suite and CLASSIFY the outcome (D0A-R29-02).
 
     Returns (outcome, evidence). A nonzero exit is not automatically a detection: a build
     failure, a launch failure or a full disk all exit nonzero and none of them is a test
     judging the mutation.
     """
-    p = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests"])
+    p = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests"], cwd=cwd)
     ev = {
         "exit": p.returncode,
         "stdout": p.stdout,           # RETAINED WHOLE — the previous version kept a filtered
@@ -266,14 +363,24 @@ def main() -> int:
 
     _install_signal_handlers()
 
+    head = sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+
+    # D0A-R31-01: this is now a WARNING, not a refusal. The campaign runs in an isolated
+    # checkout of `head`, so uncommitted work in the developer's tree cannot affect the result
+    # — the attribution question the refusal existed to answer is dissolved by construction.
+    # It still warns, because campaigning committed code while holding uncommitted changes is
+    # usually not what was meant.
     clean, dirt = inputs_are_clean()
     if not clean:
-        print("REFUSE: campaign inputs are dirty. A campaign that starts from uncommitted "
-              "changes cannot attribute a result to its mutation.\n" + dirt, file=sys.stderr)
-        return 2
+        print("NOTE: your working tree has uncommitted changes. The campaign runs against an\n"
+              "      ISOLATED CHECKOUT of " + head[:12] + ", so those changes are NOT included\n"
+              "      and NOT at risk. Uncommitted paths:\n" + dirt + "\n", file=sys.stderr)
 
-    head = sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+    work = make_isolated_checkout(head)
+    print(f"isolated checkout: {work}  (working tree is never written to)")
     lane = {
+        "isolated_checkout": str(work),
+        "working_tree_written_to": False,
         "euid": os.geteuid(),
         "privileged": os.geteuid() == 0,
         "commit": head,
@@ -288,7 +395,7 @@ def main() -> int:
     # D0A-R29-03: THE BASELINE. Without it, "the mutation caused these failures" is an
     # inference from one observation. A red baseline invalidates the whole campaign.
     print("baseline (unmutated) ...", end=" ", flush=True)
-    base_outcome, base_ev = run_suite()
+    base_outcome, base_ev = run_suite(cwd=work)
     (out / "logs" / "baseline.stdout").write_text(base_ev["stdout"])
     (out / "logs" / "baseline.stderr").write_text(base_ev["stderr"])
     (out / "baseline.json").write_text(json.dumps(
@@ -306,7 +413,7 @@ def main() -> int:
 
     for i, (label, fname, anchor, repl) in enumerate(MUTATIONS, 1):
         rel = f"runtime/src/{fname}"
-        path = SRC / fname
+        path = work / "runtime" / "src" / fname
         original = path.read_text()
         rec: dict = {"n": i, "label": label, "file": fname, "commit": head}
 
@@ -326,9 +433,9 @@ def main() -> int:
                 os.fsync(jsonl.fileno())
                 _IN_FLIGHT.update({"path": str(path), "original": original, "rel": rel})
                 path.write_text(original.replace(anchor, repl, 1))
-                rec["applied_diff"] = sh(["git", "diff", "--", rel]).stdout
+                rec["applied_diff"] = sh(["git", "diff", "--", rel], cwd=work).stdout
                 build = sh(["cargo", "test", "-p", "delphi-runtime", "--lib", "--tests",
-                            "--no-run"])
+                            "--no-run"], cwd=work)
                 if build.returncode != 0:
                     rec["outcome"] = "INVALID: mutant does not compile"
                     (out / "logs" / f"{i:02d}.build.stderr").write_text(build.stderr)
@@ -336,7 +443,7 @@ def main() -> int:
                     rec["compile_stderr_head"] = build.stderr[:1200]
                 else:
                     rec["compiles"] = True
-                    outcome, ev = run_suite()
+                    outcome, ev = run_suite(cwd=work)
                     (out / "logs" / f"{i:02d}.stdout").write_text(ev["stdout"])
                     (out / "logs" / f"{i:02d}.stderr").write_text(ev["stderr"])
                     rec["outcome"] = outcome
@@ -372,6 +479,7 @@ def main() -> int:
             break
 
     jsonl.close()
+    remove_isolated_checkout()
     (out / "results.json").write_text(json.dumps(
         {"lane": lane, "baseline_targets": baseline_targets, "results": results}, indent=2) + "\n")
 

@@ -1,0 +1,3 @@
+all 9 assembly assertions passed; killed=false
+child alive at counterfeit daemon exit: true
+child status after guard teardown: Signaled(Pid(58535), SIGKILL, false)

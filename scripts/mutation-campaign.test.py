@@ -133,6 +133,111 @@ def guard_input_closure() -> None:
         check(f"inputs: {required} is watched", required in mc.INPUT_PATHS)
 
 
+def guard_isolation() -> None:
+    """D0A-R31-01 — mutations happen in an ISOLATED CHECKOUT, never the working tree.
+
+    The journal added at R30-01 records damage; it cannot prevent it, and the reviewer's SIGKILL
+    reproduction left the source MUTATED with the journal correctly saying so. The fix is that
+    nothing writes to the working tree at all.
+
+    **THE ISOLATION MUST BE OF THE CAPTURED SHA, NOT A COPY OF THE TREE.** A copy inherits
+    uncommitted state, which reintroduces the attribution problem the clean-tree check existed
+    to prevent — and hides it, because the check inspects the working tree while the campaign
+    runs elsewhere.
+    """
+    sha = mc.sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+    victim_rel = "runtime/src/shutdown.rs"
+    working = REPO / victim_rel
+    before = working.read_text()
+
+    # Prove it is a checkout of the COMMIT: dirty the working tree first, then verify the
+    # isolated copy does NOT contain that change.
+    marker = "\n// R31-01 isolation probe — must NOT appear in the isolated checkout\n"
+    working.write_text(before + marker)
+    try:
+        work = mc.make_isolated_checkout(sha)
+        try:
+            isolated = (work / victim_rel).read_text()
+            check("isolation: the checkout exists and has the source", "fn shutdown_child" in isolated)
+            check("isolation: it is of the SHA, not a copy of the dirty working tree",
+                  marker not in isolated,
+                  "the isolated tree contains an uncommitted working-tree change")
+            # And a mutation inside it does not touch the working tree.
+            target = work / victim_rel
+            target.write_text(isolated.replace("fn shutdown_child", "fn MUTATED_shutdown_child", 1))
+            check("isolation: mutating the checkout leaves the working tree unchanged",
+                  working.read_text() == before + marker,
+                  "the working tree changed while only the isolated checkout was written")
+        finally:
+            mc.remove_isolated_checkout()
+        check("isolation: the checkout is collected afterwards", not work.exists())
+    finally:
+        working.write_text(before)
+    check("isolation: the working tree is restored by this guard",
+          mc.file_matches_commit(sha, victim_rel))
+
+
+def guard_sigkill_leaves_working_tree_intact() -> None:
+    """D0A-R31-01 — the reviewer's reproduction, run against the new harness.
+
+    Their probe SIGKILLed a campaign mid-mutation and found the source mutated. SIGKILL cannot
+    be handled, so the only defence is that the mutation was never in the working tree. This
+    drives the real lifecycle: create the isolated checkout, register an in-flight mutation,
+    write it, then simulate an uncatchable death by abandoning the handlers entirely.
+    """
+    sha = mc.sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+    victim_rel = "runtime/src/shutdown.rs"
+    working = REPO / victim_rel
+    before = working.read_text()
+    work = mc.make_isolated_checkout(sha)
+    try:
+        target = work / victim_rel
+        original = target.read_text()
+        mc._IN_FLIGHT.update({"path": str(target), "original": original, "rel": victim_rel})
+        target.write_text("// MUTANT — a removed security check\n" + original)
+        check("sigkill: the mutant is in the ISOLATED checkout", "MUTANT" in target.read_text())
+        # No handler runs — this is the uncatchable case.
+        check("sigkill: the WORKING TREE is untouched", working.read_text() == before,
+              "an uncatchable kill would have left a removed check in the working tree")
+        check("sigkill: the working tree still matches the commit",
+              mc.file_matches_commit_in_repo(sha, victim_rel))
+    finally:
+        mc._IN_FLIGHT.clear()
+        mc.remove_isolated_checkout()
+        working.write_text(before)
+
+def guard_cancellation_kills_descendants() -> None:
+    """D0A-R31-03 — cancellation collects the build's DESCENDANTS, not just its leader.
+
+    `cargo` spawns `rustc`; signalling the leader alone leaves them compiling. Worse, before
+    this the handler could not even finish exiting: it ran, and Python's teardown then BLOCKED
+    waiting for the cargo child it had never been told to stop — a SIGTERM'd campaign hung with
+    its isolated checkout uncollected until `timeout` gave up.
+    """
+    import threading
+    import time
+
+    result: dict = {}
+
+    def run() -> None:
+        # The cargo->rustc shape: a child that spawns a grandchild and waits on it.
+        result["r"] = mc.sh(["sh", "-c", "sleep 300 & wait"])
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    time.sleep(1.5)
+    pid = mc._ACTIVE_CHILD.get("pid")
+    check("cancel: the live child is registered", bool(pid),
+          "_ACTIVE_CHILD was empty; cancellation would have nothing to kill")
+    in_group = subprocess.run(["pgrep", "-g", str(pid)], capture_output=True, text=True).stdout.split()
+    check("cancel: the child leads its own session with a descendant in it",
+          len(in_group) >= 2, f"group had {len(in_group)} member(s); expected leader + grandchild")
+    mc._kill_active_child_group()
+    time.sleep(0.7)
+    after = subprocess.run(["pgrep", "-g", str(pid)], capture_output=True, text=True).stdout.split()
+    check("cancel: the WHOLE group is gone, grandchild included", not after,
+          f"{len(after)} process(es) survived: {after}")
+
 def guard_dirty_refusal() -> None:
     """The refusal that fired on the harness's own first run."""
     rel = "installer/pam/delphi-runtime"
@@ -165,6 +270,9 @@ def main() -> int:
     guard_restore_verification()
     guard_signal_restores()
     guard_input_closure()
+    guard_isolation()
+    guard_sigkill_leaves_working_tree_intact()
+    guard_cancellation_kills_descendants()
     guard_dirty_refusal()
     print(f"\n{len(CHECKS)} guards held")
     return 0

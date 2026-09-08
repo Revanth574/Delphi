@@ -1,0 +1,6 @@
+SIGTERM harness exit: 143 source restored: True
+SIGTERM journal: ['IN PROGRESS: mutation about to be written']
+SIGTERM fake build worker state after harness exited: S
+SIGKILL harness exit: -9 source restored: False
+SIGKILL journal: ['IN PROGRESS: mutation about to be written']
+SIGKILL fake build worker state after harness exited: S

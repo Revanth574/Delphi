@@ -1,0 +1,12 @@
+before run=1 rc=0 thread_identity_reused=true signals_during_subsequent_thread=51
+subsequent_thread_wait=Err(EINTR)
+before run=2 rc=0 thread_identity_reused=true signals_during_subsequent_thread=53
+subsequent_thread_wait=Err(EINTR)
+before run=3 rc=0 thread_identity_reused=true signals_during_subsequent_thread=54
+subsequent_thread_wait=Err(EINTR)
+after run=1 rc=0 thread_identity_reused=true signals_during_subsequent_thread=0
+subsequent_thread_wait=Ok(Exited(Pid(46869), 0))
+after run=2 rc=0 thread_identity_reused=true signals_during_subsequent_thread=0
+subsequent_thread_wait=Ok(Exited(Pid(46875), 0))
+after run=3 rc=0 thread_identity_reused=true signals_during_subsequent_thread=0
+subsequent_thread_wait=Ok(Exited(Pid(46881), 0))

@@ -1,0 +1,27 @@
+locked cleanup: {"returned": true, "parent_exists": false, "registered": true, "ownership": {}}
+CLEANUP FAILED: still on disk (`git worktree remove` said: ):
+  /tmp/delphi-mutation-wt-uahcmfa6
+Collect by hand: rm -rf /tmp/delphi-mutation-wt-uahcmfa6
+EXIT 4: the campaign completed but its isolated checkout was NOT collected.
+cleanup propagation success: 4
+CLEANUP FAILED: still on disk (`git worktree remove` said: ):
+  /tmp/delphi-mutation-wt-vkwmfm7o
+Collect by hand: rm -rf /tmp/delphi-mutation-wt-vkwmfm7o
+...and the isolated checkout was NOT collected (see above).
+cleanup propagation exception: RuntimeError('original failure')
+CLEANUP FAILED: still on disk (`git worktree remove` said: ):
+  /tmp/delphi-mutation-wt-j43fd3hp
+Collect by hand: rm -rf /tmp/delphi-mutation-wt-j43fd3hp
+CLEANUP FAILED: still on disk (`git worktree remove` said: fatal: '/tmp/delphi-mutation-wt-j43fd3hp/tree' is not a working tree):
+  /tmp/delphi-mutation-wt-j43fd3hp
+Collect by hand: rm -rf /tmp/delphi-mutation-wt-j43fd3hp
+...and the isolated checkout was NOT collected (see above).
+cleanup propagation signal: SystemExit(143)
+live control: present=true
+confirmed zombie: SCAN — the AI ran at [(46505, 46503)] (pid, pgid), inside the daemon's group, and the scanner still never matched it. The defect is in this control: the `comm` comparison, or a window the 1 samples missed.
+owned child elsewhere: TOPOLOGY — the AI ran in [(46506, 46506)] (pid, pgid), NOT in the daemon's group 46503. The daemon's children do not inherit its pgid, which CONTRADICTS the reasoning D0A-R28-02 rests on. An empty `survivors_before_guard` has never meant what the register says. This is a finding about the assembly.
+unrelated namesake: TOPOLOGY — the AI ran in [(46508, 46508)] (pid, pgid), NOT in the daemon's group 46507. The daemon's children do not inherit its pgid, which CONTRADICTS the reasoning D0A-R28-02 rests on. An empty `survivors_before_guard` has never meant what the register says. This is a finding about the assembly.
+no identity: UNRESOLVED — no process named "r34ai46503" was sighted anywhere at any of the 1 samples. Identity is unestablished, so neither the assembly nor this control is implicated: the AI may have exited before the first sample, or may never have been named as expected. Do not report either cause; establish identity first.
+classifier: {"payload": "ordinary payload", "exit": 101, "failing_tests": ["action_text_is_preserved"], "outcome": "CAUGHT"}
+classifier: {"payload": "Killed", "exit": 101, "failing_tests": ["action_text_is_preserved"], "outcome": "INFRASTRUCTURE"}
+classifier: {"payload": "DELPHI_PRECONDITION_FAILED", "exit": 101, "failing_tests": ["action_text_is_preserved"], "outcome": "PRECONDITION FAILURE"}

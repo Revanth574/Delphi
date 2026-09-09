@@ -1,0 +1,85 @@
+
+RESTORED /tmp/d0a-r34-suite-kb5dd_ii/tmp/tmpr02vdfov/victim.rs (isolated checkout) after test
+CLEANUP FAILED: still on disk (`git worktree remove` said: ):
+  /tmp/d0a-r34-suite-kb5dd_ii/tmp/delphi-mutation-wt-izz_9vu7
+Collect by hand: rm -rf /tmp/d0a-r34-suite-kb5dd_ii/tmp/delphi-mutation-wt-izz_9vu7
+mutation-campaign harness guards
+  [OK ] classify: disk full -> INFRASTRUCTURE
+  [OK ] classify: disk full retains full output
+  [OK ] classify: build failure -> INFRASTRUCTURE
+  [OK ] classify: build failure retains full output
+  [OK ] classify: no result lines -> INFRASTRUCTURE
+  [OK ] classify: no result lines retains full output
+  [OK ] classify: stale session precondition -> PRECONDITION FAILURE
+  [OK ] classify: stale session precondition retains full output
+  [OK ] classify: stale-session script text -> PRECONDITION FAILURE
+  [OK ] classify: stale-session script text retains full output
+  [OK ] classify: checker-launch failure -> PRECONDITION FAILURE
+  [OK ] classify: checker-launch failure retains full output
+  [OK ] classify: crash, no named test -> UNATTRIBUTED FAILURE
+  [OK ] classify: crash, no named test retains full output
+  [OK ] classify: real detection -> CAUGHT
+  [OK ] classify: real detection retains full output
+  [OK ] classify: clean green -> NOT CAUGHT
+  [OK ] classify: clean green retains full output
+  [OK ] restore: a clean file matches the captured commit
+  [OK ] restore: a TAMPERED file does NOT match (a partial restore is caught)
+  [OK ] restore: the restored file matches again
+  [OK ] restore: verification is against a SHA, not mutable HEAD
+  [OK ] signal: the mutant is present before the handler runs
+  [OK ] signal: the handler RESTORES the mutated file
+  [OK ] signal: in-flight state is cleared afterwards
+  [OK ] inputs: installer/pam/delphi-runtime is watched
+  [OK ] inputs: scripts/check-stale-test-sessions.sh is watched
+  [OK ] inputs: scripts/mutation-campaign.py is watched
+  [OK ] inputs: Cargo.lock is watched
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign publishes the live worker's identity
+  [OK ] signal: the WORKER's group is alive before cancellation
+  [OK ] signal: the WORKER's group dies PROMPTLY, before the campaign is waited on
+  [OK ] signal: the campaign exits non-zero after SIGTERM
+  [OK ] signal: the WORKING TREE source is untouched
+  [OK ] signal: the working tree still matches the commit
+  [OK ] signal: the WORKER's group is still gone once the campaign has exited
+  [OK ] signal: nothing survives in the campaign's own group either
+  [OK ] signal: no isolated checkout is left behind
+  [OK ] signal: no mkdtemp parent is left behind either
+  [OK ] precondition: the runtime defines the token
+  [OK ] precondition: the checker-LAUNCH failure carries it
+  [OK ] precondition: the live-session failure carries it
+  [OK ] precondition: the shell checker carries it
+  [OK ] isolation: the checkout exists and has the source
+  [OK ] isolation: it is of the SHA, not a copy of the dirty working tree
+  [OK ] isolation: mutating the checkout leaves the working tree unchanged
+  [OK ] isolation: the checkout is collected afterwards
+  [OK ] isolation: the working tree is restored by this guard
+  [OK ] sigkill: the mutant is in the ISOLATED checkout
+  [OK ] sigkill: the WORKING TREE is untouched
+  [OK ] sigkill: the working tree still matches the commit
+  [OK ] cancel: the live child is registered
+  [OK ] cancel: the child leads its own session with a descendant in it
+  [OK ] cancel: the WHOLE group is gone, grandchild included
+  [OK ] dirty: a modified installer fixture makes inputs UNCLEAN
+  [OK ] dirty: the refusal names the offending path
+  [OK ] dirty: the restored fixture is no longer listed as dirty
+  [OK ] instrument: a dirty harness is REFUSED, not warned about
+  [OK ] instrument: the campaign BODY never ran (no lane.json was written)
+  [OK ] instrument: no isolated checkout was even created
+  [OK ] instrument: the refusal names the harness
+  [OK ] instrument: the refusal explains that the checkout does not cover it
+  [OK ] instrument: a refused run leaves no checkout behind
+  [OK ] instrument: the recorded digest is of the executing bytes
+  [OK ] cleanup: an undeletable checkout is reported as FAILED
+  [OK ] cleanup: the directory really is still there
+  [OK ] cleanup: OWNERSHIP IS RETAINED so a retry is possible
+  [OK ] cleanup: the retry succeeds once the obstruction is gone
+  [OK ] cleanup: and the directory is actually gone
+  [OK ] cleanup: ownership is released only after success
+  [OK ] lifetime: a red baseline refuses
+  [OK ] lifetime: the baseline refusal leaves no mkdtemp parent
+  [OK ] lifetime: the baseline refusal leaves no registered worktree
+  [OK ] lifetime: the exception propagates (it is not swallowed)
+  [OK ] lifetime: an ORDINARY EXCEPTION still collects the mkdtemp parent
+  [OK ] lifetime: an ORDINARY EXCEPTION still collects the worktree
+
+77 guards held

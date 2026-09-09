@@ -209,22 +209,45 @@ def make_isolated_checkout(sha: str) -> pathlib.Path:
     return target
 
 
-def remove_isolated_checkout() -> None:
+def remove_isolated_checkout() -> bool:
     """Collect BOTH resources: the git registration and the mkdtemp that holds it.
 
     D0A-R32-05: this used to remove only the worktree, so every run leaked its `mkdtemp`
     parent. Thirty-eight had accumulated in `/tmp` before anyone looked, and the guard did not
     see them because it read `git worktree list` — which `remove` had faithfully cleaned. The
     resource the harness CREATED and the resource git KNOWS ABOUT are not the same resource.
+
+    D0A-R33-01: it also SWALLOWED failure. `ignore_errors=True` plus an unconditional
+    `_WORKTREE.clear()` meant a mode-000 directory produced a normal return with the checkout
+    still on disk and its git registration already pruned — invisible to `git worktree list`,
+    unowned by this process, and impossible to retry. Cleanup that cannot fail cannot be
+    trusted to have happened.
+
+    Returns True only if BOTH resources are verified gone.
     """
     path = _WORKTREE.get("path")
     if path:
-        sh(["git", "worktree", "remove", "--force", path])
+        r = sh(["git", "worktree", "remove", "--force", path])
         sh(["git", "worktree", "prune"])
+    else:
+        r = None
     parent = _WORKTREE.get("parent")
     if parent:
         shutil.rmtree(parent, ignore_errors=True)
+
+    # THE VERDICT IS THE FINAL STATE, not the intermediate return codes. Deriving it from the
+    # `git worktree remove` exit made a RETRY report failure: the first attempt had already
+    # pruned the registration, so the second legitimately errors while the actual removal
+    # succeeds. What is being asserted is that nothing is left behind — so look.
+    leftovers = [q for q in (path, parent) if q and os.path.exists(q)]
+    if leftovers:
+        detail = f" (`git worktree remove` said: {r.stderr.strip()})" if r is not None else ""
+        print(f"CLEANUP FAILED: still on disk{detail}:\n" +
+              "\n".join(f"  {q}" for q in leftovers) +
+              f"\nCollect by hand: rm -rf {parent}", file=sys.stderr)
+        return False                        # ownership RETAINED so this can be retried
     _WORKTREE.clear()
+    return True
 
 
 def _restore_in_flight(reason: str) -> None:
@@ -461,9 +484,21 @@ def main() -> int:
     two ordinary exits were not, which is the more common way a campaign ends.
     """
     try:
-        return _main()
-    finally:
-        remove_isolated_checkout()
+        rc = _main()
+    except BaseException:
+        # Cleanup still runs, and its failure is reported — but it must NOT mask the exception
+        # that is already propagating.
+        if not remove_isolated_checkout():
+            print("...and the isolated checkout was NOT collected (see above).",
+                  file=sys.stderr)
+        raise
+    if not remove_isolated_checkout():
+        # D0A-R33-01: a silent cleanup failure permits unnoticed accumulation. A campaign that
+        # could not collect what it created did not finish cleanly, whatever its findings say.
+        print("EXIT 4: the campaign completed but its isolated checkout was NOT collected.",
+              file=sys.stderr)
+        return rc if rc != 0 else 4
+    return rc
 
 
 def _main() -> int:

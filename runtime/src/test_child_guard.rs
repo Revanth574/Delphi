@@ -246,6 +246,29 @@ mod eintr_tests {
 
     static DELIVERED: AtomicUsize = AtomicUsize::new(0);
 
+    /// Stops the sender and restores the handler on EVERY path, including unwinding.
+    ///
+    /// The order is load-bearing: the sender must be stopped and JOINED before the handler is
+    /// restored, or a signal already in flight can arrive under the previous disposition —
+    /// which for SIGUSR1 is `SIG_DFL`, i.e. it terminates the test process.
+    struct SenderGuard {
+        stop: Arc<AtomicBool>,
+        hammer: Option<std::thread::JoinHandle<()>>,
+        previous: SigAction,
+    }
+
+    impl Drop for SenderGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.hammer.take() {
+                let _ = h.join();
+            }
+            // SAFETY: restoring the disposition captured before this test installed its own,
+            // and only after the sender is provably stopped.
+            unsafe { sigaction(Signal::SIGUSR1, &self.previous) }.expect("restore SIGUSR1");
+        }
+    }
+
     /// Async-signal-safe: one relaxed atomic add and nothing else.
     extern "C" fn on_usr1(_: nix::libc::c_int) {
         DELIVERED.fetch_add(1, Ordering::Relaxed);
@@ -301,12 +324,23 @@ mod eintr_tests {
             }
         });
 
-        let code = guard.reap_status();
-
-        stop.store(true, Ordering::Relaxed);
-        hammer.join().expect("hammer thread");
-        // SAFETY: restoring the disposition captured above, before any other test observes it.
-        unsafe { sigaction(Signal::SIGUSR1, &previous) }.expect("restore SIGUSR1");
+        // UNWIND-SAFE (D0A-R33-02). `reap_status` is the call under test and it PANICS when
+        // the retry is deleted — which is the weaken this test exists to fail under. Stopping
+        // the sender only on the normal path meant the RED path left a thread signalling
+        // SIGUSR1 into a process whose handler had just been restored to its previous
+        // disposition, and left it running past this test's lifetime. The cleanup a test needs
+        // most is the cleanup on the path where it fails.
+        let code = {
+            let sender = SenderGuard { stop: Arc::clone(&stop), hammer: Some(hammer), previous };
+            let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                guard.reap_status()
+            }));
+            drop(sender); // stops, joins, THEN restores — in that order, on both paths
+            match code {
+                Ok(c) => c,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        };
 
         assert_eq!(
             code, 7,

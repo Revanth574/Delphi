@@ -1615,6 +1615,42 @@ fn b1_shebang_interpreter_arg_reaches_exec() {
 
 // ── B1-01: the DAEMON BINARY's main runs the assembled flow (not parks) ───────
 
+/// Every process on the system whose `comm` matches, with its pid and its **actual** pgid.
+///
+/// D0A-R33-03: the control's failure could not assign cause, because scanning only the DAEMON's
+/// group cannot tell "the AI is not there" from "the AI is elsewhere". This looks for the AI
+/// wherever it is, so the diagnosis rests on where it was found rather than on a rule about
+/// where it was not.
+fn processes_named(comm: &str) -> Vec<(i32, i32)> {
+    let want: String = comm.chars().take(15).collect();
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if comm_of(pid) != want {
+            continue;
+        }
+        // pgid from `stat` field 5 (1-indexed), taken after the LAST `)` — same discipline as
+        // `live_group_members` (D0A-R32-01).
+        if let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat"))
+            && let Some(close) = stat.iter().rposition(|&b| b == b')')
+        {
+            let fields: Vec<&str> = std::str::from_utf8(&stat[close + 1..])
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            if let Some(pgid) = fields.get(2).and_then(|f| f.parse::<i32>().ok()) {
+                out.push((pid, pgid));
+            }
+        }
+    }
+    out
+}
+
 /// `comm` for a pid, as BYTES rendered lossily — never as a UTF-8 decode that can fail closed.
 ///
 /// Same reasoning as `live_group_members` (D0A-R32-01): `comm` is arbitrary bytes chosen by the
@@ -1724,9 +1760,12 @@ fn live_group_members_finds_a_survivor_reports_unknowns_and_skips_a_real_zombie(
 ///
 /// | outcome | observation |
 /// |---|---|
-/// | the DAEMON cleaned up | `survivors_before_guard` is EMPTY |
-/// | the daemon did not and the GUARD did | `survivors_before_guard` is non-empty — **the run proves nothing about the daemon** |
-/// | neither | non-empty, and still alive afterwards |
+/// | `survivors_before_guard` EMPTY | no live member remained AT THAT INSTANT — not that the daemon ended them, and not that anything was reaped |
+/// | `survivors_before_guard` non-empty | members were alive, so the guard's unconditional kill ended them; the run is VOID as evidence about the daemon |
+///
+/// **Two outcomes, not three (D0A-R33-04).** The previous table listed a third — "neither:
+/// non-empty, and still alive afterwards" — which needs an observation AFTER the guard
+/// intervenes. Nothing here retains one, so that row named a distinction the data cannot make.
 struct DaemonRun {
     output: std::process::Output,
     /// The daemon had to be killed at the guard's deadline.
@@ -1975,9 +2014,19 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
         // members NONE of which were the AI (a `comm` mismatch or a missed window — a finding
         // about this probe). Retaining the census is what separates them.
         let mut census: Vec<(i32, char, String)> = Vec::new();
+        // WHERE THE AI ACTUALLY IS, sampled system-wide WHILE IT IS ALIVE (D0A-R33-03). Scanning
+        // only the daemon's group cannot tell "the AI is not there" from "the AI is elsewhere",
+        // and a post-hoc lookup finds nothing because the AI is dead by then. Cause is assigned
+        // from this, not from a rule about which explanation is likelier.
+        let mut ai_sightings: Vec<(i32, i32)> = Vec::new();
         let mut samples: usize = 0;
         while std::time::Instant::now() < deadline {
             samples += 1;
+            for (pid, pgid) in processes_named(&probe_comm) {
+                if !ai_sightings.iter().any(|(p, _)| *p == pid) {
+                    ai_sightings.push((pid, pgid));
+                }
+            }
             for (pid, state) in live_group_members(daemon_pid, daemon_pid) {
                 let c = comm_of(pid);
                 if !census.iter().any(|(p, _, _)| *p == pid) {
@@ -1990,15 +2039,16 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
                 }
             }
             if !seen.is_empty() {
-                return (seen, census, samples);
+                return (seen, census, samples, ai_sightings);
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        (seen, census, samples)
+        (seen, census, samples, ai_sightings)
     });
 
     let run = guard.wait();
-    let (ai_seen_live, probe_census, probe_samples) = probe.join().expect("probe thread");
+    let (ai_seen_live, probe_census, probe_samples, ai_sightings) =
+        probe.join().expect("probe thread");
     let (out, killed, survivors) = (run.output, run.killed, run.survivors_before_guard);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2020,26 +2070,65 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     // is not evidence of the daemon cleaning up — it is a scan that was never going to find
     // anything. This is the same discipline as (0): the check that could invalidate the run
     // comes first, and fails the test rather than logging a caveat.
-    assert!(
-        !ai_seen_live.is_empty(),
-        "POSITIVE CONTROL FAILED: the scanner never saw the AI (comm {ai_comm:?}) alive in the \
-         daemon's process group {daemon_pid} at any point during the run, across \
-         {probe_samples} samples. The empty `survivors_before_guard` is therefore VACUOUS for \
-         the assembly case — it does not distinguish `the daemon cleaned up` from `the scan \
-         cannot reach the daemon's children`.\n\
-         \n\
-         WHICH FAILURE THIS IS, decided by the census rather than by argument:\n\
-         * census EMPTY -> the daemon's group never contained ANY member the scan could see. \
-           That is about the assembly, not this probe, and it contradicts the reasoning the \
-           register rests on (neither launcher.rs nor execute.rs calls setsid/setpgid).\n\
-         * census NON-EMPTY but no {ai_comm:?} -> the scan reaches the group and the AI was \
-           not identified in it: a comm mismatch, or a window this probe missed. That is a \
-           defect in the control, not evidence about the daemon.\n\
-         \n\
-         census ({} distinct pids): {probe_census:?}\n\
-         daemon log:\n{daemon_log}\nfixture log:\n{fixture_log}",
-        probe_census.len()
+    // The control's OBSERVATION is reported on the PASS path too. The reviewer noted that a
+    // passing run retained nothing in the transcript — the census existed only inside failure
+    // diagnostics, so the evidence for the closure vanished on exactly the runs that supported
+    // it (D0A-R33).
+    eprintln!(
+        "CONTROL OBSERVATION: daemon pgid {daemon_pid}, ai comm {ai_comm:?}, {probe_samples} \
+         samples\n  matched in the daemon's group: {ai_seen_live:?}\n  census of that group: \
+         {probe_census:?}\n  AI sighted system-wide (pid, pgid): {ai_sightings:?}"
     );
+
+    if ai_seen_live.is_empty() {
+        // NOT CLASSIFIED BY RULE (D0A-R33-03). The previous version decided between "the
+        // assembly is wrong" and "my probe is wrong" from the census alone, and the reviewer
+        // produced the exact failing shape — census non-empty, AI correctly named, sitting in
+        // ANOTHER group — which that rule calls a control defect. A two-way ambiguity resolved
+        // by a rule rather than by evidence resolves toward whatever the rule's author wanted,
+        // and what this one wanted was the closure intact.
+        //
+        // Cause is now read off identity, group membership and lifetime, all sampled while the
+        // AI was alive. Where they do not settle it, the result is UNRESOLVED and says so.
+        let elsewhere: Vec<&(i32, i32)> =
+            ai_sightings.iter().filter(|(_, pgid)| *pgid != daemon_pid).collect();
+        let in_group: Vec<&(i32, i32)> =
+            ai_sightings.iter().filter(|(_, pgid)| *pgid == daemon_pid).collect();
+        let verdict = if !elsewhere.is_empty() {
+            format!(
+                "TOPOLOGY — the AI ran in {elsewhere:?} (pid, pgid), NOT in the daemon's group \
+                 {daemon_pid}. The daemon's children do not inherit its pgid, which CONTRADICTS \
+                 the reasoning D0A-R28-02 rests on. An empty `survivors_before_guard` has never \
+                 meant what the register says. This is a finding about the assembly."
+            )
+        } else if !in_group.is_empty() {
+            format!(
+                "SCAN — the AI ran at {in_group:?} (pid, pgid), inside the daemon's group, and \
+                 the scanner still never matched it. The defect is in this control: the `comm` \
+                 comparison, or a window the {probe_samples} samples missed."
+            )
+        } else {
+            format!(
+                "UNRESOLVED — no process named {ai_comm:?} was sighted anywhere at any of the \
+                 {probe_samples} samples. Identity is unestablished, so neither the assembly nor \
+                 this control is implicated: the AI may have exited before the first sample, or \
+                 may never have been named as expected. Do not report either cause; establish \
+                 identity first."
+            )
+        };
+        panic!(
+            "POSITIVE CONTROL FAILED: the scanner never saw the AI (comm {ai_comm:?}) alive in \
+             the daemon's process group {daemon_pid}, across {probe_samples} samples. The empty \
+             `survivors_before_guard` is therefore VACUOUS for the assembly case.\n\
+             \n\
+             CAUSE, read from the evidence rather than assigned by rule:\n  {verdict}\n\
+             \n\
+             census of the daemon's group ({} distinct pids): {probe_census:?}\n\
+             AI sighted system-wide (pid, pgid): {ai_sightings:?}\n\
+             daemon log:\n{daemon_log}\nfixture log:\n{fixture_log}",
+            probe_census.len()
+        );
+    }
 
     // (0) **THE INVALIDATING OBSERVATION (D0A-R31-02), CHECKED FIRST.**
     //

@@ -2929,3 +2929,41 @@ fails to match. A normaliser tested only on already-clean input is a no-op with 
 **Related:** [41] (wrong altitude) — the sibling in searching rather than asserting. [50] (the
 filter is not the mechanism) — there post-processing discarded a true result; here rendering
 manufactures a false one.
+
+## 53. A TWO-WAY AMBIGUITY RESOLVED BY A RULE RATHER THAN BY EVIDENCE RESOLVES TOWARD WHATEVER THE RULE'S AUTHOR WANTED  *(new — D0A-R33-03, found by the reviewer constructing the case the rule gets wrong)*
+
+**The shape.** A diagnostic cannot distinguish two causes, so it ships a *rule* for deciding
+between them — "if the census is non-empty, it's the instrument". The rule looks like analysis.
+It is a default, and the author picks the default while knowing which answer is convenient.
+
+**The instance.** The assembly positive control failed in two ways that present identically:
+the scan cannot reach the daemon's children (a finding about the ASSEMBLY, which would have
+withdrawn D0A-R28-02) or the AI was not identified in a group the scan does reach (a finding
+about the CONTROL, which leaves the closure intact). The failure message classified a non-empty
+census without the AI as **a defect in the control**.
+
+The reviewer produced the exact shape that rule gets wrong: `seen=[] census=[(9609,'S',"sleep")]
+ai_pgid=9608` — two real daemon-fixture children, one inheriting the group, and the **correctly
+named AI sitting in another group**. That is a topology defect receiving the diagnosis that
+preserves the closure. The rule was not reading evidence; it was picking the reading its author
+wanted, and its author was the party whose closure was at stake.
+
+**Why it is not class 45 or 51.** 45 is asserting an absence you cannot measure; 51 is a false
+claim in a trusted record. This is neither — every individual statement was true, and the
+defect is in the *decision procedure* that maps evidence to cause. A wrong rule produces a
+confident, well-evidenced, wrong attribution.
+
+**The foreclosing discipline.** *Where a diagnostic cannot separate two causes from what it
+has, it must collect what would separate them — or return UNRESOLVED. It must never choose.*
+Concretely, that meant sampling identity, group membership and lifetime **while the subject was
+alive** (a post-hoc lookup finds nothing, because the process is gone by the time the assertion
+fires), and computing the verdict from those. The three outcomes are now TOPOLOGY, SCAN, and
+UNRESOLVED, and the third is a real outcome rather than a fallback.
+
+**The RED-proof shape.** Construct the case the rule gets wrong — not the case it gets right.
+A rule is only ever tested by its counterexample; running it on the case it was written for
+proves nothing, which is why this survived a round.
+
+**A blunt test for the class, applicable before any evidence exists.** *If the rule had come out
+the other way, would you have accepted it as readily?* If not, it is a preference wearing a
+decision procedure's clothes.

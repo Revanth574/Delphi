@@ -66,11 +66,23 @@ The assembly test passes at root **with the survivor check as its first assertio
 **immediately before** its unconditional `kill_group`, and a non-empty sample **fails the test**
 rather than being logged. So the run distinguishes the three outcomes two values could not:
 
-| outcome | observation |
-|---|---|
-| **the DAEMON cleaned up** | `survivors_before_guard` EMPTY — **this is what run 5 observed** |
-| the daemon did not and the GUARD did | non-empty; the run would prove nothing about the daemon |
-| neither | non-empty, still alive after |
+**The table that used to sit here claimed three distinguishable outcomes and was wrong twice
+over (D0A-R33-04).** It listed "neither — non-empty, still alive after", which requires an
+observation *after* the guard intervenes; the test retains no such sample. And it labelled an
+empty sample "**the DAEMON cleaned up**" — the causal claim this row's own prose withdrew one
+round earlier. A table is where a withdrawn claim survives its withdrawal, because the rewrite
+went to the sentence and the table was not read as prose.
+
+What the test actually retains, and what each retained value can support:
+
+| retained | supports | does NOT support |
+|---|---|---|
+| `survivors_before_guard` EMPTY | no live member of the daemon's group remained **at that instant**, which is immediately before `kill_group` | that the daemon ended them, or that anything was reaped |
+| `survivors_before_guard` non-empty | members were alive at that instant, so the guard's unconditional kill is what ended them | nothing about the daemon either way — the run is void |
+| `killed == false` | the daemon exited before the guard's deadline | which code path it exited through |
+
+There is **no post-intervention observation**, so "the guard did it" and "neither" are not
+distinguishable by anything this test records. Two outcomes, not three.
 
 Previously this row claimed CLOSED on evidence that could not tell the first case from the
 second: a counterfeit daemon leaving its child alive passed all nine assertions with
@@ -79,9 +91,15 @@ D0A-R31 and is restored here only with the observation that discriminates.
 
 **WHAT RUN 5 OBSERVED, in the reviewer's words rather than mine (D0A-R32):**
 
-> **The scanner was proven capable of seeing the daemon's own fork/exec'd child in its
-> inherited process group, and no live group members remained before harness intervention;
-> daemon reaping was not observed.**
+> **In lane run 20, the scanner was observed finding the daemon's own fork/exec'd child alive
+> in the daemon's process group, and no live members of that group remained before harness
+> intervention; daemon reaping was not observed.**
+
+**Scoped deliberately to that run and that group (D0A-R33-04).** The reviewer's ruling was that
+the sentence is defensible *when explicitly scoped* — T1 establishes that a positive observation
+of that group is reachable, T2 samples the same group, and **neither establishes continuous
+membership** between them nor reaping at any point. "Proven capable", unqualified, claimed the
+general form; one run against one child does not license it.
 
 The first clause is new at **lane run 20** and is the only part of this row that strengthened.
 The wording was fixed *before* the run, in the committed expectation, so it is not a claim

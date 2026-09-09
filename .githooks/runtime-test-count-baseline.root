@@ -25,7 +25,15 @@
 # its own precondition has spent the guard's value whether or not it got away with it.
 # **Free space before run 21.** Part B's feature build consumed more still.
 #
-# **2. MY HANDOVER DROPPED §4b, THE MEMBERSHIP CHECK.**
+# **2. MY HANDOVER DROPPED §4b, THE MEMBERSHIP CHECK — AND ITS INPUTS WERE NOT RETAINED.**
+#
+# D0A-R33 ADDENDUM: the reviewer could not independently verify the 227/227 result, because
+# `/tmp/root-run20.log` and `/tmp/targets.txt` are both gone. So the membership claim in this
+# record **stands on my report of having run it, not on evidence anyone else can check** — and
+# matching totals cannot substitute, which is the whole reason §4b exists. That is the second
+# edge of "closed-after is not run": the check was performed late AND its inputs were transient,
+# so lateness became unverifiability. A future §4b must write its identity lists into the run's
+# retained artifacts, not leave them in /tmp.
 #
 # I assembled the operator's command sequence from the procedure and omitted the identity
 # membership check — the step that exists because equal totals are not equal test sets

@@ -469,6 +469,34 @@ def guard_dirty_instrument_is_refused() -> None:
           ident["sha256"] == _h.sha256(inst.read_bytes()).hexdigest(), ident["sha256"][:16])
 
 
+def guard_cleanup_failure_is_visible_and_retryable() -> None:
+    """D0A-R33-01 — a cleanup that CANNOT FAIL cannot be trusted to have happened.
+
+    `shutil.rmtree(..., ignore_errors=True)` plus an unconditional `_WORKTREE.clear()` meant a
+    mode-000 directory produced a NORMAL RETURN with the checkout still on disk and its git
+    registration already pruned: invisible to `git worktree list`, unowned by this process, and
+    impossible to retry. The reviewer reproduced exactly that.
+    """
+    sha = mc.sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+    mc.make_isolated_checkout(sha)
+    parent = mc._WORKTREE["parent"]
+    os.chmod(parent, 0o000)
+    try:
+        ok = mc.remove_isolated_checkout()
+        check("cleanup: an undeletable checkout is reported as FAILED", ok is False,
+              f"remove_isolated_checkout returned {ok!r}")
+        check("cleanup: the directory really is still there", os.path.exists(parent), parent)
+        check("cleanup: OWNERSHIP IS RETAINED so a retry is possible",
+              mc._WORKTREE.get("parent") == parent,
+              f"state was cleared despite failure: {mc._WORKTREE!r}")
+    finally:
+        os.chmod(parent, 0o755)
+    ok = mc.remove_isolated_checkout()
+    check("cleanup: the retry succeeds once the obstruction is gone", ok is True, f"{ok!r}")
+    check("cleanup: and the directory is actually gone", not os.path.exists(parent), parent)
+    check("cleanup: ownership is released only after success", not mc._WORKTREE, f"{mc._WORKTREE!r}")
+
+
 def guard_checkout_collected_on_every_exit_path() -> None:
     """D0A-R32-05 — the checkout is collected on the ORDINARY exits, not only on signals.
 
@@ -561,6 +589,7 @@ def main() -> int:
     guard_cancellation_kills_descendants()
     guard_dirty_refusal()
     guard_dirty_instrument_is_refused()
+    guard_cleanup_failure_is_visible_and_retryable()
     guard_checkout_collected_on_every_exit_path()
     print(f"\n{len(CHECKS)} guards held")
     return 0

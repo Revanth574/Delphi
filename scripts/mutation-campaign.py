@@ -240,11 +240,38 @@ def remove_isolated_checkout() -> bool:
     # pruned the registration, so the second legitimately errors while the actual removal
     # succeeds. What is being asserted is that nothing is left behind — so look.
     leftovers = [q for q in (path, parent) if q and os.path.exists(q)]
-    if leftovers:
+
+    # D0A-R34-03: THE FILESYSTEM IS NOT THE ONLY RESOURCE. A LOCKED worktree keeps its entry in
+    # `git worktree list` even after the directory is gone — `prune` refuses to collect a locked
+    # entry, by documented design — so checking only for files reported success while forgetting
+    # a registration this process owns. The predicate was falsely true, which is why exit 4
+    # could not catch it.
+    reg = sh(["git", "worktree", "list", "--porcelain"])
+    if reg.returncode != 0:
+        print(f"CLEANUP FAILED: cannot read the worktree registration "
+              f"({reg.stderr.strip()}), so absence is UNVERIFIED, not established.",
+              file=sys.stderr)
+        return False
+    still_registered = path and any(
+        line.strip() == f"worktree {path}" for line in reg.stdout.splitlines())
+    if still_registered:
+        sh(["git", "worktree", "prune"])          # a second, deliberate attempt
+        reg = sh(["git", "worktree", "list", "--porcelain"])
+        still_registered = reg.returncode != 0 or any(
+            line.strip() == f"worktree {path}" for line in reg.stdout.splitlines())
+
+    if leftovers or still_registered:
         detail = f" (`git worktree remove` said: {r.stderr.strip()})" if r is not None else ""
-        print(f"CLEANUP FAILED: still on disk{detail}:\n" +
-              "\n".join(f"  {q}" for q in leftovers) +
-              f"\nCollect by hand: rm -rf {parent}", file=sys.stderr)
+        msg = f"CLEANUP FAILED{detail}:"
+        if leftovers:
+            msg += "\n  still on disk:\n" + "\n".join(f"    {q}" for q in leftovers)
+        if still_registered:
+            # NOT force-unlocked here: a lock may be someone else's deliberate act, and
+            # overriding it would be this harness damaging state it does not own.
+            msg += (f"\n  still registered in `git worktree list`: {path}\n"
+                    f"    if it is locked, that is deliberate somewhere — inspect before "
+                    f"`git worktree unlock {path} && git worktree prune`")
+        print(msg, file=sys.stderr)
         return False                        # ownership RETAINED so this can be retried
     _WORKTREE.clear()
     return True
@@ -434,6 +461,25 @@ def file_matches_commit(sha: str, rel: str) -> bool:
               ).returncode == 0
 
 
+def split_producer_and_test_output(text: str) -> tuple[str, str]:
+    """Separate what the PRODUCER said from what libtest attributed to a test (D0A-R34-05).
+
+    libtest prints captured per-test output under `---- <name> stdout ----` headers. Everything
+    inside such a section is data a test produced; everything outside is the producer speaking.
+    Cause cannot be read from arbitrary assertion text, so the two must not be searched alike.
+    """
+    producer, tests, in_test = [], [], False
+    for line in text.splitlines():
+        if re.match(r"^---- .+? (?:stdout|stderr) ----$", line):
+            in_test = True
+            tests.append(line)
+            continue
+        if in_test and (line.startswith(("failures:", "test result:", "running "))):
+            in_test = False
+        (tests if in_test else producer).append(line)
+    return "\n".join(producer), "\n".join(tests)
+
+
 def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     """Run the suite and CLASSIFY the outcome (D0A-R29-02).
 
@@ -454,11 +500,39 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     )) if "failures:" in p.stdout else []
 
     blob = p.stdout + p.stderr
-    infra = [m for m in INFRA_MARKERS if m in blob]
+
+    # D0A-R34-05: A MARKER IN ASSERTION DATA IS NOT A REPORT FROM THE INFRASTRUCTURE.
+    # This used to substring-search the whole capture, so a test asserting on the literal
+    # "Killed" was classified INFRASTRUCTURE and one asserting on the precondition token was
+    # classified PRECONDITION FAILURE — the same exit, the same named failing test, a genuine
+    # detection DISCARDED because its data happened to contain a marker. Two discriminators,
+    # each matched to how the corresponding event is really emitted:
+    #
+    #   * infrastructure events come from the PRODUCER (cargo, the linker, the kernel), never
+    #     from inside a test body, so they are searched only OUTSIDE libtest's per-test
+    #     sections;
+    #   * the precondition token is emitted by test code as a PANIC MESSAGE, which starts a
+    #     line — while the same token inside an assertion appears indented after `right: "`.
+    producer_text, test_text = split_producer_and_test_output(blob)
+    lines = blob.splitlines()
+
+    infra = [m for m in INFRA_MARKERS if m in producer_text]
+    ev["markers_seen_as_data"] = [m for m in INFRA_MARKERS
+                                  if m in test_text and m not in producer_text]
+    if infra and ev["failing_tests"]:
+        # Provenance conflicts: the producer reported a resource failure AND tests named their
+        # own failures. Asserting infrastructure causality here would discard a possible
+        # detection; asserting detection would ignore a real resource failure. Neither is
+        # established, so neither is claimed.
+        ev["infra_markers"] = infra
+        return "UNATTRIBUTED FAILURE", ev
     if infra:
         ev["infra_markers"] = infra
         return "INFRASTRUCTURE", ev
-    precond = [m for m in PRECONDITION_MARKERS if m in blob]
+
+    precond = [m for m in PRECONDITION_MARKERS if any(l.startswith(m) for l in lines)]
+    ev["precondition_markers_seen_as_data"] = [
+        m for m in PRECONDITION_MARKERS if m in blob and m not in precond]
     if precond:
         # A named failing test whose failure is a PRECONDITION, not a detection (D0A-R30-04).
         ev["precondition_markers"] = precond

@@ -59,94 +59,46 @@ two tests naming it asserted that *changing* it changes the digest and the previ
 asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
 negative does not, and should not have been written.
 
-### D0A-R28-02 — **CLOSED**, and the row says exactly what was observed
+### D0A-R28-02 — §4 "an untrusted peer cannot pin the boundary": **CLOSED on boundedness**
 
-The assembly test passes at root **with the survivor check as its first assertion**
-(D0A-R31-02): `DaemonGuard::wait()` now samples the live members of the daemon's process group
-**immediately before** its unconditional `kill_group`, and a non-empty sample **fails the test**
-rather than being logged. So the run distinguishes the three outcomes two values could not:
+**One authoritative account (D0A-R34-04).** This row was corrected in rounds 31, 32, 33 and 34;
+the previous version had become a stack of correction narratives that each left a contradictory
+fragment behind — twice the fragment was a TABLE that survived a rewrite aimed at the prose.
+The correction history is in git. What follows is the current position only.
 
-**The table that used to sit here claimed three distinguishable outcomes and was wrong twice
-over (D0A-R33-04).** It listed "neither — non-empty, still alive after", which requires an
-observation *after* the guard intervenes; the test retains no such sample. And it labelled an
-empty sample "**the DAEMON cleaned up**" — the causal claim this row's own prose withdrew one
-round earlier. A table is where a withdrawn claim survives its withdrawal, because the rewrite
-went to the sentence and the table was not read as prose.
+**The obligation.** An AI that takes its terminal response and refuses to exit must not hold the
+root daemon forever. The remedy is a bounded `reap_within` + grace + SIGKILL + bounded reap.
 
-What the test actually retains, and what each retained value can support:
+**What is observed, by whom, in lane run 20** (`b1_daemon_bounds_an_ai_that_completes_the_
+protocol_and_stays_alive`, at root, against the real binary built with `insecure-test-seams`):
 
-| retained | supports | does NOT support |
+| observation | provenance | what it establishes |
 |---|---|---|
-| `survivors_before_guard` EMPTY | no live member of the daemon's group remained **at that instant**, which is immediately before `kill_group` | that the daemon ended them, or that anything was reaped |
-| `survivors_before_guard` non-empty | members were alive at that instant, so the guard's unconditional kill is what ended them | nothing about the daemon either way — the run is void |
-| `killed == false` | the daemon exited before the guard's deadline | which code path it exited through |
+| `killed == false` against a **stubborn** AI that completed the protocol and slept | harness, independent | **the peer did not pin the daemon.** This is the §4 property, and it is the closure |
+| the pre-intervention scan returned **no live members** of the daemon's process group | harness, independent | at that instant, that scan found no live member — see the limits below |
+| the daemon exited **0** | daemon's **self-report** | it did not detect an unreaped child. `main` returns `Err` when any outcome is `Unreaped`, so a self-detected cleanup failure would have failed the test |
+| a live child of the daemon was seen in its group during the run | harness, independent | the scan can reach that group, so an empty result is not vacuous by construction |
 
-There is **no post-intervention observation**, so "the guard did it" and "neither" are not
-distinguishable by anything this test records. Two outcomes, not three.
+**What is NOT observed, stated so no reader has to derive it:**
 
-Previously this row claimed CLOSED on evidence that could not tell the first case from the
-second: a counterfeit daemon leaving its child alive passed all nine assertions with
-`killed == false`, because the harness supplied the cleanup. That claim was withdrawn at
-D0A-R31 and is restored here only with the observation that discriminates.
+- **Reaping is never independently observed.** The only reaping evidence is the daemon's own
+  exit status — a self-report by the component under test. R29-05's `Unreaped` branch remains
+  UNCONSTRUCTED.
+- **There is no post-intervention observation at all.** `DaemonGuard::wait()` samples before its
+  unconditional `kill_group` and never again. So *"the guard's kill ended them"* is not
+  available: issuing a kill is neither observing death nor establishing its cause. The
+  replacement table asserted exactly that and was wrong for a fourth round (D0A-R34-04).
+- **A non-empty scan does not mean "members were alive".** The scanner emits `(pid, '?')` for an
+  entry it could not read and `(-1, '?')` when `/proc` cannot be enumerated. Those are UNKNOWN
+  records, not demonstrated live members. A non-empty result is therefore a **failed or
+  incomplete pre-intervention scan that invalidates the daemon-cleanup inference** — which is
+  the correct handling either way, since both readings void the run as evidence about the daemon.
+- **Nothing here certifies the production logind gate.** The binary is seam-built.
 
-**WHAT RUN 5 OBSERVED, in the reviewer's words rather than mine (D0A-R32):**
-
-> **In lane run 20, the scanner was observed finding the daemon's own fork/exec'd child alive
-> in the daemon's process group, and no live members of that group remained before harness
-> intervention; daemon reaping was not observed.**
-
-**Scoped deliberately to that run and that group (D0A-R33-04).** The reviewer's ruling was that
-the sentence is defensible *when explicitly scoped* — T1 establishes that a positive observation
-of that group is reachable, T2 samples the same group, and **neither establishes continuous
-membership** between them nor reaping at any point. "Proven capable", unqualified, claimed the
-general form; one run against one child does not license it.
-
-The first clause is new at **lane run 20** and is the only part of this row that strengthened.
-The wording was fixed *before* the run, in the committed expectation, so it is not a claim
-shaped to fit a result — a pass bought exactly this sentence and nothing else, and a failure
-would have withdrawn the closure rather than the test.
-
-That is the whole claim. The previous wording — *"the daemon cleaned up"* — was called
-ambiguous, and it was: it invites a reader to conclude the daemon **reaped**, which this run
-does not show.
-
-**THE VACUITY CHECK WAS HALF-VACUOUS, and I called it the difference between this closure and
-the last one.** It has two halves:
-
-- **the survivor half HOLDS** — `live_group_members` does find a live child, so an empty sample
-  is a real observation rather than a scan that never finds anything;
-- **the zombie half PROVED NOTHING** (D0A-R32-03). The fixture's `: &` short-lived child was
-  reaped by the shell before observation, so no zombie ever existed. The reviewer ran the test
-  **30/30 with the zombie exclusion deleted and it still passed.**
-
-**And my statement of the residual was too strong (D0A-R32).** I wrote that zombie exclusion
-makes `Unreaped` invisible. It does not: **a live D-state child IS included by the scanner**, so
-zombie exclusion hides only the killed-but-already-collected case, not every `Unreaped` outcome.
-The operator let the stronger version stand without checking it, and neither of us verified a
-claim about what a check cannot see — which is harder to falsify than a claim about what it can,
-and therefore the kind that needs checking most.
-
-**The vacuity question is now MEASURED in the assembly, not argued (lane run 20).** The
-fixture showed the scan finding a child spawned by the test process with `.process_group(0)`;
-whether that transferred to a real daemon with a fork/exec'd child and a pgid inherited across
-`execve` was reasoning — that neither `launcher.rs` nor `execute.rs` calls `setsid`/`setpgid`.
-A positive control now asserts, **before** the observation it validates, that the scanner saw
-the real AI alive by `comm` in the daemon's group. It passed on its first root execution.
-Note the shape of that evidence honestly: a passing control CONFIRMS the argument rather than
-overturning it, which is the weaker of the two outcomes that were on offer.
-
-**The zombie half now bites (D0A-R32-03 fixed).** The fixture constructs a real zombie — a
-child reaped by nobody, held terminal with a *checked* `waitid(WNOWAIT)`, and its `Z` state read
-back from `/proc` **before** the scan runs. Deleting the exclusion now fails **10/10** where the
-old fixture failed **0/30**. A fixture that cannot exhibit the condition it names is not a
-fixture, and the only reason this one looked like evidence is that nobody weakened it.
-
-**Still true and still owed:** R29-05's `Unreaped` branch is UNCONSTRUCTED, and this row does
-not observe reaping.
-
-**Scope unchanged:** the test runs a binary built with `insecure-test-seams`, whose logind gate
-is bypassable. It certifies the **shutdown assembly** and **nothing about the production logind
-gate**, which stays blocked on a seated lane.
+**Scope.** All of the above is lane run 20, one daemon, one child, one group, one instant. The
+scan's ability to see that child establishes reachability for that run; it does not establish
+continuous membership between the sighting and the sample, nor that any historical run's empty
+result meant the same thing.
 
 ### The cost, stated plainly: FOUR root runs, THREE lost to my own assertions
 

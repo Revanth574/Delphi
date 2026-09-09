@@ -2930,11 +2930,20 @@ fails to match. A normaliser tested only on already-clean input is a no-op with 
 filter is not the mechanism) — there post-processing discarded a true result; here rendering
 manufactures a false one.
 
-## 53. A TWO-WAY AMBIGUITY RESOLVED BY A RULE RATHER THAN BY EVIDENCE RESOLVES TOWARD WHATEVER THE RULE'S AUTHOR WANTED  *(new — D0A-R33-03, found by the reviewer constructing the case the rule gets wrong)*
+## 53. UNSUPPORTED CAUSAL ATTRIBUTION — a diagnostic naming a cause its evidence cannot distinguish  *(new — D0A-R33-03; RETITLED at D0A-R34 because the first title made an unsupported claim of its own)*
 
-**The shape.** A diagnostic cannot distinguish two causes, so it ships a *rule* for deciding
-between them — "if the census is non-empty, it's the instrument". The rule looks like analysis.
-It is a default, and the author picks the default while knowing which answer is convenient.
+**The shape.** Two different causes can produce the same evidence, so a deterministic choice
+between them is not identification. The diagnostic ships a *rule* — "if the census is non-empty,
+it's the instrument" — which looks like analysis and is a default.
+
+**THE TITLE'S OWN CORRECTION IS PART OF THE ENTRY.** It first read *"resolves toward whatever
+the rule's author wanted"*, and that was itself an unsupported claim — about motive, which is
+neither provable nor necessary. A wrong classifier arises just as easily from a mistaken
+assumption as from a preference, and the engineering defect is fully established without
+attributing either. Naming the class after the mechanism (*unsupported causal attribution*)
+rather than the author's state of mind is the weaker claim, which is why it holds. A class about
+unsupported inference that opened with an unsupported inference would not have survived contact
+with its own rule.
 
 **The instance.** The assembly positive control failed in two ways that present identically:
 the scan cannot reach the daemon's children (a finding about the ASSEMBLY, which would have
@@ -2948,10 +2957,12 @@ named AI sitting in another group**. That is a topology defect receiving the dia
 preserves the closure. The rule was not reading evidence; it was picking the reading its author
 wanted, and its author was the party whose closure was at stake.
 
-**Why it is not class 45 or 51.** 45 is asserting an absence you cannot measure; 51 is a false
-claim in a trusted record. This is neither — every individual statement was true, and the
-defect is in the *decision procedure* that maps evidence to cause. A wrong rule produces a
-confident, well-evidenced, wrong attribution.
+**Why it is not class 45 or 51.** 45 is asserting an absence you cannot measure; this error
+occurs with positive observations and no universal absence claim. 51 is a false claim in a
+trusted record. The defect here is in the *decision procedure* that maps evidence to cause.
+(A second correction: the entry first said "every individual statement was true". It was not —
+*"this is a defect in the control"* was FALSE in the constructed case. The claim was made to
+sharpen the contrast with 51 and it overstated.)
 
 **The foreclosing discipline.** *Where a diagnostic cannot separate two causes from what it
 has, it must collect what would separate them — or return UNRESOLVED. It must never choose.*
@@ -2964,6 +2975,22 @@ UNRESOLVED, and the third is a real outcome rather than a fallback.
 A rule is only ever tested by its counterexample; running it on the case it was written for
 proves nothing, which is why this survived a round.
 
-**A blunt test for the class, applicable before any evidence exists.** *If the rule had come out
-the other way, would you have accepted it as readily?* If not, it is a preference wearing a
-decision procedure's clothes.
+**THE ENGINEERING TEST, which is the strong one:** *construct distinct causes compatible with
+the same observed record.* If they exist, the diagnostic must remain UNRESOLVED unless it
+collects a discriminator. Expected-case tests are useful and do not establish exclusivity.
+
+**A bias check, useful but NOT a correctness test:** *if the rule had come out the other way,
+would you have accepted it as readily?* It can flag a preference; it cannot certify a rule,
+because a rule can be wrong with no preference behind it at all.
+
+**THE REPLACEMENT INHERITED THE CLASS IT WAS CLOSING (D0A-R34-01/02), which is class 22's
+shape and is the entry's most useful instance.** The rule was replaced by an observer that
+made two further attributions its evidence could not support: **identity by name** (any process
+called `sai` was treated as this run's AI, so a namesake could turn an unresolved failure into
+a confident TOPOLOGY diagnosis) and **liveness by absence of state** (a zombie was counted as a
+live sighting, so a corpse the live scanner correctly excluded became proof the scanner had
+missed something). The fix now requires provenance (`ppid`) and liveness (`state`) before any
+causal claim, and an overlapping observation window before concluding a live scan missed a
+subject. **A third instance, pre-existing and found by auditing under this class:** the mutation
+campaign's outcome classifier read cause from arbitrary assertion text, so a test asserting on
+the literal `"Killed"` was classified INFRASTRUCTURE (D0A-R34-05).

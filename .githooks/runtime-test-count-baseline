@@ -245,5 +245,15 @@
 # `pthread_kill` aimed at the blocked thread rather than the process. RED-proven: deleting
 # `Err(EINTR) => continue` fails 10/10 with `unexpected wait status: Err(EINTR)`; restored it
 # passes 30/30 under DEFAULT parallel settings, per the timing-shaped rule in CLAUDE.md §6.
-EXECUTED=201
+#
+# +2 (201 -> 203): D0A-R34-01/02. `control_verdicts_require_provenance_and_liveness_before_
+# naming_a_cause` and `proc_records_carry_provenance_and_state_for_a_real_child`. The three
+# control verdicts shipped in round 33 UNEXECUTED — inside an assertion that fires only when a
+# root-gated test's control fails — so they were compiled and never evaluated. Extracting the
+# decision into a pure function over explicit records makes every branch reachable without
+# root, which is what the reviewer asked for. Each of the three discriminators is RED-proven
+# and fails on the case it targets: dropping provenance makes a NAMESAKE decide Topology,
+# dropping liveness makes a CORPSE decide Scan, dropping the overlapping-window rule makes a
+# SINGLE MISS decide Scan.
+EXECUTED=203
 SKIPPED=26

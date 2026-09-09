@@ -6,7 +6,9 @@
 #   EXECUTED 221 / SKIPPED 6 / reported 227     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
 #   predicted 221/6/227, committed ALONE and BEFORE the run — and MATCHED EXACTLY
-#   membership: root 227 identities / unpriv 227, ZERO in either direction, rc 0
+#   membership: OPERATOR REPORTED 227/227, ZERO in either direction — comparison inputs were
+#               NOT retained; INDEPENDENTLY UNAUDITABLE (D0A-R34). Matching totals do not
+#               substitute for an identity-set comparison, which is why §4b exists at all.
 #
 # =========================================================================================
 # TWO PROCESS FAILURES FIRST, BECAUSE THE RESULT IS GOOD AND THAT IS WHEN THEY GET BURIED

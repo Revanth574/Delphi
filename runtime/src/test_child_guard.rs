@@ -279,6 +279,22 @@ mod eintr_tests {
     /// reproduced the pre-fix failure with an external probe; by this project's own rule an
     /// unretained probe is not coverage, so the condition is constructed here.
     ///
+    /// **D0A-R34: MY SCOPING OF THE SENDER FIX WAS WRONG, AND UNDER-CLAIMING IS STILL WRONG.**
+    /// I reported the unwind-safe cleanup (D0A-R33-02) as "defence in depth, not a proven
+    /// impact", because my two-factor weaken gave `168 passed; 1 failed` in both shapes. That
+    /// measurement was observing the wrong property: aggregate pass/fail counts cannot see a
+    /// stray sender. The reviewer measured the mechanism — the test thread's identity is
+    /// REUSED by a later thread, which before the fix received 51/53/54 signals over 300 ms
+    /// and had an unrelated `waitpid` return EINTR, and after it received zero. So the fix has
+    /// demonstrated downstream impact. An honest under-claim is not automatically a safe one;
+    /// it was as unsupported as the over-claim would have been, and is recorded rather than
+    /// silently upgraded.
+    ///
+    /// Also corrected: I guessed a stale `pthread_t` would merely yield `ESRCH`. Unwinding a
+    /// function does not expire a thread ID, and `pthread_kill` against an expired one is
+    /// UNDEFINED, not `ESRCH` — in the reuse case the stale sender targets a different LIVE
+    /// thread.
+    ///
     /// **How the interruption is made to happen rather than hoped for:** the handler is
     /// installed with `SaFlags::empty()` — SA_RESTART deliberately ABSENT, because with it the
     /// kernel restarts `waitpid` transparently and `EINTR` never reaches the code under test.

@@ -29,6 +29,7 @@ import importlib.util
 import json
 import pathlib
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -469,6 +470,73 @@ def guard_dirty_instrument_is_refused() -> None:
           ident["sha256"] == _h.sha256(inst.read_bytes()).hexdigest(), ident["sha256"][:16])
 
 
+def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
+    """D0A-R34-05 — the reviewer's counterexamples, through the REAL classifier.
+
+    Their probe changed only the EXPECTED VALUE of a real libtest assertion: `ordinary payload`
+    gave CAUGHT, `Killed` gave INFRASTRUCTURE, `DELPHI_PRECONDITION_FAILED` gave PRECONDITION
+    FAILURE — same exit 101, same named failing test. A genuine property failure was discarded
+    because its data contained a marker.
+    """
+    def transcript(expected: str) -> str:
+        return (
+            "running 1 test\n"
+            "test the_property ... FAILED\n\n"
+            "failures:\n\n"
+            "---- the_property stdout ----\n"
+            "thread 'the_property' panicked at runtime/src/x.rs:1:1:\n"
+            "assertion `left == right` failed\n"
+            '  left: "altered payload"\n'
+            f'  right: "{expected}"\n\n'
+            "failures:\n"
+            "    the_property\n\n"
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+
+    def classify(stdout: str, code: int = 101) -> tuple[str, dict]:
+        prev = os.environ.get("DELPHI_MUTATION_TEST_CMD")
+        os.environ["DELPHI_MUTATION_TEST_CMD"] = (
+            "python3 -c " + shlex.quote(
+                f"import sys; sys.stdout.write({stdout!r}); sys.exit({code})"))
+        try:
+            return mc.run_suite()
+        finally:
+            if prev is None:
+                del os.environ["DELPHI_MUTATION_TEST_CMD"]
+            else:
+                os.environ["DELPHI_MUTATION_TEST_CMD"] = prev
+
+    for expected in ("ordinary payload", "Killed", "DELPHI_PRECONDITION_FAILED"):
+        outcome, ev = classify(transcript(expected))
+        check(f"markers: an assertion expecting {expected!r} is still CAUGHT",
+              outcome == "CAUGHT",
+              f"classified {outcome} — a detection was discarded because its DATA "
+              f"contained a marker")
+        if expected != "ordinary payload":
+            seen = ev.get("markers_seen_as_data", []) + ev.get(
+                "precondition_markers_seen_as_data", [])
+            check(f"markers: {expected!r} is recorded as data that was CONSIDERED",
+                  bool(seen), f"evidence kept no note of it: {ev.get('markers_seen_as_data')}")
+
+    # And the genuine events must still be detected, or this is not a narrowing but a deletion.
+    outcome, _ = classify("error: could not compile `delphi-runtime` (lib test)\n", 101)
+    check("markers: a PRODUCER compile failure is still INFRASTRUCTURE",
+          outcome == "INFRASTRUCTURE", outcome)
+    genuine = (
+        "running 1 test\n"
+        "test t ... FAILED\n\n"
+        "failures:\n\n"
+        "---- t stdout ----\n"
+        "thread 't' panicked at runtime/src/y.rs:1:1:\n"
+        "DELPHI_PRECONDITION_FAILED: before this test ran — a session is live on tty1\n\n"
+        "failures:\n    t\n\n"
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+    )
+    outcome, _ = classify(genuine)
+    check("markers: a token EMITTED as a panic message is still PRECONDITION FAILURE",
+          outcome == "PRECONDITION FAILURE", outcome)
+
+
 def guard_cleanup_failure_is_visible_and_retryable() -> None:
     """D0A-R33-01 — a cleanup that CANNOT FAIL cannot be trusted to have happened.
 
@@ -495,6 +563,37 @@ def guard_cleanup_failure_is_visible_and_retryable() -> None:
     check("cleanup: the retry succeeds once the obstruction is gone", ok is True, f"{ok!r}")
     check("cleanup: and the directory is actually gone", not os.path.exists(parent), parent)
     check("cleanup: ownership is released only after success", not mc._WORKTREE, f"{mc._WORKTREE!r}")
+
+
+def guard_cleanup_verifies_the_git_registration_too() -> None:
+    """D0A-R34-03 — the filesystem is not the only resource this harness owns.
+
+    A LOCKED worktree keeps its entry in `git worktree list` after the directory is gone, since
+    `prune` refuses locked entries by documented design. Verifying only file absence therefore
+    reported success while forgetting a registration — and exit 4 could not catch it, because
+    the cleanup predicate itself was falsely true.
+    """
+    sha = mc.sh(["git", "rev-parse", "HEAD"]).stdout.strip()
+    path = str(mc.make_isolated_checkout(sha))
+    mc.sh(["git", "worktree", "lock", path])
+    try:
+        ok = mc.remove_isolated_checkout()
+        listed = mc.sh(["git", "worktree", "list", "--porcelain"]).stdout
+        check("registration: a LOCKED entry makes cleanup report FAILURE", ok is False,
+              f"returned {ok!r} while {path} was still registered")
+        check("registration: and the entry really is still there",
+              any(l.strip() == f"worktree {path}" for l in listed.splitlines()), listed)
+        check("registration: ownership is retained for the retry",
+              mc._WORKTREE.get("path") == path, f"{mc._WORKTREE!r}")
+    finally:
+        mc.sh(["git", "worktree", "unlock", path])
+        mc.sh(["git", "worktree", "remove", "--force", path])
+        mc.sh(["git", "worktree", "prune"])
+        shutil.rmtree(mc._WORKTREE.get("parent", "/nonexistent"), ignore_errors=True)
+        mc._WORKTREE.clear()
+    listed = mc.sh(["git", "worktree", "list", "--porcelain"]).stdout
+    check("registration: the guard leaves nothing of its own behind",
+          not any(l.strip() == f"worktree {path}" for l in listed.splitlines()), listed)
 
 
 def guard_checkout_collected_on_every_exit_path() -> None:
@@ -589,7 +688,9 @@ def main() -> int:
     guard_cancellation_kills_descendants()
     guard_dirty_refusal()
     guard_dirty_instrument_is_refused()
+    guard_markers_in_assertion_data_do_not_decide_cause()
     guard_cleanup_failure_is_visible_and_retryable()
+    guard_cleanup_verifies_the_git_registration_too()
     guard_checkout_collected_on_every_exit_path()
     print(f"\n{len(CHECKS)} guards held")
     return 0

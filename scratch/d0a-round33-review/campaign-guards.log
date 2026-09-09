@@ -1,0 +1,54 @@
+
+CASE restored
+  [OK ] instrument: a dirty harness is REFUSED, not warned about
+  [OK ] instrument: the campaign BODY never ran (no lane.json was written)
+  [OK ] instrument: no isolated checkout was even created
+  [OK ] instrument: the refusal names the harness
+  [OK ] instrument: the refusal explains that the checkout does not cover it
+  [OK ] instrument: a refused run leaves no checkout behind
+  [OK ] instrument: the recorded digest is of the executing bytes
+  [OK ] lifetime: a red baseline refuses
+  [OK ] lifetime: the baseline refusal leaves no mkdtemp parent
+  [OK ] lifetime: the baseline refusal leaves no registered worktree
+  [OK ] lifetime: the exception propagates (it is not swallowed)
+  [OK ] lifetime: an ORDINARY EXCEPTION still collects the mkdtemp parent
+  [OK ] lifetime: an ORDINARY EXCEPTION still collects the worktree
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign publishes the live worker's identity
+  [OK ] signal: the WORKER's group is alive before cancellation
+  [OK ] signal: the WORKER's group dies PROMPTLY, before the campaign is waited on
+  [OK ] signal: the campaign exits non-zero after SIGTERM
+  [OK ] signal: the WORKING TREE source is untouched
+  [OK ] signal: the working tree still matches the commit
+  [OK ] signal: the WORKER's group is still gone once the campaign has exited
+  [OK ] signal: nothing survives in the campaign's own group either
+  [OK ] signal: no isolated checkout is left behind
+  [OK ] signal: no mkdtemp parent is left behind either
+RESULT restored: PASS
+
+CASE C refusal
+  [OK ] instrument: a dirty harness is REFUSED, not warned about
+RESULT C refusal: GUARD FAILED: instrument: the campaign BODY never ran (no lane.json was written) — lane.json exists, so the refusal did not stop the campaign — it continued and some later check produced the exit code
+
+CASE A parent cleanup
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign publishes the live worker's identity
+  [OK ] signal: the WORKER's group is alive before cancellation
+  [OK ] signal: the WORKER's group dies PROMPTLY, before the campaign is waited on
+  [OK ] signal: the campaign exits non-zero after SIGTERM
+  [OK ] signal: the WORKING TREE source is untouched
+  [OK ] signal: the working tree still matches the commit
+  [OK ] signal: the WORKER's group is still gone once the campaign has exited
+  [OK ] signal: nothing survives in the campaign's own group either
+  [OK ] signal: no isolated checkout is left behind
+RESULT A parent cleanup: GUARD FAILED: signal: no mkdtemp parent is left behind either — leaked directories: ['/tmp/d0a-r33-campaign-bcs8os3b/tmp/delphi-mutation-wt-8t54i_4c']
+
+CASE D lifetime
+  [OK ] lifetime: a red baseline refuses
+RESULT D lifetime: GUARD FAILED: lifetime: the baseline refusal leaves no mkdtemp parent — ['/tmp/d0a-r33-campaign-bcs8os3b/tmp/delphi-mutation-wt-won7juv0']
+
+CASE B group killer
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign publishes the live worker's identity
+  [OK ] signal: the WORKER's group is alive before cancellation
+RESULT B group killer: GUARD FAILED: signal: the WORKER's group dies PROMPTLY, before the campaign is waited on — worker group 9470 still had ['9470', '9471'] 1.5s after SIGTERM; with the killer disabled it survives this window and only exits on its own at ~3s

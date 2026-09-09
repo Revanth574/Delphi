@@ -1,0 +1,4 @@
+cleanup: {"returned_normally": true, "parent_survives": true, "tree_survives": true, "ownership_record": {}, "registered": false}
+eintr_restored: panicked=false signals_after_return=0 exit=0
+eintr_weakened: panicked=true signals_after_return=7 exit=0
+control_attribution: seen=[] census=[(9609, 'S', "sleep")] samples=22 ai_pgid=9608 exit=0

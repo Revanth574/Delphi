@@ -1,0 +1,12 @@
+lane acceptance for scratch/lane-run-25
+  [OK ] hygiene: helper digest aba0f0ea14b751aa… installed == staged
+  [OK ] freshness: freshness: 17 executables identical across a forced rebuild
+  [REFUSE] producers: 1 producer(s) exited nonzero: ['101\t/home/revanth-aditya/delphi-target/debug/deps/b1_integration-a7c2e331dd4d01c3']
+  [OK ] membership: membership: 232 identities each side, zero either way
+  [REFUSE] control: part-b-negative-control.txt records no `verdict:` line — a negative control with no verdict establishes nothing about whether the control can DISCRIMINATE
+  [OK ] ordering: ordering: freshness proven before the run; membership computed after it
+
+VERDICT: REFUSED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.

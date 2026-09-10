@@ -2314,7 +2314,27 @@ fn the_control_reports_topology_when_the_daemons_child_leaves_its_group() {
          the right answer for the wrong reason. census: {:?}",
         o.census
     );
-    eprintln!("NEGATIVE CONTROL: verdict {:?}, from {outside:?}", o.verdict);
+    // FORMAT MATTERS: the verifier reads `verdict: <Name>`, and this line said `verdict Topology`
+    // without the colon — so run 25's negative control returned `Topology` and the gate refused
+    // the run for "no verdict line". The observation was right and unreadable by the thing that
+    // consumes it, which is the same shape as the fixture that detached but could not be found.
+    //
+    // DEDUPLICATED: `outside` collects a record per iteration, so a 140-second run emitted the
+    // same ProcRecord ~190 times into the retained artifact. Evidence nobody can read is a
+    // weaker artifact than evidence that fits on a screen.
+    let mut distinct: Vec<&ProcRecord> = Vec::new();
+    for r in &outside {
+        if !distinct.iter().any(|q| q.pid == r.pid && q.starttime == r.starttime) {
+            distinct.push(r);
+        }
+    }
+    eprintln!(
+        "NEGATIVE CONTROL: verdict: {:?}, from {} distinct record(s) across {} sighting(s): \
+         {distinct:?}",
+        o.verdict,
+        distinct.len(),
+        outside.len()
+    );
 }
 
 /// Spawn the daemon against a given AI binary and OBSERVE the control, through one path.

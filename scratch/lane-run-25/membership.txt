@@ -1,0 +1,3 @@
+root 232 / unpriv 232
+IN ROOT NOT UNPRIV: 0
+IN UNPRIV NOT ROOT: 0

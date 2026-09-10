@@ -1,0 +1,1 @@
+no stale sessions opened by delphi-runtime

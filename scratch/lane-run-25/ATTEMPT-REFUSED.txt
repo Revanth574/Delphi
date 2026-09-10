@@ -1,0 +1,88 @@
+LANE RUN 25 — REFUSED. NOT ACCEPTANCE. But it answered the question the arc has been
+carrying, and it split run 24's two failures into two different items.
+
+=========================================================================================
+1. THE NEGATIVE CONTROL PRODUCED `Topology`. THE CONTROL DISCRIMINATES.
+=========================================================================================
+
+    NEGATIVE CONTROL: verdict Topology, from
+      ProcRecord { pid: 32595, ppid: 32440, pgid: 32595, state: 'S', starttime: 212656 }
+
+`ppid 32440` is the daemon; `pgid 32595` is the child itself. A VERIFIED live child of the
+daemon, OUTSIDE the daemon's process group — the exact input `Topology` names, produced by
+a real daemon rather than a constructed record.
+
+**What this settles.** Four `Reached` verdicts (runs 20, 21, 23, 24) were consistent with a
+control that had never discriminated — `DEFECT_CLASSES` 49's silence. They are now reports
+from an instrument SHOWN to detect a topology defect it would otherwise have passed. The
+value of this observation is retrospective, exactly as the expectation said it would be.
+
+**Its provenance, stated because the run was refused.** This observation is a discrete,
+retained, independently checkable measurement (`part-b-negative-control.txt`), and the
+refusal was for a producer failure in an unrelated test plus a format defect in my own
+verifier — neither touching this. The RUN is not accepted and does not certify the lane.
+The OBSERVATION stands on its artifact. Those are different claims and both are made here.
+
+=========================================================================================
+2. RUN 24's TWO FAILURES ARE NOW TWO DIFFERENT ITEMS
+=========================================================================================
+
+The expectation named three cases before the run. The result is a mix of two of them, and
+splitting it is the point of having named them:
+
+  the_daemon_binary_runs_the_real_gate_d0a_r4_03   FAILED 2/2  -> **PERSISTENT**
+  b1_token_expiry_blocks_the_assembled_loop        FAILED 1/2  -> INTERMITTENT
+
+**PERSISTENT is case 2, and by the expectation's own words it "outranks everything else in
+the arc": the daemon's shell setup failing at root is the trust boundary's own path.** Same
+failure both runs: `shell child failed before execve: pam_open_session failed`.
+
+**The environmental hypothesis is RULED OUT for this run.** The pre-run stale-session check
+— added for exactly this — reported `no stale sessions opened by delphi-runtime` BEFORE the
+lane, and again after. A leftover session is not the cause here.
+
+**AN ORDERING HYPOTHESIS WAS TESTED AND DOES NOT HOLD.** The two tests added since run 23
+change what runs immediately before the failing test: run 23 had
+`terminal_contract_release_produces_eof_no_wedge` directly before it, run 25 has
+`the_control_reports_topology_…` in between. But that test SKIPS instantly in the
+featureless build, so it adds negligible time and removes no slack. Checked against both
+retained logs; it does not explain a 2/2 failure.
+
+**WHAT REMAINS: a correlation with no mechanism.** Runs WITH the two new tests: 2/2 failed.
+Runs WITHOUT: 0/3. That is a real correlation with my commit range — and the only mechanism
+I could construct from it has just been falsified. I am not calling it my change and not
+calling it environmental; both are unsupported.
+
+**THE DIAGNOSTIC THAT WOULD DECIDE IT is a bisect at root:** run
+`the_daemon_binary_runs_the_real_gate_d0a_r4_03` alone on this tree, then on run 23's
+commit (`b51bd8f`), several times each. Same binary, same box, one variable. That needs
+root and has not been done.
+
+=========================================================================================
+3. THE GATE REFUSED FOR ONE REAL REASON AND ONE OF MY OWN DEFECTS
+=========================================================================================
+
+  [REFUSE] producers: 1 producer exited nonzero      <- REAL: the persistent failure above
+  [REFUSE] control: no `verdict:` line                <- MINE
+
+The second is instructive. The test printed `verdict Topology` and the verifier reads
+`verdict: <Name>` — **no colon.** So the negative control produced the right answer and the
+consumer could not read it, and the gate refused a run for a check that had in fact passed.
+
+**That is the same shape as the fixture defect it was verifying:** run 24's shim detached
+correctly and could not be FOUND; run 25's control discriminated correctly and could not be
+READ. In both cases the thing worked and the interface to it did not. Fixed, along with
+deduplicating the record list — a 140-second run emitted the same ProcRecord ~190 times into
+the artifact, and evidence nobody can read is a weaker artifact than evidence that fits on a
+screen.
+
+=========================================================================================
+4. THE COUNT
+=========================================================================================
+
+  measured 223 / 8 / 231 against predicted 224 / 8 / 232
+
+The derivation was right for the second consecutive run: §4b measured 232 identities at root
+and 232 unprivileged, ZERO in either direction, with exactly the 8 predicted skips.
+`EXECUTED` counts passing tests, so 232 − 8 skipped − 1 failed = 223. The prediction assumes
+every non-skipped test passes; one did not.

@@ -101,6 +101,27 @@ a namesake. The census again returns three processes rather than the target alon
 evidence that the scanner enumerates rather than matches — and this time that evidence is in
 `scratch/lane-run-23/part-b-control.txt` rather than in someone's terminal.
 
+**THE CONTROL HAS BEEN SHOWN TO DISCRIMINATE (lane run 25).** Four `Reached` verdicts (runs
+20, 21, 23, 24) were consistent with a control that had never detected anything — class 49's
+silence, and the reason a negative control was built. Against a daemon whose AI calls
+`setpgid(0,0)` before `exec`, the same probe and the same classifier returned:
+
+```
+NEGATIVE CONTROL: verdict Topology, from
+  ProcRecord { pid: 32595, ppid: 32440, pgid: 32595, state: 'S', starttime: 212656 }
+```
+
+`ppid` is the daemon, `pgid` is the child itself: a verified live child outside the group, from
+a real daemon rather than a constructed record. **The prior `Reached` verdicts are therefore
+reports from an instrument shown to detect a topology defect it would otherwise pass** — which
+is retrospective value, and was named as such before the run.
+
+**Provenance, because run 25 was REFUSED.** The refusal was for a producer failure in an
+unrelated test and a format defect in the verifier (the control printed `verdict Topology`; the
+verifier reads `verdict:` with a colon). Neither touches this measurement, which is retained in
+`scratch/lane-run-25/part-b-negative-control.txt`. The RUN does not certify the lane; the
+OBSERVATION stands on its artifact. An accepted run reproducing it is owed.
+
 **Run 23 is also the first lane run accepted by machine rather than by convention**
 (`acceptance.txt`, all six checks). That does not strengthen this row's claim; it means the
 claim's supporting evidence was verified present, passing and in order — including that

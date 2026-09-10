@@ -1,0 +1,528 @@
+### /home/revanth-aditya/delphi-target/debug/deps/anchor-4feba54a67cad43f
+
+running 2 tests
+test anchor_is_unsubstitutable_yet_connectable ... ok
+test red_proof_user_owned_dir_lets_attacker_unlink ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/b1_integration-a7c2e331dd4d01c3
+
+running 21 tests
+test b1_a_snapshot_mismatch_consumes_the_approval_and_blames_the_snapshot ...   outcome: Denied { pending_id: "act-0", reason: "the sealed executable snapshot does not match the approved digest (approval consumed — one-shot)" }
+ok
+test b1_approve_a_execute_b_is_rejected ... ok
+test b1_daemon_binary_runs_the_assembled_flow ... SKIP b1_daemon_binary: requires `--features insecure-test-seams` (the gate-bypass seam the real daemon binary needs in the test env). Run: `cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration`. Without it the real gate correctly DENIES the non-foreground tty1 session — not a defect.
+ok
+test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... SKIP b1_daemon_bounds_an_ai...: requires `--features insecure-test-seams` (the gate-bypass seam AND the stubborn-AI fixture are both feature-gated). Run: `cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration`
+ok
+test b1_happy_path_one_action_through_the_assembled_loop ... [minimal-ai] pending_id = act-0
+[minimal-shell] approval preview over the private channel:
+preview_version=3
+  argv[0]="tool"
+  argv[1]="B1-LIVES"
+  cwd="/"
+  net=none
+  bind[0]: mode=ro path="/usr"
+  bind[1]: mode=ro path="/bin"
+  bind[2]: mode=ro path="/lib"
+  bind[3]: mode=ro path="/lib64"
+  bind[4]: mode=rw path="/run/delphi-b1-ulgJAm/work"
+  timeout=30s
+  tier=Confirm
+  exe_digest=fc51d84100e2ed4d821820c24e34492ea018bf888c89a09ff7b0e9b070a7c216
+  script.interp_digest=c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917
+  script.interp_arg=(none)
+  script.content_digest=fc51d84100e2ed4d821820c24e34492ea018bf888c89a09ff7b0e9b070a7c216
+
+[minimal-shell] approved + mint-confirm sent
+[minimal-ai] received token
+[minimal-ai] terminal: Some(Completed(Completed { pending_id: "act-0", exit_code: 0 }))
+ok
+test b1_launcher_keeps_the_channel_out_of_the_ai ... /run/delphi-b1fd-WbuvDD/sleeper.sh: 2: 3: Bad file descriptor
+ok
+test b1_logind_deny_blocks_the_assembled_loop ... [minimal-ai] pending_id = act-0
+
+thread 'main' (7818) panicked at runtime/src/bin/delphi-minimal-ai.rs:60:18:
+expected Granted, got Some(Denied(Denied { pending_id: "act-0", reason: "logind: the shell's session is not the seat's foreground, attached to NO seat" }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (7666) panicked at runtime/src/bin/delphi-minimal-shell.rs:44:57:
+recv approval request: Protocol("approval request shorter than digest")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+test b1_session_lost_during_pam_blocks_the_mint_d0a_r1_02 ... [minimal-ai] pending_id = act-0
+[minimal-shell] approval preview over the private channel:
+preview_version=3
+  argv[0]="tool"
+  argv[1]="B1-LIVES"
+  cwd="/"
+  net=none
+  bind[0]: mode=ro path="/usr"
+  bind[1]: mode=ro path="/bin"
+  bind[2]: mode=ro path="/lib"
+  bind[3]: mode=ro path="/lib64"
+  bind[4]: mode=rw path="/run/delphi-r102-qKLF97/work"
+  timeout=30s
+  tier=Confirm
+  exe_digest=f55883863a7582a3c5808eb0188ff6429d285e268f8614733d908b1d458e53d3
+  script.interp_digest=c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917
+  script.interp_arg=(none)
+  script.content_digest=f55883863a7582a3c5808eb0188ff6429d285e268f8614733d908b1d458e53d3
+
+[minimal-shell] approved + mint-confirm sent
+
+thread 'main' (8055) panicked at runtime/src/bin/delphi-minimal-ai.rs:60:18:
+expected Granted, got Some(Denied(Denied { pending_id: "act-0", reason: "logind: the shell session stopped being active+local+seated DURING authentication - the seat's foreground moved, so this consent is not one a human at the seat gave" }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+test b1_shebang_interpreter_arg_reaches_exec ... ok
+test b1_swap_after_canonicalize_runs_the_pinned_content ... ok
+test b1_token_expiry_blocks_the_assembled_loop ... [minimal-shell] approval preview over the private channel:
+preview_version=3
+  argv[0]="tool"
+  argv[1]="SHOULD-NOT-RUN"
+  cwd="/"
+  net=none
+  bind[0]: mode=ro path="/usr"
+  bind[1]: mode=ro path="/bin"
+  bind[2]: mode=ro path="/lib"
+  bind[3]: mode=ro path="/lib64"
+  bind[4]: mode=rw path="/run/delphi-b1exp-pb1kB7/work"
+  timeout=30s
+  tier=Confirm
+  exe_digest=19a5f510c7c3e2eb9c8a4c909a8d17c738f8cb1a12bb618447c51db024ebae17
+  script.interp_digest=c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917
+  script.interp_arg=(none)
+  script.content_digest=19a5f510c7c3e2eb9c8a4c909a8d17c738f8cb1a12bb618447c51db024ebae17
+
+[minimal-ai] pending_id = act-0
+[minimal-shell] approved + mint-confirm sent
+[minimal-ai] received token
+[minimal-ai] terminal: Some(Denied(Denied { pending_id: "act-0", reason: "token does not verify against the stored action's digest" }))
+ok
+test b1_verified_then_execution_failed_consumes_the_approval ... ok
+test b1_wrong_token_does_not_burn_the_approval ... ok
+test chain_gap_approved_path_selects_the_impostor_and_the_preview_discloses_it ... chain-gap: exit=Some(0)
+  child stderr: 
+  child stdout: 
+chain-gap: preview =
+preview_version=3
+  argv[0]="env"
+  argv[1]="unused-argv"
+  cwd="/"
+  env[0]: name="PATH" value="/tmp/delphi-chain-gap-E61AQJ/bin"
+  net=none
+  bind[0]: mode=ro path="/usr"
+  bind[1]: mode=ro path="/bin"
+  bind[2]: mode=ro path="/lib"
+  bind[3]: mode=ro path="/lib64"
+  bind[4]: mode=rw path="/tmp/delphi-chain-gap-E61AQJ"
+  timeout=30s
+  tier=Confirm
+  exe_digest=a1653feaf5f63d97f465f3efe9829851fde4f4df488a00df3a1ed531c3bbd4c7
+  script.interp_digest=48893b0fb21436b54619db80486e83ef39dfccaf1aefe83dfa00c02d6146e8c0
+  script.interp_arg="python3" (the string is bound; any PROGRAM it names is resolved by the interpreter at run time and is NOT bound)
+  script.content_digest=a1653feaf5f63d97f465f3efe9829851fde4f4df488a00df3a1ed531c3bbd4c7
+
+chain-gap CONTROL: exit=Some(0) witness="py3|/bin/python3.14" stderr=
+ok
+test control_verdicts_require_provenance_and_liveness_before_naming_a_cause ... ok
+test live_group_members_finds_a_survivor_reports_unknowns_and_skips_a_real_zombie ... ok
+test proc_records_carry_provenance_and_state_for_a_real_child ... ok
+test strip_ansi_recovers_the_field_text_tracing_actually_emits ... ok
+test terminal_contract_release_produces_eof_no_wedge ... ok
+test the_daemon_binary_runs_the_real_gate_d0a_r4_03 ...   [leg 1 witness] DELPHI_GATE_WITNESS Resolved(SessionSnapshot { active: false, remote: false, seated: true })
+ok
+test the_real_logind_source_resolves_the_shells_session_d0a_r4_03 ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.92s
+
+### /home/revanth-aditya/delphi-target/debug/deps/delphi_minimal_ai-5eaa1453607e6e6f
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/delphi_minimal_shell-160067665f9ebee4
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/delphi_runtimed-2c88e8e6fed8a444
+
+running 11 tests
+test system_account_guard::a_distinct_system_tool_account_is_admitted ... ok
+test system_account_guard::a_regular_uid_is_admitted ... ok
+test system_account_guard::a_tool_account_sharing_the_session_identity_is_refused ... ok
+test system_account_guard::an_inverted_login_range_is_refused_and_a_normal_one_is_not ... ok
+test system_account_guard::an_out_of_range_value_falls_back_rather_than_truncating ... ok
+test system_account_guard::an_unreadable_login_defs_refuses_where_an_absent_one_defaults ... SKIP an_unreadable_login_defs_refuses…: measured blocker: this uid can read a 0000 file
+ok
+test system_account_guard::every_system_account_shape_is_refused ... ok
+test system_account_guard::range_is_read_from_login_defs_and_falls_back_when_absent ... ok
+test system_account_guard::root_is_refused_even_when_the_range_would_admit_it ... ok
+test system_account_guard::the_credential_plan_is_resolved_once_validated_and_propagates_errors ... ok
+test system_account_guard::the_grammar_agrees_with_shadows_measured_behaviour ...   plain                          shadow=5000   ours=5000   agree
+  leading spaces                 shadow=5000   ours=5000   agree
+  leading tab                    shadow=5000   ours=5000   agree
+  hex                            shadow=5000   ours=5000   agree
+  hex, capital X                 shadow=5000   ours=5000   agree
+  octal                          shadow=5000   ours=5000   agree
+  plus-prefixed                  shadow=5000   ours=5000   agree
+  many blanks before the value   shadow=5000   ours=5000   agree
+  trailing blanks                shadow=5000   ours=5000   agree
+  double-quoted                  shadow=5000   ours=5000   agree
+  opening quote only             shadow=5000   ours=5000   agree
+  closing quote only             shadow=5000   ours=5000   agree
+  quoted, then trailing blanks   shadow=5000   ours=5000   agree
+  quoted hex                     shadow=5000   ours=5000   agree
+  no trailing newline            shadow=5000   ours=5000   agree
+  bare zero                      shadow=0      ours=0      agree
+  trailing comment               shadow=1000   ours=1000   agree
+  single-quoted                  shadow=1000   ours=1000   agree
+  blanks inside the quotes       shadow=1000   ours=1000   agree
+  CRLF line ending               shadow=1000   ours=1000   agree
+  sign after the radix prefix    shadow=1000   ours=1000   agree
+  key=value                      shadow=1000   ours=1000   agree
+  commented out                  shadow=1000   ours=1000   agree
+  indented comment               shadow=1000   ours=1000   agree
+  lowercase key                  shadow=1000   ours=1000   agree
+  negative                       shadow=1000   ours=1000   agree
+  empty value                    shadow=1000   ours=1000   agree
+  duplicate keys — last wins     shadow=6000   ours=6000   agree
+  quoted, then a comment         shadow=5000   ours=5000   agree
+  two leading quotes             shadow=5000   ours=5000   agree
+  terminates at the first quote  shadow=5000   ours=5000   agree
+  three quotes each side         shadow=5000   ours=5000   agree
+  quotes around a hex value      shadow=5000   ours=5000   agree
+  a quote INSIDE the digits      shadow=50     ours=50     agree
+  empty quotes                   shadow=1000   ours=1000   agree
+  last raw wins even UNPARSEABLE shadow=1000   ours=1000   agree
+  unparseable then good          shadow=5000   ours=5000   agree
+  a valueless line does not define shadow=5000   ours=5000   agree
+  blanks then a quoted value     shadow=5000   ours=5000   agree
+  a tab then a quoted value      shadow=5000   ours=5000   agree
+  blanks then two quotes         shadow=5000   ours=5000   agree
+  blanks, quoted, then a comment shadow=5000   ours=5000   agree
+ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/delphi_runtime-dab89f1e90d84b56
+
+running 169 tests
+test action::tests::digest_changes_when_any_field_changes ... ok
+test action::tests::digest_destructure_covers_every_field ... ok
+test action::tests::preview_cannot_render_two_different_actions_identically ... ok
+test action::tests::preview_distinguishes_two_values_of_the_same_variable ... ok
+test action::tests::preview_marks_what_an_interpreter_arg_names_not_the_arg ... ok
+test action::tests::preview_renders_every_behavior_affecting_field ... ok
+test action::tests::preview_renders_the_bound_schema_version ... ok
+test action::tests::preview_shows_every_env_value ... ok
+test action::tests::shebang_interpreter_arg_is_bound_and_previewed ... ok
+test action::tests::the_digest_binds_environment_variable_names_not_only_their_values ... ok
+test action::tests::the_digest_binds_the_pending_id_so_a_token_cannot_cross_actions ... ok
+test action::tests::the_digest_binds_the_timeout_even_though_nothing_enforces_it_yet ... ok
+test anchor::tests::ensure_runtime_dir_rejects_non_root ... ok
+test audit::tests::audit_binds_the_approved_action_and_the_recorded_outcome ... ok
+test audit::tests::hash_destructure_covers_every_field ... ok
+test audit::tests::outcome_records_the_real_execution_result ... ok
+test canonicalize::tests::a_character_device_executable_is_refused_on_type ... ok
+test canonicalize::tests::a_fifo_executable_is_refused_promptly_rather_than_blocking_the_daemon ... ok
+test canonicalize::tests::a_malformed_ceiling_is_refused_rather_than_defaulted ... ok
+test canonicalize::tests::a_non_utf8_configured_ceiling_is_refused_not_defaulted ... ok
+test canonicalize::tests::a_read_that_does_not_return_is_refused_by_the_deadline ... ok
+test canonicalize::tests::a_real_large_executable_is_still_accepted ... ok
+test canonicalize::tests::an_argv_entry_with_an_embedded_nul_is_refused_at_proposal_time ... ok
+test canonicalize::tests::an_embedded_nul_or_equals_in_the_environment_is_refused ... ok
+test canonicalize::tests::an_empty_argv_is_refused_during_canonicalization ... ok
+test canonicalize::tests::an_oversized_executable_is_refused_on_size ... ok
+test canonicalize::tests::canonicalize_binary_hashes_through_the_held_fd ... ok
+test canonicalize::tests::canonicalize_parses_the_shebang_interpreter_arg ... ok
+test canonicalize::tests::canonicalize_script_builds_a_sealed_scriptpin ... ok
+test canonicalize::tests::missing_executable_is_a_typed_error ... ok
+test canonicalize::tests::out_of_range_wire_enum_is_rejected ... ok
+test canonicalize::tests::the_derived_ceiling_admits_the_largest_executables_known_on_this_class_of_machine ... ok
+test canonicalize::tests::the_read_budget_is_spent_across_reads_not_reset_per_object ... ok
+test canonicalize::tests::work_that_completes_within_the_deadline_is_not_refused ... ok
+test channel::tests::pair_is_a_connected_channel ... ok
+test consent_relay::host_session_tests::deny_on_eof_daemon_closes_before_prompting_dismisses_fail_closed ... ok
+test consent_relay::host_session_tests::keystone_holds_on_the_real_channel_forged_outside_window_reaches_daemon_nowhere ... ok
+test consent_relay::host_session_tests::password_in_window_reaches_daemon_then_the_held_mint_confirm ... ok
+test consent_relay::tests::forged_mint_confirm_outside_the_pam_window_is_dropped ... ok
+test consent_relay::tests::keystone_bites_the_blind_relay_and_passes_the_state_machine ... ok
+test consent_relay::tests::mint_confirm_is_always_the_held_digest_never_a_renderer_value ... ok
+test consent_relay::tests::password_in_the_pam_window_reaches_the_channel ... ok
+test execute::tests::a_directly_built_action_with_a_malformed_environment_is_refused_at_execute ... ok
+test execute::tests::a_directly_built_action_with_a_non_utf8_bind_path_is_refused_at_execute ... ok
+test execute::tests::a_directly_built_action_with_an_empty_argv_is_refused_at_execute ... ok
+test execute::tests::a_fully_sealed_program_fd_passes_the_seal_check ... ok
+test execute::tests::a_nested_shebang_interpreter_is_refused_at_canonicalization ... ok
+test execute::tests::a_partially_sealed_program_fd_is_refused ... ok
+test execute::tests::a_script_tail_passes_interp_arg_then_script_after_the_helper ...   script tail: ["--", "/proc/self/fd/9", "997", "972", "11", "/proc/self/fd/7", "approved-name", "-e", "/proc/self/fd/8", "rest"]
+ok
+test execute::tests::a_sealed_snapshot_that_is_not_the_approved_one_is_refused ... ok
+test execute::tests::a_second_kept_fd_survives_a_second_exec_and_is_executable ... ok
+test execute::tests::an_action_binding_the_daemon_runtime_directory_is_refused ... ok
+test execute::tests::an_approved_action_runs_with_the_tool_account_credentials ... [R9-01] euid=0, delphi-tool uid=997 gid=972, helper=/usr/libexec/delphi-drop
+[R9-01] the action's own /proc/self/status:
+Uid:	997	997	997	997
+Gid:	972	972	972	972
+Groups:	 
+CapEff:	0000000000000000
+
+ok
+test execute::tests::an_unsealed_program_fd_is_refused_even_when_its_digest_matches ... ok
+test execute::tests::every_fixture_that_executes_an_action_plans_its_credentials ...   5 files build-and-execute; all plan credentials and chown
+ok
+test execute::tests::fd_discipline_closes_a_daemon_fd_at_exec ... ok
+test execute::tests::fd_pinned_gated_exec_runs_the_approved_content ... ok
+test execute::tests::gate_blocks_unapproved_but_ungated_would_run ... ok
+test execute::tests::partial_seal_write_only_is_refused ... ok
+test execute::tests::red_proof_path_exec_runs_the_swapped_content ... ok
+test execute::tests::same_inode_overwrite_executes_unapproved_content ... ok
+test execute::tests::script_interpreter_is_pinned_against_path_swap ... ok
+test execute::tests::the_approved_env_reaches_the_tool_through_the_helper_after_the_drop ... [R15-01] the tool's uid line and environment:
+Uid:	997	997	997	997
+DELPHI_SECRET=s3cret-value
+PWD=/
+
+ok
+test execute::tests::the_credential_decision_covers_the_root_branch_no_unprivileged_run_can_reach ... ok
+test execute::tests::the_drop_helper_is_bound_to_the_digest_this_daemon_was_built_with ... ok
+test execute::tests::the_helper_is_interposed_with_the_credentials_and_the_approved_argv0 ...   with helper:    ["--", "/proc/self/fd/9", "997", "972", "11", "/proc/self/fd/7", "approved-name", "--flag"]
+  without helper: ["--argv0", "approved-name", "--", "/proc/self/fd/7", "--flag"]
+ok
+test execute::tests::the_predrop_payload_cannot_recover_capabilities_across_a_further_exec ... the_predrop_payload_cannot_recover_capabilities_across_a_further_exec: restricted (--cap-drop ALL --cap-add SETUID,SETGID) -> CapPrm:	00000000000000c0
+the_predrop_payload_cannot_recover_capabilities_across_a_further_exec: control    (no cap flags)                          -> CapPrm:	000001ffffffffff
+ok
+test execute::tests::the_tool_receives_its_approved_argv0 ... ok
+test execute::tests::token_is_one_shot_second_execution_denied ... ok
+test execute::tests::unsealed_script_memfd_is_refused ... ok
+test fdsec::tests::marks_all_but_keeps_the_allowlisted_fd ... ok
+test launcher::tests::a_disarmed_shell_guard_leaves_its_child_running ... ok
+test launcher::tests::an_armed_shell_guard_kills_its_child_on_drop ... ok
+test launcher::tests::reap_within_gives_up_on_a_child_that_outlives_the_budget ... ok
+test launcher::tests::reap_within_reaps_a_dead_child ... ok
+test launcher::tests::reap_within_refuses_non_positive_pids ... ok
+test launcher::tests::setup_sync_reports_child_failure_and_success_b2a_c_r1_01 ... ok
+test launcher::tests::spawn_with_pidfd_survives_sigchld_ignored_where_the_pair_does_not ... ok
+test launcher::tests::vtname_internal_construction_and_reads_stay_at_the_sanctioned_sites ... ok
+test launcher::tests::vtname_rejects_malformed_shapes ... ok
+test launcher::tests::vtname_rejects_pty_the_seatless_trap ... ok
+test launcher::tests::vtname_rejects_tty0_and_out_of_range ... ok
+test logind::tests::a_failed_seat_query_is_not_the_same_as_no_seat ... ok
+test logind::tests::a_pidfd_resolves_to_its_process_while_alive_and_to_nothing_once_reaped ... ok
+test logind::tests::an_axis_query_failure_is_produced_not_collapsed ... ok
+test logind::tests::each_resolution_failure_keeps_its_own_cause ... ok
+test logind::tests::gate_passes_only_active_local_and_seated ... ok
+test logind::tests::pidfd_refuses_a_recycled_pid_barrier ... SKIP pidfd_refuses_a_recycled_pid_barrier: user namespaces unavailable here, so a pid cannot be recycled deterministically
+ok
+test logind::tests::the_advancing_fixture_yields_one_state_at_a_time ... ok
+test logind::tests::the_gate_follows_the_session_state_in_both_directions ... ok
+test logind::tests::the_gate_witness_format_discriminates_denied_from_a_real_resolution ... ok
+test privdrop::tests::drops_in_canonical_setgroups_setgid_setuid_order ... ok
+test privdrop::tests::stops_and_names_the_failing_step ... ok
+test readiness::tests::a_scaffold_marker_is_refused_where_the_surface_claim_is_required ... ok
+test readiness::tests::channel_closed_then_death_within_grace_is_reported_as_death ... ok
+test readiness::tests::child_that_cannot_write_the_marker_exits_with_the_distinct_code ... ok
+test readiness::tests::empty_datagram_from_a_live_shell_is_a_protocol_error_not_a_death ... ok
+test readiness::tests::latched_hup_removes_the_channel_from_the_poll_set ... ok
+test readiness::tests::marker_from_an_already_dead_shell_is_not_ready ... ok
+test readiness::tests::marker_is_not_digest_sized ... ok
+test readiness::tests::marker_then_channel_close_while_alive_is_not_ready ... ok
+test readiness::tests::marker_then_immediate_exit_is_never_accepted ... ok
+test readiness::tests::marker_with_trailing_bytes_does_not_match ... ok
+test readiness::tests::neither_marker_is_a_prefix_of_the_other ... ok
+test readiness::tests::no_liveness_verdict_before_the_grace_actually_elapses ... ok
+test readiness::tests::shell_that_dies_without_signalling_is_not_ready ... ok
+test readiness::tests::shell_that_neither_signals_nor_dies_times_out ... ok
+test readiness::tests::shell_that_signals_is_ready ... ok
+test readiness::tests::silent_channel_close_while_alive_is_a_protocol_error_not_a_death ... ok
+test readiness::tests::terminal_witness_decides_injected_sequences ... ok
+test readiness::tests::the_same_scaffold_marker_satisfies_a_scaffold_requirement ... ok
+test readiness::tests::the_surface_marker_satisfies_both_requirements ... ok
+test readiness::tests::wrong_first_datagram_is_a_protocol_error_not_a_ready ... ok
+test sandbox::tests::a_bind_containing_the_runtime_directory_is_refused ... ok
+test sandbox::tests::a_bind_whose_path_does_not_exist_is_refused ... ok
+test sandbox::tests::a_created_ancestor_is_0755_inside_a_real_jail ...   in-jail mode of /tmp/delphi-r10perm-8897/deep: 755
+ok
+test sandbox::tests::a_nested_bind_does_not_create_anything_in_the_host ... ok
+test sandbox::tests::a_read_only_child_stays_read_only_when_its_parent_is_bound_after_it ... [R10-05] write attempt rc=Some(2) stderr=/bin/sh: 1: cannot create /tmp/delphi-r1005-8897/ro/witness: Read-only file system
+ok
+test sandbox::tests::a_sibling_sharing_a_string_prefix_is_not_refused ... ok
+test sandbox::tests::a_symlink_into_the_runtime_directory_is_resolved_and_refused ... ok
+test sandbox::tests::an_ancestor_inside_another_bind_is_never_created ... ok
+test sandbox::tests::derivation_enforces_exactly_the_approved_scope ... ok
+test sandbox::tests::every_ancestor_of_every_bind_is_created_traversable ... ok
+test sandbox::tests::every_spelling_of_the_runtime_directory_is_refused ... ok
+test sandbox::tests::net_policy_maps_faithfully_and_cannot_express_an_allowlist ... ok
+test sandbox::tests::ordinary_paths_are_allowed ... ok
+test sandbox::tests::red_proof_broadening_derivation_diverges_from_approved ... ok
+test sandbox::tests::shared_ancestors_are_not_emitted_twice ... ok
+test sandbox::tests::the_approved_env_cannot_choose_which_bwrap_binary_runs ... ok
+test sandbox::tests::the_approved_env_never_reaches_bwrap_itself_via_ld_preload ...   processes that loaded the preloaded library:
+sh
+env
+
+ok
+test sandbox::tests::the_approved_env_reaches_the_tool_and_never_appears_in_argv ...   the tool's environment:
+DELPHI_SECRET=s3cret-value
+PWD=/tmp
+
+ok
+test sandbox::tests::the_baked_rustc_path_is_absolute_so_the_root_lane_can_use_it ... ok
+test sandbox::tests::the_credential_drop_restriction_is_emitted_only_when_asked ... ok
+test service::accept_deadline_tests::a_requester_that_never_connects_fails_fast_and_names_itself ... ok
+test service::tests::a_gate_denied_action_sends_no_preview ... ok
+test service::tests::a_granted_entry_without_a_monotonic_instant_is_refused_rather_than_wall_clocked ... ok
+test service::tests::a_tier_the_daemon_cannot_enforce_is_denied_before_the_action_is_stored ... ok
+test service::tests::an_elapsed_consent_window_is_denied_even_when_the_wall_clock_is_frozen_at_mint_time ... ok
+test service::tests::an_oversized_preview_is_denied_before_the_action_is_stored ... ok
+test service::tests::biometric_is_refused_because_the_shipped_pam_stack_has_no_biometric_factor ... ok
+test service::tests::the_enforced_tier_passes_the_tier_check_and_reaches_the_gate ... ok
+test shutdown::tests::a_child_that_died_of_a_signal_is_not_reported_as_a_clean_exit ... ok
+test shutdown::tests::a_child_that_outlives_the_grace_period_is_killed_and_reaped ... ok
+test shutdown::tests::a_cooperating_child_is_reaped_within_grace_with_its_status_preserved ... ok
+test shutdown::tests::a_pid_that_is_not_our_child_terminates_the_policy_promptly ... ok
+test shutdown::tests::an_already_dead_childs_exit_code_survives_shutdown ... ok
+test shutdown::tests::an_already_reaped_child_is_reported_gone_without_waiting ... ok
+test shutdown::tests::children_are_shut_down_independently_and_each_outcome_is_attributed ... ok
+test shutdown::tests::non_positive_pids_are_refused_rather_than_signalling_a_group ... ok
+test shutdown::tests::only_an_unreaped_child_counts_as_failed_cleanup ... ok
+test shutdown::tests::the_daemon_delegates_shutdown_and_does_not_reap_by_hand ... ok
+test store::tests::boot_secs_agrees_with_a_direct_boottime_read_and_reports_its_own_discriminating_power ... DISCRIMINATION: BOOTTIME - MONOTONIC = 0s.              This lane has NOT suspended — the two clocks are identical here, so this test                  CANNOT distinguish them and a green proves nothing about clock selection.                  Expiry coverage comes from the_consent_window_decision_is_exact_at_its_edges.
+ok
+test store::tests::ids_are_unique_and_entries_round_trip ... ok
+test store::tests::the_consent_window_decision_is_exact_at_its_edges ... ok
+test test_child_guard::eintr_tests::reap_status_retries_a_waitpid_interrupted_by_a_signal ... ok
+test test_child_guard::leak_report_tests::an_already_removed_dir_is_not_a_leak_and_a_busy_one_is ... ok
+test token::tests::expired_or_future_token_rejected ... ok
+test token::tests::forged_or_malformed_wire_rejected ... ok
+test token::tests::mint_then_verify_same_action_within_ttl ... ok
+test token::tests::token_for_one_action_is_rejected_for_another ... ok
+test token::tests::wire_round_trips ... ok
+test token::tests::wrong_key_cannot_verify ... ok
+test wire::tests::a_complete_frame_within_the_deadline_is_still_accepted ... ok
+test wire::tests::a_frame_whose_last_byte_arrives_after_the_deadline_is_refused ... ok
+test wire::tests::a_stalled_peer_cannot_hold_the_daemon_past_the_frame_deadline ... ok
+test wire::tests::a_trickling_peer_cannot_extend_the_frame_deadline_by_making_progress ... ok
+test wire::tests::frame_round_trips ... ok
+test wire::tests::oversized_length_prefix_rejected ... ok
+test wire::tests::read_frame_applies_no_deadline_to_a_cooperating_peer ... ok
+
+test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.20s
+
+### /home/revanth-aditya/delphi-target/debug/deps/divergence-e0ffb25547add24b
+
+running 2 tests
+test red_proof_decoupling_execution_from_the_object_diverges ... ok
+test the_four_derivations_cannot_diverge ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+### /home/revanth-aditya/delphi-target/debug/deps/drop_helper_is_self_contained-cd2d82445377804f
+
+running 3 tests
+test dropping_to_root_is_refused ... ok
+test dropping_to_root_is_refused_for_either_id ... ok
+test the_shipped_helper_runs_in_a_jail_binding_nothing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+### /home/revanth-aditya/delphi-target/debug/deps/end_to_end-36b41daab0bd212f
+
+running 1 test
+test one_biometric_action_through_1a_to_1d ... userdel: user 'de2e9396' does not exist
+BAD PASSWORD: The password fails the dictionary check - it is too simplistic/systematic
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+### /home/revanth-aditya/delphi-target/debug/deps/fixture_hygiene-c5d8ef5549426e00
+
+running 1 test
+test no_test_fixture_deletes_a_system_file_it_may_not_own ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+### /home/revanth-aditya/delphi-target/debug/deps/leader_is_shell-69ba50db6c057635
+
+running 5 tests
+test launch_kills_the_shell_when_a_later_step_fails_d0_r4_02 ... ok
+test launch_returns_err_when_shell_child_fails_before_execve_b2a_c_r1_01 ... delphi-runtimed: shell child failed before execve: execve shell
+ok
+test session_leader_is_the_shell_itself_r3_01c ... 
+thread 'main' (9974) panicked at runtime/src/bin/delphi-minimal-ai.rs:31:10:
+DELPHI_AI_EXE: NotPresent
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+B1-ASSERTION-EXECUTED: pinned_pid=9821 session=Some("c11") leader=Some("9821") executing_shell=[9821]
+ok
+test shell_child_drops_to_the_session_user_b3 ... B1-ASSERTION-EXECUTED(B3): shell_pid=10048 exec_done=true ids=Some(([1010, 1010, 1010, 1010], [1010, 1010, 1010, 1010], []))
+ok
+test shell_inherits_only_the_allowlisted_fds_fd_01 ... B1-ASSERTION-EXECUTED(FD-01): shell_pid=10279 exec_done=true injected_fd=4 injected_in_child=false fds=[(0, "/dev/null"), (1, "/tmp/root-run21.log"), (2, "/tmp/root-run21.log"), (3, "socket:[65668]")]
+
+thread 'main' (10431) panicked at runtime/src/bin/delphi-minimal-ai.rs:31:10:
+DELPHI_AI_EXE: NotPresent
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.29s
+
+### /home/revanth-aditya/delphi-target/debug/deps/logind_gate-d0926481fb10af55
+
+running 4 tests
+test live_logind_query_path_works_or_documents_deferral ... DEFER live logind query: this process has no logind session (WSL2 sessions are ephemeral/seatless). DEPLOY REQUIREMENT: the daemon provisions a logind session for the spawned shell via pam_open_session/pam_systemd; the gate then queries it live via the same sd_session_* path proven here.
+ok
+test logind_trust_denies_same_uid_forge ... ok
+test red_proof_same_uid_signal_trust_lets_forge_succeed ... ok
+test seatless_active_session_fails_the_seated_gate_live ... gate-negative-live BIT: real logind session "3" — active=true remote=false seated=false → OLD gate (active&&!remote)=true, tightened seated gate=false
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/pam_interposition-62142e7a32869025
+
+running 2 tests
+test interposition_denied_when_routed_over_private_channel ... userdel: user 'dpam10478' does not exist
+ok
+test red_proof_shared_surface_routing_lets_attacker_observe_prompt ... userdel: user 'dpam10478' does not exist
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.48s
+
+### /home/revanth-aditya/delphi-target/debug/deps/sandbox_reentry-ab7e25658f75b208
+
+running 2 tests
+test jailed_tool_cannot_reach_the_daemon_socket ... ok
+test red_proof_binding_the_daemon_socket_lets_the_tool_reenter ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+### /home/revanth-aditya/delphi-target/debug/deps/sibling_fd_theft-1cb7f6b7a632aa36
+
+running 2 tests
+test f1_sibling_cannot_steal_shell_fd ... ok
+test red_proof_ancestor_can_steal_shell_fd ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/system_account_refused-68f9d236c5f466c6
+
+running 3 tests
+test a_regular_login_user_is_not_refused_as_a_system_account ... SKIP a_regular_login_user_is_not_refused_as_a_system_account: running as root
+ok
+test reached_the_anchor_rejects_an_unrelated_permission_error ... ok
+test root_session_is_refused_as_a_system_account_before_the_anchor ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### /home/revanth-aditya/delphi-target/debug/deps/systemd_smoke-0531b5a54302d54f
+
+running 1 test
+test shipped_unit_produces_root_owned_anchor_on_systemd ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+

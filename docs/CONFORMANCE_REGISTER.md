@@ -79,6 +79,25 @@ protocol_and_stays_alive`, at root, against the real binary built with `insecure
 | the daemon exited **0** | daemon's **self-report** | it did not detect an unreaped child. `main` returns `Err` when any outcome is `Unreaped`, so a self-detected cleanup failure would have failed the test |
 | a live child of the daemon was seen in its group during the run | harness, independent | the scan can reach that group, so an empty result is not vacuous by construction |
 
+**Re-validated at lane run 21 after the observer was rebuilt.** The last row above was
+originally established by run 20, whose observer identified the AI **by name** and counted a
+zombie as a live sighting (D0A-R34-01/02). Run 21 re-ran it against the rebuilt observer, which
+requires provenance (`ppid`) and liveness (`state`) before any causal claim, and the computed
+verdict was `Reached`:
+
+```
+CONTROL OBSERVATION: daemon pgid 30007, ai comm "sai", 20 samples
+  matched in the daemon's group: [(30095, 'S', "sai")]
+  census: [(30010, 'S', "delphi-runtimed"), (30095, 'S', "sai"), (30098, 'R', "unix_chkpwd")]
+  verdict: Reached
+```
+
+The census carries more than the match does: it enumerates the **whole group** — a second
+`delphi-runtimed` and `unix_chkpwd` mid-authentication — so the scanner is visibly not a
+name-matcher that returns only what it was asked for. That evidence is a **transcription** of
+the operator's terminal, not a captured artifact (`scratch/lane-run-21/part-b-control.txt`
+says so at its head); the procedure now tees it, from run 22 on.
+
 **What is NOT observed, stated so no reader has to derive it:**
 
 - **Reaping is never independently observed.** The only reaping evidence is the daemon's own

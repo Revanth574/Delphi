@@ -1,7 +1,117 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 20 — **the assembly positive control PASSED on its first root execution.**
-# Measured 2026-09-08 at `fc22117`.
+# LANE RUN 21 — **the assembly control re-validated AFTER the observer was rebuilt.**
+# Measured 2026-09-10 at `d1fa4fe`.
+#
+#   EXECUTED 223 / SKIPPED 6 / reported 229     extractor rc=0
+#   producers: 17/17 exited 0                   failures: 0
+#   predicted 223/6/229, committed ALONE and BEFORE the run — and MATCHED EXACTLY
+#   membership: 229 identities each side, ZERO in either direction, rc 0 — **AND ITS INPUTS
+#               ARE RETAINED**: `scratch/lane-run-21/{root,unpriv}-identities.txt` (229 lines
+#               each, `diff` empty, verified in-repo rather than taken from the report),
+#               `membership.txt`, `root-run.log`
+#
+# **WHY THIS RUN EXISTED.** The assembly test had not executed since round 33, while the
+# observer was rebuilt with provenance + liveness gating (D0A-R34-01/02), `classify_control`
+# was extracted, the probe was rewired, and both outcome tables were rewritten. D0A-R28-02's
+# supplementary evidence rested on a run predating every one of those changes — the same
+# compiled-not-executed condition round 34 fixed, one layer up.
+#
+# =========================================================================================
+# PART B — VERDICT `Reached`, and the census is the more informative half
+# =========================================================================================
+#
+#   CONTROL OBSERVATION: daemon pgid 30007, ai comm "sai", 20 samples
+#     matched in the daemon's group: [(30095, 'S', "sai")]
+#     census: [(30010, 'S', "delphi-runtimed"), (30095, 'S', "sai"), (30098, 'R', "unix_chkpwd")]
+#     verdict: Reached
+#
+# `Reached` is the first of the four outcomes named in the expectation. The scanner found the
+# AI **alive** (`S`), verified as this daemon's child, across 20 samples — provenance and
+# liveness, not a name match, which is what R34-01/02 forced.
+#
+# **THE CENSUS IS ITS OWN SMALL CONTROL.** It returns THREE processes, not just the target:
+# a second `delphi-runtimed` (30010 — the leader 30007 is excluded by design, so this is the
+# forked child before/at `execve`) and `unix_chkpwd` in state **R**, the PAM helper caught
+# mid-authentication. **A scanner that only ever returned its own target would be
+# indistinguishable from one matching on name alone**; this one enumerates the group and
+# reports what is there. That distinction is not something the `Reached` verdict alone shows.
+#
+# What `Reached` does and does not buy, fixed in the expectation BEFORE the run: the
+# supplementary scan is meaningful **for this run**. It does not touch the §4 closure either
+# way — that rests on `killed == false` against a stubborn AI, observed independently of the
+# scan. Reaping is still not independently observed.
+#
+# =========================================================================================
+# ONE PROCESS DEFECT — a step that appears to run and does not
+# =========================================================================================
+#
+# `$LOG`/`$STATUS` were unset in a fresh shell, so `: > ""` failed with
+# `bash: : No such file or directory` and the chain stopped — **while looking like the
+# long-running loop it was supposed to start.** Nothing was lost (the step was re-run), but the
+# shape is the one this arc keeps paying for and is the SAME CLASS as run 20's dropped §4b: a
+# check that presents as executed and was not. The procedure's own commands did not guard their
+# variables; they now use `${VAR:?}`, which names the missing variable instead of failing at a
+# token.
+#
+# Recorded because the failure was loud THIS time by luck of where it landed. `: > ""` happened
+# to be the first command in the chain; the same unset variable inside the loop would have
+# written a log nobody could find and produced a count from a stale file.
+#
+# =========================================================================================
+# RETENTION — the run-20 fix applied rather than promised, and its remaining gap named
+# =========================================================================================
+#
+# §4b's identity lists are now written by the check itself into the repo and committed, so run
+# 21's membership is checkable by someone who was not here. Run 20's is not, and never will be.
+#
+# **The gap that remains, stated rather than discovered later:** Part B's `CONTROL OBSERVATION`
+# — the evidence the supplementary scan rests on — was NOT captured to a file. It exists as
+# `scratch/lane-run-21/part-b-control.txt`, **transcribed from the operator's terminal paste**,
+# and that file says so at the top rather than sitting silently beside the captured ones. The
+# procedure now tees Part B, so run 22's is captured; run 21's is a transcription and is
+# labelled as one.
+#
+# ---------------------------------------------------------------------------------------
+# EVERY HYGIENE CHECK, WITH THE EVIDENCE THAT DECIDES IT
+#   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
+#   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED, both printed
+#   bwrap            0.11.1
+#   free space       /run 1483M, target 20139M, /tmp 3710M — **passed on its own.** Run 20's
+#                    refusal was OVERRIDDEN; this one did not have to be, because the condition
+#                    was resolved rather than argued with
+#   forced freshness ENFORCED: enumeration asserted at 17, both hash sides asserted equal to
+#                    17, rebuild failure fatal, `diff` empty
+#   PAM before/after `md5sum -c` OK             (class 16, already paid for once)
+#   stale sessions   none, before AND after
+#
+# THE SIX SKIPS are run 20's, unchanged and each naming its own blocker: the two feature-gated
+# b1 tests, `an_unreadable_login_defs` (this uid can read a 0000 file),
+# `pidfd_refuses_a_recycled_pid_barrier` (no user namespaces), `live_logind_query` (standing
+# DEFER), `a_regular_login_user_is_not_refused` (running as root).
+#
+# ORDERING HELD UNDER CONVENTION FOR THE NINTH CONSECUTIVE RUN (D0A-R22-01, still reopened —
+# and the acceptance verifier the reviewer specified is still not built).
+#
+# ---------------------------------------------------------------------------------------
+# WHAT A GREEN RUN 21 STILL DOES NOT ESTABLISH
+#
+# 1. **Reaping.** Never independently observed; the only reaping evidence remains the daemon's
+#    own exit status, a self-report by the component under test. R29-05's `Unreaped` is
+#    UNCONSTRUCTED.
+# 2. **The production logind gate.** Part B is a seam-built binary.
+# 3. `Topology`, `Scan` and `Unresolved` are reachable and unit-tested, but only `Reached` has
+#    ever been produced at root. The other three remain unexercised IN THE ASSEMBLY.
+# 4. The mutation campaign is unprivileged-only; the six root-gated tests are un-mutated.
+# 5. The suspend divergence is unmeasured; `action.timeout` is enforced nowhere (R9-04).
+#
+# ---------------------------------------------------------------------------------------
+# SUPERSEDED — LANE RUN 20 (`221/6/227` at `fc22117`) — the control's first root execution. Sound, except
+# that its membership claim is INDEPENDENTLY UNAUDITABLE (below). Superseded by run 21, which
+# covers two more tests and re-validates the control after the observer was rebuilt. Its full
+# record follows.
+#
+# LANE RUN 20 detail:
 #
 #   EXECUTED 221 / SKIPPED 6 / reported 227     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
@@ -244,5 +354,5 @@
 # (`208/5/213` at `c3cca14` — same figure, different tree), run 16 (`200/5/205`), run 15
 # (`192/5/197`), run 14 (`187/5/192`, closed D0A-R24-01), run 13 (`177/5/182`, freshness
 # WITHDRAWN by D0A-R25-05).
-EXECUTED=221
+EXECUTED=223
 SKIPPED=6

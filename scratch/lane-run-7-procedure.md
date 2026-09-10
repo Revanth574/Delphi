@@ -168,6 +168,11 @@ freshness check.
 ## 3. The run — every target, serial, one log
 
 ```bash
+# D0A-R34: REFUSE ON UNSET VARIABLES. In a fresh shell `$LOG`/`$STATUS` are empty, so
+# `: > ""` fails with `bash: : No such file or directory` and the chain stops — while LOOKING
+# like the long-running loop it was supposed to start. Same shape as the §4b omission: a step
+# that appears to run and does not. `${VAR:?}` names the missing variable instead.
+: "${RUN:?set RUN first (§0b)}" "${LOG:?LOG unset — re-run §0b}" "${STATUS:?STATUS unset — re-run §0b}"
 : > "$LOG" ; : > "$STATUS"
 while read -r b; do
   echo "### $b" >> "$LOG"
@@ -227,6 +232,7 @@ as proof the sets were identical. It happened to be true — a reviewer verified
 — but the evidence recorded did not establish it.
 
 ```bash
+: "${RUN:?set RUN first (§0b)}" "${LOG:?LOG unset — re-run §0b}"
 mkdir -p "scratch/lane-run-$RUN"          # RETAINED, in the repo — see below
 python3 - <<'EOF'
 import re,subprocess,os,collections
@@ -275,6 +281,26 @@ exactly as a count mismatch would be explained. If the tree has moved since the 
 delta must be exactly the tests added or removed since — verify that by name, not by number.
 
 **RETAIN `$LOG`** until this has run. It is the only record of which tests actually executed.
+
+## 4c. PART B — the assembly control, retained rather than transcribed
+
+Part B rebuilds with `--features insecure-test-seams`, so it must run AFTER §2b's hashes.
+**Tee it**: its `CONTROL OBSERVATION` line is the evidence D0A-R28-02's supplementary scan
+rests on, and run 21's was only ever a terminal paste (D0A-R34's ruling: printing alone is not
+durable storage).
+
+```bash
+: "${RUN:?set RUN first (§0b)}"
+cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration --no-run \
+  --message-format=json 2>/dev/null | python3 -c 'import sys,json
+for l in sys.stdin:
+    try: m=json.loads(l)
+    except Exception: continue
+    if m.get("executable") and m.get("profile",{}).get("test"): print(m["executable"])' \
+  | sort -u > /tmp/b1-seams.txt
+sudo "$(cat /tmp/b1-seams.txt)" b1_daemon_bounds_an_ai --nocapture --test-threads=1 \
+  2>&1 | tee "scratch/lane-run-$RUN/part-b-control.txt"
+```
 
 ## 5. The three checks, BY NAME
 

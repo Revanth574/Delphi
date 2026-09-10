@@ -1,0 +1,20 @@
+PART B — the assembly test's control observation, lane run 21.
+
+*** PROVENANCE: TRANSCRIBED FROM THE OPERATOR'S TERMINAL PASTE, NOT CAPTURED TO A FILE. ***
+
+This is a weaker artifact than the files beside it, and the difference is the point. §4b's
+identity lists were WRITTEN BY THE CHECK ITSELF; this was copied by hand from a terminal.
+It is retained because a quotation in a commit message is worse still, and it is labelled
+because the reviewer's ruling on run 20 applies to it exactly: printing alone is not durable
+storage, and a claim only its author can vouch for is what the retention discipline exists to
+eliminate.
+
+The procedure now tees Part B into this directory, so run 22's equivalent is captured rather
+than transcribed. Run 21's is not, and this file says so rather than looking like the others.
+
+    test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... ok
+
+    CONTROL OBSERVATION: daemon pgid 30007, ai comm "sai", 20 samples
+      matched in the daemon's group: [(30095, 'S', "sai")]
+      census: [(30010, 'S', "delphi-runtimed"), (30095, 'S', "sai"), (30098, 'R', "unix_chkpwd")]
+      verdict: Reached

@@ -1,0 +1,3 @@
+root 229 / unpriv 229
+IN ROOT NOT UNPRIV: 0
+IN UNPRIV NOT ROOT: 0

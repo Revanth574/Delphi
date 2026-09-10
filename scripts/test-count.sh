@@ -38,6 +38,19 @@ set -uo pipefail
 
 REFUSE() { echo "REFUSING to report a count: $*" >&2; exit 2; }
 
+# D0A-R35: SET-BUT-EMPTY IS AN INTENT WITH A MISSING VALUE, NOT AN ABSENT INTENT.
+# `-n ""` is false, so `DELPHI_TESTCOUNT_LOG=""` silently fell through to a LIVE cargo run —
+# and in run 22's attempt that produced `failed to run custom build command for
+# llama-cpp-sys-2`, a build error from an unrelated crate reported where a test count was
+# expected. The caller had asked for parse-only and got a different mode, loudly failing for
+# the wrong reason. Refusing names the real problem: the variable was set and carried nothing.
+for v in DELPHI_TESTCOUNT_LOG DELPHI_TESTCOUNT_EXPECT_TARGETS; do
+    if [ -n "${!v+set}" ] && [ -z "${!v}" ]; then
+        REFUSE "$v is set but EMPTY — you asked for a mode and supplied no value. This is \
+usually an unexported variable in a fresh shell; re-run the step that sets it."
+    fi
+done
+
 if [ -n "${DELPHI_TESTCOUNT_LOG:-}" ]; then
     # Parse-only: exercises this script's parsing against a captured log, so the parser is
     # checkable by something other than itself.

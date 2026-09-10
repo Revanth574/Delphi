@@ -3035,6 +3035,24 @@ forwards instead of backwards.
 *runs the lane* and a tool that *refuses an under-evidenced lane* are different things. The
 second is precisely the mechanism that would have caught the first one's failure.
 
+**FIFTH INSTANCE, on the gate's first real use — and it ended at the gate.** Run 22 was handed
+over as separate command blocks, each executed in a FRESH SHELL, so `$RUN`/`$LOG`/`$STATUS`
+were empty from the second step onward. The run step **refused by name** because `${VAR:?}` had
+been added there. Every unguarded sibling ran anyway and produced a **plausible artifact**
+rather than a refusal: a count reporting an unrelated crate's build failure, a `tee` whose
+target could not be opened while the test carried on regardless, a `cp` that copied nothing.
+Guarding the step where the defect had bitten and not its siblings is **class 48 applied to the
+fix for this class**.
+
+The difference from instances one to four is the whole argument for the tool: those were found
+later, by someone reading. This one ended the run at the gate, with `REFUSED` captured by the
+verifier, and nothing downstream claimed success.
+
+**The durable fix is not more guards.** Exports live in one shell; a handover split across
+shells cannot rely on them. §0b now writes `/tmp/lane-env.sh` and every later step sources it,
+so each step is self-contained and the guard is a second line of defence rather than the only
+one.
+
 **Its first execution found a defect in its own retention step** — `cp` without `-p` stamps
 copies with the time of the copy, destroying the evidence that freshness preceded the run — and
 it refuses lane run 21, which lacks hygiene capture and writes identities without counts. **That

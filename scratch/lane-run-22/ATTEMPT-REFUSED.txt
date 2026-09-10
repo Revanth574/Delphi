@@ -1,0 +1,50 @@
+LANE RUN 22 — ATTEMPTED, REFUSED BY THE ACCEPTANCE GATE, NOT EVIDENCE.
+
+This directory exists to record that run 22 was attempted and is NOT accepted. Nothing in
+it may be cited as merge acceptance, and the counts were never produced at all.
+
+WHAT HAPPENED, and the cause is in the handover rather than the product:
+
+The run was handed over as separate command blocks. Each executed in a FRESH SHELL, so the
+`export RUN=22 LOG=... STATUS=...` from the first block did not reach any later block. From
+the run step onward every variable was empty.
+
+  step                what happened
+  ------------------  --------------------------------------------------------------
+  build + enumerate   OK — 17 targets (needs no variables)
+  forced freshness    OK — 17 executables identical after a forced rebuild
+  THE RUN             REFUSED BY ITS OWN GUARD: `bash: RUN: set RUN first`
+  count               ran UNGUARDED with DELPHI_TESTCOUNT_LOG="" and reported
+                      `failed to run custom build command for llama-cpp-sys-2`
+  §4b membership      guard fired; produced nothing; `cp` of an empty $LOG failed
+  retention           `cp ... scratch/lane-run-/` — copied nothing
+  Part B              RAN, and its `tee` into `scratch/lane-run-/` FAILED, so the
+                      control observation exists only as a terminal paste
+  ACCEPTANCE          REFUSED (rc=2): `scratch/lane-run- is not a directory`
+
+THE GUARD WORKED WHERE IT WAS ADDED AND NOWHERE ELSE. `${VAR:?}` was put on the two steps
+where the defect had previously bitten. Its siblings were left unguarded and each produced a
+PLAUSIBLE ARTIFACT instead of a refusal — a count that looked like a build failure, a `tee`
+whose target could not be opened while the test itself carried on, a `cp` that reported
+nothing copied. That is class 48 applied to the fix for class 54, which is the fourth time
+this arc has scoped a fix to where the finding pointed.
+
+THE ACCEPTANCE GATE DID ITS JOB ON ITS FIRST REAL USE. Every prior instance of this shape
+was found later, by someone reading. This one ended the run at the gate, and nothing
+downstream claimed success. That is the whole point of it and it is the only thing here
+worth carrying forward.
+
+PART B'S OBSERVATION, TRANSCRIBED FROM THE TERMINAL — NOT EVIDENCE, since its capture failed
+and it belongs to a refused run. Recorded only because it is the first `Reached` computed
+under the ENFORCED provenance gate (D0A-R35-01), and `ppid 54603 == daemon pgid 54603`:
+
+    CONTROL OBSERVATION: daemon pgid 54603, ai comm "sai", 21 samples
+      VERIFIED live children matched in the daemon's group:
+        [ProcRecord { pid: 54683, ppid: 54603, pgid: 54603, state: 'S', starttime: 470956 }]
+    census of that group: [(54605, 'S', "delphi-runtimed"), (54683, 'S', "sai"),
+                           (54686, 'R', "unix_chkpwd")]
+      verdict: Reached
+
+    A RE-RUN IS REQUIRED BEFORE THIS CAN BE CITED. It is a paste from a refused run, and
+    "the observation looked right" is exactly the reasoning the retention discipline exists
+    to stop.

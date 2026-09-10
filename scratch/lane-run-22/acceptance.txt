@@ -1,0 +1,12 @@
+lane acceptance for scratch/lane-run-22
+  [REFUSE] hygiene: hygiene.txt is MISSING — the step that produces it left no evidence, which is indistinguishable from it never having run
+  [REFUSE] freshness: hashes-before.txt is MISSING — the step that produces it left no evidence, which is indistinguishable from it never having run
+  [REFUSE] producers: no producer-status file (root-run*.status) — without it a target that CRASHED before printing its summary vanishes from the count entirely
+  [REFUSE] membership: membership.txt is MISSING — the step that produces it left no evidence, which is indistinguishable from it never having run
+  [REFUSE] control: part-b-control.txt is MISSING — the step that produces it left no evidence, which is indistinguishable from it never having run
+  [REFUSE] ordering: root-run.log is MISSING — there is no run transcript to order against
+
+VERDICT: REFUSED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.

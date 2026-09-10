@@ -89,6 +89,17 @@ two helper digests must MATCH; a mismatch is a stale install, not a profile diff
 export RUN=15                     # <- the only edit per run (14 was the last run)
 export LOG=/tmp/root-run$RUN.log
 export STATUS=/tmp/root-run$RUN.status
+export CARGO_TARGET_DIR="$HOME/delphi-target"
+
+# D0A-R35: WRITE THE ENVIRONMENT TO A FILE AND SOURCE IT IN EVERY LATER STEP. Exports live in
+# ONE shell. Run 22's attempt was handed over as separate command blocks, each executed in a
+# FRESH shell, so `$RUN`/`$LOG`/`$STATUS` were empty from the second step onward: the run step
+# refused by name (the guard worked), and every UNGUARDED step after it ran anyway and produced
+# plausible garbage — a count that reported an unrelated crate's build failure, a `tee` into
+# `scratch/lane-run-/` that silently lost the control observation, and a retention step that
+# copied nothing. Guarding the step where it had bitten and not its siblings is class 48 again.
+printf 'export RUN=%s\nexport LOG=%s\nexport STATUS=%s\nexport CARGO_TARGET_DIR=%s\n' \
+  "$RUN" "$LOG" "$STATUS" "$CARGO_TARGET_DIR" > /tmp/lane-env.sh
 ```
 
 D0A-R25-06: the operative commands used to hard-code `root-run7` while the prose said to
@@ -168,6 +179,7 @@ freshness check.
 ## 3. The run — every target, serial, one log
 
 ```bash
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}" "${LOG:?run §0b first}" "${STATUS:?run §0b first}"
 # D0A-R34: REFUSE ON UNSET VARIABLES. In a fresh shell `$LOG`/`$STATUS` are empty, so
 # `: > ""` fails with `bash: : No such file or directory` and the chain stops — while LOOKING
 # like the long-running loop it was supposed to start. Same shape as the §4b omission: a step
@@ -197,6 +209,7 @@ CLAUDE.md §6's fork+PAM carve-out makes the serial run the authoritative one fo
 **parse-only** mode on the captured log, unprivileged:
 
 ```bash
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}" "${LOG:?run §0b first}" "${STATUS:?run §0b first}"
 DELPHI_TESTCOUNT_EXPECT_TARGETS=$(wc -l < /tmp/targets.txt) \
   DELPHI_TESTCOUNT_LOG="$LOG" scripts/test-count.sh ; echo "rc=$?"
 ```
@@ -232,7 +245,7 @@ as proof the sets were identical. It happened to be true — a reviewer verified
 — but the evidence recorded did not establish it.
 
 ```bash
-: "${RUN:?set RUN first (§0b)}" "${LOG:?LOG unset — re-run §0b}"
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}" "${LOG:?run §0b first}" "${STATUS:?run §0b first}"
 mkdir -p "scratch/lane-run-$RUN"          # RETAINED, in the repo — see below
 python3 - <<'EOF'
 import re,subprocess,os,collections
@@ -317,7 +330,7 @@ rests on, and run 21's was only ever a terminal paste (D0A-R34's ruling: printin
 durable storage).
 
 ```bash
-: "${RUN:?set RUN first (§0b)}"
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}" "${LOG:?run §0b first}" "${STATUS:?run §0b first}"
 cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration --no-run \
   --message-format=json 2>/dev/null | python3 -c 'import sys,json
 for l in sys.stdin:

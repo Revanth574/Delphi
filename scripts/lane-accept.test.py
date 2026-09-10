@@ -64,12 +64,16 @@ def fixture() -> pathlib.Path:
     (d / "membership.txt").write_text(
         "root 5 / unpriv 5\nIN ROOT NOT UNPRIV: 0\nIN UNPRIV NOT ROOT: 0\n")
     (d / "part-b-control.txt").write_text("CONTROL OBSERVATION: ...\n  verdict: Reached\n")
+    # A CURRENT run carries both controls (D0A-R35). The base fixture is a current run, so a
+    # missing negative control must be introduced deliberately by a guard, never be the default.
+    (d / "part-b-negative-control.txt").write_text("NEGATIVE CONTROL: ...\n  verdict: Topology\n")
     # Stamp the ordering the checks require.
     base = 1_000_000
     for i, name in enumerate(["hashes-before.txt", "hashes-after.txt", "rebuild.log",
                               "root-run.log", "root-run7.status", "membership.txt",
                               "root-identities.txt", "unpriv-identities.txt",
-                              "part-b-control.txt", "hygiene.txt"]):
+                              "part-b-control.txt", "part-b-negative-control.txt",
+                              "hygiene.txt"]):
         os.utime(d / name, (base + i * 10, base + i * 10))
     return d
 
@@ -138,6 +142,50 @@ def main() -> int:
             "a NONZERO identity difference is refused", "identity SETS differ")
     refuses(lambda d: (d / "part-b-control.txt").write_text("no verdict here\n"),
             "a control with NO VERDICT is refused", "verdict")
+
+    # D0A-R35 — THE NEGATIVE CONTROL, required from run 24. The fixture's directory name is
+    # what carries the run number, so these use a named copy.
+    def as_run(d: pathlib.Path, n: int) -> pathlib.Path:
+        dst = d.parent / f"lane-run-{n}"
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(d, dst)
+        for f in dst.iterdir():
+            st = (d / f.name).stat()
+            os.utime(f, (st.st_atime, st.st_mtime))
+        return dst
+
+    d = fixture()
+    try:
+        r23 = as_run(d, 23)
+        (r23 / "part-b-negative-control.txt").unlink()
+        ok, _ = la.accept(r23)
+        check("run 23 is still ACCEPTED without a negative control", ok,
+              "requiring it retroactively would invalidate history it was never applied to")
+        r24 = as_run(d, 24)
+        (r24 / "part-b-negative-control.txt").unlink()
+        ok, report = la.accept(r24)
+        check("run 24 WITHOUT a negative control is REFUSED", not ok)
+        check("...and the refusal names it",
+              "part-b-negative-control.txt" in "\n".join(report), "\n".join(report))
+        (r24 / "part-b-negative-control.txt").write_text("  verdict: Reached\n")
+        ok, report = la.accept(r24)
+        check("a negative control returning `Reached` is REFUSED", not ok,
+              "a control that cannot discriminate was recorded as an accepted run")
+        check("...and the refusal says what Reached means here",
+              "CANNOT DETECT A TOPOLOGY DEFECT" in "\n".join(report), "\n".join(report))
+        (r24 / "part-b-negative-control.txt").write_text("  verdict: Unresolved\n")
+        ok, _ = la.accept(r24)
+        check("a negative control returning `Unresolved` is REFUSED", not ok,
+              "the fixture did not produce the input it claims, which is not an accepted run")
+        (r24 / "part-b-negative-control.txt").write_text("  verdict: Topology\n")
+        st = (d / "part-b-control.txt").stat()
+        os.utime(r24 / "part-b-negative-control.txt", (st.st_atime, st.st_mtime))
+        ok, report = la.accept(r24)
+        check("a negative control returning `Topology` is ACCEPTED", ok, "\n".join(report))
+        shutil.rmtree(r23, ignore_errors=True)
+        shutil.rmtree(r24, ignore_errors=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
     refuses(lambda d: os.utime(d / "hashes-after.txt", (9_000_000, 9_000_000)),
             "freshness proven AFTER the run is refused", "MISORDERED")
 

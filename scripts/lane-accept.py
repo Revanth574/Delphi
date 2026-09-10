@@ -41,6 +41,13 @@ import sys
 
 EXPECTED_TARGETS = 17
 
+# From this run on, a lane run must also carry the NEGATIVE control's evidence (D0A-R35). It is
+# keyed to the run number rather than applied unconditionally: run 23 and earlier predate the
+# fixture, and a check that retroactively invalidated history it was never applied to would be a
+# different kind of overreach. Runs from here cannot quietly omit it — which is the whole
+# distinction this tool exists to hold (`DEFECT_CLASSES` 54).
+FIRST_RUN_REQUIRING_NEGATIVE_CONTROL = 24
+
 
 class Refusal(Exception):
     """A named, specific reason this run cannot be certified."""
@@ -138,13 +145,45 @@ def check_membership(d: pathlib.Path) -> list[str]:
     return [f"membership: {len(root.strip().splitlines())} identities each side, zero either way"]
 
 
-def check_control(d: pathlib.Path) -> list[str]:
-    text = _read(d, "part-b-control.txt")
-    m = re.search(r"verdict: (\w+)", text)
+def _verdict_in(d: pathlib.Path, name: str, what: str) -> str:
+    m = re.search(r"verdict: (\w+)", _read(d, name))
     if m is None:
-        raise Refusal("part-b-control.txt records no `verdict:` line — the control's outcome "
-                      "is the evidence the supplementary scan rests on")
-    return [f"control verdict: {m.group(1)}"]
+        raise Refusal(f"{name} records no `verdict:` line — {what}")
+    return m.group(1)
+
+
+def _run_number(d: pathlib.Path) -> int | None:
+    m = re.search(r"lane-run-(\d+)", d.resolve().name)
+    return int(m.group(1)) if m else None
+
+
+def check_control(d: pathlib.Path) -> list[str]:
+    notes = [f"positive control: {_verdict_in(d, 'part-b-control.txt', 'the control outcome is the evidence the supplementary scan rests on')}"]
+
+    run = _run_number(d)
+    negative = d / "part-b-negative-control.txt"
+    if run is not None and run < FIRST_RUN_REQUIRING_NEGATIVE_CONTROL and not negative.exists():
+        notes.append(f"negative control: not required for run {run} (predates the fixture)")
+        return notes
+    if run is None and not negative.exists():
+        raise Refusal("the directory name carries no run number, so the negative-control "
+                      "requirement cannot be waived by age — provide the evidence or a "
+                      "correctly named directory")
+
+    verdict = _verdict_in(
+        d, "part-b-negative-control.txt",
+        "a negative control with no verdict establishes nothing about whether the control can "
+        "DISCRIMINATE")
+    if verdict != "Topology":
+        raise Refusal(
+            f"the negative control returned {verdict}, not Topology. The fixture puts a "
+            f"VERIFIED live child of the daemon OUTSIDE its process group, which is exactly the "
+            f"input Topology names. `Reached` means THE CONTROL CANNOT DETECT A TOPOLOGY DEFECT, "
+            f"and every prior `Reached` in the record is consistent with a control that never "
+            f"discriminated; `Scan`/`Unresolved` mean the fixture did not produce the input it "
+            f"claims. None of the three may be recorded as an accepted run")
+    notes.append(f"negative control: {verdict} — the control DISCRIMINATES, so a `Reached` means something")
+    return notes
 
 
 def check_ordering(d: pathlib.Path) -> list[str]:

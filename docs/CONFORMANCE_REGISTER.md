@@ -81,9 +81,10 @@ protocol_and_stays_alive`, at root, against the real binary built with `insecure
 
 **Re-validated at lane run 21 after the observer was rebuilt.** The last row above was
 originally established by run 20, whose observer identified the AI **by name** and counted a
-zombie as a live sighting (D0A-R34-01/02). Run 21 re-ran it against the rebuilt observer, which
-requires provenance (`ppid`) and liveness (`state`) before any causal claim, and the computed
-verdict was `Reached`:
+zombie as a live sighting (D0A-R34-01/02). Run 21 re-ran it against the rebuilt observer and the computed verdict was `Reached` — but
+**that verdict established name + group membership, NOT parentage (D0A-R35-01)**: the success
+path returned before the `ppid` gate, so it was the one path the rebuild did not cover. The gate
+is now enforced on every verdict; no run has yet produced a `Reached` under it.
 
 ```
 CONTROL OBSERVATION: daemon pgid 30007, ai comm "sai", 20 samples

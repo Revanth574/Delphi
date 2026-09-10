@@ -256,10 +256,14 @@ print(f"IN UNPRIV NOT ROOT: {sum(only_unpriv.values())}"); [print("  ",k) for k 
 # matching totals do not substitute for an identity-set comparison. These files are committed
 # with the run record.
 out = f"scratch/lane-run-{os.environ['RUN']}"
+# D0A-R35-05: write COUNTS, not bare keys. Serializing `sorted(counter)` drops multiplicity,
+# so {a:2,b:1} and {a:1,b:2} produce identical files AND identical totals — the multiset cannot
+# be reconstructed, which is exactly what an identity-set comparison is for. Run 21 happened to
+# have no duplicates, so the defect was invisible in its output.
 with open(f"{out}/root-identities.txt", "w") as f:
-    f.write("\n".join(f"{t}::{n}" for (t, n) in sorted(root)) + "\n")
+    f.write("\n".join(f"{c}\t{t}::{n}" for (t, n), c in sorted(root.items())) + "\n")
 with open(f"{out}/unpriv-identities.txt", "w") as f:
-    f.write("\n".join(f"{t}::{n}" for (t, n) in sorted(unpriv)) + "\n")
+    f.write("\n".join(f"{c}\t{t}::{n}" for (t, n), c in sorted(unpriv.items())) + "\n")
 with open(f"{out}/membership.txt", "w") as f:
     f.write(f"root {sum(root.values())} / unpriv {sum(unpriv.values())}\n")
     f.write(f"IN ROOT NOT UNPRIV: {sum(only_root.values())}\n")
@@ -273,6 +277,21 @@ raise SystemExit(0 if not only_root and not only_unpriv else 1)
 EOF
 echo "membership rc=$?"    # 0 = identical sets; ANY non-empty side is a RESULT
 cp "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, also retained
+
+# D0A-R35-04: RETAIN EVERY ARTIFACT THE RECORD ASSERTS ABOUT. The lane record claims freshness,
+# producer exits and hygiene results; until now only the membership inputs were kept, so those
+# other claims were operator reports exactly like Part B's transcription was. Retention was
+# fixed where the finding pointed and nowhere else — class 48 inside the remediation.
+cp /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
+   "scratch/lane-run-$RUN/" 2>&1 | tee -a "scratch/lane-run-$RUN/retention-errors.txt"
+{ echo "=== free space ==="; scripts/check-free-space.sh
+  echo "=== stale sessions ==="; scripts/check-stale-test-sessions.sh
+  echo "=== PAM ==="; md5sum -c /tmp/pam-before.md5
+  echo "=== helper digests ==="; sha256sum /usr/libexec/delphi-drop installer/staging/delphi-drop
+  echo "=== account ==="; getent passwd delphi-tool
+  echo "=== bwrap ==="; bwrap --version
+} > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
+ls -la "scratch/lane-run-$RUN/"
 ```
 
 Counters, not sets — a duplicated `#[test]` inflated a count once already, and set arithmetic

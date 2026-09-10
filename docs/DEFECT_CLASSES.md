@@ -2954,8 +2954,12 @@ census without the AI as **a defect in the control**.
 The reviewer produced the exact shape that rule gets wrong: `seen=[] census=[(9609,'S',"sleep")]
 ai_pgid=9608` — two real daemon-fixture children, one inheriting the group, and the **correctly
 named AI sitting in another group**. That is a topology defect receiving the diagnosis that
-preserves the closure. The rule was not reading evidence; it was picking the reading its author
-wanted, and its author was the party whose closure was at stake.
+preserves the closure. The rule selected the diagnosis that left the closure intact. **That is the defect, stated
+without reference to why it was written (D0A-R35-06):** the counterexample establishes an
+incorrect classification, not a preference. The entry said "picking the reading its author
+wanted" — the same motive attribution the title had already been corrected for, left standing
+in the body by a fix scoped to the heading. Third time this class's own text has demonstrated
+it.
 
 **Why it is not class 45 or 51.** 45 is asserting an absence you cannot measure; this error
 occurs with positive observations and no universal absence claim. 51 is a false claim in a

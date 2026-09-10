@@ -64,23 +64,29 @@ def guard_classification() -> None:
             "disk full": ("", "error: No space left on device", 101, "INFRASTRUCTURE"),
             "build failure": ("", "error: could not compile `x`", 101, "INFRASTRUCTURE"),
             "no result lines": ("", "", 101, "INFRASTRUCTURE"),
-            # D0A-R30-04: a NAMED failing test whose cause is the environment.
-            "stale session precondition": (
+            # D0A-R30-04 established this as PRECONDITION FAILURE when the token in output was
+            # the evidence. D0A-R35-03 removed that path: any test can print the token, and one
+            # that did was classified as an environment failure while a real detection was
+            # discarded. The token in output is now DATA, and the case is retained inverted —
+            # the genuine precondition path is asserted through the SIDE CHANNEL in
+            # `guard_markers_in_assertion_data_do_not_decide_cause`.
+            "precondition token as text is NOT a precondition report": (
                 "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
                 "PRECONDITION FAILED before this test ran — a session is live on tty1",
-                101, "PRECONDITION FAILURE"),
-            "stale-session script text": (
+                101, "CAUGHT"),
+            # Same inversion, same reason: the legacy phrasing is text too.
+            "legacy stale-session phrasing as text is NOT a report": (
                 "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
                 "STALE SESSION FROM A PREVIOUS RUN — a PRECONDITION failure, not a code regression.",
-                101, "PRECONDITION FAILURE"),
+                101, "CAUGHT"),
             # D0A-R31-06: the reviewer's case — the checker could not be LAUNCHED, so the
             # environment is UNKNOWN. It has a named failing test and no infra substring, and
             # was therefore scored CAUGHT: an infrastructure failure credited to the mutation.
-            "checker-launch failure": (
+            "checker-launch text is NOT a report either": (
                 "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
                 "DELPHI_PRECONDITION_FAILED: could not run scripts/check-stale-test-sessions.sh: "
                 "Permission denied (os error 13) — the environment is UNKNOWN, not clean",
-                101, "PRECONDITION FAILURE"),
+                101, "CAUGHT"),
             "crash, no named test": ("test result: FAILED. 1 failed\n", "", 101,
                                      "UNATTRIBUTED FAILURE"),
             "real detection": (
@@ -493,11 +499,22 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
             "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
         )
 
-    def classify(stdout: str, code: int = 101) -> tuple[str, dict]:
+    def classify(stdout: str, code: int = 101, stderr: str = "",
+                 precondition: str | None = None) -> tuple[str, dict]:
         prev = os.environ.get("DELPHI_MUTATION_TEST_CMD")
-        os.environ["DELPHI_MUTATION_TEST_CMD"] = (
-            "python3 -c " + shlex.quote(
-                f"import sys; sys.stdout.write({stdout!r}); sys.exit({code})"))
+        # A stub that writes the given streams — and, when asked, writes the SIDE-CHANNEL file
+        # the campaign named, which is what a real helper does and what test text cannot.
+        body = (f"import os,sys; sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); ")
+        if precondition is not None:
+            body += ("open(os.environ['DELPHI_PRECONDITION_REPORT'],'a')"
+                     f".write({precondition!r} + chr(10)); ")
+        # A NEGATIVE code means death BY SIGNAL, which must be real: `sys.exit(-9)` merely
+        # exits 247. The whole point of the signal branch is that output cannot fake it.
+        if code < 0:
+            body += f"sys.stdout.flush(); sys.stderr.flush(); os.kill(os.getpid(), {-code})"
+        else:
+            body += f"sys.exit({code})"
+        os.environ["DELPHI_MUTATION_TEST_CMD"] = "python3 -c " + shlex.quote(body)
         try:
             return mc.run_suite()
         finally:
@@ -506,35 +523,32 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
             else:
                 os.environ["DELPHI_MUTATION_TEST_CMD"] = prev
 
-    for expected in ("ordinary payload", "Killed", "DELPHI_PRECONDITION_FAILED"):
+    # D0A-R34-05's three, PLUS D0A-R35-03's two framing escapes: a test that prints its own
+    # "running " line to fake a section boundary, and a test that prints the precondition token
+    # at the start of a line. Both defeated the round-34 parser, which is why the parser is gone
+    # and cause is now read from invocation-bound facts instead.
+    for expected in ("ordinary payload", "Killed", "DELPHI_PRECONDITION_FAILED",
+                     "running user command\nKilled",
+                     "\nDELPHI_PRECONDITION_FAILED: not really"):
         outcome, ev = classify(transcript(expected))
-        check(f"markers: an assertion expecting {expected!r} is still CAUGHT",
+        check(f"markers: printed {expected.splitlines()[0][:28]!r} is still CAUGHT",
               outcome == "CAUGHT",
-              f"classified {outcome} — a detection was discarded because its DATA "
-              f"contained a marker")
-        if expected != "ordinary payload":
-            seen = ev.get("markers_seen_as_data", []) + ev.get(
-                "precondition_markers_seen_as_data", [])
-            check(f"markers: {expected!r} is recorded as data that was CONSIDERED",
-                  bool(seen), f"evidence kept no note of it: {ev.get('markers_seen_as_data')}")
+              f"classified {outcome} — a detection was discarded because of text a TEST "
+              f"printed")
 
-    # And the genuine events must still be detected, or this is not a narrowing but a deletion.
-    outcome, _ = classify("error: could not compile `delphi-runtime` (lib test)\n", 101)
-    check("markers: a PRODUCER compile failure is still INFRASTRUCTURE",
+    # The genuine events must still be detected, or this is a deletion rather than a narrowing.
+    outcome, _ = classify("", 101, stderr="error: could not compile `delphi-runtime`\n")
+    check("markers: a PRODUCER stderr compile failure is still INFRASTRUCTURE",
           outcome == "INFRASTRUCTURE", outcome)
-    genuine = (
-        "running 1 test\n"
-        "test t ... FAILED\n\n"
-        "failures:\n\n"
-        "---- t stdout ----\n"
-        "thread 't' panicked at runtime/src/y.rs:1:1:\n"
-        "DELPHI_PRECONDITION_FAILED: before this test ran — a session is live on tty1\n\n"
-        "failures:\n    t\n\n"
-        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
-    )
-    outcome, _ = classify(genuine)
-    check("markers: a token EMITTED as a panic message is still PRECONDITION FAILURE",
+    outcome, _ = classify(transcript("x"), -9)
+    check("markers: death by SIGNAL is INFRASTRUCTURE, unfakeable from output",
+          outcome == "INFRASTRUCTURE", outcome)
+    outcome, ev = classify(transcript("x"), 101, precondition="stale session on tty1")
+    check("markers: a SIDE-CHANNEL report is PRECONDITION FAILURE",
           outcome == "PRECONDITION FAILURE", outcome)
+    check("markers: and it carries the reported reason",
+          any("stale session" in m for m in ev.get("precondition_markers", [])),
+          f"{ev.get('precondition_markers')}")
 
 
 def guard_cleanup_failure_is_visible_and_retryable() -> None:

@@ -1,0 +1,19 @@
+Artifact provenance for lane run 21 — read this before citing anything here.
+
+CAPTURED BY THE CHECK ITSELF, during the run:
+  root-identities.txt, unpriv-identities.txt, membership.txt   (§4b)
+  root-run.log                                                 (the producer transcript)
+
+RECOVERED AFTER THE RUN from /tmp, where the run left them (D0A-R35-04). These are the
+ACTUAL files the run produced — not transcriptions — but they were collected by a later
+session rather than by the procedure, because the procedure did not yet retain them:
+  hashes-before.txt, hashes-after.txt   (the freshness inputs)
+  rebuild.log                           (the forced-rebuild transcript)
+  root-run21.status                     (per-producer exit codes)
+
+TRANSCRIBED FROM A TERMINAL, not captured — the weakest artifact here, and labelled in
+its own header too:
+  part-b-control.txt                    (the control observation)
+
+From run 22 the procedure captures all of the above during the run, so this file should
+list only the first group.

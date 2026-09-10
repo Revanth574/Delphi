@@ -1647,6 +1647,13 @@ fn read_proc_record(pid: i32) -> Option<ProcRecord> {
     })
 }
 
+/// `comm` for a pid, as BYTES rendered lossily — never a UTF-8 decode that can fail closed.
+fn comm_of(pid: i32) -> String {
+    std::fs::read(format!("/proc/{pid}/comm"))
+        .map(|b| String::from_utf8_lossy(&b).trim_end().to_owned())
+        .unwrap_or_default()
+}
+
 /// Candidate discovery ONLY — every process whose `comm` matches. A name is not an identity
 /// (D0A-R34-01); callers must verify provenance before treating a candidate as this run's AI.
 fn processes_named(comm: &str) -> Vec<ProcRecord> {
@@ -1662,83 +1669,84 @@ fn processes_named(comm: &str) -> Vec<ProcRecord> {
         .collect()
 }
 
-/// What one poll of the probe saw.
+/// What one poll of the probe saw. Records, never booleans (D0A-R35-01).
+///
+/// The previous shape passed `scanner_saw_ai: bool` and returned `Reached` on it before any
+/// provenance check — so a live **same-group namesake** satisfied the control while a verified
+/// child sat outside the group. The success path was the one path that skipped the very check
+/// the round-34 rebuild was for, and run 21's record claimed parentage the code never tested.
 #[derive(Debug, Clone)]
 struct IterationEvidence {
-    /// Everything with the AI's name, anywhere on the system. Candidates, not identifications.
-    candidates: Vec<ProcRecord>,
-    /// Whether the live group scan matched the AI in the SAME iteration, which is what makes
-    /// the two observations an overlapping window rather than two unrelated snapshots.
-    group_saw_ai: bool,
+    /// Records the LIVE GROUP SCAN matched by name, inside the daemon's group.
+    group_matches: Vec<ProcRecord>,
+    /// Name-matching candidates sampled system-wide immediately BEFORE the group scan...
+    before: Vec<ProcRecord>,
+    /// ...and immediately AFTER it. The SAME identity present in both brackets is what makes a
+    /// group scan's miss an observation about the scan rather than about a child that exited
+    /// (D0A-R35-02).
+    after: Vec<ProcRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlVerdict {
-    /// The scanner saw the AI alive in the daemon's group. The control holds.
+    /// A VERIFIED, LIVE child of this daemon was matched inside its group.
     Reached,
     /// A VERIFIED, LIVE child of this daemon ran outside its process group.
     Topology,
-    /// A VERIFIED, LIVE child was inside the group across an overlapping window and the live
-    /// scanner still missed it.
+    /// One VERIFIED identity was alive on both sides of a group scan that missed it, twice.
     Scan,
     /// The evidence does not separate the causes. A real outcome, not a fallback.
     Unresolved,
 }
 
-/// Decide the control's outcome FROM EVIDENCE, never by a rule that prefers one cause
-/// (`DEFECT_CLASSES` 53). Pure, so every branch is reachable without root — which is what the
-/// reviewer asked for after all three verdicts shipped unexecuted.
+/// Is this record this daemon's live child? The two gates every causal claim passes.
+fn verified_live(r: &ProcRecord, daemon_pid: i32) -> bool {
+    r.ppid == daemon_pid && r.state != 'Z'
+}
+
+/// Decide the control's outcome FROM RECORDS, never from a rule that prefers one cause
+/// (`DEFECT_CLASSES` 53) and never from a caller-supplied boolean (D0A-R35-01).
 ///
-/// Two verifications gate every causal claim:
-///
-/// * **provenance** — `ppid == daemon_pid`. A namesake elsewhere on the system is not this
-///   run's AI, and must never turn an unresolved failure into a confident diagnosis.
-/// * **liveness** — `state != 'Z'`. A zombie is a correctly excluded corpse, not a live
-///   sighting the group scanner missed.
-///
-/// `Scan` additionally needs the miss repeated across **two** iterations, because a single
-/// pair of sequential snapshots can differ legitimately: the child may have exited between
-/// them, which is not the scanner failing.
-fn classify_control(
-    daemon_pid: i32,
-    scanner_saw_ai: bool,
-    iterations: &[IterationEvidence],
-) -> ControlVerdict {
-    if scanner_saw_ai {
-        return ControlVerdict::Reached;
-    }
-    let verified_live = |it: &IterationEvidence| -> Vec<ProcRecord> {
-        it.candidates
-            .iter()
-            .filter(|r| r.ppid == daemon_pid && r.state != 'Z')
-            .cloned()
-            .collect()
-    };
+/// `Scan` is the hardest to earn, and deliberately: it needs ONE identity — pid **and**
+/// `starttime`, so a recycled pid is a different identity — alive in both brackets around a
+/// scan that missed it, in **two** iterations. Counting bare qualifying iterations let two
+/// DIFFERENT children, each dying before its own scan, add up to a scanner defect while both
+/// scans were correctly reporting absence.
+fn classify_control(daemon_pid: i32, iterations: &[IterationEvidence]) -> ControlVerdict {
     if iterations
         .iter()
-        .flat_map(&verified_live)
-        .any(|r| r.pgid != daemon_pid)
+        .flat_map(|it| it.group_matches.iter())
+        .any(|r| verified_live(r, daemon_pid))
+    {
+        return ControlVerdict::Reached;
+    }
+    if iterations
+        .iter()
+        .flat_map(|it| it.before.iter().chain(it.after.iter()))
+        .any(|r| verified_live(r, daemon_pid) && r.pgid != daemon_pid)
     {
         return ControlVerdict::Topology;
     }
-    let missed = iterations
-        .iter()
-        .filter(|it| !it.group_saw_ai && verified_live(it).iter().any(|r| r.pgid == daemon_pid))
-        .count();
-    if missed >= 2 {
+    let mut misses: std::collections::HashMap<(i32, u64), usize> =
+        std::collections::HashMap::new();
+    for it in iterations {
+        if it.group_matches.iter().any(|r| verified_live(r, daemon_pid)) {
+            continue;
+        }
+        for r in &it.before {
+            let bracketed = it
+                .after
+                .iter()
+                .any(|q| q.pid == r.pid && q.starttime == r.starttime);
+            if bracketed && verified_live(r, daemon_pid) && r.pgid == daemon_pid {
+                *misses.entry((r.pid, r.starttime)).or_default() += 1;
+            }
+        }
+    }
+    if misses.values().any(|n| *n >= 2) {
         return ControlVerdict::Scan;
     }
     ControlVerdict::Unresolved
-}
-
-/// `comm` for a pid, as BYTES rendered lossily — never as a UTF-8 decode that can fail closed.
-///
-/// Same reasoning as `live_group_members` (D0A-R32-01): `comm` is arbitrary bytes chosen by the
-/// process, so a strict decode lets a process hide from an identity check by being named badly.
-fn comm_of(pid: i32) -> String {
-    std::fs::read(format!("/proc/{pid}/comm"))
-        .map(|b| String::from_utf8_lossy(&b).trim_end().to_owned())
-        .unwrap_or_default()
 }
 
 /// D0A-R34-01/02 — every verdict of `classify_control`, exercised WITHOUT root.
@@ -1760,66 +1768,118 @@ fn control_verdicts_require_provenance_and_liveness_before_naming_a_cause() {
         state,
         starttime: 42,
     };
-    let iter = |candidates: Vec<ProcRecord>, group_saw_ai: bool| IterationEvidence {
-        candidates,
-        group_saw_ai,
+    let it = |group_matches: Vec<ProcRecord>, around: Vec<ProcRecord>| IterationEvidence {
+        group_matches,
+        before: around.clone(),
+        after: around,
     };
 
+    // Reached needs a VERIFIED live child matched IN the group.
     assert_eq!(
-        classify_control(DAEMON, true, &[]),
-        ControlVerdict::Reached,
-        "the scanner having seen the AI is the control holding, whatever else was collected"
+        classify_control(DAEMON, &[it(vec![rec(1001, DAEMON, DAEMON, 'S')], vec![])]),
+        ControlVerdict::Reached
     );
 
-    // A VERIFIED live child outside the group. The one outcome that is about the assembly.
+    // D0A-R35-01 — A SAME-GROUP NAMESAKE. The success path used to return on a caller-supplied
+    // bool derived from name + group, so this satisfied the control while a verified child sat
+    // OUTSIDE the group — the one path that skipped the check the whole rebuild was for.
     assert_eq!(
-        classify_control(DAEMON, false, &[iter(vec![rec(1001, DAEMON, 9999, 'S')], false)]),
-        ControlVerdict::Topology
+        classify_control(
+            DAEMON,
+            &[it(
+                vec![rec(1001, 7, DAEMON, 'S')],                    // namesake, in the group
+                vec![rec(1002, DAEMON, 9999, 'S')],                 // the REAL child, elsewhere
+            )]
+        ),
+        ControlVerdict::Topology,
+        "a NAMESAKE in the group satisfied the control while the daemon's real child ran \
+         outside it — Reached must verify parentage like every other verdict"
     );
-
-    // D0A-R34-01 — A NAMESAKE. Same `comm`, not this daemon's child. It must NOT be able to
-    // turn an unresolved failure into a confident TOPOLOGY diagnosis, which is exactly what
-    // the round-33 version did because `elsewhere` took precedence over everything.
+    // A zombie matched in the group is not a live match either.
     assert_eq!(
-        classify_control(DAEMON, false, &[iter(vec![rec(1001, 7, 9999, 'S')], false)]),
-        ControlVerdict::Unresolved,
-        "a process merely SHARING THE NAME decided TOPOLOGY — identity by name is not identity"
-    );
-
-    // D0A-R34-02 — A ZOMBIE, correctly excluded by the live scanner. Treating it as a live
-    // sighting made a correct exclusion into evidence that the scanner had missed something.
-    assert_eq!(
-        classify_control(DAEMON, false, &std::iter::repeat_with(|| iter(vec![rec(1001, DAEMON, DAEMON, 'Z')], false))
-            .take(5)
-            .collect::<Vec<_>>()),
-        ControlVerdict::Unresolved,
-        "a CORPSE decided SCAN — absence from a LIVE scan is not the live scan being wrong"
-    );
-    // ...and a zombie outside the group must not decide TOPOLOGY either.
-    assert_eq!(
-        classify_control(DAEMON, false, &[iter(vec![rec(1001, DAEMON, 9999, 'Z')], false)]),
+        classify_control(DAEMON, &[it(vec![rec(1001, DAEMON, DAEMON, 'Z')], vec![])]),
         ControlVerdict::Unresolved
     );
 
-    // SCAN needs the miss REPEATED — one snapshot pair can differ because the child exited
-    // between them, which is not the scanner failing.
-    let in_group = iter(vec![rec(1001, DAEMON, DAEMON, 'S')], false);
+    // Topology: a verified live child outside the group.
     assert_eq!(
-        classify_control(DAEMON, false, std::slice::from_ref(&in_group)),
+        classify_control(DAEMON, &[it(vec![], vec![rec(1001, DAEMON, 9999, 'S')])]),
+        ControlVerdict::Topology
+    );
+    // ...but not a namesake outside it, and not a corpse outside it.
+    assert_eq!(
+        classify_control(DAEMON, &[it(vec![], vec![rec(1001, 7, 9999, 'S')])]),
+        ControlVerdict::Unresolved,
+        "a process merely SHARING THE NAME decided Topology"
+    );
+    assert_eq!(
+        classify_control(DAEMON, &[it(vec![], vec![rec(1001, DAEMON, 9999, 'Z')])]),
+        ControlVerdict::Unresolved
+    );
+
+    // Scan needs ONE identity bracketed across TWO scans.
+    let in_group = rec(1001, DAEMON, DAEMON, 'S');
+    let miss = it(vec![], vec![in_group.clone()]);
+    assert_eq!(
+        classify_control(DAEMON, std::slice::from_ref(&miss)),
         ControlVerdict::Unresolved,
         "a single miss is not an overlapping observation window"
     );
     assert_eq!(
-        classify_control(DAEMON, false, &[in_group.clone(), in_group]),
+        classify_control(DAEMON, &[miss.clone(), miss]),
         ControlVerdict::Scan
     );
 
-    // No candidates at all, and unreadable evidence, are both UNRESOLVED — a real outcome.
-    assert_eq!(classify_control(DAEMON, false, &[]), ControlVerdict::Unresolved);
+    // D0A-R35-02 — TWO DIFFERENT CHILDREN, each dying before its own scan, must NOT add up to
+    // a scanner defect: both scans were correctly reporting absence.
+    let died_before_its_scan = |pid: i32| IterationEvidence {
+        group_matches: vec![],
+        before: vec![rec(pid, DAEMON, DAEMON, 'S')],
+        after: vec![],                                   // gone by the time the scan finished
+    };
     assert_eq!(
-        classify_control(DAEMON, false, &[iter(vec![], true)]),
-        ControlVerdict::Unresolved
+        classify_control(DAEMON, &[died_before_its_scan(1001), died_before_its_scan(1002)]),
+        ControlVerdict::Unresolved,
+        "two DIFFERENT short-lived children summed into a Scan verdict while both scans were \
+         correctly reporting absence"
     );
+    // The BRACKET is a separate defence from the identity key, and needs its own case: the
+    // SAME identity seen before each scan but gone by the time the scan finished. Twice. It
+    // was never alive ACROSS a scan, so the scan missing it is not the scan's fault.
+    let seen_then_gone = IterationEvidence {
+        group_matches: vec![],
+        before: vec![in_group.clone()],
+        after: vec![],
+    };
+    assert_eq!(
+        classify_control(DAEMON, &[seen_then_gone.clone(), seen_then_gone]),
+        ControlVerdict::Unresolved,
+        "one identity seen twice but never alive ACROSS a scan produced Scan — the bracket is \
+         what distinguishes `the scanner missed it` from `it was already gone`"
+    );
+
+    // And a RECYCLED pid is a different identity, so it cannot supply the second observation.
+    let recycled = IterationEvidence {
+        group_matches: vec![],
+        before: vec![ProcRecord { starttime: 99, ..rec(1001, DAEMON, DAEMON, 'S') }],
+        after: vec![ProcRecord { starttime: 99, ..rec(1001, DAEMON, DAEMON, 'S') }],
+    };
+    assert_eq!(
+        classify_control(DAEMON, &[miss_once(&rec(1001, DAEMON, DAEMON, 'S')), recycled]),
+        ControlVerdict::Unresolved,
+        "the same pid with a different starttime is a DIFFERENT process"
+    );
+
+    assert_eq!(classify_control(DAEMON, &[]), ControlVerdict::Unresolved);
+}
+
+/// One iteration in which `r` was alive on both sides of a scan that missed it.
+fn miss_once(r: &ProcRecord) -> IterationEvidence {
+    IterationEvidence {
+        group_matches: vec![],
+        before: vec![r.clone()],
+        after: vec![r.clone()],
+    }
 }
 
 /// The record parser, against a REAL process rather than a fabricated string.
@@ -2195,52 +2255,41 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     let probe_comm = ai_comm.clone();
     let probe = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(140);
-        let mut seen: Vec<(i32, char, String)> = Vec::new();
-        // EVERYTHING the probe observed, not only the matches. A control that reports "no
-        // match" cannot distinguish the two failures that matter: the group was EMPTY
-        // throughout (the AI is not in the daemon's group at all — a finding about the
-        // architecture, and about the argument the register rests on), or the group had
-        // members NONE of which were the AI (a `comm` mismatch or a missed window — a finding
-        // about this probe). Retaining the census is what separates them.
         let mut census: Vec<(i32, char, String)> = Vec::new();
-        // WHERE THE AI ACTUALLY IS, sampled system-wide WHILE IT IS ALIVE (D0A-R33-03). Scanning
-        // only the daemon's group cannot tell "the AI is not there" from "the AI is elsewhere",
-        // and a post-hoc lookup finds nothing because the AI is dead by then. Cause is assigned
-        // from this, not from a rule about which explanation is likelier.
         let mut iterations: Vec<IterationEvidence> = Vec::new();
         let mut samples: usize = 0;
         while std::time::Instant::now() < deadline {
             samples += 1;
-            // The candidate scan and the group scan happen in the SAME iteration, which is what
-            // makes them an overlapping window rather than two unrelated snapshots (D0A-R34-02).
-            let candidates = processes_named(&probe_comm);
-            let before_len = seen.len();
-            for (pid, state) in live_group_members(daemon_pid, daemon_pid) {
-                let c = comm_of(pid);
-                if !census.iter().any(|(p, _, _)| *p == pid) {
-                    census.push((pid, state, c.clone()));
+            // BRACKETED (D0A-R35-02): candidates immediately before the group scan and again
+            // immediately after, so an identity present in both was alive ACROSS it.
+            let before = processes_named(&probe_comm);
+            let group = live_group_members(daemon_pid, daemon_pid);
+            let after = processes_named(&probe_comm);
+
+            let want: String = probe_comm.chars().take(15).collect();
+            let mut group_matches: Vec<ProcRecord> = Vec::new();
+            for (pid, state) in &group {
+                let c = comm_of(*pid);
+                if !census.iter().any(|(p, _, _)| p == pid) {
+                    census.push((*pid, *state, c.clone()));
                 }
-                // `comm` is truncated to 15 bytes by the kernel, so compare on that prefix.
-                let want: String = probe_comm.chars().take(15).collect();
-                if c == want && !seen.iter().any(|(p, _, _)| *p == pid) {
-                    seen.push((pid, state, c));
+                if c == want && let Some(r) = read_proc_record(*pid) {
+                    group_matches.push(r);
                 }
             }
-            iterations.push(IterationEvidence {
-                candidates,
-                group_saw_ai: seen.len() > before_len || !seen.is_empty(),
-            });
-            if !seen.is_empty() {
-                return (seen, census, samples, iterations);
+            let reached = group_matches.iter().any(|r| verified_live(r, daemon_pid));
+            iterations.push(IterationEvidence { group_matches, before, after });
+            if reached {
+                return (census, samples, iterations);
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        (seen, census, samples, iterations)
+        (census, samples, iterations)
     });
 
     let run = guard.wait();
-    let (ai_seen_live, probe_census, probe_samples, probe_iterations) =
-        probe.join().expect("probe thread");
+    let (probe_census, probe_samples, probe_iterations) = probe.join().expect("probe thread");
+    let control = classify_control(daemon_pid, &probe_iterations);
     let (out, killed, survivors) = (run.output, run.killed, run.survivors_before_guard);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2266,50 +2315,45 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     // passing run retained nothing in the transcript — the census existed only inside failure
     // diagnostics, so the evidence for the closure vanished on exactly the runs that supported
     // it (D0A-R33).
+    let verified_matches: Vec<&ProcRecord> = probe_iterations
+        .iter()
+        .flat_map(|it| it.group_matches.iter())
+        .filter(|r| verified_live(r, daemon_pid))
+        .collect();
     eprintln!(
         "CONTROL OBSERVATION: daemon pgid {daemon_pid}, ai comm {ai_comm:?}, {probe_samples} \
-         samples\n  matched in the daemon's group: {ai_seen_live:?}\n  census of that group: \
-         {probe_census:?}\n  verdict: {:?}",
-        classify_control(daemon_pid, !ai_seen_live.is_empty(), &probe_iterations)
+         samples\n  VERIFIED live children matched in the daemon's group: {verified_matches:?}\n\
+           census of that group: {probe_census:?}\n  verdict: {control:?}"
     );
 
-    if ai_seen_live.is_empty() {
-        // The verdict is COMPUTED by `classify_control`, whose branches are unit-tested. The
-        // previous version decided here, by a rule that sent one shape to "my instrument is
-        // broken, the closure stands" — and its replacement then made two further attributions
-        // its evidence could not support (D0A-R34-01/02): a namesake counted as this run's AI,
-        // and a zombie counted as a live sighting the scanner had missed.
-        let verdict = classify_control(daemon_pid, false, &probe_iterations);
-        let explanation = match verdict {
-            ControlVerdict::Reached => unreachable!("`ai_seen_live` is empty"),
+    if control != ControlVerdict::Reached {
+        let explanation = match control {
+            ControlVerdict::Reached => unreachable!(),
             ControlVerdict::Topology =>
                 "TOPOLOGY — a VERIFIED live child of this daemon (ppid matches) ran OUTSIDE its \
                  process group. The daemon's children do not inherit its pgid, which contradicts \
-                 the reasoning D0A-R28-02's supplementary scan rests on. A finding about the \
-                 assembly.",
+                 the reasoning the supplementary scan rests on. A finding about the assembly.",
             ControlVerdict::Scan =>
-                "SCAN — a VERIFIED live child was inside the group across an overlapping window, \
-                 repeated across iterations, and the live scanner still never matched it. The \
-                 defect is in this control.",
+                "SCAN — ONE identity (pid AND starttime) was alive on both sides of a group scan \
+                 that missed it, in two iterations. The defect is in this control.",
             ControlVerdict::Unresolved =>
-                "UNRESOLVED — the evidence does not separate the causes. Either no process with \
-                 the AI's name was seen, or the ones seen were NOT verified as this daemon's \
-                 children (a namesake), or they were ZOMBIES (a corpse the live scanner is \
-                 right to exclude), or a single snapshot pair differed with no overlapping \
-                 window. Establish identity and liveness before reporting any cause.",
+                "UNRESOLVED — the evidence does not separate the causes: no process with the \
+                 AI's name was verified as this daemon's LIVE child, or the ones seen were \
+                 namesakes or corpses, or no identity was alive across a scan twice. Establish \
+                 identity and liveness before reporting any cause.",
         };
         panic!(
-            "POSITIVE CONTROL FAILED: the scanner never saw the AI (comm {ai_comm:?}) alive in \
-             the daemon's process group {daemon_pid}, across {probe_samples} samples. The empty \
-             `survivors_before_guard` is therefore VACUOUS for the assembly case.\n\
+            "POSITIVE CONTROL FAILED: no VERIFIED live child of daemon {daemon_pid} (comm \
+             {ai_comm:?}) was matched in its process group across {probe_samples} samples. The \
+             empty `survivors_before_guard` is therefore VACUOUS for the assembly case.\n\
              \n\
-             VERDICT {verdict:?}: {explanation}\n\
+             VERDICT {control:?}: {explanation}\n\
              \n\
              census of the daemon's group ({} distinct pids): {probe_census:?}\n\
-             last iteration's candidates: {:?}\n\
+             last iteration: {:?}\n\
              daemon log:\n{daemon_log}\nfixture log:\n{fixture_log}",
             probe_census.len(),
-            probe_iterations.last().map(|it| &it.candidates)
+            probe_iterations.last()
         );
     }
 

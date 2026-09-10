@@ -51,6 +51,21 @@ pub struct ChildGuard {
 /// covered the moment they carry it.
 pub const PRECONDITION_TOKEN: &str = "DELPHI_PRECONDITION_FAILED";
 
+/// Report a precondition failure on the SIDE CHANNEL as well as by panicking (D0A-R35-03).
+///
+/// The token in stdout is for a human reading a transcript. It cannot be a machine's evidence,
+/// because any test can print it — the mutation campaign classified an ordinary assertion as a
+/// PRECONDITION FAILURE for exactly that reason. The campaign passes a path it chose for this
+/// invocation; a test that was never told the path cannot write to it.
+pub fn report_precondition(reason: &str) {
+    if let Ok(path) = std::env::var("DELPHI_PRECONDITION_REPORT") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{reason}");
+        }
+    }
+}
+
 impl ChildGuard {
     /// Guard `pid` until this value drops.
     pub fn arm(pid: Pid) -> Self {
@@ -130,11 +145,17 @@ pub fn assert_no_stale_session_on(vt: &str) {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/check-stale-test-sessions.sh");
     let out = match std::process::Command::new(script).args(["--vt", vt]).output() {
         Ok(o) => o,
-        Err(e) => panic!(
+        Err(e) => {
+            report_precondition(&format!("could not run {script}: {e}"));
+            panic!(
             "{PRECONDITION_TOKEN}: could not run {script}: {e} — the environment is UNKNOWN, \
              not clean"
-        ),
+        )
+        }
     };
+    if !out.status.success() {
+        report_precondition(&format!("stale session on {vt}"));
+    }
     assert!(
         out.status.success(),
         "{PRECONDITION_TOKEN}: before this test ran — a session is live on {vt}. \
@@ -368,6 +389,33 @@ mod eintr_tests {
             "no SIGUSR1 was delivered at all, so this run exercised nothing — the test would \
              pass with the retry deleted, which is the PASS/PASS case Iron Law 15 clause 2 \
              calls worthless"
+        );
+    }
+}
+
+#[cfg(test)]
+mod precondition_channel_tests {
+    /// D0A-R35-03 — every `PRECONDITION_TOKEN` panic site must ALSO report on the side channel.
+    ///
+    /// The campaign no longer reads the token from output, because any test can print it. That
+    /// is only safe while every real precondition site reports through the channel; a site that
+    /// panics with the token and reports nothing would be silently reclassified as a detection.
+    /// A source-text assertion is the right instrument here because the property is exactly
+    /// "these two appear together" (`DEFECT_CLASSES` 41 acknowledged).
+    #[test]
+    fn every_precondition_panic_is_accompanied_by_a_side_channel_report() {
+        let src = include_str!("test_child_guard.rs");
+        let body = src
+            .split_once("pub fn report_precondition")
+            .expect("the reporter exists")
+            .1;
+        let sites = body.matches("{PRECONDITION_TOKEN}:").count();
+        let reports = body.matches("report_precondition(").count();
+        assert!(
+            sites > 0 && reports >= sites,
+            "{sites} site(s) panic with the token but only {reports} report on the side \
+             channel. A site that does not report is classified as a DETECTION by the mutation \
+             campaign, which is the false-attribution direction (D0A-R35-03)."
         );
     }
 }

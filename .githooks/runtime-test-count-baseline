@@ -255,5 +255,13 @@
 # and fails on the case it targets: dropping provenance makes a NAMESAKE decide Topology,
 # dropping liveness makes a CORPSE decide Scan, dropping the overlapping-window rule makes a
 # SINGLE MISS decide Scan.
-EXECUTED=203
+#
+# +1 (203 -> 204): `every_precondition_panic_is_accompanied_by_a_side_channel_report`
+# (D0A-R35-03). The mutation campaign no longer reads the precondition token from output,
+# because any test can print it — one that did was classified as an environment failure while a
+# real detection was discarded. That is only safe while EVERY precondition site reports through
+# the side channel, so a source-text guard asserts the two appear together. A site that panicked
+# with the token and reported nothing would now be silently reclassified as a DETECTION, which
+# is the false-attribution direction.
+EXECUTED=204
 SKIPPED=26

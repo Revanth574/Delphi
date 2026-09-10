@@ -116,13 +116,6 @@ INPUT_PATHS = [
 # detection. Matching prose means every new phrasing is a new instance to discover, which is
 # class 48 by construction.
 PRECONDITION_TOKEN = "DELPHI_PRECONDITION_FAILED"
-PRECONDITION_MARKERS = (
-    PRECONDITION_TOKEN,
-    # Legacy phrasings, retained so an older binary in the tree is still classified correctly.
-    "PRECONDITION FAILED",
-    "PRECONDITION failure",
-    "STALE SESSION FROM A PREVIOUS RUN",
-)
 
 INFRA_MARKERS = (
     "No space left on device",
@@ -461,25 +454,6 @@ def file_matches_commit(sha: str, rel: str) -> bool:
               ).returncode == 0
 
 
-def split_producer_and_test_output(text: str) -> tuple[str, str]:
-    """Separate what the PRODUCER said from what libtest attributed to a test (D0A-R34-05).
-
-    libtest prints captured per-test output under `---- <name> stdout ----` headers. Everything
-    inside such a section is data a test produced; everything outside is the producer speaking.
-    Cause cannot be read from arbitrary assertion text, so the two must not be searched alike.
-    """
-    producer, tests, in_test = [], [], False
-    for line in text.splitlines():
-        if re.match(r"^---- .+? (?:stdout|stderr) ----$", line):
-            in_test = True
-            tests.append(line)
-            continue
-        if in_test and (line.startswith(("failures:", "test result:", "running "))):
-            in_test = False
-        (tests if in_test else producer).append(line)
-    return "\n".join(producer), "\n".join(tests)
-
-
 def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     """Run the suite and CLASSIFY the outcome (D0A-R29-02).
 
@@ -487,7 +461,21 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     failure, a launch failure or a full disk all exit nonzero and none of them is a test
     judging the mutation.
     """
-    p = sh(suite_cmd(no_run=False), cwd=cwd, publish=True)
+    # The side channel: a path THIS process chooses, per invocation. A test cannot write to a
+    # path it was never told, which is what makes the report an event rather than text.
+    precondition_report = None
+    if not _WORKER_PUBLISH.get("path"):
+        # The self-test drives `run_suite` directly; give the side channel a home anyway.
+        _WORKER_PUBLISH.setdefault(
+            "path", str(pathlib.Path(tempfile.mkdtemp(prefix="delphi-sidechan-")) / "worker.json"))
+    if _WORKER_PUBLISH.get("path"):
+        precondition_report = str(
+            pathlib.Path(_WORKER_PUBLISH["path"]).parent / f"precondition-{os.getpid()}.txt")
+        pathlib.Path(precondition_report).unlink(missing_ok=True)
+    env = dict(os.environ)
+    if precondition_report:
+        env["DELPHI_PRECONDITION_REPORT"] = precondition_report
+    p = sh(suite_cmd(no_run=False), cwd=cwd, publish=True, env=env)
     ev = {
         "exit": p.returncode,
         "stdout": p.stdout,           # RETAINED WHOLE — the previous version kept a filtered
@@ -499,44 +487,42 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
         re.findall(r"^\s{4}(\S+)$", p.stdout[p.stdout.find("failures:"):], re.M)
     )) if "failures:" in p.stdout else []
 
-    blob = p.stdout + p.stderr
-
-    # D0A-R34-05: A MARKER IN ASSERTION DATA IS NOT A REPORT FROM THE INFRASTRUCTURE.
-    # This used to substring-search the whole capture, so a test asserting on the literal
-    # "Killed" was classified INFRASTRUCTURE and one asserting on the precondition token was
-    # classified PRECONDITION FAILURE — the same exit, the same named failing test, a genuine
-    # detection DISCARDED because its data happened to contain a marker. Two discriminators,
-    # each matched to how the corresponding event is really emitted:
+    # D0A-R35-03: THE PARSER IS GONE. Round 34 separated producer output from libtest's
+    # per-test sections and anchored the precondition token to a line start. Both remained
+    # controllable by what a test PRINTS: `running user command` was accepted as a section
+    # boundary, so a test could push its own text into the "producer" region and make a
+    # detection read as INFRASTRUCTURE; and any line beginning with the token — including one a
+    # test simply printed — read as PRECONDITION FAILURE.
     #
-    #   * infrastructure events come from the PRODUCER (cargo, the linker, the kernel), never
-    #     from inside a test body, so they are searched only OUTSIDE libtest's per-test
-    #     sections;
-    #   * the precondition token is emitted by test code as a PANIC MESSAGE, which starts a
-    #     line — while the same token inside an assertion appears indented after `right: "`.
-    producer_text, test_text = split_producer_and_test_output(blob)
-    lines = blob.splitlines()
+    # Cause is now read from facts BOUND TO THE INVOCATION, never from text a test can emit:
+    #
+    #   * signal death        -> `returncode < 0`, which no test output can fabricate;
+    #   * producer diagnostics-> the process's OWN stderr. Under libtest capture a test's
+    #     output goes to STDOUT (inside `---- name stdout ----`), so cargo/linker/kernel
+    #     messages on stderr are the producer speaking, by construction rather than by parsing;
+    #   * preconditions       -> a SIDE-CHANNEL FILE the helper writes, whose path this process
+    #     chooses per invocation. A test cannot write to a path it was never told.
+    ev["markers_seen_as_data"] = [m for m in INFRA_MARKERS if m in p.stdout]
 
-    infra = [m for m in INFRA_MARKERS if m in producer_text]
-    ev["markers_seen_as_data"] = [m for m in INFRA_MARKERS
-                                  if m in test_text and m not in producer_text]
+    if p.returncode < 0:
+        ev["infra_markers"] = [f"killed by signal {-p.returncode}"]
+        return "INFRASTRUCTURE", ev
+
+    infra = [m for m in INFRA_MARKERS if m in p.stderr]
     if infra and ev["failing_tests"]:
-        # Provenance conflicts: the producer reported a resource failure AND tests named their
-        # own failures. Asserting infrastructure causality here would discard a possible
-        # detection; asserting detection would ignore a real resource failure. Neither is
-        # established, so neither is claimed.
+        # Provenance conflicts: neither cause is established, so neither is claimed.
         ev["infra_markers"] = infra
         return "UNATTRIBUTED FAILURE", ev
     if infra:
         ev["infra_markers"] = infra
         return "INFRASTRUCTURE", ev
 
-    precond = [m for m in PRECONDITION_MARKERS if any(l.startswith(m) for l in lines)]
-    ev["precondition_markers_seen_as_data"] = [
-        m for m in PRECONDITION_MARKERS if m in blob and m not in precond]
-    if precond:
-        # A named failing test whose failure is a PRECONDITION, not a detection (D0A-R30-04).
-        ev["precondition_markers"] = precond
-        return "PRECONDITION FAILURE", ev
+    if precondition_report and os.path.exists(precondition_report):
+        reported = pathlib.Path(precondition_report).read_text().strip()
+        if reported:
+            ev["precondition_markers"] = reported.splitlines()
+            return "PRECONDITION FAILURE", ev
+
     if ev["result_lines"] == 0:
         # Nothing reported a result: the suite did not get to judge anything.
         return "INFRASTRUCTURE", ev

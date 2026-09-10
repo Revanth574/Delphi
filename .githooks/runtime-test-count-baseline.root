@@ -26,9 +26,17 @@
 #     census: [(30010, 'S', "delphi-runtimed"), (30095, 'S', "sai"), (30098, 'R', "unix_chkpwd")]
 #     verdict: Reached
 #
-# `Reached` is the first of the four outcomes named in the expectation. The scanner found the
-# AI **alive** (`S`), verified as this daemon's child, across 20 samples — provenance and
-# liveness, not a name match, which is what R34-01/02 forced.
+# `Reached` is the first of the four outcomes named in the expectation. The scanner found a
+# process named `sai`, **alive** (`S`), in the daemon's group, across 20 samples.
+#
+# **CORRECTION (D0A-R35-01): THIS RECORD CLAIMED THE MATCH WAS VERIFIED AS THE DAEMON'S CHILD.
+# IT WAS NOT.** `classify_control` returned `Reached` on a caller-supplied boolean derived from
+# NAME + GROUP MEMBERSHIP, before any `ppid` check — so the success path was the one path that
+# skipped the provenance gate the whole round-34 rebuild existed to add. A live same-group
+# NAMESAKE would have satisfied it, and the reviewer demonstrated exactly that while a verified
+# child sat outside the group. Run 21's `Reached` therefore establishes name + group membership
+# and NOT parentage. The fix carries records through the success path; a re-run would be needed
+# to claim parentage for this observation, and none has happened.
 #
 # **THE CENSUS IS ITS OWN SMALL CONTROL.** It returns THREE processes, not just the target:
 # a second `delphi-runtimed` (30010 — the leader 30007 is excluded by design, so this is the

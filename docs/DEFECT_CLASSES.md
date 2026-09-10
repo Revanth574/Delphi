@@ -3095,3 +3095,38 @@ each component was complete and correct against its own spec. The defect lives i
 "It ran and found nothing" is weak evidence and should always prompt the question *was the
 thing findable in the form I looked for it?* Both instances above were expensive — 140-second
 runs — and produced only the information that the interface was wrong.
+
+## 56. COVERAGE THAT DEPENDS ON BUILD RESIDUE IS COVERAGE NOBODY IS ENTITLED TO  *(new — D0A-R35, found by a bisect refusing to measure)*
+
+**The shape.** A test needs an auxiliary binary that a `required-features` build produces. In a
+featureless build the binary is absent and the test **skips** — and a skip is scored as a PASS
+(class 10). So the test's coverage is contingent on some *earlier, differently configured*
+build having left the binary in the shared target directory, and the difference between
+"covered" and "silently uncovered" is invisible in the summary line either way.
+
+**The instance.** `the_daemon_binary_runs_the_real_gate_d0a_r4_03` needs
+`delphi-surface-shell`, which carries `required-features = ["insecure-test-seams"]`. The lane
+builds featureless. It ran in lane runs 20–25 **only because each run's Part B — a
+feature-enabled build — left the binary behind for the next run's lane.** Measured: the binary
+in the shared target dir was stamped at run 25's Part B, and no lane run's skip list ever
+contained this test.
+
+**On a fresh clone, the lane silently loses this test**, and the count would not move in a way
+anyone would notice, because the skip is one more `ok`.
+
+**How it was found: a bisect REFUSED to measure.** Comparing HEAD against an older commit in an
+isolated worktree, the worktree side skipped with `delphi-surface-shell does not exist` while
+HEAD ran. The harness refused rather than counting the skip — and that refusal is what exposed
+the dependency. **A clean tree beside a contaminated one is what makes residue visible;** the
+contaminated tree alone never reports anything.
+
+**The foreclosing discipline.** A test whose prerequisites come from a *different build
+configuration* than the one running it must either (a) declare them as build dependencies of
+that configuration, or (b) FAIL rather than skip when they are absent — the choice turns on
+whether the absence is a legitimate environment limit or a build mistake. A skip is right for
+"this machine cannot do it" and wrong for "this build did not produce it", and the two are
+easy to conflate because both read as `ok`.
+
+**The generalisation worth carrying:** a shared build directory is shared *state*, and state
+that accumulates across differently configured runs makes each run's coverage depend on its
+predecessors. Isolation is not only for the thing under test.

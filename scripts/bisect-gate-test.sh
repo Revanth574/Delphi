@@ -36,28 +36,46 @@ command -v cargo >/dev/null || REFUSE "cargo is not on PATH — build as the nor
 [ "$(id -u)" -ne 0 ] || REFUSE "run this as the NORMAL user; it builds with cargo and invokes \
 sudo per iteration (root has no rustup toolchain)"
 
-echo "== building HEAD ($(git rev-parse --short HEAD)) =="
-cargo test -p delphi-runtime --test b1_integration --no-run --message-format=json 2>/dev/null \
-  | python3 -c 'import sys,json
+# D0A-R35: BUILD BOTH SIDES THE SAME WAY, INCLUDING THE FEATURE-GATED AUXILIARY BINARIES.
+# The first run of this script compared a HEAD target dir CONTAMINATED with feature-built
+# artifacts against a clean worktree, and the worktree side skipped:
+#
+#   SKIP r4_03_daemon_real_gate: measured blocker: .../delphi-surface-shell does not exist
+#
+# `delphi-surface-shell` carries `required-features = ["insecure-test-seams"]`, so a featureless
+# build does not produce it — and the test SKIPS when it is absent. HEAD only ran because a
+# previous Part B had left one in the shared target dir. Comparing a contaminated tree against a
+# clean one measures the contamination.
+build_both() {   # $1 = dir, $2 = target dir
+    ( cd "$1" && CARGO_TARGET_DIR="$2" cargo test -p delphi-runtime --features \
+        insecure-test-seams --test b1_integration --no-run >/dev/null 2>&1 ) \
+      || REFUSE "feature build failed in $1"
+    ( cd "$1" && CARGO_TARGET_DIR="$2" cargo test -p delphi-runtime --test b1_integration \
+        --no-run --message-format=json 2>/dev/null \
+      | python3 -c 'import sys,json
 for l in sys.stdin:
     try: m=json.loads(l)
     except Exception: continue
     if m.get("executable") and m.get("profile",{}).get("test"): print(m["executable"])' \
-  | sort -u > /tmp/bisect-head.txt
-NEW_BIN=$(cat /tmp/bisect-head.txt)
+      | sort -u )
+}
+
+echo "== building HEAD ($(git rev-parse --short HEAD)) =="
+NEW_BIN=$(build_both "$PWD" "${CARGO_TARGET_DIR:-$PWD/target}")
 [ -x "$NEW_BIN" ] || REFUSE "no HEAD test binary"
 
 echo "== building $OLD in an isolated worktree =="
 if [ ! -d "$WT" ]; then git worktree add --detach "$WT" "$OLD" >/dev/null; fi
-OLD_BIN=$(cd "$WT" && CARGO_TARGET_DIR="$WT/target" cargo test -p delphi-runtime --test \
-  b1_integration --no-run --message-format=json 2>/dev/null \
-  | python3 -c 'import sys,json
-for l in sys.stdin:
-    try: m=json.loads(l)
-    except Exception: continue
-    if m.get("executable") and m.get("profile",{}).get("test"): print(m["executable"])' \
-  | sort -u)
+OLD_BIN=$(build_both "$WT" "$WT/target")
 [ -x "$OLD_BIN" ] || REFUSE "no $OLD test binary"
+
+# Both trees must now carry the auxiliary binary the test needs, or the comparison is between
+# a test that runs and a test that skips.
+for pair in "HEAD:${CARGO_TARGET_DIR:-$PWD/target}" "$OLD:$WT/target"; do
+    d="${pair#*:}"
+    [ -x "$d/debug/delphi-surface-shell" ] \
+      || REFUSE "${pair%%:*} has no delphi-surface-shell — the test would SKIP on that side"
+done
 
 echo "HEAD: $NEW_BIN"
 echo "$OLD: $OLD_BIN"

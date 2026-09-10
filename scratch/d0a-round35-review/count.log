@@ -1,0 +1,8 @@
+EXECUTED 223 / SKIPPED 6 / reported 229   (27310ms total, 122ms per executed test)
+--- the 6 skipped test(s) returned early and were scored as passes ---
+  test b1_daemon_binary_runs_the_assembled_flow ... SKIP b1_daemon_binary: requires `--features insecure-test-se
+  test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... SKIP b1_daemon_bounds_an_ai...: re
+  test system_account_guard::an_unreadable_login_defs_refuses_where_an_absent_one_defaults ... SKIP an_unreadabl
+  test logind::tests::pidfd_refuses_a_recycled_pid_barrier ... SKIP pidfd_refuses_a_recycled_pid_barrier: user n
+  test live_logind_query_path_works_or_documents_deferral ... DEFER live logind query: this process has no login
+  test a_regular_login_user_is_not_refused_as_a_system_account ... SKIP a_regular_login_user_is_not_refused_as_a

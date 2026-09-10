@@ -1,0 +1,21 @@
+
+running 1 test
+test action_text_is_preserved ... FAILED
+
+failures:
+
+---- action_text_is_preserved stdout ----
+Killed
+
+thread 'action_text_is_preserved' (40237) panicked at /tmp/d0a-r35-probe-q_t7syah/libtest.rs:5:5:
+assertion `left == right` failed
+  left: "altered payload"
+ right: "ordinary payload"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    action_text_is_preserved
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

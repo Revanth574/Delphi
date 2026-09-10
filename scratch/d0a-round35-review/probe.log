@@ -1,0 +1,11 @@
+real outside-group owned child: Topology
+same-group namesake, no direct-child candidate: Reached; candidates=[ProcRecord { pid: 40211, ppid: 40210, pgid: 40208, state: 'S', starttime: 206866 }]
+same-group namesake masks verified outside-group child: Reached
+two different children exit before their scans: Scan; evidence=[IterationEvidence { candidates: [ProcRecord { pid: 40213, ppid: 40208, pgid: 40208, state: 'S', starttime: 206867 }], group_saw_ai: false }, IterationEvidence { candidates: [ProcRecord { pid: 40214, ppid: 40208, pgid: 40208, state: 'S', starttime: 206869 }], group_saw_ai: false }]
+no remaining named process: Unresolved; candidates=[]
+real libtest: {"data": "ordinary payload", "outcome": "CAUGHT", "exit": 101, "failing_tests": ["action_text_is_preserved"]}
+real libtest: {"data": "Killed", "outcome": "CAUGHT", "exit": 101, "failing_tests": ["action_text_is_preserved"]}
+real libtest: {"data": "running user command\nKilled", "outcome": "UNATTRIBUTED FAILURE", "exit": 101, "failing_tests": ["action_text_is_preserved"]}
+real libtest: {"data": "DELPHI_PRECONDITION_FAILED is the payload under test", "outcome": "PRECONDITION FAILURE", "exit": 101, "failing_tests": ["action_text_is_preserved"]}
+retained membership: producer == root-identities == unpriv-identities; 229/229, multiplicities all 1
+retention counterexample: {a:2,b:1} and {a:1,b:2} serialize identically with equal totals; multiplicities lost

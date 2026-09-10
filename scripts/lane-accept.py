@@ -37,6 +37,7 @@ import argparse
 import os
 import pathlib
 import re
+import time
 import sys
 
 EXPECTED_TARGETS = 17
@@ -248,9 +249,21 @@ def main() -> int:
     print(body)
     # D0A-R35-04 applied to this tool: its own verdict is CAPTURED, never transcribed. Written
     # by the verifier itself so it cannot become another terminal paste on its first use.
+    # THE RUN'S VERDICT IS NOT OVERWRITTEN BY A LATER RE-VERIFICATION (D0A-R35). Re-running
+    # this tool over a historical directory rewrote run 23's captured verdict with output from
+    # a NEWER version of the tool — text that execution never produced. The verdict was still
+    # ACCEPTED, so nothing false was claimed, but a capture that any later run can mutate is not
+    # a capture. The original stays; the re-verification is retained beside it under its own
+    # name, because discarding it would lose evidence too.
+    target = d / "acceptance.txt"
+    if target.exists():
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        target = d / f"acceptance-reverified-{stamp}.txt"
+        print(f"\nNOTE: {d / 'acceptance.txt'} already exists and is the RUN's verdict. This "
+              f"re-verification is written beside it, not over it.")
     try:
-        (d / "acceptance.txt").write_text(body + "\n")
-        print(f"\nverdict captured in {d / 'acceptance.txt'}")
+        target.write_text(body + "\n")
+        print(f"\nverdict captured in {target}")
     except OSError as e:
         print(f"REFUSE: could not capture the verdict ({e}) — an uncapturable verdict is the "
               f"defect this tool exists to stop", file=sys.stderr)

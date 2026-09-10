@@ -201,6 +201,22 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # D0A-R35: a later re-verification must NOT overwrite the RUN's verdict.
+    d = fixture()
+    try:
+        (d / "acceptance.txt").write_text("VERDICT: ACCEPTED\nthe run's own verdict\n")
+        original = (d / "acceptance.txt").read_text()
+        subprocess.run([sys.executable, str(REPO / "scripts" / "lane-accept.py"), str(d)],
+                       capture_output=True, text=True, timeout=60)
+        check("re-verification does NOT overwrite the run's captured verdict",
+              (d / "acceptance.txt").read_text() == original,
+              "a capture any later run can mutate is not a capture")
+        extra = list(d.glob("acceptance-reverified-*.txt"))
+        check("...and the re-verification is retained beside it", len(extra) == 1,
+              f"found {extra} — discarding it would lose evidence too")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     d = fixture()
     try:
         os.chmod(d, 0o555)

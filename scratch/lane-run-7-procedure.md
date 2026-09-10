@@ -227,6 +227,7 @@ as proof the sets were identical. It happened to be true — a reviewer verified
 — but the evidence recorded did not establish it.
 
 ```bash
+mkdir -p "scratch/lane-run-$RUN"          # RETAINED, in the repo — see below
 python3 - <<'EOF'
 import re,subprocess,os,collections
 root=collections.Counter(); target=None
@@ -243,9 +244,29 @@ only_root=root-unpriv; only_unpriv=unpriv-root
 print(f"root {sum(root.values())} / unpriv {sum(unpriv.values())}")
 print(f"IN ROOT NOT UNPRIV: {sum(only_root.values())}"); [print("  ",k) for k in only_root]
 print(f"IN UNPRIV NOT ROOT: {sum(only_unpriv.values())}"); [print("  ",k) for k in only_unpriv]
+# D0A-R34: WRITE THE INPUTS SOMEWHERE THAT SURVIVES. Run 20's membership result became
+# INDEPENDENTLY UNAUDITABLE because both comparison inputs lived in /tmp and were gone by the
+# time anyone tried to check it — so the record stood on the operator's report alone, and
+# matching totals do not substitute for an identity-set comparison. These files are committed
+# with the run record.
+out = f"scratch/lane-run-{os.environ['RUN']}"
+with open(f"{out}/root-identities.txt", "w") as f:
+    f.write("\n".join(f"{t}::{n}" for (t, n) in sorted(root)) + "\n")
+with open(f"{out}/unpriv-identities.txt", "w") as f:
+    f.write("\n".join(f"{t}::{n}" for (t, n) in sorted(unpriv)) + "\n")
+with open(f"{out}/membership.txt", "w") as f:
+    f.write(f"root {sum(root.values())} / unpriv {sum(unpriv.values())}\n")
+    f.write(f"IN ROOT NOT UNPRIV: {sum(only_root.values())}\n")
+    for k in only_root:
+        f.write(f"  {k}\n")
+    f.write(f"IN UNPRIV NOT ROOT: {sum(only_unpriv.values())}\n")
+    for k in only_unpriv:
+        f.write(f"  {k}\n")
+print(f"identity lists retained in {out}/ — commit them with the run record")
 raise SystemExit(0 if not only_root and not only_unpriv else 1)
 EOF
 echo "membership rc=$?"    # 0 = identical sets; ANY non-empty side is a RESULT
+cp "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, also retained
 ```
 
 Counters, not sets — a duplicated `#[test]` inflated a count once already, and set arithmetic

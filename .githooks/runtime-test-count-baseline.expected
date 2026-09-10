@@ -1,8 +1,24 @@
-# EXPECTATION FOR LANE RUN 22 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
+# EXPECTATION FOR LANE RUN 23 (the re-attempt; run 22 was REFUSED at the gate) — derived and committed ALONE, BEFORE the run (D0A-R21-07).
 #
-# Target commit: 87d98ae. The instrument changes — `cp -p`, the hygiene capture, explicit
+# Target commit: fba091a. The instrument changes — `cp -p`, the hygiene capture, explicit
 # identity counts, and the acceptance gate itself — were committed at 87d98ae, one commit
 # earlier, so this prediction is about the procedure that will actually run.
+#
+# =========================================================================================
+# WHY THIS IS RUN 23 AND NOT RUN 22 AGAIN
+# =========================================================================================
+#
+# Run 22 was attempted and REFUSED by the acceptance gate; `scratch/lane-run-23/` holds its
+# captured REFUSED verdict and an ATTEMPT-REFUSED record. Re-running into that directory would
+# put fresh artifacts beside a retained refusal and let the verifier overwrite `acceptance.txt`
+# with ACCEPTED while the refusal record still sat next to it — **a directory contradicting
+# itself**, which is the same shape as the register table that survived the prose rewrite
+# (D0A-R33-04/R34-04). A refused attempt is permanent record; the re-attempt gets its own number.
+#
+# **THE PREDICTION IS UNCHANGED AND WAS COMMITTED BEFORE RUN 22'S ATTEMPT** (75da430). No Rust
+# test was added or removed since — the fixes in this range are `test-count.sh`'s set-but-empty
+# refusal, the procedure's per-step env sourcing, and records. Re-measured at fba091a: unprivileged
+# is still 204/26/230, so the root derivation below stands as written.
 #
 # =========================================================================================
 # THE DERIVATION
@@ -30,7 +46,7 @@
 # THE VERIFIER'S VERDICT *IS* THE RUN'S ACCEPTANCE — it is not a check on the run
 # =========================================================================================
 #
-# `scripts/lane-accept.py scratch/lane-run-22` runs LAST and decides whether this run may be
+# `scripts/lane-accept.py scratch/lane-run-23` runs LAST and decides whether this run may be
 # cited as merge acceptance. **If it refuses, the run is not accepted regardless of what the
 # counts say.** A green 224/6/230 with a REFUSED verdict is an unaccepted run, and recording it
 # any other way would recreate the exact defect the tool exists to close — a required check
@@ -41,7 +57,8 @@
 #
 # **This is its first real use.** It has been run against lane run 21, which it REFUSED for two
 # genuine gaps (no hygiene capture; identities written without counts). Both are fixed in the
-# procedure for this run, so run 22 is the first that can be ACCEPTED rather than refused.
+# procedure for this run, so run 23 is the first that can be ACCEPTED rather than refused — run 22 never
+# reached the count at all.
 #
 # =========================================================================================
 # WHAT A REFUSAL WOULD MEAN AT EACH CHECK — three different findings, one of them surprising

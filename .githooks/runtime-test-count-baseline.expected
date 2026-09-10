@@ -1,110 +1,93 @@
-# EXPECTATION FOR LANE RUN 20 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
+# EXPECTATION FOR LANE RUN 21 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
 #
-# Target commit: 29a0590. The instrument was frozen one commit earlier (29a0590) so this
-# prediction is about the code that will actually run, not a different version of it.
-#
-# =========================================================================================
-# THE DERIVATION — checkable independently of whether the number matches
-# =========================================================================================
-#
-# Run 19 measured root 216 / 5 / 221 at c10810f. Six test identities have been added since
-# and NONE removed, giving 227 reported. Enumerated from the diff, not from memory — and the
-# first enumeration was WRONG: the grep used `fn [a-z_]+`, which excludes digits, so every
-# test with `b1` in its name was invisible, including the one this run exists for. Corrected
-# to `[a-z0-9_]+`. A derivation produced by a grep is only as sound as the grep.
-#
-#   test                                                    | file                | root gate
-#   --------------------------------------------------------|---------------------|----------
-#   an_already_dead_childs_exit_code_survives_shutdown       | shutdown.rs         | NONE
-#   a_child_that_died_of_a_signal_is_not_reported_as_clean   | shutdown.rs         | NONE
-#   reap_status_retries_a_waitpid_interrupted_by_a_signal    | test_child_guard.rs | NONE
-#   live_group_members_..._skips_a_real_zombie               | b1_integration.rs   | NONE
-#   strip_ansi_recovers_the_field_text_tracing_actually_emits| b1_integration.rs   | NONE
-#   b1_daemon_bounds_an_ai_..._and_stays_alive               | b1_integration.rs   | feature+
-#                                                           |                     | root+bwrap
-#
-# Gates verified by grep of the 25 lines following each `fn`, per the procedure's "never from
-# memory" clause. Five are ungated and run in both lanes. The sixth checks the FEATURE FIRST,
-# so it skips in BOTH lanes here: the lane builds without `--features insecure-test-seams`.
-#
-#   EXECUTED  216 + 5 = 221
-#   SKIPPED     5 + 1 =   6      (the five from run 19, plus the assembly test's feature skip)
-#   reported  221 + 6 = 227      (agrees with the measured unprivileged 201/26/227)
-#
-# Cross-check: unprivileged went 196/25/221 -> 201/26/227, i.e. +5 executed and +1 skipped,
-# which is the same partition of the same six tests. If root reports anything other than
-# 221/6/227, ONE of these two statements is false and the mismatch is the result.
+# Target commit: 9f6b9db. §4b's retention change was committed one commit earlier (9f6b9db) so
+# this prediction is about the instrument that will actually run.
 #
 # =========================================================================================
-# RUN 20 HAS TWO PARTS, AND THE SECOND IS THE POINT
+# THE DERIVATION
 # =========================================================================================
 #
-# PART A — the standard 17-target lane, built WITHOUT the feature. This is the count evidence
-# and it stays comparable to run 19. It does NOT execute the assembly test.
+# Run 20 measured root 221 / 6 / 227 at fc22117. TWO test identities added since, none removed
+# (enumerated from the diff with `fn [a-z0-9_]+` — the digit-excluding form that hid the
+# assembly test before run 20 is not repeated):
 #
-# PART B — a SEPARATE root execution of the assembly test WITH `--features
-# insecure-test-seams`, which is how the previous five assembly runs were done. Part B does
-# not contribute to the counts above and must not be folded into them.
+#   control_verdicts_require_provenance_and_liveness_before_naming_a_cause | b1_integration | NONE
+#   proc_records_carry_provenance_and_state_for_a_real_child               | b1_integration | NONE
 #
-# =========================================================================================
-# THE CONTROL'S POSSIBLE OUTCOMES, NAMED BEFORE THE RUN
-# =========================================================================================
+# Both ungated — verified by grep of the 25 lines after each `fn`, per the procedure's "never
+# from memory" clause. Both are deliberately root-free: they exist because the control's three
+# verdicts shipped UNEXECUTED inside a root-gated assertion, and a decision procedure should not
+# need a privileged lane to be tested.
 #
-# The control asserts the scanner saw the real AI ALIVE in the daemon's process group. Three
-# outcomes, and they are not equally informative:
+#   EXECUTED  221 + 2 = 223
+#   SKIPPED       6    =   6      (unchanged; nothing added or removed is gated)
+#   reported  227 + 2 = 229       (agrees with the measured unprivileged 203/26/229)
 #
-# 1. CONTROL PASSES, survivors empty, nine assertions pass.
-#    The scanner is proven capable in the assembly, not merely in a fixture. This is the only
-#    outcome in which the empty sample is evidence about the daemon.
-#
-# 2. CONTROL FAILS, census EMPTY.
-#    The daemon's group never contained any member the scan could see. **This is a PRODUCT /
-#    ARCHITECTURE finding** and it contradicts the reasoning the closure rests on — that
-#    neither launcher.rs nor execute.rs calls setsid/setpgid, so forked children inherit the
-#    pgid. It would mean the empty sample has never meant what the register says.
-#
-# 3. CONTROL FAILS, census NON-EMPTY but containing no member named as the AI.
-#    The scan reaches the group; the AI was not identified in it. **This is a defect in the
-#    CONTROL** — a comm mismatch (the staged name is truncated to 15 bytes by the kernel) or a
-#    window the 25 ms poll missed — and it is evidence about my instrument, not about the
-#    daemon. Do NOT report it as a product finding, and do not report it as a harness artifact
-#    either until the census SHOWS it (Iron Law 15 clause 5: the harness is guilty only when
-#    shown to be).
-#
-# Outcomes 2 and 3 both present as "POSITIVE CONTROL FAILED". The census is what separates
-# them, which is why the probe was changed to retain one before this file was written.
-#
-# A fourth outcome is possible and is not a control failure: the control passes and
-# `survivors_before_guard` is NON-EMPTY. That is the daemon failing to clean up, caught by
-# the assertion that already exists.
+# Cross-check: unprivileged went 201/26/227 -> 203/26/229, i.e. +2 executed and +0 skipped —
+# the same partition of the same two tests. A root figure other than 223/6/229 falsifies one of
+# these two statements, and the mismatch is the result.
 #
 # =========================================================================================
-# WHAT EACH OUTCOME DOES TO D0A-R28-02'S CLOSURE
+# WHY THIS RUN EXISTS: THE ASSEMBLY TEST HAS NOT RUN SINCE ROUND 33
 # =========================================================================================
 #
-# ON A PASS the register's wording STRENGTHENS, from
+# Since its last root execution the observer was REBUILT (provenance + liveness gating),
+# `classify_control` was extracted, the probe was rewired to collect typed per-iteration
+# evidence, and both outcome tables were rewritten. Meanwhile D0A-R28-02's closure rests on
+# `killed == false` from that test. **The closure currently rests on a run that predates every
+# change made to the thing producing it** — which is the same condition (compiled, not
+# executed) one layer up from the one round 34 fixed.
 #
-#     "No live group members remained before harness intervention; daemon reaping was not
-#      observed."
+# PART A — the standard 17-target lane, built WITHOUT the feature. Count evidence, comparable
+# to run 20. Does NOT execute the assembly test.
+# PART B — a SEPARATE root run of the assembly test WITH `--features insecure-test-seams`.
+# Part B contributes nothing to the counts above and must not be folded into them.
 #
-# to
+# =========================================================================================
+# WHAT A CONTROL FAILURE WOULD NOW MEAN — the verdicts are REACHABLE for the first time
+# =========================================================================================
 #
-#     "The scanner was proven capable of seeing the daemon's own fork/exec'd child in its
-#      inherited process group, and no live group members remained before harness
-#      intervention; daemon reaping was not observed."
+# In round 33 these were compiled branches. `classify_control` now computes one from evidence,
+# and each says something different about whether the closure holds:
 #
-# The reaping clause does NOT change — this run observes cleanup, not reaping, and R29-05's
-# `Unreaped` branch stays UNCONSTRUCTED.
+# 1. CONTROL PASSES (`Reached`). The scanner saw a VERIFIED, LIVE child of this daemon inside
+#    its group. The supplementary scan is meaningful for this run. The §4 closure
+#    (`killed == false` against a stubborn AI) is unaffected either way — it does not depend
+#    on the scan.
 #
-# ON A FAILURE OF KIND 2 the CLOSURE WITHDRAWS — not the test. The test would have done
-# exactly its job. D0A-R28-02 returns to OPEN with the reason recorded, and the fixture
-# demonstration is marked as not transferring to the assembly.
+# 2. `Topology`. A verified live child ran OUTSIDE the daemon's process group. **This is a
+#    finding about the assembly**, and it would mean the pre-intervention scan has never been
+#    able to see what it was assumed to see — the supplementary evidence in D0A-R28-02's row
+#    comes out, and the row keeps only `killed == false` and the daemon's self-report. It would
+#    NOT withdraw the §4 closure, because boundedness is observed independently of the scan.
+#    Being able to state that separation in advance is the benefit of last round's rewrite.
 #
-# ON A FAILURE OF KIND 3 nothing about the closure changes and the control is fixed; the
-# closure stays where it is, still resting on an argument, and says so.
+# 3. `Scan`. A verified live child was inside the group across an overlapping window and the
+#    scanner still missed it. **A defect in the control**, not evidence about the daemon — and
+#    this time that is a computed verdict gated on provenance and liveness, not the rule that
+#    sent every ambiguous case to this answer (D0A-R34-01/02).
 #
-# I do not know which of these will happen. Stating that plainly is the point of writing them
-# down first: after the run, whichever occurs will feel like the one that was expected.
-EXPECTED_EXECUTED=221
+# 4. `Unresolved`. Identity or liveness is unestablished — a namesake, a corpse, or a single
+#    snapshot with no overlapping window. **Report no cause.** This is a real outcome; it is the
+#    one the round-33 code could not produce, and producing it is success, not a failure to
+#    diagnose.
+#
+# A fifth possibility is not a control failure: the control passes and
+# `survivors_before_guard` is NON-EMPTY. That voids the run as evidence about the daemon and is
+# caught by the assertion that already runs first.
+#
+# I do not know which will occur. Naming them first is what stops the one that does from
+# reading as the one that was expected.
+#
+# =========================================================================================
+# §4b's INPUTS ARE RETAINED THIS RUN — the first time the fix is applied rather than promised
+# =========================================================================================
+#
+# Run 20's membership stands on the operator's report because both comparison inputs lived in
+# /tmp and were gone when the reviewer went to check. §4b now writes
+# `scratch/lane-run-21/{root-identities.txt,unpriv-identities.txt,membership.txt}` plus the
+# producer transcript, and they are committed with the run record. **If those files are not in
+# the commit, the membership claim for run 21 is worth exactly what run 20's was.**
+EXPECTED_EXECUTED=223
 EXPECTED_SKIPPED=6
-EXPECTED_REPORTED=227
+EXPECTED_REPORTED=229

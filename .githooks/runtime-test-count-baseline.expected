@@ -1,93 +1,88 @@
-# EXPECTATION FOR LANE RUN 21 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
+# EXPECTATION FOR LANE RUN 22 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
 #
-# Target commit: 9f6b9db. §4b's retention change was committed one commit earlier (9f6b9db) so
-# this prediction is about the instrument that will actually run.
+# Target commit: 87d98ae. The instrument changes — `cp -p`, the hygiene capture, explicit
+# identity counts, and the acceptance gate itself — were committed at 87d98ae, one commit
+# earlier, so this prediction is about the procedure that will actually run.
 #
 # =========================================================================================
 # THE DERIVATION
 # =========================================================================================
 #
-# Run 20 measured root 221 / 6 / 227 at fc22117. TWO test identities added since, none removed
-# (enumerated from the diff with `fn [a-z0-9_]+` — the digit-excluding form that hid the
-# assembly test before run 20 is not repeated):
+# Run 21 measured root 223 / 6 / 229 at d1fa4fe. ONE test identity added since, none removed
+# (enumerated with `fn [a-z0-9_]+`, digits included):
 #
-#   control_verdicts_require_provenance_and_liveness_before_naming_a_cause | b1_integration | NONE
-#   proc_records_carry_provenance_and_state_for_a_real_child               | b1_integration | NONE
+#   every_precondition_panic_is_accompanied_by_a_side_channel_report | test_child_guard.rs | NONE
 #
-# Both ungated — verified by grep of the 25 lines after each `fn`, per the procedure's "never
-# from memory" clause. Both are deliberately root-free: they exist because the control's three
-# verdicts shipped UNEXECUTED inside a root-gated assertion, and a decision procedure should not
-# need a privileged lane to be tested.
+# Ungated — verified by grep of the 25 lines after the `fn`, and confirmed to carry `#[test]`
+# rather than being a helper. It exists because the mutation campaign stopped reading the
+# precondition token from output (D0A-R35-03): that is only safe while every precondition site
+# reports through the side channel, so this asserts the two appear together.
 #
-#   EXECUTED  221 + 2 = 223
-#   SKIPPED       6    =   6      (unchanged; nothing added or removed is gated)
-#   reported  227 + 2 = 229       (agrees with the measured unprivileged 203/26/229)
+#   EXECUTED  223 + 1 = 224
+#   SKIPPED       6    =   6      (nothing added or removed is gated)
+#   reported  229 + 1 = 230       (agrees with the measured unprivileged 204/26/230)
 #
-# Cross-check: unprivileged went 201/26/227 -> 203/26/229, i.e. +2 executed and +0 skipped —
-# the same partition of the same two tests. A root figure other than 223/6/229 falsifies one of
-# these two statements, and the mismatch is the result.
+# Cross-check: unprivileged went 203/26/229 -> 204/26/230, i.e. +1 executed and +0 skipped —
+# the same partition of the same test. Any other root figure falsifies one of these two
+# statements, and the mismatch is the result.
 #
 # =========================================================================================
-# WHY THIS RUN EXISTS: THE ASSEMBLY TEST HAS NOT RUN SINCE ROUND 33
+# THE VERIFIER'S VERDICT *IS* THE RUN'S ACCEPTANCE — it is not a check on the run
 # =========================================================================================
 #
-# Since its last root execution the observer was REBUILT (provenance + liveness gating),
-# `classify_control` was extracted, the probe was rewired to collect typed per-iteration
-# evidence, and both outcome tables were rewritten. Meanwhile D0A-R28-02's closure rests on
-# `killed == false` from that test. **The closure currently rests on a run that predates every
-# change made to the thing producing it** — which is the same condition (compiled, not
-# executed) one layer up from the one round 34 fixed.
+# `scripts/lane-accept.py scratch/lane-run-22` runs LAST and decides whether this run may be
+# cited as merge acceptance. **If it refuses, the run is not accepted regardless of what the
+# counts say.** A green 224/6/230 with a REFUSED verdict is an unaccepted run, and recording it
+# any other way would recreate the exact defect the tool exists to close — a required check
+# whose failure changes nothing (`DEFECT_CLASSES` 54).
 #
-# PART A — the standard 17-target lane, built WITHOUT the feature. Count evidence, comparable
-# to run 20. Does NOT execute the assembly test.
-# PART B — a SEPARATE root run of the assembly test WITH `--features insecure-test-seams`.
-# Part B contributes nothing to the counts above and must not be folded into them.
+# It executes nothing. The procedure still runs by hand, unchanged. The verifier reads only what
+# the steps retained.
 #
-# =========================================================================================
-# WHAT A CONTROL FAILURE WOULD NOW MEAN — the verdicts are REACHABLE for the first time
-# =========================================================================================
-#
-# In round 33 these were compiled branches. `classify_control` now computes one from evidence,
-# and each says something different about whether the closure holds:
-#
-# 1. CONTROL PASSES (`Reached`). The scanner saw a VERIFIED, LIVE child of this daemon inside
-#    its group. The supplementary scan is meaningful for this run. The §4 closure
-#    (`killed == false` against a stubborn AI) is unaffected either way — it does not depend
-#    on the scan.
-#
-# 2. `Topology`. A verified live child ran OUTSIDE the daemon's process group. **This is a
-#    finding about the assembly**, and it would mean the pre-intervention scan has never been
-#    able to see what it was assumed to see — the supplementary evidence in D0A-R28-02's row
-#    comes out, and the row keeps only `killed == false` and the daemon's self-report. It would
-#    NOT withdraw the §4 closure, because boundedness is observed independently of the scan.
-#    Being able to state that separation in advance is the benefit of last round's rewrite.
-#
-# 3. `Scan`. A verified live child was inside the group across an overlapping window and the
-#    scanner still missed it. **A defect in the control**, not evidence about the daemon — and
-#    this time that is a computed verdict gated on provenance and liveness, not the rule that
-#    sent every ambiguous case to this answer (D0A-R34-01/02).
-#
-# 4. `Unresolved`. Identity or liveness is unestablished — a namesake, a corpse, or a single
-#    snapshot with no overlapping window. **Report no cause.** This is a real outcome; it is the
-#    one the round-33 code could not produce, and producing it is success, not a failure to
-#    diagnose.
-#
-# A fifth possibility is not a control failure: the control passes and
-# `survivors_before_guard` is NON-EMPTY. That voids the run as evidence about the daemon and is
-# caught by the assertion that already runs first.
-#
-# I do not know which will occur. Naming them first is what stops the one that does from
-# reading as the one that was expected.
+# **This is its first real use.** It has been run against lane run 21, which it REFUSED for two
+# genuine gaps (no hygiene capture; identities written without counts). Both are fixed in the
+# procedure for this run, so run 22 is the first that can be ACCEPTED rather than refused.
 #
 # =========================================================================================
-# §4b's INPUTS ARE RETAINED THIS RUN — the first time the fix is applied rather than promised
+# WHAT A REFUSAL WOULD MEAN AT EACH CHECK — three different findings, one of them surprising
 # =========================================================================================
 #
-# Run 20's membership stands on the operator's report because both comparison inputs lived in
-# /tmp and were gone when the reviewer went to check. §4b now writes
-# `scratch/lane-run-21/{root-identities.txt,unpriv-identities.txt,membership.txt}` plus the
-# producer transcript, and they are committed with the run record. **If those files are not in
-# the commit, the membership claim for run 21 is worth exactly what run 20's was.**
-EXPECTED_EXECUTED=223
+# 1. **MISSING artifact** (hygiene.txt, a hash file, the status file, the transcript, the
+#    identity lists, the control observation). Means a retention step did not run, or ran and
+#    wrote nowhere. **A finding about the PROCEDURE or about my handover of it** — which is
+#    where three of class 54's four instances came from. Not surprising; expected to be the
+#    most likely refusal on a first use.
+#
+# 2. **FAILING artifact** (a nonzero producer exit, hashes that differ across the forced
+#    rebuild, mismatched helper digests, a PAM mismatch, a stale session, a non-zero identity
+#    difference, free space short). Means **a real condition the lane is supposed to catch**,
+#    and the verifier is doing exactly what it was built for. A failing hash pair in particular
+#    would mean the executables were STALE and the run measured code that is not this tree's —
+#    that is a finding about the RUN, and the counts from it would be void.
+#
+# 3. **MISORDERED artifacts** — specifically `hashes-after` newer than `root-run.log`, i.e.
+#    **freshness proven AFTER the run rather than before it.** This is the one that would be
+#    SURPRISING, and it is the one no count or content check can see: the artifacts would all be
+#    present and all internally valid, and the run would still prove nothing about the binaries
+#    it executed. It is "closed-after is not run" one level up. If this fires, suspect the
+#    retention step before the run — `cp` without `-p` produces exactly this signature, and
+#    that is how the verifier justified itself on its first execution, refusing artifacts
+#    written minutes earlier.
+#
+# =========================================================================================
+# THE LIMIT, STATED BEFORE THE RUN SO A GREEN CANNOT IMPLY MORE THAN IT COVERS
+# =========================================================================================
+#
+# **The verifier cannot bind these artifacts to a commit.** Nothing in `scratch/lane-run-22/`
+# says which tree produced it. An ACCEPTED verdict establishes that every required step ran, in
+# the right order, and passed — it does NOT establish that they ran against the tree being
+# merged. The run record carries the SHA and a reader must still check it. This is stated in the
+# tool's own docstring and repeated here because a verdict that reads as "the run is good"
+# invites exactly the over-read this arc keeps producing.
+#
+# Two further limits carried forward: Part B's control has produced only `Reached`, and
+# `Topology`/`Scan`/`Unresolved` have never been produced at root; and **reaping is still
+# never independently observed** — the only reaping evidence is the daemon's own exit status.
+EXPECTED_EXECUTED=224
 EXPECTED_SKIPPED=6
-EXPECTED_REPORTED=229
+EXPECTED_REPORTED=230

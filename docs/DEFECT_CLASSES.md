@@ -3058,3 +3058,40 @@ copies with the time of the copy, destroying the evidence that freshness precede
 it refuses lane run 21, which lacks hygiene capture and writes identities without counts. **That
 refusal was recorded rather than tuned away**, which is the discriminating test from Iron Law 15
 clause 1: the same edit would not have been made if the check were passing.
+
+## 55. A PRODUCER AND ITS CONSUMER CAN AGREE ABOUT THE PROPERTY AND DISAGREE ABOUT THE FORMAT, AND NEITHER SIDE'S TESTS CAN SEE IT  *(new — D0A-R35, two instances in two consecutive runs, both in code written to observe something)*
+
+**The shape.** One component establishes a property. Another reads it. Each is tested against
+its own contract and passes. **Nothing tests that they compose**, so a mismatch in the
+interface between them is invisible from both sides — and the symptom is not a wrong answer
+but a *missing* one, which reads as absence of evidence rather than as a defect.
+
+**Two instances, one run apart:**
+
+| run | the producer was RIGHT | the consumer could not | how it presented |
+|---|---|---|---|
+| 24 | the shim detached: `ppid` = daemon, `pgid` = itself | **find** it — `exec` replaces `comm`, so the process carried the exec'd file's name and the probe searched for the shim's | `Unresolved` after 2640 samples: an expensive run proving only that the search term was wrong |
+| 25 | the control discriminated: verdict `Topology` from a verified live child outside the group | **read** it — the test printed `verdict Topology`, the verifier's parser requires `verdict:` with a colon | the acceptance gate REFUSED a run for a check that had in fact passed |
+
+**Why each side's own tests were useless here.** Run 24's mechanism test asserted `ppid` and
+`pgid` — both true of a process the probe cannot find. Run 25's verifier suite asserted its own
+parsing against its own fixture — which used the format the verifier expected, not the format
+the test emits. **Both suites were correct and both were testing one end of a rope.**
+
+**The foreclosing discipline: test the JOIN, with the real producer's output.** Not a fixture
+shaped like it. Concretely — a verifier fixture must be built from a *recorded real* producer
+transcript, and a discovery mechanism must be asserted against the identity the producer
+actually ends up with rather than the one it was launched as.
+
+**The RED-proof shape.** Break the format on one side only and require the other side to fail.
+If both sides still pass, nothing was testing the join.
+
+**Why this is not class 41 or 48.** 41 is reading at the wrong altitude; here the altitude is
+right on both sides. 48 is a fix scoped to the named instance; here there was no fix to scope —
+each component was complete and correct against its own spec. The defect lives in the space
+*between* two correct things, which is exactly the space no single component's suite covers.
+
+**The tell, worth recognising early: a component reports NOTHING rather than something wrong.**
+"It ran and found nothing" is weak evidence and should always prompt the question *was the
+thing findable in the form I looked for it?* Both instances above were expensive — 140-second
+runs — and produced only the information that the interface was wrong.

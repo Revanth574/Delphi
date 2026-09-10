@@ -40,6 +40,11 @@ path = "src/bin/delphi-stubborn-ai.rs"
 required-features = ["insecure-test-seams"]
 
 [[bin]]
+name = "delphi-detached-ai"
+path = "src/bin/delphi-detached-ai.rs"
+required-features = ["insecure-test-seams"]
+
+[[bin]]
 name = "delphi-surface-shell"
 path = "src/bin/delphi-surface-shell.rs"
 required-features = ["insecure-test-seams"]

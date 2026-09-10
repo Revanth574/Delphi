@@ -1882,6 +1882,61 @@ fn miss_once(r: &ProcRecord) -> IterationEvidence {
     }
 }
 
+/// D0A-R35 — the topology fixture actually detaches, proven WITHOUT root.
+///
+/// The negative control it serves needs root. Its MECHANISM does not, and a fixture that
+/// silently failed to detach would produce `Reached` and be read as the control working — the
+/// false green the whole construction exists to prevent. So the property is measured here:
+/// spawned as a child of this process, `delphi-detached-ai` must end up with `ppid` still
+/// pointing at us and `pgid` pointing at itself.
+#[test]
+fn the_topology_fixture_leaves_the_parents_process_group() {
+    if !cfg!(feature = "insecure-test-seams") {
+        eprintln!("SKIP the_topology_fixture...: requires `--features insecure-test-seams`");
+        return;
+    }
+    // `exec`s a sleeper, so the process is observable after it has detached.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_delphi-detached-ai"))
+        .env("DELPHI_DETACHED_AI_REAL", "/bin/sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the topology fixture");
+    #[allow(clippy::cast_possible_wrap)]
+    let pid = child.id() as i32;
+
+    let mut rec = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Some(r) = read_proc_record(pid)
+            && r.pgid == pid
+        {
+            rec = Some(r);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let r = rec.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("the fixture never became its own group leader within 5s — it did NOT detach, \
+                so any `Topology` verdict built on it would be about a topology it does not have")
+    });
+
+    #[allow(clippy::cast_possible_wrap)]
+    let us = std::process::id() as i32;
+    assert_eq!(r.ppid, us, "the fixture must remain OUR child — `exec` replaces the image in \
+                            the same process, so provenance is unchanged. If ppid moved, the \
+                            record would not be `verified_live` and the verdict would be \
+                            Unresolved rather than Topology");
+    assert_eq!(r.pgid, pid, "the fixture must lead its OWN group");
+    assert_ne!(r.pgid, nix::unistd::getpgrp().as_raw(),
+               "the fixture is still in OUR process group, which is the topology it is \
+                supposed to break");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// The record parser, against a REAL process rather than a fabricated string.
 #[test]
 fn proc_records_carry_provenance_and_state_for_a_real_child() {
@@ -2156,56 +2211,112 @@ fn strip_ansi_recovers_the_field_text_tracing_actually_emits() {
     assert_eq!(strip_ansi("plain child=\"ai\""), "plain child=\"ai\"");
 }
 
-/// **D0A-R30 decision A — ASSEMBLY COVERAGE for the bounded daemon exit (D0A-R28-02).**
+/// D0A-R35 — **THE NEGATIVE CONTROL: a real daemon whose child sits outside its group.**
 ///
-/// # What this proves that the extraction's unit tests cannot
+/// The positive control has returned `Reached` three times at root. `Topology`, `Scan` and
+/// `Unresolved` had been produced only against constructed records in a unit test — three
+/// confirmations, zero discriminations, which is `DEFECT_CLASSES` 49's silence rather than
+/// convergence.
 ///
-/// `runtime/src/shutdown.rs` proves the POLICY is correct. `the_daemon_delegates_shutdown_and_
-/// does_not_reap_by_hand` proves `main` CONTAINS a call to it — but that guard is an
-/// `include_str!` source read, so it proves the token is present, not that the branch is
-/// TAKEN. This test is the missing half: the daemon, running as the real binary, actually
-/// exercising the policy against an AI that refuses to exit.
+/// **Producing `Topology` from a synthetic record proves the classifier's arithmetic. It does
+/// not prove the control detects a topology defect it would otherwise pass.** This runs the
+/// IDENTICAL observation — `observe_assembly`, the same probe, the same classifier — against a
+/// daemon whose AI calls `setpgid(0, 0)` before `exec`, so the child is verified as the
+/// daemon's own (`ppid` unchanged by `exec`) and outside its process group.
 ///
-/// # The five assertions, and why each is load-bearing
-///
-/// 1. **The bypass POSITIVELY REPORTED itself.** Without this the test is outcome coverage:
-///    an untrusted AI staying alive and a daemon exiting anyway could both be true for reasons
-///    unrelated to the fix. The report ties the outcome to the mechanism that produced it.
-/// 2. **A specific terminal outcome occurred** — `Completed`, not merely "the daemon ended".
-/// 3. **The AI acknowledged the terminal response AND remained alive past grace.** If it died
-///    early the daemon's clean exit means nothing, so this is checked from the AI's own stderr
-///    rather than assumed from the fixture's name.
-/// 4. **The daemon attributed termination to that AI, cleaned up the shell, and exited within
-///    the bound** — `!killed` is the whole property: `DaemonGuard` kills at its deadline, and a
-///    kill means the daemon did NOT bound its own wait.
-/// 5. **Removing the shutdown call makes this test fail.** It needs no special construction:
-///    with a stubborn AI and no bounded exit, `main` blocks in `waitpid` forever, the guard
-///    kills it at the deadline, and `!killed` fails. That is the RED the delegation guard could
-///    not provide, and it is why this test — not that one — is the assembly evidence.
-///
-/// **Scope, stated so a green cannot be over-read:** this runs a binary built with
-/// `insecure-test-seams`, whose logind gate is bypassable. It certifies the SHUTDOWN ASSEMBLY
-/// and **nothing about the production logind gate**, which remains blocked on a seated lane.
-/// Those are separate obligations and this closes only the first.
+/// If this returns `Reached`, the control cannot see a topology defect and every `Reached` in
+/// the record means less than it appears to. That is the question three greens leave open.
 #[test]
-fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
+fn the_control_reports_topology_when_the_daemons_child_leaves_its_group() {
     if !cfg!(feature = "insecure-test-seams") {
-        eprintln!(
-            "SKIP b1_daemon_bounds_an_ai...: requires `--features insecure-test-seams` (the \
-             gate-bypass seam AND the stubborn-AI fixture are both feature-gated). Run: \
-             `cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration`"
-        );
+        eprintln!("SKIP the_control_reports_topology...: requires `--features \
+                   insecure-test-seams` (the gate-bypass seam and both AI fixtures are gated)");
         return;
     }
     if geteuid().as_raw() != 0 {
-        eprintln!("SKIP b1_daemon_bounds_an_ai...: requires root");
+        eprintln!("SKIP the_control_reports_topology...: requires root");
         return;
     }
     if !bwrap_available() {
-        eprintln!("SKIP b1_daemon_bounds_an_ai...: requires bwrap + unprivileged userns");
+        eprintln!("SKIP the_control_reports_topology...: requires bwrap + unprivileged userns");
         return;
     }
-    let setup = Setup::new("stubborn");
+
+    let o = observe_assembly(
+        "detached",
+        env!("CARGO_BIN_EXE_delphi-detached-ai"),
+        &[
+            ("DELPHI_DETACHED_AI_REAL", env!("CARGO_BIN_EXE_delphi-stubborn-ai")),
+            // A SHORT sleep, deliberately: this child is in its own group, so `DaemonGuard`'s
+            // emergency `kill_group` cannot reach it. If the daemon fails to kill it by pid,
+            // the default hour-long sleeper would leak one process per failing run.
+            ("DELPHI_STUBBORN_AI_SLEEP_SECS", "30"),
+        ],
+    );
+
+    assert_eq!(
+        o.verdict,
+        ControlVerdict::Topology,
+        "THE CONTROL DID NOT SEE A TOPOLOGY DEFECT IT WAS BUILT TO SEE. The daemon's AI called \
+         `setpgid(0,0)` before `exec`, so its child is verified (`ppid` == daemon) and OUTSIDE \
+         the daemon's group — the exact input `Topology` names. Getting `{:?}` instead means \
+         the three `Reached` verdicts in the record are consistent with a control that cannot \
+         discriminate, and the supplementary evidence in D0A-R28-02's row does not hold.\n\
+         daemon pgid {}, ai comm {:?}, {} samples\n\
+         census: {:?}\n\
+         last iteration: {:?}",
+        o.verdict,
+        o.daemon_pid,
+        o.ai_comm,
+        o.samples,
+        o.census,
+        o.iterations.last()
+    );
+
+    // AND THE DISCRIMINATING HALF: it must be Topology for the RIGHT REASON — a record that is
+    // this daemon's live child and is outside its group. A `Topology` reached any other way
+    // would pass this test while proving nothing.
+    let outside: Vec<&ProcRecord> = o
+        .iterations
+        .iter()
+        .flat_map(|it| it.before.iter().chain(it.after.iter()))
+        .filter(|r| verified_live(r, o.daemon_pid) && r.pgid != o.daemon_pid)
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the verdict was Topology but no VERIFIED live child outside the group was recorded — \
+         the right answer for the wrong reason. census: {:?}",
+        o.census
+    );
+    eprintln!("NEGATIVE CONTROL: verdict {:?}, from {outside:?}", o.verdict);
+}
+
+/// Spawn the daemon against a given AI binary and OBSERVE the control, through one path.
+///
+/// D0A-R35: extracted so the negative control runs the SAME observation as the positive one.
+/// A negative control that reproduced the probe would be testing its own copy — the point is
+/// that the identical machinery, given a daemon whose child sits outside its group, produces
+/// `Topology` instead of `Reached`.
+struct AssemblyObservation {
+    /// The marker file the sandboxed action writes, read by the caller's assertions.
+    result: std::path::PathBuf,
+    /// RAII guards RETURNED rather than dropped in the helper. `_stage` removes the staging
+    /// directory and `_setup` runs `userdel`; if the helper kept them, both would fire before
+    /// the caller read `result` — the extraction would have deleted the evidence it exists to
+    /// hand back.
+    _stage: tempfile::TempDir,
+    _setup: Setup,
+    run: DaemonRun,
+    verdict: ControlVerdict,
+    census: Vec<(i32, char, String)>,
+    samples: usize,
+    daemon_pid: i32,
+    ai_comm: String,
+    iterations: Vec<IterationEvidence>,
+}
+
+fn observe_assembly(tag: &str, ai_exe: &str, extra_env: &[(&str, &str)]) -> AssemblyObservation {
+    let setup = Setup::new(tag);
     let _stage_tmp = tempfile::Builder::new()
         .prefix("delphi-r30asm-")
         .tempdir_in(std::env::temp_dir())
@@ -2215,7 +2326,7 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     let shell_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-minimal-shell"), &stage, "mshell");
     // THE ONLY DIFFERENCE FROM b1_daemon_binary_runs_the_assembled_flow. Same protocol, same
     // helpers; it just does not exit. Any behavioural difference is attributable to that.
-    let ai_bin = stage_bin(env!("CARGO_BIN_EXE_delphi-stubborn-ai"), &stage, "sai");
+    let ai_bin = stage_bin(ai_exe, &stage, "sai");
     let result = stage.join("result");
     let exe = write_marker_exe(&stage, &result);
 
@@ -2229,6 +2340,9 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
         .env(delphi_runtime::scaffold_env::AI_BIND_RW, &stage)
         .env("DELPHI_SHELL_VT", "tty1")
         .env("DELPHI_INSECURE_ASSUME_ACTIVE_SESSION", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
 
     // ── THE POSITIVE CONTROL (D0A-R32-01) ───────────────────────────────────────────────
     // `survivors_before_guard` being EMPTY is the observation this test rests on. The fixture
@@ -2290,6 +2404,77 @@ fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
     let run = guard.wait();
     let (probe_census, probe_samples, probe_iterations) = probe.join().expect("probe thread");
     let control = classify_control(daemon_pid, &probe_iterations);
+    AssemblyObservation {
+        result,
+        _stage: _stage_tmp,
+        _setup: setup,
+        run,
+        verdict: control,
+        census: probe_census,
+        samples: probe_samples,
+        daemon_pid,
+        ai_comm,
+        iterations: probe_iterations,
+    }
+}
+
+/// **D0A-R30 decision A — ASSEMBLY COVERAGE for the bounded daemon exit (D0A-R28-02).**
+///
+/// # What this proves that the extraction's unit tests cannot
+///
+/// `runtime/src/shutdown.rs` proves the POLICY is correct. `the_daemon_delegates_shutdown_and_
+/// does_not_reap_by_hand` proves `main` CONTAINS a call to it — but that guard is an
+/// `include_str!` source read, so it proves the token is present, not that the branch is
+/// TAKEN. This test is the missing half: the daemon, running as the real binary, actually
+/// exercising the policy against an AI that refuses to exit.
+///
+/// # The five assertions, and why each is load-bearing
+///
+/// 1. **The bypass POSITIVELY REPORTED itself.** Without this the test is outcome coverage:
+///    an untrusted AI staying alive and a daemon exiting anyway could both be true for reasons
+///    unrelated to the fix. The report ties the outcome to the mechanism that produced it.
+/// 2. **A specific terminal outcome occurred** — `Completed`, not merely "the daemon ended".
+/// 3. **The AI acknowledged the terminal response AND remained alive past grace.** If it died
+///    early the daemon's clean exit means nothing, so this is checked from the AI's own stderr
+///    rather than assumed from the fixture's name.
+/// 4. **The daemon attributed termination to that AI, cleaned up the shell, and exited within
+///    the bound** — `!killed` is the whole property: `DaemonGuard` kills at its deadline, and a
+///    kill means the daemon did NOT bound its own wait.
+/// 5. **Removing the shutdown call makes this test fail.** It needs no special construction:
+///    with a stubborn AI and no bounded exit, `main` blocks in `waitpid` forever, the guard
+///    kills it at the deadline, and `!killed` fails. That is the RED the delegation guard could
+///    not provide, and it is why this test — not that one — is the assembly evidence.
+///
+/// **Scope, stated so a green cannot be over-read:** this runs a binary built with
+/// `insecure-test-seams`, whose logind gate is bypassable. It certifies the SHUTDOWN ASSEMBLY
+/// and **nothing about the production logind gate**, which remains blocked on a seated lane.
+/// Those are separate obligations and this closes only the first.
+#[test]
+fn b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive() {
+    if !cfg!(feature = "insecure-test-seams") {
+        eprintln!(
+            "SKIP b1_daemon_bounds_an_ai...: requires `--features insecure-test-seams` (the \
+             gate-bypass seam AND the stubborn-AI fixture are both feature-gated). Run: \
+             `cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration`"
+        );
+        return;
+    }
+    if geteuid().as_raw() != 0 {
+        eprintln!("SKIP b1_daemon_bounds_an_ai...: requires root");
+        return;
+    }
+    if !bwrap_available() {
+        eprintln!("SKIP b1_daemon_bounds_an_ai...: requires bwrap + unprivileged userns");
+        return;
+    }
+    let o = observe_assembly("stubborn", env!("CARGO_BIN_EXE_delphi-stubborn-ai"), &[]);
+    let result = o.result.clone();
+    let (run, control, probe_census, probe_samples, daemon_pid, ai_comm, probe_iterations) = (
+        o.run, o.verdict, o.census, o.samples, o.daemon_pid, o.ai_comm, o.iterations,
+    );
+    // `o` is partially moved above; the guards it held are kept alive by these bindings so the
+    // staging directory and the test account outlive the assertions below.
+    let (_stage, _setup) = (o._stage, o._setup);
     let (out, killed, survivors) = (run.output, run.killed, run.survivors_before_guard);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

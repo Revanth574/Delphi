@@ -263,5 +263,18 @@
 # the side channel, so a source-text guard asserts the two appear together. A site that panicked
 # with the token and reported nothing would now be silently reclassified as a DETECTION, which
 # is the false-attribution direction.
+#
+# +2 SKIPPED (26 -> 28), EXECUTED UNCHANGED: `the_topology_fixture_leaves_the_parents_process_
+# group` and `the_control_reports_topology_when_the_daemons_child_leaves_its_group` (D0A-R35,
+# the negative control). Both live in `b1_integration.rs` and gate on the feature, so in the
+# LANE's featureless build they skip — which is why the executed count does not move. The
+# fixture test DOES run under `--features insecure-test-seams` unprivileged, and that is where
+# its mechanism was proven.
+#
+# THE NEGATIVE CONTROL HAS NEVER RUN. It needs root AND the feature, and no such execution has
+# happened. It is committed unrun and said to be unrun: the positive control has returned
+# `Reached` three times at root while `Topology`, `Scan` and `Unresolved` existed only against
+# constructed records, and this test is what would show `Topology` is REACHABLE IN THE ASSEMBLY
+# rather than merely written. Until it runs, that remains open.
 EXECUTED=204
-SKIPPED=26
+SKIPPED=28

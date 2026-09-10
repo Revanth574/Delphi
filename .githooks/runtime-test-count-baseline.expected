@@ -1,101 +1,93 @@
-# EXPECTATION FOR LANE RUN 24 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
+# EXPECTATION FOR LANE RUN 25 — derived and committed ALONE, BEFORE the run (D0A-R21-07).
 #
-# Target commit: f61d8df. The instrument changes — the negative-control fixture, the extracted
-# `observe_assembly`, and the verifier's requirement that runs from 24 on carry the negative
-# control's evidence — were committed at 1c5f92b and f61d8df, before this file.
+# Target commit: a07c21d. Run 24 was attempted and REFUSED; its numbers are not a baseline.
 #
 # =========================================================================================
-# THE DERIVATION
+# THE DERIVATION — UNCHANGED FROM RUN 24, and that is checkable rather than assumed
 # =========================================================================================
 #
-# Run 23 measured root 224 / 6 / 230 at b51bd8f. TWO identities added since, none removed:
+#   EXECUTED 224 / SKIPPED 8 / reported 232
 #
-#   the_topology_fixture_leaves_the_parents_process_group          | b1_integration | FEATURE
-#   the_control_reports_topology_when_the_daemons_child_leaves...   | b1_integration | FEATURE
+# **No test identity has been added or removed since the run-24 expectation (ecfffec)** —
+# enumerated from the diff with `fn [a-z0-9_]+`, both directions, empty. The intervening
+# commits fixed a fixture, added an assertion to an existing test, and changed the verifier;
+# none of that moves the set. The unprivileged pair is still 204/28/232.
 #
-# **Both gate on the FEATURE FIRST** — verified by grep of the first gate after each `fn`, not
-# from memory — so in the lane's FEATURELESS build they skip at root exactly as they do
-# unprivileged. The executed count therefore does NOT move:
-#
-#   EXECUTED  224 + 0 = 224
-#   SKIPPED     6 + 2 =   8
-#   reported  230 + 2 = 232       (agrees with the measured unprivileged 204/28/232)
-#
-# Cross-check: unprivileged went 204/26/230 -> 204/28/232, i.e. +0 executed and +2 skipped —
-# the same partition of the same two tests. Any other root figure falsifies one of these.
-#
-# **A skipped test is scored as a pass by libtest, which is why the skip count is predicted
-# rather than ignored.** Eight skips is the largest this lane has carried; each must still quote
-# its own blocker in the transcript.
+# **Run 24 measured 222/8/230 against this same prediction, and the miss was NOT in the
+# derivation:** §4b counted 232 identities at root and 232 unprivileged, zero in either
+# direction, with exactly the 8 predicted skips. `EXECUTED` counts PASSING tests, so
+# 232 − 8 skipped − 2 failed = 222. A match this time therefore confirms the set a second time;
+# a repeat of 222 would mean the same two tests failed again, which is the point of the run.
 #
 # =========================================================================================
-# RUN 24 HAS THREE PARTS, AND THE THIRD IS ITS REASON
+# RUN 25 OWES THREE THINGS
 # =========================================================================================
 #
-# PART A   — the standard 17-target lane, featureless. Count evidence, comparable to run 23.
-# PART B1  — the POSITIVE control, feature-built, at root.
-# PART B2  — the NEGATIVE control, feature-built, at root. New this run.
-#
-# Only Part A contributes to the counts above.
-#
-# =========================================================================================
-# WHAT EACH NEGATIVE-CONTROL OUTCOME MEANS — this is the run's reason
-# =========================================================================================
-#
-# The fixture makes the daemon's AI call `setpgid(0,0)` and then `exec` the real stubborn AI.
-# `exec` replaces the image in the SAME process, so `ppid` still points at the daemon: the
-# child is VERIFIED as the daemon's own and OUTSIDE its group — precisely `Topology`'s input.
-#
-# 1. **`Topology`.** The control detects a topology defect **it would otherwise have passed**.
-#    This is what gives the three prior `Reached` verdicts their meaning: a control that can
-#    discriminate, having said `Reached` three times, is reporting something. Expected outcome,
-#    and the least informative of the three in isolation — its value is retrospective.
-#
-# 2. **`Reached`.** THE CONTROL CANNOT DETECT A TOPOLOGY DEFECT. Then every `Reached` in the
-#    record is consistent with a control that never discriminated, and **the supplementary scan
-#    is WITHDRAWN from D0A-R28-02's row entirely — not weakened.** The row would keep
-#    `killed == false` and the daemon's self-report, which is the §4 boundedness closure and
-#    does not depend on the scan. **This is the outcome worth more than the expected one**, and
-#    the consequence is fixed here so it cannot be renegotiated after the fact.
-#
-# 3. **`Scan` or `Unresolved`.** The fixture did not produce the input it claims — a finding
-#    about the FIXTURE, not about the control or the product. The mechanism is already proven
-#    unprivileged (`the_topology_fixture_leaves_the_parents_process_group`, RED-proven), so
-#    this would mean something about the assembly path differs from the direct-spawn path, and
-#    that difference is the finding.
-#
-# The verifier REFUSES the run for any of 2 or 3. A run whose negative control does not return
-# `Topology` is not an accepted run: the lane's evidence would not support the closure it is
-# cited for, and "the run was properly conducted" must not certify "the product passed".
+# 1. **The repeat that distinguishes intermittent from persistent** on run 24's two PAM
+#    failures. This is the run's primary obligation.
+# 2. **The negative control with a fixture that can be found.** It has EXECUTED EXACTLY ONCE
+#    (run 24) and produced no verdict about the assembly — `Unresolved`, because `exec`
+#    replaces `comm` and the probe was looking for a name the process no longer had. The
+#    fixture now execs a file staged under the SAME name.
+# 3. **A fourth positive control**, which proves nothing on its own — see below.
 #
 # =========================================================================================
-# THE POSITIVE CONTROL'S FOURTH `Reached` PROVES NOTHING NEW ON ITS OWN
+# WHAT A CLEAN REPEAT MEANS, AND WHAT A SECOND FAILURE MEANS — fixed before the run
 # =========================================================================================
 #
-# Stated before the run so a fourth green cannot read as accumulating confidence. Runs 20, 21
-# and 23 all returned `Reached`; run 23's was the first under the enforced provenance gate.
-# A fourth adds one more instance of the outcome that changes nothing.
+# Run 24's failures were `b1_token_expiry_blocks_the_assembled_loop` (ShellSetupFailed) and
+# `the_daemon_binary_runs_the_real_gate_d0a_r4_03` (pam_open_session failed). Runs 20, 21 and
+# 23 had zero failures. They are attributable to NEITHER my changes NOR §6's documented
+# parallel-PAM artifact (measured 0/30 serial; run 24 was serial).
 #
-# **It is the NEGATIVE control that gives the prior greens their meaning, or removes it.**
-# Three confirmations and zero discriminations is `DEFECT_CLASSES` 49's silence; the discriminating
-# observation is the only one that resolves it, and it has never run.
+# 1. **BOTH PASS -> INTERMITTENT, and still UNEXPLAINED.** One clean repeat does not identify a
+#    cause; it bounds the frequency at "not every run". The honest record is *intermittent,
+#    cause unknown*, and §6's own rule then applies: a test whose outcome varies needs >=30
+#    iterations before its green is evidence. **A clean repeat does NOT close this** — it
+#    changes what is owed from "diagnose a persistent failure" to "measure an intermittent one".
+#
+# 2. **EITHER FAILS AGAIN -> PERSISTENT, and a genuine finding about the assembly.** Two
+#    consecutive serial runs failing the same PAM path is not contention this project has
+#    measured away, and the "harness" explanation would then be dead by evidence rather than by
+#    assertion. That is a product-side investigation, and it outranks everything else in the
+#    arc — the daemon's shell setup failing at root is the trust boundary's own path.
+#
+# 3. **DIFFERENT TESTS FAIL -> a third case, named so it is not folded into the first two.**
+#    That would suggest an environmental variable neither run controls (session pressure, a
+#    leftover logind session, resource limits) and makes the environment itself the subject.
+#
+# Whichever occurs, it is recorded as the case it is. Reconstructing the reading afterwards is
+# what this project has paid for repeatedly.
 #
 # =========================================================================================
-# THE VERIFIER DECIDES ACCEPTANCE, AND THE COMMIT BINDING IS CAPTURED FOR THE FIRST TIME
+# A FOURTH `Reached` STILL PROVES NOTHING ON ITS OWN
 # =========================================================================================
 #
-# `scripts/lane-accept.py scratch/lane-run-24` runs LAST. **If it refuses, the run is not
-# accepted regardless of what the counts say.**
+# This was stated in run 24's expectation and it held: the positive control returned `Reached`
+# for a fourth time (runs 20, 21, 23, 24) and it changed nothing. **The negative control is the
+# only thing that gives the positives meaning, and it has produced no verdict about the assembly
+# in its single execution.** Three prior `Reached` verdicts plus a fourth remain consistent with
+# a control that has never discriminated.
 #
-# **Run 23's commit was established by INFERENCE FROM TIMESTAMPS** — b51bd8f committed at 13:10,
-# the transcript stamped 13:16, no commit between. Better than memory, weaker than a binding,
-# and its record says so. Run 24 is the first where `hygiene.txt` carries `git rev-parse HEAD`
-# and `git status --porcelain` written BY THE RUN, and the verifier refuses a run whose tree was
-# DIRTY — artifacts from a dirty tree describe no commit at all.
+# If the negative control returns `Topology` this run, that changes retrospectively — the
+# positives become reports from an instrument shown to discriminate. If it returns `Reached`,
+# the supplementary scan is WITHDRAWN from D0A-R28-02's row entirely rather than weakened. If it
+# returns `Scan`/`Unresolved` a second time, the fixture is wrong twice and the right move is to
+# stop building fixtures and ask whether the probe should identify the AI by PROVENANCE rather
+# than by name — which is where R34-01's lesson pointed and I did not follow it far enough.
 #
-# **The limit that remains:** the verifier checks that a commit was recorded and the tree was
-# clean. It does not check that the recorded commit is the one being merged. That is still a
-# human's job, and an ACCEPTED verdict does not do it.
+# =========================================================================================
+# ACCEPTANCE
+# =========================================================================================
+#
+# `scripts/lane-accept.py scratch/lane-run-25` decides. It now requires the negative control's
+# evidence with a `Topology` verdict, so **a run whose negative control returns anything else is
+# refused** — including the outcome that would be a genuine product finding. That is deliberate:
+# the lane's evidence would not support the closure it is cited for.
+#
+# The commit binding is captured in `hygiene.txt`, with the run's own artifact directory
+# filtered from the dirty check — a false positive that would have refused every future run and
+# was caught on the tool's SECOND use, by the tool being used rather than by someone reading.
 EXPECTED_EXECUTED=224
 EXPECTED_SKIPPED=8
 EXPECTED_REPORTED=232

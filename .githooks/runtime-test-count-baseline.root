@@ -1,7 +1,103 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
-# LANE RUN 21 — **the assembly control re-validated AFTER the observer was rebuilt.**
-# Measured 2026-09-10 at `d1fa4fe`.
+# LANE RUN 23 — **the first lane run whose acceptance was decided by a machine, not by
+# convention.** Measured 2026-09-10 at `b51bd8f`. (Run 22 was attempted and REFUSED at the
+# gate; see `scratch/lane-run-22/`.)
+#
+#   EXECUTED 224 / SKIPPED 6 / reported 230     extractor rc=0
+#   producers: 17/17 exited 0                   failures: 0
+#   predicted 224/6/230 — committed ALONE at 75da430, BEFORE run 22's attempt, and carried to
+#   run 23 unchanged. The prediction therefore predates BOTH attempts.
+#   membership: 230 identities each side, ZERO in either direction, rc 0
+#   ACCEPTANCE: **ACCEPTED** — all six checks, verdict captured by the tool in
+#   `scratch/lane-run-23/acceptance.txt`
+#
+# =========================================================================================
+# WHAT IS DIFFERENT ABOUT THIS RUN, AND IT IS NOT THE NUMBERS
+# =========================================================================================
+#
+# Runs 7-21 were accepted BY CONVENTION: a human followed the procedure and reported that the
+# checks passed. Four times that failed and was found later by someone reading (class 54). Run
+# 22's attempt failed a fifth time and **ended at the gate instead**, with nothing downstream
+# claiming success. Run 23 is the first that the gate ACCEPTED.
+#
+# **Every claim in this record is backed by a retained artifact, and each was re-verified here
+# rather than taken from the operator's report:**
+#
+#   the verifier, re-run from a clean shell          -> ACCEPTED
+#   `root-identities.txt` vs `unpriv-identities.txt` -> `diff` empty, 230 lines each, and both
+#                                                       carry EXPLICIT COUNTS (D0A-R35-05), so
+#                                                       the multiset can be reconstructed
+#   the count, re-derived from `root-run.log`        -> EXECUTED 224 / SKIPPED 6 / reported 230
+#   `part-b-control.txt`                             -> CAPTURED by `tee`, not transcribed
+#
+# That third line matters most: **the headline figure is now checkable from an artifact by
+# someone who was not here.** Run 20's membership never will be; run 21's was.
+#
+# =========================================================================================
+# PART B — `Reached`, AND FOR THE FIRST TIME UNDER THE ENFORCED PROVENANCE GATE
+# =========================================================================================
+#
+#   CONTROL OBSERVATION: daemon pgid 62556, ai comm "sai", 18 samples
+#     VERIFIED live children matched in the daemon's group:
+#       [ProcRecord { pid: 62693, ppid: 62556, pgid: 62556, state: 'S', starttime: 539550 }]
+#   census of that group: [(62558, 'S', "delphi-runtimed"), (62693, 'S', "sai"),
+#                          (62698, 'R', "unix_chkpwd")]
+#     verdict: Reached
+#
+# **`ppid 62556 == daemon pgid 62556`.** D0A-R35-01 found that `Reached` used to return on a
+# caller-supplied boolean derived from NAME + GROUP MEMBERSHIP, before any parentage check — so
+# runs 20 and 21 established that a process *named* `sai` was in the daemon's group, and NOT
+# that it was the daemon's child. Both records were corrected to say so. This is the first run
+# whose `Reached` was computed with the gate enforced, and it is CAPTURED rather than pasted.
+#
+# The census again returns THREE processes rather than the target alone — the forked
+# `delphi-runtimed` and `unix_chkpwd` mid-authentication — which is the evidence that the
+# scanner ENUMERATES rather than matching a name and handing back what it was asked for. This
+# time that evidence is in a file.
+#
+# ---------------------------------------------------------------------------------------
+# EVERY HYGIENE CHECK — and they are in `hygiene.txt`, not in a paraphrase
+#   account          delphi-tool:x:997:972       (gid 972, not 997 — D0A-R17-02)
+#   helper digest    aba0f0ea14b751aa…           INSTALLED == STAGED, asserted by the verifier
+#   bwrap            0.11.1
+#   free space       above every floor, passed on its own
+#   forced freshness ENFORCED: 17 executables, both hash sides, `diff` empty — and the verifier
+#                    independently asserts hashes-after is NOT newer than the run transcript,
+#                    i.e. freshness was proven BEFORE the run
+#   PAM before/after `md5sum -c` OK
+#   stale sessions   none, before AND after
+#
+# THE SIX SKIPS are unchanged from run 21 and each names its own blocker.
+#
+# ORDERING HELD FOR THE TENTH CONSECUTIVE RUN — and for the first time it is MACHINE-CHECKED
+# rather than conventional (D0A-R22-01 can finally be closed against this mechanism).
+#
+# ---------------------------------------------------------------------------------------
+# WHAT AN ACCEPTED RUN 23 STILL DOES NOT ESTABLISH
+#
+# 1. **That these artifacts came from THIS TREE.** The verifier cannot bind them to a commit —
+#    stated in its docstring and in the expectation before the run. An ACCEPTED verdict means
+#    every required step ran, in order, and passed.
+#
+#    **How `b51bd8f` was established, since it is exactly the link nothing checks:** it was
+#    committed at 13:10 and the run's transcript is timestamped 13:16, with no commit in
+#    between. That is an INFERENCE FROM TIMESTAMPS — better than memory, weaker than a binding.
+#    A future retention step should record `git rev-parse HEAD` into the run directory, which
+#    would make the verifier able to assert it. It does not yet.
+# 2. **Reaping.** Never independently observed; the only evidence is the daemon's own exit
+#    status, a self-report by the component under test. R29-05's `Unreaped` is UNCONSTRUCTED.
+# 3. `Topology`, `Scan` and `Unresolved` are unit-tested and have NEVER been produced at root.
+#    Three `Reached` verdicts in a row is class 49's silence, not convergence.
+# 4. The production logind gate — Part B is a seam-built binary.
+# 5. The mutation campaign is unprivileged-only; the six root-gated tests are un-mutated.
+#
+# ---------------------------------------------------------------------------------------
+# SUPERSEDED — LANE RUN 21 (`223/6/229` at `d1fa4fe`) — the assembly control re-validated after the observer
+# was rebuilt, but its `Reached` established name + group membership only (D0A-R35-01). Its
+# full record follows.
+#
+# LANE RUN 21 detail:
 #
 #   EXECUTED 223 / SKIPPED 6 / reported 229     extractor rc=0
 #   producers: 17/17 exited 0                   failures: 0
@@ -362,5 +458,5 @@
 # (`208/5/213` at `c3cca14` — same figure, different tree), run 16 (`200/5/205`), run 15
 # (`192/5/197`), run 14 (`187/5/192`, closed D0A-R24-01), run 13 (`177/5/182`, freshness
 # WITHDRAWN by D0A-R25-05).
-EXECUTED=223
+EXECUTED=224
 SKIPPED=6

@@ -306,6 +306,7 @@ cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
   echo "=== helper digests ==="; sha256sum /usr/libexec/delphi-drop installer/staging/delphi-drop
   echo "=== account ==="; getent passwd delphi-tool
   echo "=== bwrap ==="; bwrap --version
+  echo "=== commit ==="; git rev-parse HEAD; git status --porcelain
 } > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
 ls -la "scratch/lane-run-$RUN/"
 

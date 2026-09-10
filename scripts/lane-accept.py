@@ -71,6 +71,17 @@ def check_hygiene(d: pathlib.Path) -> list[str]:
     if not re.search(r"delphi-runtime: OK", text):
         raise Refusal("hygiene.txt does not show the PAM stack unchanged (`md5sum -c` OK) — "
                       "class 16 is a defect this project has already paid for once")
+    # D0A-R35: the commit the run was taken against, RECORDED so the binding stops being an
+    # inference from file timestamps. Run 23's SHA was established that way and it is the one
+    # link this tool could not check.
+    if "=== commit ===" in text:
+        m = re.search(r"=== commit ===\n([0-9a-f]{40})\n(.*?)(?=\n=== |\Z)", text, re.S)
+        if m is None:
+            raise Refusal("hygiene.txt has a commit section but no 40-char SHA under it")
+        if m.group(2).strip():
+            raise Refusal(f"the working tree was DIRTY when the run was taken:\n"
+                          f"{m.group(2).strip()[:300]}\n— the artifacts do not describe any "
+                          f"commit, so the run cannot be attributed to one")
     digests = re.findall(r"^([0-9a-f]{64})\s+\S*delphi-drop$", text, re.M)
     if len(digests) < 2:
         raise Refusal("hygiene.txt does not record BOTH helper digests (installed and staged)")

@@ -122,6 +122,15 @@ def main() -> int:
     refuses(lambda d: (d / "hygiene.txt").write_text(
                 HYGIENE.replace("/etc/pam.d/delphi-runtime: OK", "delphi-runtime: FAILED")),
             "a CHANGED PAM stack is refused", "PAM")
+    # D0A-R35: the recorded commit. Present-and-clean is required only when the section
+    # exists, so historical runs without it are not retroactively refused — but a DIRTY tree
+    # is, because artifacts from a dirty tree describe no commit at all.
+    refuses(lambda d: (d / "hygiene.txt").write_text(
+                HYGIENE + "=== commit ===\n" + "a" * 40 + "\n M runtime/src/execute.rs\n"),
+            "a DIRTY tree at run time is refused", "DIRTY")
+    refuses(lambda d: (d / "hygiene.txt").write_text(HYGIENE + "=== commit ===\nnot-a-sha\n"),
+            "a commit section without a SHA is refused", "no 40-char SHA")
+
     refuses(lambda d: (d / "root-identities.txt").write_text("target::test_0\n"),
             "identities without COUNTS are refused", "MULTIPLICITY")
     refuses(lambda d: (d / "membership.txt").write_text(

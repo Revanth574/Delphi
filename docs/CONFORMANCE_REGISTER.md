@@ -81,10 +81,30 @@ protocol_and_stays_alive`, at root, against the real binary built with `insecure
 
 **Re-validated at lane run 21 after the observer was rebuilt.** The last row above was
 originally established by run 20, whose observer identified the AI **by name** and counted a
-zombie as a live sighting (D0A-R34-01/02). Run 21 re-ran it against the rebuilt observer and the computed verdict was `Reached` — but
-**that verdict established name + group membership, NOT parentage (D0A-R35-01)**: the success
-path returned before the `ppid` gate, so it was the one path the rebuild did not cover. The gate
-is now enforced on every verdict; no run has yet produced a `Reached` under it.
+zombie as a live sighting (D0A-R34-01/02). Run 21 re-ran it against the rebuilt observer and returned `Reached` — but that verdict
+established name + group membership, **not parentage** (D0A-R35-01): the success path returned
+before the `ppid` gate, so it was the one path the rebuild did not cover.
+
+**LANE RUN 23 IS THE FIRST `Reached` COMPUTED WITH THE GATE ENFORCED, and it is captured rather
+than transcribed:**
+
+```
+CONTROL OBSERVATION: daemon pgid 62556, ai comm "sai", 18 samples
+  VERIFIED live children matched in the daemon's group:
+    [ProcRecord { pid: 62693, ppid: 62556, pgid: 62556, state: 'S', starttime: 539550 }]
+census of that group: [(62558, 'S', "delphi-runtimed"), (62693, 'S', "sai"), (62698, 'R', "unix_chkpwd")]
+  verdict: Reached
+```
+
+`ppid 62556 == daemon pgid 62556`, so the matched process is **this daemon's live child**, not
+a namesake. The census again returns three processes rather than the target alone, which is the
+evidence that the scanner enumerates rather than matches — and this time that evidence is in
+`scratch/lane-run-23/part-b-control.txt` rather than in someone's terminal.
+
+**Run 23 is also the first lane run accepted by machine rather than by convention**
+(`acceptance.txt`, all six checks). That does not strengthen this row's claim; it means the
+claim's supporting evidence was verified present, passing and in order — including that
+freshness was proven *before* the run rather than after.
 
 ```
 CONTROL OBSERVATION: daemon pgid 30007, ai comm "sai", 20 samples

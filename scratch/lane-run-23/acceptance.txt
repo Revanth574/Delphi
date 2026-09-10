@@ -1,0 +1,12 @@
+lane acceptance for scratch/lane-run-23
+  [OK ] hygiene: helper digest aba0f0ea14b751aa… installed == staged
+  [OK ] freshness: freshness: 17 executables identical across a forced rebuild
+  [OK ] producers: producers: 17/17 exited 0
+  [OK ] membership: membership: 230 identities each side, zero either way
+  [OK ] control: control verdict: Reached
+  [OK ] ordering: ordering: freshness proven before the run; membership computed after it
+
+VERDICT: ACCEPTED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.

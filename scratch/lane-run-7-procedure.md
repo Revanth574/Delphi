@@ -276,13 +276,16 @@ print(f"identity lists retained in {out}/ — commit them with the run record")
 raise SystemExit(0 if not only_root and not only_unpriv else 1)
 EOF
 echo "membership rc=$?"    # 0 = identical sets; ANY non-empty side is a RESULT
-cp "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, also retained
+cp -p "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, also retained
 
 # D0A-R35-04: RETAIN EVERY ARTIFACT THE RECORD ASSERTS ABOUT. The lane record claims freshness,
 # producer exits and hygiene results; until now only the membership inputs were kept, so those
 # other claims were operator reports exactly like Part B's transcription was. Retention was
 # fixed where the finding pointed and nowhere else — class 48 inside the remediation.
-cp /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
+# `-p` IS LOAD-BEARING: plain `cp` stamps the copy with the time of the copy, which destroys
+# the only evidence that freshness was proven BEFORE the run. `scripts/lane-accept.py` caught
+# exactly that on its first execution — against artifacts this session had just copied.
+cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
    "scratch/lane-run-$RUN/" 2>&1 | tee -a "scratch/lane-run-$RUN/retention-errors.txt"
 { echo "=== free space ==="; scripts/check-free-space.sh
   echo "=== stale sessions ==="; scripts/check-stale-test-sessions.sh
@@ -292,6 +295,11 @@ cp /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
   echo "=== bwrap ==="; bwrap --version
 } > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
 ls -la "scratch/lane-run-$RUN/"
+
+# THE ACCEPTANCE GATE (D0A-R35). It executes nothing; it reads what the steps above retained
+# and REFUSES a run whose evidence is missing, failed, or out of order. A run it refuses may
+# not be cited as merge acceptance. Its own verdict is captured by the tool, not pasted.
+scripts/lane-accept.py "scratch/lane-run-$RUN" ; echo "acceptance rc=$?"
 ```
 
 Counters, not sets — a duplicated `#[test]` inflated a count once already, and set arithmetic

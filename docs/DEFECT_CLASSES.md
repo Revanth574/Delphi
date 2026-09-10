@@ -2998,3 +2998,45 @@ causal claim, and an overlapping observation window before concluding a live sca
 subject. **A third instance, pre-existing and found by auditing under this class:** the mutation
 campaign's outcome classifier read cause from arbitrary assertion text, so a test asserting on
 the literal `"Killed"` was classified INFRASTRUCTURE (D0A-R34-05).
+
+## 54. A REQUIRED CHECK DISCONNECTED FROM ACCEPTANCE IS NOT A CHECK  *(new — D0A-R35, after four instances and one wrong deferral)*
+
+**The shape.** A procedure names a check; nothing refuses a run that lacks it. The check then
+depends entirely on the actor executing it correctly, and every failure mode is invisible to
+that actor by construction.
+
+**Four instances, all within two lane runs:**
+
+| instance | how it failed | how it was found |
+|---|---|---|
+| run 20's §4b | dropped from a hand-assembled sequence | reading the record afterwards |
+| run 20's free-space guard | fired, and was overridden | the transcript |
+| run 21's `$LOG`/`$STATUS` | unset, so the step failed at its first token **while looking like the long-running loop it should have started** | the operator noticing |
+| run 21's freshness / producer / hygiene claims | asserted with no retained evidence | the reviewer asking for the artifacts |
+
+**None was caught by the actor that caused it.** That is the class's defining property: the
+actor's own view cannot distinguish "I ran it" from "I believe I ran it".
+
+**The foreclosing mechanism: `scripts/lane-accept.py`.** It executes nothing — the procedure
+still runs by hand — and refuses to certify a run whose retained evidence is missing, failed, or
+out of order. Acceptance is what it gates, not execution.
+
+**AND THE DEFERRAL IS PART OF THE ENTRY.** This tool was specified, then deferred, on the
+reasoning that *this branch's history with infrastructure-during-remediation argues against it*.
+That reasoning was sound about **the runner reverted at D0A-R23-05** — which REPLACED the
+procedure and silently dropped five of its checks — and was generalized to **all lane
+infrastructure**. Every round after the deferral produced another instance, three of them inside
+remediation for the finding that named the pattern. The deferral was not a threshold that later
+got crossed; it was wrong when it was made, and it was wrong by **over-scoping a sound
+conclusion about one artifact to a whole category** — which is class 48's shape pointed
+forwards instead of backwards.
+
+**The distinction the deferral collapsed, stated so it is not collapsed again:** a tool that
+*runs the lane* and a tool that *refuses an under-evidenced lane* are different things. The
+second is precisely the mechanism that would have caught the first one's failure.
+
+**Its first execution found a defect in its own retention step** — `cp` without `-p` stamps
+copies with the time of the copy, destroying the evidence that freshness preceded the run — and
+it refuses lane run 21, which lacks hygiene capture and writes identities without counts. **That
+refusal was recorded rather than tuned away**, which is the discriminating test from Iron Law 15
+clause 1: the same edit would not have been made if the check were passing.

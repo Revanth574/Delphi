@@ -1,0 +1,12 @@
+lane acceptance for scratch/lane-run-21
+  [REFUSE] hygiene: hygiene.txt is MISSING — the step that produces it left no evidence, which is indistinguishable from it never having run
+  [OK ] freshness: freshness: 17 executables identical across a forced rebuild
+  [OK ] producers: producers: 17/17 exited 0
+  [REFUSE] membership: root-identities.txt line 'anchor::anchor_is_unsubstitutable_yet_connectable' has no explicit count — bare keys drop MULTIPLICITY, so the multiset cannot be reconstructed (D0A-R35-05)
+  [OK ] control: control verdict: Reached
+  [OK ] ordering: ordering: freshness proven before the run; membership computed after it
+
+VERDICT: REFUSED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.

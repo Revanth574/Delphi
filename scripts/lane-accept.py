@@ -86,7 +86,17 @@ def check_hygiene(d: pathlib.Path) -> list[str]:
         m = re.search(r"=== commit ===\n([0-9a-f]{40})\n(.*?)(?=\n=== |\Z)", text, re.S)
         if m is None:
             raise Refusal("hygiene.txt has a commit section but no 40-char SHA under it")
-        if m.group(2).strip():
+        # The run's OWN artifacts make the tree untracked-dirty by construction — the
+        # directory is created by §4b, several steps before this is recorded. Filtering them is
+        # not a loophole: they ARE the run's output, and treating a run's own products as
+        # evidence that it ran against no commit refused run 24 for a condition the procedure
+        # guarantees (D0A-R35). Anything else dirty still refuses.
+        dirty = [
+            l for l in m.group(2).splitlines()
+            if l.strip() and not re.match(r"^\?\?\s+scratch/lane-run-\d+/?$", l.strip())
+        ]
+        if dirty:
+            m = type("M", (), {"group": staticmethod(lambda n: "\n".join(dirty))})()
             raise Refusal(f"the working tree was DIRTY when the run was taken:\n"
                           f"{m.group(2).strip()[:300]}\n— the artifacts do not describe any "
                           f"commit, so the run cannot be attributed to one")

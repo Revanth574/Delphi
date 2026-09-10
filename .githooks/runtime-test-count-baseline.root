@@ -1,5 +1,18 @@
 # Root-lane counts for `-p delphi-runtime --tests`, ALL 17 targets under sudo.
 #
+# RUN 24 WAS ATTEMPTED AND **REFUSED** — its numbers are NOT below and must not be cited.
+# `scratch/lane-run-24/ATTEMPT-REFUSED.txt` carries the detail. Three reasons, and the one that
+# matters is open: TWO ROOT TESTS FAILED (`b1_token_expiry_blocks_the_assembled_loop`,
+# `the_daemon_binary_runs_the_real_gate_d0a_r4_03`), both inside PAM session setup, both new
+# relative to runs 20/21/23 — and attributable NEITHER to the intervening commit (which does not
+# touch those paths) NOR to §6's documented parallel-PAM artifact (this run was serial, the
+# configuration measured 0/30 for that shape). A repeat root run is owed before any run can be
+# accepted. The prediction 224/8/232 derived the TEST SET correctly — §4b measured 232
+# identities each side, 8 skips — and the count differs only because the extractor's EXECUTED
+# counts passing tests: 232 − 8 − 2 = 222.
+#
+# THE BASELINE THEREFORE REMAINS RUN 23's. A refused run does not set it.
+#
 # LANE RUN 23 — **the first lane run whose acceptance was decided by a machine, not by
 # convention.** Measured 2026-09-10 at `b51bd8f`. (Run 22 was attempted and REFUSED at the
 # gate; see `scratch/lane-run-22/`.)

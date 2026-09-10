@@ -1,0 +1,21 @@
+=== free space ===
+PATH                                             FREE      FLOOR  STATUS
+/run                                            1483M        64M  ok
+/home/revanth-aditya/delphi-target             19073M      2048M  ok
+/tmp                                            3710M       512M  ok
+
+All checked filesystems above their floors.
+=== stale sessions ===
+no stale sessions opened by delphi-runtime
+=== PAM ===
+/etc/pam.d/delphi-runtime: OK
+=== helper digests ===
+aba0f0ea14b751aa4a78e22467293f643384ac5f659286088864969cb0e8aace  /usr/libexec/delphi-drop
+aba0f0ea14b751aa4a78e22467293f643384ac5f659286088864969cb0e8aace  installer/staging/delphi-drop
+=== account ===
+delphi-tool:x:997:972::/home/delphi-tool:/usr/sbin/nologin
+=== bwrap ===
+bubblewrap 0.11.1
+=== commit ===
+76ecb45dea7c8277f6c38075e3fc53a5463a5681
+?? scratch/lane-run-24/

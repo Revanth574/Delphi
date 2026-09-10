@@ -135,6 +135,26 @@ def main() -> int:
     refuses(lambda d: (d / "hygiene.txt").write_text(HYGIENE + "=== commit ===\nnot-a-sha\n"),
             "a commit section without a SHA is refused", "no 40-char SHA")
 
+    # D0A-R35: the run's OWN artifacts must not count as a dirty tree. Run 24 was refused for
+    # `?? scratch/lane-run-24/`, which §4b creates several steps before the commit is recorded —
+    # a condition the procedure guarantees, so the check refused every run by construction.
+    d = fixture()
+    try:
+        (d / "hygiene.txt").write_text(
+            HYGIENE + "=== commit ===\n" + "c" * 40 + "\n?? scratch/lane-run-24/\n")
+        ok, report = la.accept(d)
+        check("the run's OWN artifact directory is not a dirty tree", ok, "\n".join(report))
+        (d / "hygiene.txt").write_text(
+            HYGIENE + "=== commit ===\n" + "c" * 40 +
+            "\n?? scratch/lane-run-24/\n M runtime/src/execute.rs\n")
+        ok, report = la.accept(d)
+        check("...but a REAL modification alongside it still refuses", not ok)
+        check("...and the refusal names only the real one",
+              "execute.rs" in "\n".join(report) and "lane-run-24" not in "\n".join(report),
+              "\n".join(report))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     refuses(lambda d: (d / "root-identities.txt").write_text("target::test_0\n"),
             "identities without COUNTS are refused", "MULTIPLICITY")
     refuses(lambda d: (d / "membership.txt").write_text(

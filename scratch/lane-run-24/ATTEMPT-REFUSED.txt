@@ -1,0 +1,102 @@
+LANE RUN 24 — REFUSED BY THE ACCEPTANCE GATE. NOT EVIDENCE, NOT ACCEPTANCE.
+
+The gate refused for three reasons. One was the gate's own defect, one is a defect in a
+fixture I wrote, and ONE IS UNEXPLAINED AND MATTERS MOST.
+
+=========================================================================================
+1. THE PREDICTION MISSED — 222/8/230 measured against 224/8/232 predicted
+=========================================================================================
+
+The mismatch is a RESULT and is recorded before its explanation, per the procedure.
+
+**The derivation of the TEST SET was right.** §4b counted 232 identities at root and 232
+unprivileged, zero in either direction — exactly the predicted 232, with the predicted 8
+skips, each quoting its own blocker. The two new tests skipped in the featureless lane as
+derived.
+
+**The count differs because TWO TESTS FAILED.** `scripts/test-count.sh`'s EXECUTED counts
+passing tests, so 232 identities − 8 skipped − 2 failed = 222. The prediction assumed all
+non-skipped tests would pass; it did not mis-derive the set.
+
+=========================================================================================
+2. TWO ROOT TESTS FAILED, AND I CANNOT ATTRIBUTE THEM — THIS IS THE OPEN ITEM
+=========================================================================================
+
+    b1_token_expiry_blocks_the_assembled_loop        launch: ShellSetupFailed
+    the_daemon_binary_runs_the_real_gate_d0a_r4_03   shell child failed before execve:
+                                                     pam_open_session failed
+
+Runs 20, 21 and 23 each had ZERO failures, so these are new relative to every accepted run.
+
+**What the evidence does NOT support:** attributing them to my changes. The only commit
+between run 23 and run 24 touching `b1_integration.rs` is 1c5f92b, whose removals are
+confined to the assembly test's body as it moved into `observe_assembly` — checked line by
+line. Neither failing test calls `observe_assembly`, the new fixtures, or anything that
+commit altered. Both failed inside PAM/logind session setup, which that commit does not
+touch.
+
+**What the evidence does NOT support either:** calling it a harness artifact. CLAUDE.md §6
+documents this exact shape — `pam_open_session failed` from `b1_integration` — as
+contention among concurrent PAM sessions on a shared VT, measured 30/30 under PARALLEL
+execution and **0/30 serial**. This run was serial (`--test-threads=1`), which is the
+configuration where the documented artifact does NOT occur. Iron Law 15 clause 5: the
+harness is guilty only when SHOWN to be, and an undemonstrated harness excuse is how a
+real defect ships green.
+
+**So it is UNEXPLAINED.** Distinguishing intermittent from persistent needs a repeat root
+run, which is owed before any run can be accepted. Recording it as "probably the known
+flake" would be the exact move clause 5 forbids.
+
+=========================================================================================
+3. THE NEGATIVE CONTROL RETURNED `Unresolved` — outcome 3, a defect in MY FIXTURE
+=========================================================================================
+
+    daemon pgid 20203, ai comm "sai", 2640 samples
+    census: [(20205, 'S', "delphi-runtimed")]
+    last iteration: IterationEvidence { group_matches: [], before: [], after: [] }
+    left: Unresolved   right: Topology
+
+The expectation named this outcome before the run: *the fixture did not produce the input
+it claims — a finding about the FIXTURE, not the control or the product.* That is what it
+was.
+
+**CAUSE, MEASURED: `exec` REPLACES `comm`.** A shell that `exec`s `sleep` has `comm=sleep`,
+not `sh`. The shim was staged as `sai` and exec'd `delphi-stubborn-ai`, so it became
+`delphi-stubborn` — and the probe, which discovers candidates by `comm`, never saw it
+across 2640 samples. `before` and `after` are empty in every iteration.
+
+**THE PART WORTH KEEPING: my mechanism test proved the wrong property.** It asserted the
+shim's `ppid` and `pgid` and stopped — both true of a process the probe cannot find. The
+property the CONSUMER needs is that the process stays findable, and I never asserted it.
+Proving the property I thought mattered is not proving the one the consumer needs, and the
+gap was invisible until an assembly run 140 seconds long spent every sample looking for a
+name that no longer existed.
+
+Fixed: the negative control now execs a file STAGED UNDER THE SAME NAME, so `comm` survives
+the transition. The mechanism test now asserts `comm` after `exec` — RED-proven, a shim
+that never execs fails it with `left: "delphi-detached"`.
+
+**The negative control has still never produced a verdict.** `Topology` remains unobserved
+in the assembly, and the question three `Reached` verdicts leave open is still open.
+
+=========================================================================================
+4. THE GATE'S OWN DEFECT — it refused every run by construction
+=========================================================================================
+
+    [REFUSE] hygiene: the working tree was DIRTY when the run was taken:
+    ?? scratch/lane-run-24/
+
+`scratch/lane-run-24/` is created by §4b, several steps BEFORE the commit is recorded. The
+run's own output made the tree untracked-dirty, so the check I added one commit earlier
+would have refused every future run for a condition the procedure guarantees. Fixed and
+guarded both ways: the run's own directory is filtered, any other modification still
+refuses, and the refusal names only the real one.
+
+=========================================================================================
+WHAT THE GATE GOT RIGHT
+=========================================================================================
+
+It refused. The producer failure and the missing negative-control verdict are both real,
+and both were named. A run with two root failures and a fixture that produced nothing did
+not become an accepted lane run — which is the second time the mechanism has ended a run
+that convention would have carried forward.

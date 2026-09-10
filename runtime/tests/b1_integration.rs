@@ -1930,6 +1930,19 @@ fn the_topology_fixture_leaves_the_parents_process_group() {
                             record would not be `verified_live` and the verdict would be \
                             Unresolved rather than Topology");
     assert_eq!(r.pgid, pid, "the fixture must lead its OWN group");
+
+    // D0A-R35: **THE PROPERTY THE PROBE DEPENDS ON, AND THE ONE THIS TEST MISSED.** It asserted
+    // `ppid` and `pgid` and stopped — both true of a process the probe cannot find. `exec`
+    // REPLACES `comm`, so the exec'd file's name is what the scan sees, and run 24's negative
+    // control returned `Unresolved` across 2640 samples for exactly that reason. Proving the
+    // property I thought mattered is not proving the one the consumer needs.
+    assert_eq!(
+        comm_of(pid),
+        "sleep",
+        "after `exec` the process carries the EXEC'D file's name, not the shim's. Any fixture \
+         built on this must exec a file whose name the probe is looking for, or it will be \
+         invisible to a scan that discovers candidates by `comm`"
+    );
     assert_ne!(r.pgid, nix::unistd::getpgrp().as_raw(),
                "the fixture is still in OUR process group, which is the topology it is \
                 supposed to break");
@@ -2242,11 +2255,24 @@ fn the_control_reports_topology_when_the_daemons_child_leaves_its_group() {
         return;
     }
 
+    // D0A-R35: THE EXEC'D FILE MUST HAVE THE SAME NAME, because `exec` REPLACES `comm`.
+    // Measured after run 24 returned `Unresolved` across 2640 samples: the shim was staged as
+    // `sai`, exec'd `delphi-stubborn-ai`, and became `delphi-stubborn` — so the probe, which
+    // discovers candidates by `comm`, never saw it. The fixture produced no `Topology` input
+    // because it produced nothing the probe could find at all.
+    let real_dir = tempfile::Builder::new()
+        .prefix("delphi-r35neg-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("tempdir for the exec target");
+    std::fs::set_permissions(real_dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let real_ai = stage_bin(env!("CARGO_BIN_EXE_delphi-stubborn-ai"), real_dir.path(), "sai");
+    let real_ai = real_ai.to_string_lossy().into_owned();
+
     let o = observe_assembly(
         "detached",
         env!("CARGO_BIN_EXE_delphi-detached-ai"),
         &[
-            ("DELPHI_DETACHED_AI_REAL", env!("CARGO_BIN_EXE_delphi-stubborn-ai")),
+            ("DELPHI_DETACHED_AI_REAL", real_ai.as_str()),
             // A SHORT sleep, deliberately: this child is in its own group, so `DaemonGuard`'s
             // emergency `kill_group` cannot reach it. If the daemon fails to kill it by pid,
             // the default hour-long sleeper would leak one process per failing run.

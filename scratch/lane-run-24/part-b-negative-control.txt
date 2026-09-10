@@ -1,0 +1,21 @@
+
+running 1 test
+test the_control_reports_topology_when_the_daemons_child_leaves_its_group ... 
+thread 'the_control_reports_topology_when_the_daemons_child_leaves_its_group' (20155) panicked at runtime/tests/b1_integration.rs:2257:5:
+assertion `left == right` failed: THE CONTROL DID NOT SEE A TOPOLOGY DEFECT IT WAS BUILT TO SEE. The daemon's AI called `setpgid(0,0)` before `exec`, so its child is verified (`ppid` == daemon) and OUTSIDE the daemon's group — the exact input `Topology` names. Getting `Unresolved` instead means the three `Reached` verdicts in the record are consistent with a control that cannot discriminate, and the supplementary evidence in D0A-R28-02's row does not hold.
+daemon pgid 20203, ai comm "sai", 2640 samples
+census: [(20205, 'S', "delphi-runtimed")]
+last iteration: Some(IterationEvidence { group_matches: [], before: [], after: [] })
+  left: Unresolved
+ right: Topology
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Could not terminate user: User ID 1011 is not logged in or lingering
+FAILED
+
+failures:
+
+failures:
+    the_control_reports_topology_when_the_daemons_child_leaves_its_group
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 140.33s
+

@@ -1,0 +1,10 @@
+
+running 1 test
+test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... CONTROL OBSERVATION: daemon pgid 19719, ai comm "sai", 20 samples
+  VERIFIED live children matched in the daemon's group: [ProcRecord { pid: 19843, ppid: 19719, pgid: 19719, state: 'S', starttime: 93069 }]
+census of that group: [(19721, 'S', "delphi-runtimed"), (19843, 'S', "sai"), (19849, 'R', "unix_chkpwd")]
+  verdict: Reached
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 6.32s
+

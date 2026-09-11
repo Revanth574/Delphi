@@ -307,6 +307,13 @@ cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
   echo "=== account ==="; getent passwd delphi-tool
   echo "=== bwrap ==="; bwrap --version
   echo "=== commit ==="; git rev-parse HEAD; git status --porcelain
+  # D0A-R35: the axis the r4_03 investigation could not test. Runs 24 and 25 failed deep into
+  # one uptime session; every repro ran on a 15-minute-old boot and passed 17/17. Capture what
+  # accumulates so a future failure and a future pass are comparable.
+  echo "=== session state ==="; uptime -p; uptime -s
+  echo "leftover test accounts: $(getent passwd | grep -cE '^db1' || true)"
+  loginctl list-sessions --no-legend 2>/dev/null | wc -l | xargs echo "logind sessions:"
+  loginctl list-sessions --no-legend 2>/dev/null || true
 } > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
 ls -la "scratch/lane-run-$RUN/"
 

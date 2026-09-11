@@ -16,6 +16,7 @@ pam_open_session failed`, which makes the daemon exit before emitting the gate w
 | 6 | full `b1_integration` binary, serial, root, no `--nocapture`, 3 iterations | **PASS 3/3** (23 passed, 0 failed) |
 | 7 | same, WITH `--nocapture`, 3 iterations | **PASS 3/3** |
 | 8 | `anchor` first, then `b1_integration`, both `--nocapture`, 3 iterations | **PASS 3/3** |
+| 9 | same, with the LANE'S FD SHAPE — stdin a regular file, stdout/stderr appended to a file | **PASS 3/3** |
 
 ## Hypotheses eliminated, with what eliminated them
 
@@ -82,6 +83,36 @@ If (a) passes and (b) fails, `anchor` leaves residue.
 
 If both pass, the context is wider still and the next step is the lane's remaining
 difference: the freshness step's `touch` + rebuild immediately before the run.
+
+## A SCOPE CORRECTION ON EVERY ELIMINATION ABOVE
+
+**The box rebooted between the failures and the investigation.** Runs 24 and 25 ran
+2026-09-10 at ~18:19 and ~18:39, the 4th and 5th heavy root runs of one uptime session.
+Lines 4 and 6-9 all ran 2026-09-12 on a system **15 minutes old**, with **zero leftover
+test users** and none of that session's accumulated state. (`/tmp` being cleaned — which
+broke the bisect's worktree registration — was the same reboot.)
+
+**So the eliminations are narrower than they read.** Each shows that *X alone does not
+cause the failure on a freshly booted system*. None shows that *X was not a contributor
+under the conditions that actually produced it*. Seventeen consecutive passes in a
+condition that differs from the failing one is weaker evidence than seventeen passes
+sounds, and saying so is the difference between a ledger and a story.
+
+**This also means the failure is currently UNREPRODUCIBLE, not resolved.** The condition
+under which it occurred no longer exists on this machine. Nothing here has fixed it, and
+the next opportunity to observe it is the next long session with several root runs.
+
+## The proportionate response: instrument, do not chase
+
+Chasing an unreproducible failure by rebuilding the conditions is expensive and
+speculative. Capturing the differential evidence when it next occurs is cheap. The lane's
+`hygiene.txt` now records **uptime, the count of leftover test accounts, and the live
+logind session list** — so a future failure and a future pass can be compared on the axis
+this investigation could not test.
+
+If it never recurs, that is also information, and the ledger says what it would take to
+believe it gone: root runs in a long session, which is precisely the condition that
+produced it twice.
 
 ## Why this is being written down rather than concluded
 

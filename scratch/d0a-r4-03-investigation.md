@@ -14,6 +14,8 @@ pam_open_session failed`, which makes the daemon exit before emitting the gate w
 | 4 | bisect, HEAD, the test ALONE, 5 iterations | **PASS 5/5** |
 | 5 | bisect, `b51bd8f`, the test alone | **NON-MEASUREMENT** — helper digest pinning; the daemon refused before reaching the gate. Build-path nondeterminism, source verified identical |
 | 6 | full `b1_integration` binary, serial, root, no `--nocapture`, 3 iterations | **PASS 3/3** (23 passed, 0 failed) |
+| 7 | same, WITH `--nocapture`, 3 iterations | **PASS 3/3** |
+| 8 | `anchor` first, then `b1_integration`, both `--nocapture`, 3 iterations | **PASS 3/3** |
 
 ## Hypotheses eliminated, with what eliminated them
 
@@ -25,6 +27,32 @@ pam_open_session failed`, which makes the daemon exit before emitting the gate w
 - **The commit range, as a sufficient explanation.** Line 4: HEAD passes 5/5 in isolation.
   Whatever the cause, it is not "this commit made the test fail".
 - **Something earlier in `b1_integration`.** Line 6: the whole binary, serially, 3/3 clean.
+
+## What is left, after lines 7 and 8
+
+Fourteen consecutive passes outside the lane against 2/2 failures inside it. `--nocapture`
+is eliminated; so is `anchor` as a predecessor.
+
+**The difference I had not accounted for is the FILE DESCRIPTORS.** The lane runs:
+
+```
+while read -r b; do
+  sudo "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
+done < /tmp/targets.txt
+```
+
+so the test binary gets **stdin = a regular file** (`targets.txt`, positioned partway
+through) and **stdout/stderr = a regular file opened for append**. Every repro above ran
+with **stdin = a terminal** and stdout = a pipe.
+
+That is not cosmetic for this failure. The failing step is `pam_open_session` in a child
+the daemon spawns, and that child inherits these descriptors. PAM and logind care about the
+terminal; a session opened by a process whose stdin is a regular file is not the same
+situation as one whose stdin is a tty.
+
+**This is the first candidate with a mechanism rather than a correlation**, and it was
+sitting in the procedure the whole time — visible in the invocation, invisible because
+every repro was typed at a prompt.
 
 ## What is left, and it is now narrow
 
@@ -41,8 +69,10 @@ The lane differs from line 6 in exactly two ways:
 
 Two runs, one variable each:
 
-  (a) `b1_integration` alone WITH `--nocapture` — isolates the stdio variable
-  (b) `anchor` then `b1_integration`, both with `--nocapture` — adds the predecessor
+  (a) DONE — line 7, PASS 3/3. `--nocapture` eliminated.
+  (b) DONE — line 8, PASS 3/3. `anchor` eliminated.
+  (c) NEXT — the lane's FD shape: stdin from a regular file, stdout/stderr appended to a
+      file. If this reproduces, split it: stdin alone, then stdout alone.
 
 If (a) fails, `--nocapture` is the variable and the lane's own invocation is implicated —
 which would mean the lane has been measuring the product under a condition the product does

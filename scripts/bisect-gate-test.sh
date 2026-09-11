@@ -108,6 +108,21 @@ run_one() {   # $1 = label, $2 = binary
         head -5 <<<"$out" >&2
         exit 2
     fi
+    # A DAEMON THAT REFUSES ITS OWN HELPER NEVER REACHED THE GATE. `build.rs` compiles
+    # `helper/delphi-drop.rs` into OUT_DIR and pins the digest of THAT binary, so a tree built
+    # at a different path pins a different helper than the installed one — measured: the helper
+    # source and build.rs are IDENTICAL across the two commits, so the mismatch is build-path
+    # nondeterminism, not a source change. Counting it as a test failure produced
+    # "only b51bd8f fails", which is a confident answer about a gate that never ran.
+    if grep -q "is not the helper this daemon was built against" <<<"$out"; then
+        printf 'REFUSING: %s pinned a helper that is not the installed one, so it never\n' "$1" >&2
+        printf 'reached the gate. This is a NON-MEASUREMENT, not a FAIL.\n\n' >&2
+        grep -o 'built [0-9a-f]\{16\}\|installed [0-9a-f]\{16\}' <<<"$out" | head -2 >&2
+        printf '\nAn out-of-tree build cannot run against an installed helper. To measure an\n' >&2
+        printf 'older commit you must install ITS helper first, which mutates system state --\n' >&2
+        printf 'do that deliberately or not at all.\n' >&2
+        exit 2
+    fi
     if grep -q "SKIP r4_03_daemon_real_gate" <<<"$out"; then
         REFUSE "the test SKIPPED (not root?) — a skip is scored as a PASS, so counting it \
 would report a clean bisect from a test that never ran"

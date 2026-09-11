@@ -1613,51 +1613,21 @@ the test's verdict differs. For the D0 instance that is the measured pair:
 
 ---
 
-## 26. A stale observation asserted in the present tense  *(new — D0 round 2)*
-
-**Description.** A syscall that observes state — `poll`, `stat`, `access`, a directory
-listing — returns a description of **what was true at the moment it ran**. Code then performs
-another syscall and *reuses the earlier observation* to draw a conclusion. The conclusion is
-a claim about the past, stated in the present tense, and it is wrong exactly when the state
-changed in between.
-
-The dangerous half is asymmetric, and naming it is the point:
-
-> **A negative observation is not a positive claim.** "The pidfd was not readable" is not
-> "the process is alive"; "`POLLHUP` was not set" is not "the peer still holds its end";
-> "the path did not exist" is not "the path does not exist". Positive evidence (death
-> observed, HUP observed) is conclusive when it arrives. Its **absence** is conclusive only
-> after waiting out the arrival that would contradict it.
-
-**Instances — all three in one module, in three consecutive rounds:**
-
-- **D0-R1-06.** `poll(pidfd, 0)` returning nothing was read as **"alive"**. A child closes its
-  fds *before* its pidfd becomes readable, so a corpse was reported as a live shell with a
-  protocol fault.
-- **D0-R2-01.** The `revents` captured *before* a `read` were reused *after* it to decide
-  readiness. Measured: an already-dead shell accepted as ready **83/100**.
-- **D0-R2-01b.** The `n == 0` branch read an absent (and stale) `POLLHUP` as proof the peer
-  still held its end — "alive by construction". Found by us, not by review.
-- **D0-R2-01c.** The *fix* then returned `ChannelClosed` on the first `POLLHUP`, which asserts
-  the child is alive — while the death that had already happened was still in flight. The
-  class re-entering its own fix (Class 22) at the third attempt.
-
-**Foreclosing primitive.** **Re-poll before concluding; never reuse captured `revents` across
-a syscall boundary.** Concretely, in this module: `classify_and_confirm_alive` takes no
-`revents` parameter at all — the type makes the stale value unavailable — and every liveness
-conclusion goes through `witness_terminal`, which polls afresh and lets only *death* return
-early. Where a negative must become a positive claim, it costs a **grace** (`DEATH_GRACE`),
-calibrated by measurement rather than chosen: 0 ms → 32/100 wrongly accepted, ≥2 ms → 0/100.
-
-**RED-proof shape.** Force the interleaving rather than sampling it (Class 22): construct an
-input where the state provably changes between the two syscalls — a child that writes and
-exits immediately, or one that closes its channel and dies 50 ms later — and assert the
-verdict is the *post*-change one. Detection must be deterministic; if it is not, the
-instrument is sampling a race it should be forcing.
-
----
-
 ## 26. A captured observation read as a present-tense claim  *(new — D0 rounds 1-3)*
+
+**THIS CLASS WAS RECORDED TWICE UNDER THE SAME NUMBER, and the duplicate was found by
+COUNTING the corpus rather than reading it** (2026-09-12). An earlier, thinner entry — "A
+stale observation asserted in the present tense", D0 round 2, three instances, with a
+*rule* as its foreclosing primitive — sat immediately above this one. This entry already
+superseded it in substance: its foreclosing primitive is a MECHANISM adopted **after three
+rules failed**, which is the same conclusion arrived at later and more expensively. The
+thinner entry is removed and nothing unique was lost.
+
+Worth keeping as its own small lesson: a corpus whose own standard is *one concise
+authoritative account over accumulated correction narratives* (D0A-R34-04) carried two
+entries for one class, and a citation of "class 26" was ambiguous for however long that
+stood. The check that found it was `grep -c` against the numbering — a mechanical count,
+not attention.
 
 **Description.** A `poll`/`read`/`waitpid` result witnesses what was true **at the moment of
 the call**. Any conclusion drawn *after* an intervening syscall is a claim about the past

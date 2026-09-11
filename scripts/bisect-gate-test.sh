@@ -65,7 +65,19 @@ NEW_BIN=$(build_both "$PWD" "${CARGO_TARGET_DIR:-$PWD/target}")
 [ -x "$NEW_BIN" ] || REFUSE "no HEAD test binary"
 
 echo "== building $OLD in an isolated worktree =="
-if [ ! -d "$WT" ]; then git worktree add --detach "$WT" "$OLD" >/dev/null; fi
+# A worktree whose directory is gone but whose REGISTRATION survives makes `add` fail with
+# "missing but already registered". That is exactly what /tmp being cleaned between sessions
+# produces — and it is the same hazard the lane's own retention fixed: state parked in /tmp does
+# not survive, while the registration in .git does. Prune first, then add.
+if [ ! -d "$WT" ]; then
+    git worktree prune
+    if git worktree list --porcelain | grep -qxF "worktree $WT"; then
+        git worktree remove --force "$WT" 2>/dev/null || true
+        git worktree prune
+    fi
+    git worktree add --detach "$WT" "$OLD" >/dev/null \
+      || REFUSE "could not create the $OLD worktree at $WT"
+fi
 OLD_BIN=$(build_both "$WT" "$WT/target")
 [ -x "$OLD_BIN" ] || REFUSE "no $OLD test binary"
 

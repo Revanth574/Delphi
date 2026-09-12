@@ -1,0 +1,3 @@
+real Cargo, plain: outcome=UNATTRIBUTED FAILURE; exit=101; summaries=1; named_failures=[]
+real Cargo, diagnostic: outcome=CAUGHT; exit=101; summaries=1; named_failures=['nonexistent_guard']
+actual build-failure branch, signal 9 and passing free-space check: INVALID: mutant does not compile

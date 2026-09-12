@@ -1,0 +1,84 @@
+  [OK ] a COMPLETE run directory is ACCEPTED
+  [OK ] a MISSING artifact is refused
+  [OK ] a MISSING artifact is refused — the refusal says why
+  [OK ] missing hygiene evidence is refused
+  [OK ] missing hygiene evidence is refused — the refusal says why
+  [OK ] a NONZERO producer exit is refused
+  [OK ] a NONZERO producer exit is refused — the refusal says why
+  [OK ] a SUBSET of producers is refused
+  [OK ] a SUBSET of producers is refused — the refusal says why
+  [OK ] a CHANGED executable set is refused
+  [OK ] a CHANGED executable set is refused — the refusal says why
+  [OK ] a SUBSET of hashes is refused
+  [OK ] a SUBSET of hashes is refused — the refusal says why
+  [OK ] MISMATCHED helper digests are refused
+  [OK ] MISMATCHED helper digests are refused — the refusal says why
+  [OK ] an OVERRIDDEN free-space refusal is refused
+  [OK ] an OVERRIDDEN free-space refusal is refused — the refusal says why
+  [OK ] a CHANGED PAM stack is refused
+  [OK ] a CHANGED PAM stack is refused — the refusal says why
+  [OK ] a DIRTY tree at run time is refused
+  [OK ] a DIRTY tree at run time is refused — the refusal says why
+  [OK ] a commit section without a SHA is refused
+  [OK ] a commit section without a SHA is refused — the refusal says why
+  [OK ] the run's OWN artifact directory is not a dirty tree
+  [OK ] ...but a REAL modification alongside it still refuses
+  [OK ] ...and the refusal names only the real one
+  [OK ] identities without COUNTS are refused
+  [OK ] identities without COUNTS are refused — the refusal says why
+  [OK ] a NONZERO identity difference is refused
+  [OK ] a NONZERO identity difference is refused — the refusal says why
+  [OK ] a control with NO VERDICT is refused
+  [OK ] a control with NO VERDICT is refused — the refusal says why
+  [OK ] a control whose verdict is followed by FAILURE is refused
+  [OK ] a control whose verdict is followed by FAILURE is refused — the refusal says why
+  [OK ] a control that SKIPPED is refused
+  [OK ] a control that SKIPPED is refused — the refusal says why
+  [OK ] a control naming the WRONG test is refused
+  [OK ] a control naming the WRONG test is refused — the refusal says why
+  [OK ] a POSITIVE control returning Topology is refused
+  [OK ] a POSITIVE control returning Topology is refused — the refusal says why
+  [OK ] an EMPTY identity file is refused
+  [OK ] an EMPTY identity file is refused — the refusal says why
+  [OK ] an EMPTY transcript is refused
+  [OK ] an EMPTY transcript is refused — the refusal says why
+  [OK ] 17 copies of ONE producer are refused
+  [OK ] 17 copies of ONE producer are refused — the refusal says why
+  [OK ] producers that are not the HASHED set are refused
+  [OK ] producers that are not the HASHED set are refused — the refusal says why
+  [OK ] a membership total contradicting the files is refused
+  [OK ] a membership total contradicting the files is refused — the refusal says why
+  [OK ] a FAILED rebuild is refused despite identical hashes
+  [OK ] a FAILED rebuild is refused despite identical hashes — the refusal says why
+  [OK ] a missing rebuild artifact is refused
+  [OK ] a missing rebuild artifact is refused — the refusal says why
+  [OK ] membership computed BEFORE the run is refused
+  [OK ] membership computed BEFORE the run is refused — the refusal says why
+  [OK ] a rebuild after the START but before the run's last write is refused
+  [OK ] a rebuild after the START but before the run's last write is refused — the refusal says why
+  [OK ] run 23 is still ACCEPTED without a negative control
+  [OK ] run 24 WITHOUT a negative control is REFUSED
+  [OK ] ...and the refusal names it
+  [OK ] a negative control returning `Reached` is REFUSED
+  [OK ] ...and the refusal says what Reached means here
+  [OK ] a negative control returning `Unresolved` is REFUSED
+  [OK ] a negative control returning `Topology` is ACCEPTED
+  [OK ] freshness proven AFTER the run is refused
+  [OK ] freshness proven AFTER the run is refused — the refusal says why
+  [OK ] the verifier CAPTURES its own verdict
+  [OK ] the captured verdict matches what it printed
+  [OK ] re-verification does NOT overwrite the run's captured verdict
+  [OK ] ...and the re-verification is retained beside it
+  [OK ] re-verification: same-second captures do not overwrite each other
+  [OK ] re-verification: the RUN's verdict is still the one it wrote
+  [OK ] a verdict it cannot capture is a REFUSAL, not a pass
+  [OK ] contract: the verifier's required inputs were extracted
+  [OK ] contract: every artifact the gate REQUIRES is produced by the procedure
+  [OK ] contract: the procedure produces something matching 'root-run*.status'
+  [OK ] contract: the procedure produces something matching 'root-run.log'
+  [OK ] contract: acceptance is invoked at all
+  [OK ] contract: part-b-control.txt is produced BEFORE acceptance is invoked
+  [OK ] contract: part-b-negative-control.txt is produced BEFORE acceptance is invoked
+  [OK ] contract: hygiene.txt is produced BEFORE acceptance is invoked
+
+82 guards held

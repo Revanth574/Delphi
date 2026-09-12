@@ -1,0 +1,6 @@
+restored: exit=0; 82 guards held
+omit inverted freshness pair: exit=0; 82 guards held
+disable required run-start for modern runs: exit=0; 82 guards held
+disable required rebuild status for modern runs: exit=0; 82 guards held
+fixed-clock restored: exit=0; 82 guards held
+fixed-clock allow only two re-verification captures: exit=0; 82 guards held

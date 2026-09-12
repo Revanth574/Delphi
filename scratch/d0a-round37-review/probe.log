@@ -1,0 +1,12 @@
+restored run 23: ACCEPTED
+different unpriv identity, same total: ACCEPTED
+positive invocation exited 101: ACCEPTED
+root summary changed to failure: ACCEPTED
+current run 26 fixture: True
+run 26 without rebuild.status: False
+  [REFUSE] freshness: no rebuild.status — identical hashes are consistent with a rebuild that failed, so the exit status is what makes them evidence
+same evidence in directory without run number: True
+procedure mentions rebuild.status: False
+restored contract: GUARD PASSED
+positive control artifact omitted everywhere: GUARD PASSED
+acceptance invocation commented out: GUARD PASSED

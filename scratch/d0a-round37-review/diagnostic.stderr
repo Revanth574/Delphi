@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/a_pass.rs (/tmp/r37-producer-r_y66ads/target/debug/deps/a_pass-0dcdc101db4254eb)
+     Running tests/z_abort.rs (/tmp/r37-producer-r_y66ads/target/debug/deps/z_abort-cc5999db21ac1ed1)
+error: test failed, to rerun pass `--test z_abort`
+
+Caused by:
+  process didn't exit successfully: `/tmp/r37-producer-r_y66ads/target/debug/deps/z_abort-cc5999db21ac1ed1 --test-threads=1` (signal: 6, SIGABRT: process abort signal)

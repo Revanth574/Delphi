@@ -1,0 +1,23 @@
+run 23 positive transcript has VERIFIED live children: True
+run 24 positive transcript has VERIFIED live children: True
+classifier before run 23:
+fn classify_control(daemon_pid: i32, iterations: &[IterationEvidence]) -> ControlVerdict {
+    if iterations
+        .iter()
+        .flat_map(|it| it.group_matches.iter())
+        .any(|r| verified_live(r, daemon_pid))
+    {
+        return ControlVerdict::Reached;
+    }
+    if iterations
+        .iter()
+        .flat_map(|it| it.before.iter().chain(it.after.iter()))
+        .any(|r| verified_live(r, daemon_pid) && r.pgid != daemon_pid)
+    {
+        return ControlVerdict::Topology;
+    }
+
+corpus numbering exactly unique 1..57: True
+run 23: root=230, unpriv=230, actual counters equal=True
+run 24: root=232, unpriv=232, actual counters equal=True
+run 25: root=232, unpriv=232, actual counters equal=True

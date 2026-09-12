@@ -317,10 +317,10 @@ cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
 } > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
 ls -la "scratch/lane-run-$RUN/"
 
-# THE ACCEPTANCE GATE (D0A-R35). It executes nothing; it reads what the steps above retained
-# and REFUSES a run whose evidence is missing, failed, or out of order. A run it refuses may
-# not be cited as merge acceptance. Its own verdict is captured by the tool, not pasted.
-scripts/lane-accept.py "scratch/lane-run-$RUN" ; echo "acceptance rc=$?"
+# NO ACCEPTANCE HERE. It used to sit at this point — BEFORE Part B existed — so following this
+# procedure in order could never produce an accepted run: the gate refused for controls the
+# procedure had not yet told you to produce, and there was no later invocation (D0A-R36-08).
+# Acceptance is §4d, after both controls and the final hygiene checks.
 ```
 
 Counters, not sets — a duplicated `#[test]` inflated a count once already, and set arithmetic
@@ -330,15 +330,16 @@ delta must be exactly the tests added or removed since — verify that by name, 
 
 **RETAIN `$LOG`** until this has run. It is the only record of which tests actually executed.
 
-## 4c. PART B — the assembly control, retained rather than transcribed
+## 4c. PART B — BOTH controls, retained rather than transcribed
 
-Part B rebuilds with `--features insecure-test-seams`, so it must run AFTER §2b's hashes.
-**Tee it**: its `CONTROL OBSERVATION` line is the evidence D0A-R28-02's supplementary scan
-rests on, and run 21's was only ever a terminal paste (D0A-R34's ruling: printing alone is not
-durable storage).
+Part B rebuilds with `--features insecure-test-seams`, so it must run AFTER §2b's hashes. Both
+controls are required from run 24, and **the procedure has to name both or the gate refuses for
+an artifact the procedure never asked for** (D0A-R36-08). Tee each and retain its exit status:
+the transcript proves the test completed, the status proves the invocation did.
 
 ```bash
-. /tmp/lane-env.sh ; : "${RUN:?run §0b first}" "${LOG:?run §0b first}" "${STATUS:?run §0b first}"
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}"
+D="scratch/lane-run-$RUN"
 cargo test -p delphi-runtime --features insecure-test-seams --test b1_integration --no-run \
   --message-format=json 2>/dev/null | python3 -c 'import sys,json
 for l in sys.stdin:
@@ -346,8 +347,32 @@ for l in sys.stdin:
     except Exception: continue
     if m.get("executable") and m.get("profile",{}).get("test"): print(m["executable"])' \
   | sort -u > /tmp/b1-seams.txt
-sudo "$(cat /tmp/b1-seams.txt)" b1_daemon_bounds_an_ai --nocapture --test-threads=1 \
-  2>&1 | tee "scratch/lane-run-$RUN/part-b-control.txt"
+B=$(cat /tmp/b1-seams.txt)
+
+# B1 — the POSITIVE control.
+sudo "$B" b1_daemon_bounds_an_ai --nocapture --test-threads=1 2>&1 | tee "$D/part-b-control.txt"
+echo "${PIPESTATUS[0]}" > "$D/part-b-control.status"
+
+# B2 — the NEGATIVE control. Required from run 24; its verdict must be Topology.
+sudo "$B" the_control_reports_topology --nocapture --test-threads=1 2>&1 \
+  | tee "$D/part-b-negative-control.txt"
+echo "${PIPESTATUS[0]}" > "$D/part-b-negative-control.status"
+```
+
+## 4d. ACCEPTANCE — LAST, after every artifact it reads exists
+
+The gate executes nothing. It reads what §§2b-4c retained and REFUSES a run whose evidence is
+missing, failed, or out of order. **A run it refuses may not be cited as merge acceptance.** Its
+verdict is captured by the tool, never pasted.
+
+**This step is last for a reason that cost the arc a wrong claim:** it used to sit inside §4b,
+before Part B, so an operator following the procedure in order was refused for missing controls
+and reached the end with no later invocation. Run 23 — the one accepted run in this arc — was
+therefore accepted through a hand-assembled sequence, NOT through this document.
+
+```bash
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}"
+scripts/lane-accept.py "scratch/lane-run-$RUN" ; echo "acceptance rc=$?"
 ```
 
 ## 5. The three checks, BY NAME

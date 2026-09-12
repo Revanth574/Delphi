@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -100,6 +101,55 @@ def refuses(mutate, label: str, needle: str) -> None:
               f"refusal did not mention {needle!r}: {body}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def guard_the_procedure_produces_what_the_verifier_requires() -> None:
+    """D0A-R36-08 — the two contracts must MEET, and nothing was checking that they do.
+
+    The gate's required inputs and the procedure's produced artifacts are two halves of one
+    interface, each correct on its own: the verifier refused for missing controls the procedure
+    never told anyone to produce, and the procedure ended without a later acceptance
+    invocation. Following it in order could not produce an accepted run, and the arc's ONE
+    accepted run went through a hand-assembled sequence instead.
+
+    That is `DEFECT_CLASSES` 55 — producer and consumer agreeing about the property and
+    disagreeing about the interface — at the level of a document and a program. This guard is
+    the join.
+    """
+    verifier = (REPO / "scripts" / "lane-accept.py").read_text()
+    procedure = (REPO / "scratch" / "lane-run-7-procedure.md").read_text()
+
+    # What the verifier READS: `_read(d, "name")`, `d / "name"`, and its glob patterns.
+    required = set(re.findall(r'_read\(d,\s*"([^"]+)"\)', verifier))
+    required |= set(re.findall(r'd\s*/\s*"([^"]+\.txt)"', verifier))
+    globbed = set(re.findall(r'd\.glob\("([^"]+)"\)', verifier))
+    check("contract: the verifier's required inputs were extracted", len(required) >= 6,
+          f"only found {sorted(required)} — the extraction is wrong, not the contract")
+
+    # Artifacts the verifier WRITES are not inputs it requires.
+    required -= {"acceptance.txt"}
+
+    missing = sorted(a for a in required if a not in procedure)
+    check("contract: every artifact the gate REQUIRES is produced by the procedure",
+          not missing,
+          f"the gate reads {missing} and the procedure never writes them — following the "
+          f"procedure cannot produce an accepted run")
+
+    for pattern in globbed:
+        stem = pattern.split("*")[0]
+        check(f"contract: the procedure produces something matching {pattern!r}",
+              stem in procedure, f"nothing in the procedure writes a {pattern} artifact")
+
+    # ORDER: acceptance must be invoked after the last artifact-producing step, or the gate
+    # runs before the evidence exists — which is exactly what R36-08 found.
+    accept_at = procedure.rfind("scripts/lane-accept.py")
+    check("contract: acceptance is invoked at all", accept_at != -1)
+    for artifact in ("part-b-control.txt", "part-b-negative-control.txt", "hygiene.txt"):
+        produced_at = procedure.rfind(artifact)
+        check(f"contract: {artifact} is produced BEFORE acceptance is invoked",
+              produced_at < accept_at,
+              f"acceptance at {accept_at} precedes {artifact} at {produced_at} — the gate "
+              f"would read an artifact the procedure has not written yet")
 
 
 def main() -> int:
@@ -319,6 +369,8 @@ def main() -> int:
     finally:
         os.chmod(d, 0o755)
         shutil.rmtree(d, ignore_errors=True)
+
+    guard_the_procedure_produces_what_the_verifier_requires()
 
     print(f"\n{PASSED} guards held")
     return 0

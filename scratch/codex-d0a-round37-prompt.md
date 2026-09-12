@@ -127,10 +127,12 @@ miss?
 | **R36-09** | one capture shape at THREE moments — before, at a producer failure, after | a single snapshot cannot show what ACCUMULATED; every command's status is reported, because `loginctl \| wc -l` returns 0 both for "none" and for "failed" |
 | **R36-10/12/13** | register scoped to the observer actually exercised; `DEATH_GRACE` calibration restored; diff stat regenerated | three false claims in cited records |
 
-**R36-11 was a finding about MY claim and I checked its arithmetic before accepting it.** "Every
-check weaken-proven" was false — but of the two ordering checks named, the freshness-before-run
-one IS covered; only membership-after-run was not. The finding stands, one of its three
-instances does not.
+**R36-11 was a finding about MY claim, and my "correction" of it was itself wrong
+(D0A-R37-11).** R36-11 named the **inverted freshness pair** (`hashes-before <= hashes-after`).
+I weakened **freshness-before-run** (`hashes-after <= boundary`) — a DIFFERENT predicate —
+found it covered, and reported the reviewer's arithmetic as overstated by one. Verified since:
+removing the inverted-pair check leaves all 82 assertions passing. All three of their instances
+stood; the correction checked the wrong thing.
 
 ## What remains open
 

@@ -121,9 +121,16 @@ DEFECTIVE one, in the same section that records the defect:
 
 | runs | observer | what run 25 says about them |
 |---|---|---|
-| 20, 21 | `Reached` returned on a caller-supplied boolean derived from NAME + GROUP MEMBERSHIP, **before any parentage check** (D0A-R35-01) | **nothing.** Their limitation is a property of the code that produced them and a later negative control does not remove it |
-| 23, 24 | same success path | **nothing**, for the same reason |
-| 25 | provenance enforced on every verdict | the instrument that produced THIS verdict discriminates |
+| 20, 21 | `Reached` returned on a caller-supplied boolean derived from NAME + GROUP MEMBERSHIP, **before any parentage check** (D0A-R35-01) | **nothing.** Their limitation is a property of the code that produced them, and a later negative control does not remove it |
+| 23, 24 | **the REPAIRED observer** — `4343350` fixed the success path BEFORE either run, and both retained artifacts record `VERIFIED live children … ppid == daemon pgid` | they establish parentage **on their own evidence**, independently of run 25 |
+| 25 | same, plus the negative control | the instrument that produced THIS verdict discriminates |
+
+**THE ROW ABOVE WAS WRONG IN THE OPPOSITE DIRECTION UNTIL D0A-R37-12.** Correcting R36-10's
+over-claim, I swept runs 23 and 24 in with 20 and 21 and said all four used the defective
+success path. They did not: `4343350` precedes `5ef2c89` (run 23) and `a07c21d` (run 24), and
+both runs' retained control transcripts carry the verified-parentage record. **A correction
+that over-corrects removes evidence that was actually there**, which is the same defect as the
+over-claim it replaced, pointing the other way.
 
 **The discrimination evidence is scoped to the implementation actually exercised.** Runs 20–24's
 `Reached` verdicts establish that a process named `sai` was in the daemon's group; they do not

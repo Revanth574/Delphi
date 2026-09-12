@@ -59,6 +59,38 @@ two tests naming it asserted that *changing* it changes the digest and the previ
 asserted a gate outcome for any tier. Every narrower claim follows from that. The universal
 negative does not, and should not have been written.
 
+### A CORRECTION I MADE TO A REVIEWER'S FINDING WAS ITSELF WRONG — TWICE, AND RATIFIED BOTH TIMES
+
+Recorded here rather than in a commit message because it is a fact about **how findings get
+accepted in this project**, and the register is where a later reader looks for that.
+
+**D0A-R36-11** said "every check weaken-proven" was false and named three predicates that
+survived removal with every assertion still passing. I verified it, reported that its
+arithmetic was overstated by one — *"of the two ordering checks named, the freshness-before-run
+one IS covered"* — and the operator accepted that as diligence.
+
+**It was not.** R36-11 named the **inverted freshness pair** (`hashes-before <= hashes-after`).
+I weakened **freshness-before-run** (`hashes-after <= boundary`), a different predicate, found
+it covered, and reported the finding as partly wrong. All three of its instances stood. The
+correction was the error.
+
+**The shape, which is why it is here and not only in `9af9a74`:**
+
+- **A correction to a reviewer's numbers is itself a claim** and owes the same verification as
+  any other. Mine cited a weaken I had run — so it *looked* like measurement — while the weaken
+  was aimed at the wrong target. Citing evidence is not the same as citing the right evidence.
+- **It was ratified without being checked**, because a correction reads as care. An actor who
+  usually verifies is granted the assumption that this time too. That assumption is the whole
+  mechanism by which a wrong correction survives.
+- **Twice in this arc.** D0A-R37-12 is the same shape pointed the other way: correcting an
+  over-claim, I over-corrected and stripped parentage evidence from runs 23 and 24 that their
+  own artifacts record. Over-claim and over-correction are one failure with two signs.
+
+**What follows for the process:** a correction to a finding gets the RED-proof discipline the
+finding's fix gets — name the exact predicate, run the weaken against *that* predicate, quote
+the assertion it fails on. "I checked and it is two, not three" is a claim, and this project's
+standing rule is that a claim without its measurement attached is decoration.
+
 ### D0A-R28-02 — §4 "an untrusted peer cannot pin the boundary": **CLOSED on boundedness**
 
 **One authoritative account (D0A-R34-04).** This row was corrected in rounds 31, 32, 33 and 34;

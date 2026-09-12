@@ -174,6 +174,16 @@ def guard_the_procedure_produces_what_the_verifier_requires() -> None:
               f"acceptance at {accept_at} precedes {artifact} at {produced_at} — the gate "
               f"would read an artifact the procedure has not written yet")
 
+    # D0A-R37-08: hygiene must be captured AFTER both controls, not merely before acceptance.
+    # Taken earlier it predates two root daemon runs, so a PAM stack those controls damaged or a
+    # session they left behind is certified by a snapshot from before they ran.
+    hygiene_at = procedure.rfind("hygiene.txt")
+    for control in ("part-b-control.txt", "part-b-negative-control.txt"):
+        check(f"contract: hygiene is captured AFTER {control}",
+              procedure.rfind(control) < hygiene_at,
+              f"hygiene at {hygiene_at} precedes {control} at {procedure.rfind(control)} — it "
+              f"would certify the state from before the controls ran")
+
 
 def main() -> int:
     # POSITIVE CONTROL FIRST. A verifier that refuses everything passes every guard below.
@@ -455,20 +465,34 @@ def main() -> int:
         # D0A-R36-05: two captures in the SAME SECOND must not overwrite one another. The
         # filename has one-second resolution and the old code used exists()-then-write, a
         # check-then-act race whose loser is silently destroyed.
+        # D0A-R37-10: THE CLOCK PATCH DID NOT REACH THE SUBPROCESSES. Patching `time.strftime`
+        # in THIS process leaves a `subprocess.run` child using the real clock, so the three
+        # invocations got three different timestamps and distinct names for free — the guard
+        # proved nothing about a same-second collision. It also ignored the children's exits, so
+        # an implementation that refused after two captures passed. Driven IN-PROCESS, where the
+        # patch applies, with EVERY invocation's status checked.
         real_strftime = time.strftime
+        rcs = []
         try:
             time.strftime = lambda *a, **k: "FROZEN"
             for _ in range(3):
-                subprocess.run([sys.executable, str(REPO / "scripts" / "lane-accept.py"),
-                                str(d)], capture_output=True, text=True, timeout=60,
-                               env={**os.environ, "TZ": "UTC"})
+                argv = sys.argv
+                try:
+                    sys.argv = ["lane-accept", str(d)]
+                    rcs.append(la.main())
+                finally:
+                    sys.argv = argv
         finally:
             time.strftime = real_strftime
-        caps = sorted(d.glob("acceptance-reverified-*"))
+        check("re-verification: every same-clock invocation SUCCEEDED",
+              rcs == [0, 0, 0],
+              f"exits {rcs} — an implementation that refuses after two captures would pass a "
+              f"guard that never looks at the status")
+        caps = sorted(d.glob("acceptance-reverified-FROZEN*"))
         check("re-verification: same-second captures do not overwrite each other",
-              len({c.read_text() for c in caps}) >= 1 and len(caps) >= 2,
-              f"only {[c.name for c in caps]} survived — a capture another capture can destroy "
-              f"is not a capture")
+              len(caps) == 3,
+              f"{[c.name for c in caps]} — three invocations under one clock must leave three "
+              f"distinct captures; a capture another capture can destroy is not a capture")
         check("re-verification: the RUN's verdict is still the one it wrote",
               (d / "acceptance.txt").read_text() == original)
     finally:

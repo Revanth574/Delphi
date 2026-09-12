@@ -157,6 +157,23 @@ impl Setup {
 }
 impl Drop for Setup {
     fn drop(&mut self) {
+        // D0A-R37-06: CAPTURE AT THE FAILING OPERATION, BEFORE THIS GUARD CLEANS UP. The lane's
+        // failure snapshot ran after the test BINARY exited — by which point this `Drop` has
+        // already terminated the user, killed the session scope and run `userdel`. It therefore
+        // recorded the state cleanup LEFT, not the state the failure MET, which is the same
+        // defect as run 20's membership: evidence gathered late enough to be uninformative.
+        //
+        // Only on the panicking path, so a passing run pays nothing. Best-effort and silent on
+        // error: a capture that could fail the test would make the diagnostic a hazard.
+        if std::thread::panicking()
+            && let Ok(dir) = std::env::var("DELPHI_FAILURE_SNAPSHOT_DIR")
+        {
+            let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/session-state.sh");
+            let path = format!("{dir}/at-failure-{}-{}.txt", self.user, std::process::id());
+            if let Ok(f) = std::fs::File::create(&path) {
+                let _ = Command::new(script).stdout(f).status();
+            }
+        }
         // Remove ONLY a file this test created; an operator-installed stack is left alone.
         if self.provisioned {
             let _ = std::fs::remove_file(PAM_FILE);

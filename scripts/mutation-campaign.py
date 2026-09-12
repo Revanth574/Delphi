@@ -715,9 +715,19 @@ def _main() -> int:
                     # campaign measures rather than reading cargo's text, for the same reason
                     # the suite classifier stopped: the only party that can attest to the
                     # environment is the one that invoked the build.
+                    #
+                    # D0A-R37-09: PRESERVE THE SIGNAL/EXIT EVIDENCE, and do not let every
+                    # nonzero build become a claim about the MUTANT. A build KILLED BY SIGNAL 9
+                    # — an OOM kill, a supervisor, a manual kill — was recorded as "mutant does
+                    # not compile", which is a demonstrated statement about the mutation made
+                    # from an event that says nothing about it.
+                    rec["build_exit"] = build.returncode
                     space = sh([str(pathlib.Path(__file__).resolve().parent
                                     / "check-free-space.sh")])
-                    if space.returncode != 0:
+                    if build.returncode < 0:
+                        rec["outcome"] = (f"INFRASTRUCTURE: the build was KILLED by signal "
+                                          f"{-build.returncode}")
+                    elif space.returncode != 0:
                         rec["outcome"] = "INFRASTRUCTURE: build failed with the disk short"
                         rec["free_space"] = space.stdout + space.stderr
                     else:

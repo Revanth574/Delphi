@@ -98,8 +98,14 @@ export CARGO_TARGET_DIR="$HOME/delphi-target"
 # plausible garbage — a count that reported an unrelated crate's build failure, a `tee` into
 # `scratch/lane-run-/` that silently lost the control observation, and a retention step that
 # copied nothing. Guarding the step where it had bitten and not its siblings is class 48 again.
-printf 'export RUN=%s\nexport LOG=%s\nexport STATUS=%s\nexport CARGO_TARGET_DIR=%s\n' \
-  "$RUN" "$LOG" "$STATUS" "$CARGO_TARGET_DIR" > /tmp/lane-env.sh
+# D0A-R37-07: a snapshot directory SCOPED TO THIS RUN. Global `/tmp/session-at-failure-*`
+# files survive between runs and were copied indiscriminately, so a later PASSING run could
+# inherit an earlier failure's snapshot and retain it as its own evidence. Per-run, and emptied
+# here so a re-run of the same number cannot inherit its own previous attempt either.
+export SNAPDIR="/tmp/lane-run-$RUN-snapshots"
+rm -rf "$SNAPDIR" && mkdir -p "$SNAPDIR"
+printf 'export RUN=%s\nexport LOG=%s\nexport STATUS=%s\nexport CARGO_TARGET_DIR=%s\nexport SNAPDIR=%s\nexport DELPHI_FAILURE_SNAPSHOT_DIR=%s\n' \
+  "$RUN" "$LOG" "$STATUS" "$CARGO_TARGET_DIR" "$SNAPDIR" "$SNAPDIR" > /tmp/lane-env.sh
 ```
 
 D0A-R25-06: the operative commands used to hard-code `root-run7` while the prose said to
@@ -119,7 +125,7 @@ block), and — if a producer fails — AT THE FAILURE, before anything cleans u
 
 ```bash
 . /tmp/lane-env.sh ; : "${RUN:?run §0b first}"
-scripts/session-state.sh > /tmp/session-before.txt ; cat /tmp/session-before.txt
+scripts/session-state.sh > "$SNAPDIR/session-before.txt" ; cat "$SNAPDIR/session-before.txt"
 ```
 
 ## 1. Build UNPRIVILEGED (the freshness PROOF is §2b, after enumeration)
@@ -219,8 +225,11 @@ while read -r b; do
   printf '%s\t%s\n' "$rc" "$b" >> "$STATUS"   # D0A-R18-04
   # D0A-R36-09: AT THE FAILURE, before the next target runs and before any cleanup. An
   # after-the-lane snapshot cannot show the state a failure encountered.
+  # The IN-PROCESS capture (D0A-R37-06) fires inside the test at the failing operation, before
+  # its guards clean up, and lands in $SNAPDIR. This is the coarser outside-the-process
+  # companion: it records what survived the binary's own teardown.
   [ "$rc" -eq 0 ] || scripts/session-state.sh \
-      > "/tmp/session-at-failure-$(basename "$b").txt" 2>&1
+      > "$SNAPDIR/after-binary-exit-$(basename "$b").txt" 2>&1
 done < /tmp/targets.txt
 
 # Every producer's status, checked. A target that CRASHES before printing its summary
@@ -329,23 +338,14 @@ cp -p "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, a
 # `-p` IS LOAD-BEARING: plain `cp` stamps the copy with the time of the copy, which destroys
 # the only evidence that freshness was proven BEFORE the run. `scripts/lane-accept.py` caught
 # exactly that on its first execution — against artifacts this session had just copied.
-cp -p /tmp/session-before.txt /tmp/session-at-failure-*.txt "scratch/lane-run-$RUN/" 2>/dev/null
+cp -p "$SNAPDIR"/*.txt "scratch/lane-run-$RUN/" 2>/dev/null
 cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log /tmp/rebuild.status \
    /tmp/run-start.txt "$STATUS" \
    "scratch/lane-run-$RUN/" 2>&1 | tee -a "scratch/lane-run-$RUN/retention-errors.txt"
-{ echo "=== free space ==="; scripts/check-free-space.sh
-  echo "=== stale sessions ==="; scripts/check-stale-test-sessions.sh
-  echo "=== PAM ==="; md5sum -c /tmp/pam-before.md5
-  echo "=== helper digests ==="; sha256sum /usr/libexec/delphi-drop installer/staging/delphi-drop
-  echo "=== account ==="; getent passwd delphi-tool
-  echo "=== bwrap ==="; bwrap --version
-  echo "=== commit ==="; git rev-parse HEAD; git status --porcelain
-  # D0A-R36-09: this is the AFTER sample only, and it is labelled as such. A single snapshot
-  # taken here cannot show what ACCUMULATED during the run — the tests have already created and
-  # deleted accounts and swept sessions by now. The BEFORE sample is taken in §0c and the pair
-  # is what makes a future failing run comparable to a passing one.
-  echo "=== session state AFTER the run ==="; scripts/session-state.sh
-} > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
+# D0A-R37-08: HYGIENE IS CAPTURED IN §4c, AFTER BOTH CONTROLS. Taken here it predates two
+# root daemon runs, so a PAM stack those controls damaged, or a session they left behind, would
+# be certified by a snapshot from before they ran.
+echo "(hygiene.txt is captured after the controls — see §4c)"
 ls -la "scratch/lane-run-$RUN/"
 
 # NO ACCEPTANCE HERE. It used to sit at this point — BEFORE Part B existed — so following this
@@ -388,6 +388,24 @@ echo "${PIPESTATUS[0]}" > "$D/part-b-control.status"
 sudo "$B" the_control_reports_topology --nocapture --test-threads=1 2>&1 \
   | tee "$D/part-b-negative-control.txt"
 echo "${PIPESTATUS[0]}" > "$D/part-b-negative-control.status"
+
+# D0A-R37-08: the hygiene capture belongs HERE — after both controls and before acceptance —
+# so PAM, sessions and free space are checked against the state the LAST root run left.
+{ echo "=== free space ==="; scripts/check-free-space.sh
+  echo "=== stale sessions ==="; scripts/check-stale-test-sessions.sh
+  echo "=== PAM ==="; md5sum -c /tmp/pam-before.md5
+  echo "=== helper digests ==="; sha256sum /usr/libexec/delphi-drop installer/staging/delphi-drop
+  echo "=== account ==="; getent passwd delphi-tool
+  echo "=== bwrap ==="; bwrap --version
+  echo "=== commit ==="; git rev-parse HEAD; git status --porcelain
+  # D0A-R36-09: this is the AFTER sample only, and it is labelled as such. A single snapshot
+  # taken here cannot show what ACCUMULATED during the run — the tests have already created and
+  # deleted accounts and swept sessions by now. The BEFORE sample is taken in §0c and the pair
+  # is what makes a future failing run comparable to a passing one.
+  echo "=== session state AFTER the run ==="; scripts/session-state.sh
+} > "$D/hygiene.txt" 2>&1
+cp -p "$SNAPDIR"/*.txt "$D/" 2>/dev/null
+ls -la "$D/"
 ```
 
 ## 4d. ACCEPTANCE — LAST, after every artifact it reads exists

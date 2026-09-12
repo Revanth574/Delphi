@@ -1,0 +1,12 @@
+restored run 23: ACCEPTED
+positive verdict Topology and failed test: ACCEPTED
+positive Reached but later assertion fails: ACCEPTED
+root identities empty, old membership summary: ACCEPTED
+unpriv identity multiplicity changed: ACCEPTED
+empty root transcript: ACCEPTED
+failed rebuild, hashes unchanged: ACCEPTED
+17 copies of one producer: ACCEPTED
+same-second re-verification: rc 0 -> 1; previous capture overwritten=True; captures=1
+run 23: derived=230, root=230, unpriv=230, derived==root=True, root==unpriv=True
+run 24: derived=232, root=232, unpriv=232, derived==root=True, root==unpriv=True
+run 25: derived=232, root=232, unpriv=232, derived==root=True, root==unpriv=True

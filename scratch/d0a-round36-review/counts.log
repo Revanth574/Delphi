@@ -1,0 +1,4 @@
+run 23: rc=0; EXECUTED 224 / SKIPPED 6 / reported 230   (30020ms total, 134ms per executed test)
+run 24: rc=1; EXECUTED 222 / SKIPPED 8 / reported 230   (32380ms total, 145ms per executed test)
+run 25: rc=1; EXECUTED 223 / SKIPPED 8 / reported 231   (31050ms total, 139ms per executed test)
+corpus: 56 numbered headings; exactly unique 1..56=True

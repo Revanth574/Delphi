@@ -1,0 +1,8 @@
+actual libtest capture with direct stderr write: UNATTRIBUTED FAILURE; exit=101; failing_tests=['real_detection']; stderr='Killed\n'
+only diagnostic text changed: CAUGHT; exit=101; failing_tests=['real_detection']
+bisect with zero matching tests: exit=0; stdout='PASS'
+===== old =====
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s

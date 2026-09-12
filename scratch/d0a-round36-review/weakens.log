@@ -1,0 +1,4 @@
+restored: exit=0; 46 guards held
+drop inverted freshness-pair check: exit=0; 46 guards held
+drop membership-after-run check: exit=0; 46 guards held
+drop rebuild artifact requirement: exit=0; 46 guards held

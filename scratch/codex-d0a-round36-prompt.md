@@ -8,7 +8,11 @@ If you are reading it detached from that branch, say so and stop.
 **`git diff 4319c83..e9a843a`** — 22 commits. Pinned to a SHA, not `..HEAD` (D0A-R18-09).
 
 ```
- 74 files changed, 6315 insertions(+), 365 deletions(-)
+ 74 files changed, 6328 insertions(+), 408 deletions(-)
+
+(D0A-R36-13: the stat first published here was 6315/365 — generated BEFORE the last commit
+in the range and then pinned to a SHA that included it. The stat exists so scope drift is
+detectable, and the first drift it detected was the author's.)
 ```
 
 The round-35 remediation, the lane acceptance verifier, lane runs 22-25, the negative control,

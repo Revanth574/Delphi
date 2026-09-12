@@ -112,9 +112,22 @@ NEGATIVE CONTROL: verdict Topology, from
 ```
 
 `ppid` is the daemon, `pgid` is the child itself: a verified live child outside the group, from
-a real daemon rather than a constructed record. **The prior `Reached` verdicts are therefore
-reports from an instrument shown to detect a topology defect it would otherwise pass** — which
-is retrospective value, and was named as such before the run.
+a real daemon rather than a constructed record.
+
+**WHAT THIS DOES AND DOES NOT REHABILITATE (D0A-R36-10).** The register previously said the
+prior `Reached` verdicts become "reports from an instrument shown to detect a topology defect".
+That extended a successful test of the REPAIRED observer backwards over observations made by a
+DEFECTIVE one, in the same section that records the defect:
+
+| runs | observer | what run 25 says about them |
+|---|---|---|
+| 20, 21 | `Reached` returned on a caller-supplied boolean derived from NAME + GROUP MEMBERSHIP, **before any parentage check** (D0A-R35-01) | **nothing.** Their limitation is a property of the code that produced them and a later negative control does not remove it |
+| 23, 24 | same success path | **nothing**, for the same reason |
+| 25 | provenance enforced on every verdict | the instrument that produced THIS verdict discriminates |
+
+**The discrimination evidence is scoped to the implementation actually exercised.** Runs 20–24's
+`Reached` verdicts establish that a process named `sai` was in the daemon's group; they do not
+establish parentage, and run 25 does not retroactively make them establish it.
 
 **Provenance, because run 25 was REFUSED.** The refusal was for a producer failure in an
 unrelated test and a format defect in the verifier (the control printed `verdict Topology`; the

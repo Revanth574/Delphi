@@ -1621,7 +1621,19 @@ stale observation asserted in the present tense", D0 round 2, three instances, w
 *rule* as its foreclosing primitive — sat immediately above this one. This entry already
 superseded it in substance: its foreclosing primitive is a MECHANISM adopted **after three
 rules failed**, which is the same conclusion arrived at later and more expensively. The
-thinner entry is removed and nothing unique was lost.
+thinner entry is removed.
+
+**"NOTHING UNIQUE WAS LOST" WAS WRONG, and it was asserted without a content comparison
+(D0A-R36-12).** The removed entry uniquely carried a quantitative calibration of
+`DEATH_GRACE`: **0 ms yielded 32/100 wrong acceptances; >=2 ms yielded 0/100.** That number
+is restored here because it is the only measurement in the corpus showing this class has a
+THRESHOLD and not merely a shape — a re-poll that happens too soon is still a stale
+observation, and 2 ms is where the measurement said it stopped being one. Its scope is
+historical: it calibrates the D0-era pidfd path, not any current code.
+
+The claim is corrected here rather than quietly deleted, because a consolidation that
+asserted no loss while losing something is the instructive half — and it was asserted in
+the same commit that criticised the corpus for carrying two accounts of one class.
 
 Worth keeping as its own small lesson: a corpus whose own standard is *one concise
 authoritative account over accumulated correction narratives* (D0A-R34-04) carried two

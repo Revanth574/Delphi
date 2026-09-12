@@ -48,6 +48,18 @@ CHECKS: list[str] = []
 def check(label: str, condition: bool, detail: str = "") -> None:
     """Record and ENFORCE. The previous version had a reporting path that did not decide."""
     CHECKS.append(label)
+    # D0A-R37: THE SIDE CHANNEL a weaken driver reads instead of grepping stdout. The label is
+    # written by the FAILING check itself, to a path the driver names per invocation — so
+    # "which guard failed" is a structured fact rather than a text match. Three text-derived
+    # readings were wrong this session; this is the mechanism that replaces the fourth.
+    if not condition:
+        report = os.environ.get("DELPHI_GUARD_FAILURE_REPORT")
+        if report:
+            try:
+                with open(report, "a", encoding="utf-8") as f:
+                    f.write(label + "\n")
+            except OSError:
+                pass
     assert condition, f"GUARD FAILED: {label}{(' — ' + detail) if detail else ''}"
     print(f"  [OK ] {label}")
 

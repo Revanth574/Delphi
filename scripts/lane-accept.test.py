@@ -52,25 +52,35 @@ def fixture() -> pathlib.Path:
     d = pathlib.Path(tempfile.mkdtemp(prefix="lane-accept-fixture-"))
     (d / "hygiene.txt").write_text(HYGIENE)
     hashes = "\n".join(f"{i:064x}  /t/exe-{i}" for i in range(la.EXPECTED_TARGETS)) + "\n"
+    (d / "rebuild.status").write_text("0\n")
     (d / "hashes-before.txt").write_text(hashes)
     (d / "hashes-after.txt").write_text(hashes)
     (d / "rebuild.log").write_text("Finished test profile\n")
     (d / "root-run7.status").write_text(
         "\n".join(f"0\t/t/exe-{i}" for i in range(la.EXPECTED_TARGETS)) + "\n")
-    (d / "root-run.log").write_text("### /t/exe-0\ntest a ... ok\n")
-    ids = "\n".join(f"1\ttarget::test_{i}" for i in range(5)) + "\n"
+    # The transcript must actually CONTAIN the identities the files claim (D0A-R36-02).
+    (d / "root-run.log").write_text(
+        "### /t/exe-0\n" + "".join(f"test test_{i} ... ok\n" for i in range(5)))
+    ids = "\n".join(f"1\texe::test_{i}" for i in range(5)) + "\n"
     (d / "root-identities.txt").write_text(ids)
     (d / "unpriv-identities.txt").write_text(ids)
     (d / "membership.txt").write_text(
         "root 5 / unpriv 5\nIN ROOT NOT UNPRIV: 0\nIN UNPRIV NOT ROOT: 0\n")
-    (d / "part-b-control.txt").write_text("CONTROL OBSERVATION: ...\n  verdict: Reached\n")
+    (d / "part-b-control.txt").write_text(
+        "test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... \n"
+        "CONTROL OBSERVATION: ...\n  verdict: Reached\nok\n\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out\n")
     # A CURRENT run carries both controls (D0A-R35). The base fixture is a current run, so a
     # missing negative control must be introduced deliberately by a guard, never be the default.
-    (d / "part-b-negative-control.txt").write_text("NEGATIVE CONTROL: ...\n  verdict: Topology\n")
+    (d / "part-b-negative-control.txt").write_text(
+        "test the_control_reports_topology_when_the_daemons_child_leaves_its_group ... \n"
+        "NEGATIVE CONTROL: verdict: Topology, from 1 distinct record(s)\nok\n\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out\n")
     # Stamp the ordering the checks require.
     base = 1_000_000
     for i, name in enumerate(["hashes-before.txt", "hashes-after.txt", "rebuild.log",
-                              "root-run.log", "root-run7.status", "membership.txt",
+                              "root-run.log", "root-run7.status", "rebuild.status",
+                              "membership.txt",
                               "root-identities.txt", "unpriv-identities.txt",
                               "part-b-control.txt", "part-b-negative-control.txt",
                               "hygiene.txt"]):
@@ -160,11 +170,72 @@ def main() -> int:
     refuses(lambda d: (d / "membership.txt").write_text(
                 "root 5 / unpriv 4\nIN ROOT NOT UNPRIV: 1\nIN UNPRIV NOT ROOT: 0\n"),
             "a NONZERO identity difference is refused", "identity SETS differ")
-    refuses(lambda d: (d / "part-b-control.txt").write_text("no verdict here\n"),
-            "a control with NO VERDICT is refused", "verdict")
+    # The mutation must remove ONLY the verdict, or it trips the name/completion checks first
+    # and stops testing what it names (D0A-R36-01 added those checks).
+    refuses(lambda d: (d / "part-b-control.txt").write_text(
+                "test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... ok\n"
+                "\ntest result: ok. 1 passed; 0 failed\n"),
+            "a control with NO VERDICT is refused", "no `verdict:` line")
+
+    # D0A-R36-01 — a verdict line is a DIAGNOSTIC, not a result. Each of these was reproduced
+    # against run 23's REAL transcript before the fix and returned ACCEPTED.
+    refuses(lambda d: (d / "part-b-control.txt").write_text(
+                "test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... \n"
+                "  verdict: Reached\n\ntest result: FAILED. 0 passed; 1 failed\n"),
+            "a control whose verdict is followed by FAILURE is refused", "did not pass")
+    refuses(lambda d: (d / "part-b-control.txt").write_text(
+                "test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... "
+                "SKIP requires root\n\ntest result: ok. 0 passed; 0 failed\n"),
+            "a control that SKIPPED is refused", "skip is scored as a PASS")
+    refuses(lambda d: (d / "part-b-control.txt").write_text(
+                "test some_other_test ... \n  verdict: Reached\nok\n\n"
+                "test result: ok. 1 passed; 0 failed\n"),
+            "a control naming the WRONG test is refused", "does not name")
+    refuses(lambda d: (d / "part-b-control.txt").write_text(
+                "test b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive ... \n"
+                "  verdict: Topology\nok\n\ntest result: ok. 1 passed; 0 failed\n"),
+            "a POSITIVE control returning Topology is refused", "not Reached")
+
+    # D0A-R36-02 — counting is not verifying.
+    refuses(lambda d: (d / "root-identities.txt").write_text(""),
+            "an EMPTY identity file is refused", "does not match the retained transcript")
+    refuses(lambda d: (d / "root-run.log").write_text(""),
+            "an EMPTY transcript is refused", "NO test lines")
+    refuses(lambda d: (d / "root-run7.status").write_text(
+                "\n".join("0\t/t/exe-0" for _ in range(la.EXPECTED_TARGETS)) + "\n"),
+            "17 copies of ONE producer are refused", "DISTINCT")
+    refuses(lambda d: (d / "root-run7.status").write_text(
+                "\n".join(f"0\t/t/other-{i}" for i in range(la.EXPECTED_TARGETS)) + "\n"),
+            "producers that are not the HASHED set are refused", "not the executables")
+    refuses(lambda d: (d / "membership.txt").write_text(
+                "root 99 / unpriv 5\nIN ROOT NOT UNPRIV: 0\nIN UNPRIV NOT ROOT: 0\n"),
+            "a membership total contradicting the files is refused", "but the retained files")
+
+    # D0A-R36-03 — identical hashes with a rebuild that failed.
+    refuses(lambda d: (d / "rebuild.status").write_text("101\n"),
+            "a FAILED rebuild is refused despite identical hashes", "exited 101")
+
+    # D0A-R36-11 — two constraints had NO discriminating guard: removing either left all 46
+    # assertions passing. These are those cases.
+    refuses(lambda d: (d / "rebuild.log").unlink(),
+            "a missing rebuild artifact is refused", "MISSING")
+    refuses(lambda d: os.utime(d / "membership.txt", (900_000, 900_000)),
+            "membership computed BEFORE the run is refused", "MISORDERED")
 
     # D0A-R35 — THE NEGATIVE CONTROL, required from run 24. The fixture's directory name is
     # what carries the run number, so these use a named copy.
+    def neg(verdict: str) -> str:
+        """A COMPLETE negative-control transcript carrying the given verdict.
+
+        A bare `verdict: X` line stopped being sufficient at D0A-R36-01: the checks now
+        require the named test, no skip, and a completed passing summary. A mutation that
+        omits those tests the name check rather than the verdict it means to vary.
+        """
+        return (
+            "test the_control_reports_topology_when_the_daemons_child_leaves_its_group ... \n"
+            f"NEGATIVE CONTROL: verdict: {verdict}, from 1 distinct record(s)\nok\n\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out\n")
+
     def as_run(d: pathlib.Path, n: int) -> pathlib.Path:
         dst = d.parent / f"lane-run-{n}"
         shutil.rmtree(dst, ignore_errors=True)
@@ -187,17 +258,17 @@ def main() -> int:
         check("run 24 WITHOUT a negative control is REFUSED", not ok)
         check("...and the refusal names it",
               "part-b-negative-control.txt" in "\n".join(report), "\n".join(report))
-        (r24 / "part-b-negative-control.txt").write_text("  verdict: Reached\n")
+        (r24 / "part-b-negative-control.txt").write_text(neg("Reached"))
         ok, report = la.accept(r24)
         check("a negative control returning `Reached` is REFUSED", not ok,
               "a control that cannot discriminate was recorded as an accepted run")
         check("...and the refusal says what Reached means here",
               "CANNOT DETECT A TOPOLOGY DEFECT" in "\n".join(report), "\n".join(report))
-        (r24 / "part-b-negative-control.txt").write_text("  verdict: Unresolved\n")
+        (r24 / "part-b-negative-control.txt").write_text(neg("Unresolved"))
         ok, _ = la.accept(r24)
         check("a negative control returning `Unresolved` is REFUSED", not ok,
               "the fixture did not produce the input it claims, which is not an accepted run")
-        (r24 / "part-b-negative-control.txt").write_text("  verdict: Topology\n")
+        (r24 / "part-b-negative-control.txt").write_text(neg("Topology"))
         st = (d / "part-b-control.txt").stat()
         os.utime(r24 / "part-b-negative-control.txt", (st.st_atime, st.st_mtime))
         ok, report = la.accept(r24)

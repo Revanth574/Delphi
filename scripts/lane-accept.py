@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import os
 import pathlib
 import re
 import time
@@ -48,6 +49,10 @@ EXPECTED_TARGETS = 17
 # different kind of overreach. Runs from here cannot quietly omit it — which is the whole
 # distinction this tool exists to hold (`DEFECT_CLASSES` 54).
 FIRST_RUN_REQUIRING_NEGATIVE_CONTROL = 24
+
+# D0A-R36-03: freshness rests on a rebuild that SUCCEEDED, and the exit status is the
+# evidence. Keyed like the negative control so historical runs are not retroactively refused.
+FIRST_RUN_REQUIRING_REBUILD_STATUS = 26
 
 
 class Refusal(Exception):
@@ -119,8 +124,31 @@ def check_freshness(d: pathlib.Path) -> list[str]:
     if before != after:
         raise Refusal("the executables CHANGED under the forced rebuild: the hashed set was "
                       "STALE, so the run measured code that is not this tree's")
-    _read(d, "rebuild.log")
-    return [f"freshness: {nb} executables identical across a forced rebuild"]
+    log = _read(d, "rebuild.log")
+
+    # D0A-R36-03: IDENTICAL HASHES ARE EQUALLY CONSISTENT WITH A REBUILD THAT NEVER RAN.
+    # `rebuild.log` merely had to EXIST — so replacing it with `error: could not compile`
+    # still certified "freshness proven". Reproduced against run 23's real artifacts before
+    # this fix. A failed rebuild leaves the stale binaries untouched, which is exactly the
+    # condition the check exists to exclude.
+    run = _run_number(d)
+    status = d / "rebuild.status"
+    if status.exists():
+        rc = status.read_text().strip()
+        if rc != "0":
+            raise Refusal(f"the forced rebuild exited {rc}, so the identical hashes prove "
+                          f"nothing: a rebuild that FAILED leaves the stale binaries in place")
+    elif run is not None and run >= FIRST_RUN_REQUIRING_REBUILD_STATUS:
+        raise Refusal("no rebuild.status — identical hashes are consistent with a rebuild "
+                      "that failed, so the exit status is what makes them evidence")
+    else:
+        # Historical runs predate the artifact. Read the log for the failure shapes instead;
+        # weaker than an exit status and labelled as such rather than passed off as equal.
+        if re.search(r"^error(\[|:)|could not compile|error: linking with", log, re.M):
+            raise Refusal("rebuild.log reports a BUILD FAILURE, so the identical hashes are "
+                          "the stale set surviving a rebuild that did not happen")
+    return [f"freshness: {nb} executables identical across a rebuild that "
+            f"{'exited 0' if status.exists() else 'logged no build failure'}"]
 
 
 def check_producers(d: pathlib.Path) -> list[str]:
@@ -134,7 +162,24 @@ def check_producers(d: pathlib.Path) -> list[str]:
     bad = [l for l in lines if not l.split("\t")[0].strip() == "0"]
     if bad:
         raise Refusal(f"{len(bad)} producer(s) exited nonzero: {bad[:3]}")
-    return [f"producers: {len(lines)}/{EXPECTED_TARGETS} exited 0"]
+
+    # D0A-R36-02: COUNTING LINES IS NOT CHECKING IDENTITIES. Seventeen copies of ONE
+    # producer's successful status certified — reproduced against run 23's artifacts. The
+    # status file is joined to the hash manifest, which is the independently produced list of
+    # what was supposed to run.
+    paths = [l.split("\t", 1)[1].strip() for l in lines if "\t" in l]
+    if len(set(paths)) != EXPECTED_TARGETS:
+        raise Refusal(f"{name} names {len(set(paths))} DISTINCT executables across "
+                      f"{len(lines)} lines — duplicated status lines are not {EXPECTED_TARGETS} "
+                      f"producers")
+    hashed = {l.split(None, 1)[1].strip()
+              for l in _read(d, "hashes-before.txt").strip().splitlines() if " " in l}
+    if hashed and set(paths) != hashed:
+        missing, extra = sorted(hashed - set(paths))[:3], sorted(set(paths) - hashed)[:3]
+        raise Refusal(f"the producers that RAN are not the executables that were HASHED. "
+                      f"hashed-but-not-run: {missing}; run-but-not-hashed: {extra}")
+    return [f"producers: {len(set(paths))}/{EXPECTED_TARGETS} distinct, all exited 0, "
+            f"matching the hashed set"]
 
 
 def check_membership(d: pathlib.Path) -> list[str]:
@@ -153,14 +198,85 @@ def check_membership(d: pathlib.Path) -> list[str]:
                 raise Refusal(f"{name} line {line!r} has no explicit count — bare keys drop "
                               f"MULTIPLICITY, so the multiset cannot be reconstructed "
                               f"(D0A-R35-05)")
-    return [f"membership: {len(root.strip().splitlines())} identities each side, zero either way"]
+    # D0A-R36-02: THE PRINTED ZEROES WERE TRUSTED. An EMPTY root identity file certified
+    # ("0 identities each side, zero either way"), and so did an EMPTY root transcript,
+    # because the transcript was read only for its mtime. Both reproduced against run 23's
+    # artifacts. The root side is now RE-DERIVED from the retained transcript and compared.
+    root_counter: dict[str, int] = {}
+    target = None
+    for line in _read(d, "root-run.log").splitlines():
+        if line.startswith("### "):
+            target = os.path.basename(line[4:].strip()).rsplit("-", 1)[0]
+        m = re.match(r"^test (\S+) \.\.\. ", line)
+        if m and target:
+            root_counter[f"{target}::{m.group(1)}"] = root_counter.get(
+                f"{target}::{m.group(1)}", 0) + 1
+    if not root_counter:
+        raise Refusal("the retained transcript contains NO test lines, so the identity files "
+                      "cannot be checked against anything — an empty log is not a run")
 
+    recorded: dict[str, int] = {}
+    for line in root.strip().splitlines():
+        c, ident = line.split("\t", 1)
+        recorded[ident.strip()] = int(c)
+    if recorded != root_counter:
+        only_file = sorted(set(recorded) - set(root_counter))[:3]
+        only_log = sorted(set(root_counter) - set(recorded))[:3]
+        raise Refusal(f"root-identities.txt does not match the retained transcript "
+                      f"({len(recorded)} vs {len(root_counter)} identities). "
+                      f"in-file-only: {only_file}; in-log-only: {only_log}")
 
-def _verdict_in(d: pathlib.Path, name: str, what: str) -> str:
-    m = re.search(r"verdict: (\w+)", _read(d, name))
+    n_unpriv = sum(int(l.split("\t", 1)[0]) for l in unpriv.strip().splitlines() if l.strip())
+    m = re.search(r"^root (\d+) / unpriv (\d+)$", text, re.M)
     if m is None:
-        raise Refusal(f"{name} records no `verdict:` line — {what}")
-    return m.group(1)
+        raise Refusal("membership.txt has no `root N / unpriv N` line to check the files against")
+    if (sum(root_counter.values()), n_unpriv) != (int(m.group(1)), int(m.group(2))):
+        raise Refusal(f"membership.txt claims root {m.group(1)} / unpriv {m.group(2)}, but the "
+                      f"retained files carry root {sum(root_counter.values())} / unpriv "
+                      f"{n_unpriv}")
+    return [f"membership: {len(root_counter)} identities RE-DERIVED from the transcript and "
+            f"matching the retained file, {n_unpriv} unprivileged, zero either way"]
+
+
+# The exact test each control transcript must contain, and the verdict it must carry.
+CONTROLS = {
+    "part-b-control.txt": ("b1_daemon_bounds_an_ai_that_completes_the_protocol_and_stays_alive",
+                           "Reached", "positive control"),
+    "part-b-negative-control.txt": (
+        "the_control_reports_topology_when_the_daemons_child_leaves_its_group",
+        "Topology", "negative control"),
+}
+
+
+def _check_control_transcript(d: pathlib.Path, name: str) -> str:
+    """A verdict line is a DIAGNOSTIC, not a result (D0A-R36-01).
+
+    The positive control prints its verdict BEFORE the survivor, deadline and shutdown
+    assertions, so `Reached` followed by an assertion failure certified — reproduced against
+    run 23's real transcript. What certifies is the test completing, by name, passing, unskipped.
+    """
+    test, want, what = CONTROLS[name]
+    text = _read(d, name)
+
+    if f"test {test} " not in text:
+        raise Refusal(f"{name} does not name {test} — a transcript that does not identify the "
+                      f"test it reports cannot certify it")
+    if "SKIP" in text or "DEFER" in text:
+        raise Refusal(f"the {what} SKIPPED; a skip is scored as a PASS and is not a run")
+    m = re.search(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", text, re.M)
+    if m is None:
+        raise Refusal(f"{name} carries no `test result:` summary, so the {what} did not "
+                      f"complete — a verdict printed mid-test is not an outcome")
+    outcome, passed, failed = m.group(1), int(m.group(2)), int(m.group(3))
+    if outcome != "ok" or passed != 1 or failed != 0:
+        raise Refusal(f"the {what} reported `{outcome}. {passed} passed; {failed} failed` — its "
+                      f"verdict line says nothing about a test that did not pass")
+
+    mv = re.search(r"verdict: (\w+)", text)
+    if mv is None:
+        raise Refusal(f"{name} records no `verdict:` line — a {what} with no verdict "
+                      f"establishes nothing about whether the control can DISCRIMINATE")
+    return mv.group(1)
 
 
 def _run_number(d: pathlib.Path) -> int | None:
@@ -169,7 +285,11 @@ def _run_number(d: pathlib.Path) -> int | None:
 
 
 def check_control(d: pathlib.Path) -> list[str]:
-    notes = [f"positive control: {_verdict_in(d, 'part-b-control.txt', 'the control outcome is the evidence the supplementary scan rests on')}"]
+    pos = _check_control_transcript(d, "part-b-control.txt")
+    if pos != "Reached":
+        raise Refusal(f"the positive control returned {pos}, not Reached — the supplementary "
+                      f"scan it underwrites has no basis in this run")
+    notes = [f"positive control: {pos}, from a completed passing run of its named test"]
 
     run = _run_number(d)
     negative = d / "part-b-negative-control.txt"
@@ -181,10 +301,7 @@ def check_control(d: pathlib.Path) -> list[str]:
                       "requirement cannot be waived by age — provide the evidence or a "
                       "correctly named directory")
 
-    verdict = _verdict_in(
-        d, "part-b-negative-control.txt",
-        "a negative control with no verdict establishes nothing about whether the control can "
-        "DISCRIMINATE")
+    verdict = _check_control_transcript(d, "part-b-negative-control.txt")
     if verdict != "Topology":
         raise Refusal(
             f"the negative control returned {verdict}, not Topology. The fixture puts a "
@@ -193,7 +310,8 @@ def check_control(d: pathlib.Path) -> list[str]:
             f"and every prior `Reached` in the record is consistent with a control that never "
             f"discriminated; `Scan`/`Unresolved` mean the fixture did not produce the input it "
             f"claims. None of the three may be recorded as an accepted run")
-    notes.append(f"negative control: {verdict} — the control DISCRIMINATES, so a `Reached` means something")
+    notes.append(f"negative control: {verdict}, from a completed passing run — the control "
+                 f"DISCRIMINATES, so a `Reached` means something")
     return notes
 
 

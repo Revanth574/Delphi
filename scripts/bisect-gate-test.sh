@@ -32,6 +32,11 @@ OUT=/tmp/bisect-$TEST-$(date -u +%Y%m%dT%H%M%SZ).txt
 
 REFUSE() { echo "REFUSING: $*" >&2; exit 2; }
 
+# D0A-R36-07: validate N BEFORE spending two builds on it. `seq 1 0` runs zero iterations and
+# reports "0 pass / 0 fail" on both sides, which reads as a clean comparison.
+case "$N" in ''|*[!0-9]*) REFUSE "iteration count '$N' is not a number" ;; esac
+[ "$N" -ge 1 ] || REFUSE "iteration count must be at least 1; '$N' would compare nothing"
+
 command -v cargo >/dev/null || REFUSE "cargo is not on PATH — build as the normal user, not root"
 [ "$(id -u)" -ne 0 ] || REFUSE "run this as the NORMAL user; it builds with cargo and invokes \
 sudo per iteration (root has no rustup toolchain)"
@@ -95,7 +100,8 @@ echo "alternating $N iteration(s) per side; transcript: $OUT"
 
 run_one() {   # $1 = label, $2 = binary
     local out rc
-    out=$(sudo "$2" "$TEST" --nocapture --test-threads=1 2>&1) && rc=0 || rc=$?
+    # `--exact` so the filter cannot select a DIFFERENT test that happens to share a prefix.
+    out=$(sudo "$2" --exact "$TEST" --nocapture --test-threads=1 2>&1) && rc=0 || rc=$?
     printf '\n===== %s =====\n%s\n' "$1" "$out" >> "$OUT"
     # THE TEST MUST HAVE ACTUALLY RUN. Verified by building this and watching it print
     # "BOTH sides fail — the range is ELIMINATED" from ZERO measurements: `sudo` could not
@@ -127,7 +133,33 @@ run_one() {   # $1 = label, $2 = binary
         REFUSE "the test SKIPPED (not root?) — a skip is scored as a PASS, so counting it \
 would report a clean bisect from a test that never ran"
     fi
-    if grep -qE '^test result: ok' <<<"$out"; then echo PASS; else echo "FAIL(rc=$rc)"; fi
+    # D0A-R36-07: A SUMMARY LINE IS NOT EXECUTION OF THE REQUESTED TEST. `run_one` returned
+    # PASS for a real libtest binary reporting `running 0 tests` / `test result: ok. 0 passed` —
+    # so an older revision that simply does not CONTAIN the test scores clean, which is the
+    # answer a bisect most wants to hear and least deserves to.
+    if ! grep -qE "^test ${TEST} \.\.\." <<<"$out"; then
+        REFUSE "the transcript never names $TEST, so this side ran SOMETHING ELSE (or nothing). \
+A revision that does not contain the test is not a revision that passes it"
+    fi
+    if ! grep -qE '^test result: (ok|FAILED)\. [01] passed; [01] failed' <<<"$out"; then
+        REFUSE "expected exactly one test to complete; the summary says: \
+$(grep -E '^test result:' <<<"$out" | head -1)"
+    fi
+    if grep -qE '^test result: ok\. 0 passed' <<<"$out"; then
+        REFUSE "ZERO tests ran and the binary still reported ok — a filter that matched no \
+test is not a measurement of that test"
+    fi
+    if grep -qE '\.\.\. ignored' <<<"$out"; then
+        REFUSE "the test was IGNORED, which libtest scores as a pass"
+    fi
+    if grep -qE '^test result: ok' <<<"$out"; then
+        [ "$rc" -eq 0 ] || REFUSE "the summary says ok but the process exited $rc — the \
+transcript and the exit status disagree, and neither is evidence while they do"
+        echo PASS
+    else
+        [ "$rc" -ne 0 ] || REFUSE "the summary reports a failure but the process exited 0"
+        echo "FAIL(rc=$rc)"
+    fi
 }
 
 : > "$OUT"

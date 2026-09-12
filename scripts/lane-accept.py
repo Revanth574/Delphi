@@ -404,14 +404,39 @@ def main() -> int:
     # ACCEPTED, so nothing false was claimed, but a capture that any later run can mutate is not
     # a capture. The original stays; the re-verification is retained beside it under its own
     # name, because discarding it would lose evidence too.
-    target = d / "acceptance.txt"
-    if target.exists():
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        target = d / f"acceptance-reverified-{stamp}.txt"
+    # D0A-R36-05: EVERY capture is created EXCLUSIVELY and never opened for truncation. The
+    # previous version tested `exists()` then wrote — a check-then-act race — and its fallback
+    # name had ONE-SECOND resolution, so two re-verifications in the same second overwrote each
+    # other. Reproduced with the clock held constant: an ACCEPTED capture was replaced by a
+    # REFUSED one with only a single file left behind. A capture that another capture can
+    # destroy is not a capture, which is the same thing this tool says about the run's verdict.
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    candidates = [d / "acceptance.txt"] + [
+        d / (f"acceptance-reverified-{stamp}.txt" if n == 0
+             else f"acceptance-reverified-{stamp}-{n}.txt")
+        for n in range(0, 1000)
+    ]
+    target, fd = None, None
+    for cand in candidates:
+        try:
+            fd = os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            target = cand
+            break
+        except FileExistsError:
+            continue
+        except OSError as e:
+            print(f"REFUSE: could not capture the verdict ({e}) — an uncapturable verdict is "
+                  f"the defect this tool exists to stop", file=sys.stderr)
+            return 2
+    if target is None:
+        print("REFUSE: could not create a unique capture after 1000 attempts", file=sys.stderr)
+        return 2
+    if target.name != "acceptance.txt":
         print(f"\nNOTE: {d / 'acceptance.txt'} already exists and is the RUN's verdict. This "
               f"re-verification is written beside it, not over it.")
     try:
-        target.write_text(body + "\n")
+        with os.fdopen(fd, "w") as f:
+            f.write(body + "\n")
         print(f"\nverdict captured in {target}")
     except OSError as e:
         print(f"REFUSE: could not capture the verdict ({e}) — an uncapturable verdict is the "

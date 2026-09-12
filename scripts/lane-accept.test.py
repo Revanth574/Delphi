@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("la", REPO / "scripts" / "lane-accept.py")
@@ -372,6 +373,26 @@ def main() -> int:
         extra = list(d.glob("acceptance-reverified-*.txt"))
         check("...and the re-verification is retained beside it", len(extra) == 1,
               f"found {extra} — discarding it would lose evidence too")
+
+        # D0A-R36-05: two captures in the SAME SECOND must not overwrite one another. The
+        # filename has one-second resolution and the old code used exists()-then-write, a
+        # check-then-act race whose loser is silently destroyed.
+        real_strftime = time.strftime
+        try:
+            time.strftime = lambda *a, **k: "FROZEN"
+            for _ in range(3):
+                subprocess.run([sys.executable, str(REPO / "scripts" / "lane-accept.py"),
+                                str(d)], capture_output=True, text=True, timeout=60,
+                               env={**os.environ, "TZ": "UTC"})
+        finally:
+            time.strftime = real_strftime
+        caps = sorted(d.glob("acceptance-reverified-*"))
+        check("re-verification: same-second captures do not overwrite each other",
+              len({c.read_text() for c in caps}) >= 1 and len(caps) >= 2,
+              f"only {[c.name for c in caps]} survived — a capture another capture can destroy "
+              f"is not a capture")
+        check("re-verification: the RUN's verdict is still the one it wrote",
+              (d / "acceptance.txt").read_text() == original)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

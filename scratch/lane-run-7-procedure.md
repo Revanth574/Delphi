@@ -106,6 +106,22 @@ D0A-R25-06: the operative commands used to hard-code `root-run7` while the prose
 substitute `N`, so following the document as written parsed the WRONG run's evidence. One
 variable, derived paths, no literal run numbers below this line.
 
+## 0c. SESSION STATE, BEFORE ANYTHING RUNS (D0A-R36-09)
+
+Runs 24 and 25 failed deep into one uptime session; every repro ran on a fifteen-minute-old
+boot and passed 17/17. The axis was never tested, so the lane records it — **and a single
+snapshot cannot, because one taken after the lane is taken after the tests have created and
+deleted accounts and swept sessions.** That is run 20's membership defect in another costume:
+evidence gathered late enough to be uninformative.
+
+**Three captures, and the third is the one that matters.** BEFORE (here), AFTER (§4b's hygiene
+block), and — if a producer fails — AT THE FAILURE, before anything cleans up.
+
+```bash
+. /tmp/lane-env.sh ; : "${RUN:?run §0b first}"
+scripts/session-state.sh > /tmp/session-before.txt ; cat /tmp/session-before.txt
+```
+
 ## 1. Build UNPRIVILEGED (the freshness PROOF is §2b, after enumeration)
 
 `sudo -E cargo` does not work here (sudoers drops `-E`; root has no rustup toolchain).
@@ -194,7 +210,12 @@ date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/run-start.txt
 while read -r b; do
   echo "### $b" >> "$LOG"
   sudo "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
-  printf '%s\t%s\n' "$?" "$b" >> "$STATUS"   # D0A-R18-04
+  rc=$?
+  printf '%s\t%s\n' "$rc" "$b" >> "$STATUS"   # D0A-R18-04
+  # D0A-R36-09: AT THE FAILURE, before the next target runs and before any cleanup. An
+  # after-the-lane snapshot cannot show the state a failure encountered.
+  [ "$rc" -eq 0 ] || scripts/session-state.sh \
+      > "/tmp/session-at-failure-$(basename "$b").txt" 2>&1
 done < /tmp/targets.txt
 
 # Every producer's status, checked. A target that CRASHES before printing its summary
@@ -303,6 +324,7 @@ cp -p "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, a
 # `-p` IS LOAD-BEARING: plain `cp` stamps the copy with the time of the copy, which destroys
 # the only evidence that freshness was proven BEFORE the run. `scripts/lane-accept.py` caught
 # exactly that on its first execution — against artifacts this session had just copied.
+cp -p /tmp/session-before.txt /tmp/session-at-failure-*.txt "scratch/lane-run-$RUN/" 2>/dev/null
 cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log /tmp/run-start.txt "$STATUS" \
    "scratch/lane-run-$RUN/" 2>&1 | tee -a "scratch/lane-run-$RUN/retention-errors.txt"
 { echo "=== free space ==="; scripts/check-free-space.sh
@@ -312,13 +334,11 @@ cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log /tmp/run-sta
   echo "=== account ==="; getent passwd delphi-tool
   echo "=== bwrap ==="; bwrap --version
   echo "=== commit ==="; git rev-parse HEAD; git status --porcelain
-  # D0A-R35: the axis the r4_03 investigation could not test. Runs 24 and 25 failed deep into
-  # one uptime session; every repro ran on a 15-minute-old boot and passed 17/17. Capture what
-  # accumulates so a future failure and a future pass are comparable.
-  echo "=== session state ==="; uptime -p; uptime -s
-  echo "leftover test accounts: $(getent passwd | grep -cE '^db1' || true)"
-  loginctl list-sessions --no-legend 2>/dev/null | wc -l | xargs echo "logind sessions:"
-  loginctl list-sessions --no-legend 2>/dev/null || true
+  # D0A-R36-09: this is the AFTER sample only, and it is labelled as such. A single snapshot
+  # taken here cannot show what ACCUMULATED during the run — the tests have already created and
+  # deleted accounts and swept sessions by now. The BEFORE sample is taken in §0c and the pair
+  # is what makes a future failing run comparable to a passing one.
+  echo "=== session state AFTER the run ==="; scripts/session-state.sh
 } > "scratch/lane-run-$RUN/hygiene.txt" 2>&1
 ls -la "scratch/lane-run-$RUN/"
 

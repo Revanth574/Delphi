@@ -2788,6 +2788,29 @@ mechanism's success is what you then trust.
 never sees the thing. Here the sweep sees it, reports it, and a *second* step throws it away.
 The remedies differ: 41 says widen the search; 50 says audit the filter.
 
+**THE SIBLING SHAPE, and it has produced three instances in one session (D0A-R36): AN EMPTY
+FILTER RESULT READ AS A MEANINGFUL NEGATIVE.** Above, the filter deletes a signal that was
+there. Here the filter returns nothing *because the run never produced what the pattern
+describes* — and the emptiness is read as "the thing did not happen". Recorded as an extension
+rather than a new class, because it is the same asymmetry: **a filter's silence has at least
+two causes and reports only one.**
+
+| instance | the grep was for | why it was empty | what was nearly concluded |
+|---|---|---|---|
+| the `b51bd8f` bisect | a test's `... ok`/`FAILED` line | the binary refused at helper pinning and never reached the gate | "only b51bd8f fails" — a range eliminated |
+| the R36-04 weaken | `GUARD FAILED:` | the suite PASSED, because the guard could not discriminate | "RED-proven" — committed, then withdrawn |
+| the R36-06 weaken | `GUARD FAILED:` | the mutation referenced an unimported name, so the suite died on a `NameError` | "NO BITE" — a guard called unproven that was not |
+
+**The foreclosing discipline: read the SUBJECT'S OWN SUMMARY, not the filter's output.** A test
+suite's last line, a command's exit status, a run's own result count — each distinguishes "did
+not happen" from "did not run" and from "ran and said it differently". The filter is a
+convenience for reading; it is not a measurement, and it returns the same empty string for
+success, for absence, and for malformed input.
+
+**The tell:** a conclusion drawn from output you did not see. If the evidence for a claim is
+that *nothing was printed*, the claim rests on the absence of a string, which is the weakest
+evidence available and the easiest to obtain by accident.
+
 **The instance.** Running class 48's predicate over `CONFORMANCE_REGISTER.md` correctly
 surfaced every line naming run 13. To separate live claims from deliberate history, the output
 was filtered with `grep -viE "supersed|withdrew|prior|run 13's|historical|run 13 \("`. The line
@@ -3112,3 +3135,35 @@ easy to conflate because both read as `ok`.
 **The generalisation worth carrying:** a shared build directory is shared *state*, and state
 that accumulates across differently configured runs makes each run's coverage depend on its
 predecessors. Isolation is not only for the thing under test.
+
+## 57. A TEST DOUBLE THAT ANSWERS FOR A COLLABORATOR IT DOES NOT MODEL  *(new — D0A-R36-06, found because a correct classifier appeared broken)*
+
+**The class.** A stub replaces a shared entry point — `sh`, `fetch`, a clock, a connection
+factory — in order to control ONE collaborator's answers. The code under test also calls that
+entry point for a DIFFERENT collaborator the stub was never written for, and the stub answers
+that too. **The subject then appears to behave in ways it does not**, and the appearance is
+produced by the harness rather than observed in the product.
+
+**The instance.** `mutation-campaign.test.py`'s `fake_sh` intercepted every `sh` call so the
+suite invocation could be scripted. The classifier had just been changed to take the campaign's
+OWN free-space measurement — also through `sh` — precisely so cause would stop being read from
+forgeable text. The stub answered the measurement with the suite's scripted nonzero exit, so a
+run with a named failing test classified INFRASTRUCTURE, and a correct classifier looked wrong.
+
+**Why neither side's tests see it.** The stub is correct for what it models. The subject is
+correct for what it calls. The defect is in the stub's SCOPE — everything it answers for beyond
+its subject — and scope is exactly what a stub does not declare.
+
+**Relation to class 55.** 55 is producer and consumer disagreeing about the FORMAT of a real
+interface. This is a double answering for an interface it does not represent at all. Both live
+between two correct things; 55 is a mismatch, 57 is an impersonation.
+
+**The foreclosing discipline: a double must answer ONLY for its subject and delegate the rest.**
+`fake_sh` now inspects the command and passes anything that is not the suite invocation to the
+real `sh`. Stated generally: *a double narrows to what it models and forwards what it does
+not*, and a double that cannot tell the difference is too coarse for the seam it occupies.
+
+**The tell, and it is the useful one:** the code under test starts failing in a way its own
+logic cannot produce. Before suspecting the subject, ask what else reaches the seam the double
+occupies (Iron Law 15 clause 5 — but note the asymmetry still binds: the harness is guilty only
+when SHOWN to be, and here it was shown by reading which call returned the stub's value).

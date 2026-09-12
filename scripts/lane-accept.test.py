@@ -51,13 +51,21 @@ bubblewrap 0.11.1
 
 def fixture() -> pathlib.Path:
     """A run directory in which every step left PASSING evidence, in the right order."""
-    d = pathlib.Path(tempfile.mkdtemp(prefix="lane-accept-fixture-"))
+    # D0A-R37-11/05: THE POSITIVE FIXTURE IS AN EXPLICITLY CURRENT RUN. It used to be a bare
+    # mkdtemp with no run number, so `_run_number` returned None, every modern-artifact
+    # requirement was waived, and the positive control exercised the HISTORICAL fallback. That
+    # is why disabling the rebuild-status requirement, the run-start requirement, or the
+    # inverted-hash check each left all assertions passing: no case required them. A fixture
+    # that silently exercises the lenient path cannot discriminate the strict one.
+    d = pathlib.Path(tempfile.mkdtemp()) / f"lane-run-{la.FIRST_RUN_REQUIRING_RUN_START + 1}"
+    d.mkdir()
     (d / "hygiene.txt").write_text(HYGIENE)
     hashes = "\n".join(f"{i:064x}  /t/exe-{i}" for i in range(la.EXPECTED_TARGETS)) + "\n"
     (d / "rebuild.status").write_text("0\n")
     (d / "hashes-before.txt").write_text(hashes)
     (d / "hashes-after.txt").write_text(hashes)
     (d / "rebuild.log").write_text("Finished test profile\n")
+    (d / "run-start.txt").write_text("2026-01-01T00:00:00Z\n")
     (d / "root-run7.status").write_text(
         "\n".join(f"0\t/t/exe-{i}" for i in range(la.EXPECTED_TARGETS)) + "\n")
     # The transcript must actually CONTAIN the identities the files claim (D0A-R36-02).
@@ -80,7 +88,10 @@ def fixture() -> pathlib.Path:
         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out\n")
     # Stamp the ordering the checks require.
     base = 1_000_000
+    # Order encodes the ordering contract: freshness pair, then the run START, then the
+    # transcript, then everything derived from it.
     for i, name in enumerate(["hashes-before.txt", "hashes-after.txt", "rebuild.log",
+                              "run-start.txt",
                               "root-run.log", "root-run7.status", "rebuild.status",
                               "membership.txt",
                               "root-identities.txt", "unpriv-identities.txt",
@@ -121,14 +132,22 @@ def guard_the_procedure_produces_what_the_verifier_requires() -> None:
     procedure = (REPO / "scratch" / "lane-run-7-procedure.md").read_text()
 
     # What the verifier READS: `_read(d, "name")`, `d / "name"`, and its glob patterns.
+    # D0A-R37-04: the extraction missed `.status` paths entirely, so `rebuild.status` — a
+    # MANDATORY artifact from run 26 — was never checked against the procedure, and the
+    # procedure did not produce it. A contract extracted by pattern is only as wide as the
+    # pattern, which is this guard's own standing weakness (class 41).
     required = set(re.findall(r'_read\(d,\s*"([^"]+)"\)', verifier))
-    required |= set(re.findall(r'd\s*/\s*"([^"]+\.txt)"', verifier))
+    required |= set(re.findall(r'd\s*/\s*"([^"]+\.\w+)"', verifier))
     globbed = set(re.findall(r'd\.glob\("([^"]+)"\)', verifier))
     check("contract: the verifier's required inputs were extracted", len(required) >= 6,
           f"only found {sorted(required)} — the extraction is wrong, not the contract")
 
-    # Artifacts the verifier WRITES are not inputs it requires.
-    required -= {"acceptance.txt"}
+    # Two exclusions, each for a stated reason rather than to make the guard pass:
+    #   acceptance.txt — the verifier WRITES it; it is an output, not an input.
+    #   PREDATES.txt   — an OPTIONAL marker by which a historical run declares which
+    #                    requirements it predates. A current run never produces one, so
+    #                    requiring the procedure to write it would be backwards.
+    required -= {"acceptance.txt", "PREDATES.txt"}
 
     missing = sorted(a for a in required if a not in procedure)
     check("contract: every artifact the gate REQUIRES is produced by the procedure",
@@ -272,6 +291,44 @@ def main() -> int:
             "a missing rebuild artifact is refused", "MISSING")
     refuses(lambda d: os.utime(d / "membership.txt", (900_000, 900_000)),
             "membership computed BEFORE the run is refused", "MISORDERED")
+
+    # D0A-R37-11 — THE THREE PREDICATES THAT HAD NO DISCRIMINATING CASE. Each was named in
+    # R36-11, each survived removal with every assertion passing, and my "correction" checked a
+    # different predicate and reported the finding overstated. These are the cases.
+    #
+    # (a) the INVERTED freshness pair — before NEWER than after, with both still preceding the
+    #     run start, so ONLY the pair check can catch it.
+    def invert_pair(d: pathlib.Path) -> None:
+        os.utime(d / "hashes-before.txt", (1_000_015, 1_000_015))
+        os.utime(d / "hashes-after.txt", (1_000_010, 1_000_010))
+    refuses(invert_pair, "an INVERTED freshness pair is refused", "inverted")
+
+    # (b) and (c) the modern artifacts, absent from a CURRENT run.
+    refuses(lambda d: (d / "rebuild.status").unlink(),
+            "a current run with no rebuild.status is refused", "no rebuild.status")
+    refuses(lambda d: (d / "run-start.txt").unlink(),
+            "a current run with no run-start.txt is refused", "no run-start.txt")
+
+    # D0A-R37-05 — an UNKNOWN run identity must be treated as CURRENT, not waived. Renaming a
+    # refused directory used to make it accept.
+    d_anon = fixture()
+    try:
+        anon = d_anon.parent / "review-copy"
+        d_anon.rename(anon)
+        (anon / "rebuild.status").unlink()
+        ok, report = la.accept(anon)
+        check("an UNNAMED directory is treated as CURRENT, not waived", not ok,
+              "an age waiver obtainable by renaming is a bypass, not a waiver")
+        # ...and a run that declares what it predates IS waived, explicitly.
+        (anon / "PREDATES.txt").write_text(
+            f"predates {la.FIRST_RUN_REQUIRING_REBUILD_STATUS} and "
+            f"{la.FIRST_RUN_REQUIRING_RUN_START}\n")
+        (anon / "run-start.txt").unlink()
+        ok, report = la.accept(anon)
+        check("...but a run DECLARING what it predates is waived explicitly", ok,
+              "\n".join(report))
+    finally:
+        shutil.rmtree(d_anon.parent, ignore_errors=True)
 
     # D0A-R36-04 — freshness must precede the run's START, not its last append. Without a
     # distinct start event the only available boundary is the transcript's mtime, which a

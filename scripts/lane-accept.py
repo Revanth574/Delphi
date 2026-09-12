@@ -142,7 +142,7 @@ def check_freshness(d: pathlib.Path) -> list[str]:
         if rc != "0":
             raise Refusal(f"the forced rebuild exited {rc}, so the identical hashes prove "
                           f"nothing: a rebuild that FAILED leaves the stale binaries in place")
-    elif run is not None and run >= FIRST_RUN_REQUIRING_REBUILD_STATUS:
+    elif not _is_historical(d, FIRST_RUN_REQUIRING_REBUILD_STATUS):
         raise Refusal("no rebuild.status — identical hashes are consistent with a rebuild "
                       "that failed, so the exit status is what makes them evidence")
     else:
@@ -284,8 +284,30 @@ def _check_control_transcript(d: pathlib.Path, name: str) -> str:
 
 
 def _run_number(d: pathlib.Path) -> int | None:
+    """The run number, or None when the directory name does not carry one.
+
+    D0A-R37-05: an unknown identity used to WAIVE the modern-artifact requirements, so renaming
+    a refused `lane-run-26` directory to anything else made it accept. An age waiver that can be
+    obtained by renaming is not a waiver, it is a bypass — and the direction is wrong: the
+    unknown case must be treated as CURRENT, because current is the stricter reading and a
+    genuinely historical run can say so explicitly.
+    """
     m = re.search(r"lane-run-(\d+)", d.resolve().name)
     return int(m.group(1)) if m else None
+
+
+def _is_historical(d: pathlib.Path, first_required: int) -> bool:
+    """Is this run old enough to predate a requirement — ESTABLISHED, not assumed?
+
+    Two ways to establish it, both explicit: the directory name carries a run number below the
+    threshold, or the run retains a `PREDATES.txt` naming the requirements it predates. An
+    unnamed directory is NOT historical; it is current evidence that failed to identify itself.
+    """
+    run = _run_number(d)
+    if run is not None:
+        return run < first_required
+    predates = d / "PREDATES.txt"
+    return predates.exists() and str(first_required) in predates.read_text()
 
 
 def check_control(d: pathlib.Path) -> list[str]:
@@ -295,15 +317,11 @@ def check_control(d: pathlib.Path) -> list[str]:
                       f"scan it underwrites has no basis in this run")
     notes = [f"positive control: {pos}, from a completed passing run of its named test"]
 
-    run = _run_number(d)
     negative = d / "part-b-negative-control.txt"
-    if run is not None and run < FIRST_RUN_REQUIRING_NEGATIVE_CONTROL and not negative.exists():
-        notes.append(f"negative control: not required for run {run} (predates the fixture)")
+    if not negative.exists() and _is_historical(d, FIRST_RUN_REQUIRING_NEGATIVE_CONTROL):
+        notes.append(f"negative control: not required for run {_run_number(d)} "
+                     f"(predates the fixture)")
         return notes
-    if run is None and not negative.exists():
-        raise Refusal("the directory name carries no run number, so the negative-control "
-                      "requirement cannot be waived by age — provide the evidence or a "
-                      "correctly named directory")
 
     verdict = _check_control_transcript(d, "part-b-negative-control.txt")
     if verdict != "Topology":
@@ -337,7 +355,7 @@ def check_ordering(d: pathlib.Path) -> list[str]:
     # it is absent the check falls back to the transcript and SAYS the boundary is the weak one.
     run = _run_number(d)
     start = "run-start.txt" if (d / "run-start.txt").exists() else None
-    if start is None and run is not None and run >= FIRST_RUN_REQUIRING_RUN_START:
+    if start is None and not _is_historical(d, FIRST_RUN_REQUIRING_RUN_START):
         raise Refusal("no run-start.txt — without a distinct start event, freshness can only be "
                       "compared against the transcript's LAST write, which a mid-run rebuild "
                       "also satisfies")

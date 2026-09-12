@@ -176,7 +176,12 @@ sha256sum $(cat /tmp/targets.txt) | sort -k2 > /tmp/hashes-before.txt
 [ "$(wc -l < /tmp/hashes-before.txt)" -eq "$N" ] || { echo "REFUSE: hashed fewer than $N before"; exit 1; }
 
 touch runtime/src/execute.rs
-cargo test -p delphi-runtime --tests --no-run > /tmp/rebuild.log 2>&1 \
+# D0A-R36-03 / R37-04: RETAIN THE REBUILD'S EXIT STATUS. Identical hashes are equally
+# consistent with a rebuild that never ran, so the status is what makes them evidence — and the
+# verifier requires this file from run 26. The early exit below protects THIS run; the file is
+# what lets an evidence-only verifier check it later.
+cargo test -p delphi-runtime --tests --no-run > /tmp/rebuild.log 2>&1 ; echo "$?" > /tmp/rebuild.status
+[ "$(cat /tmp/rebuild.status)" = "0" ] \
   || { echo "REFUSE: the forced rebuild FAILED — comparing stale hashes would print FRESH"; tail -20 /tmp/rebuild.log; exit 1; }
 
 sha256sum $(cat /tmp/targets.txt) | sort -k2 > /tmp/hashes-after.txt
@@ -325,7 +330,8 @@ cp -p "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, a
 # the only evidence that freshness was proven BEFORE the run. `scripts/lane-accept.py` caught
 # exactly that on its first execution — against artifacts this session had just copied.
 cp -p /tmp/session-before.txt /tmp/session-at-failure-*.txt "scratch/lane-run-$RUN/" 2>/dev/null
-cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log /tmp/run-start.txt "$STATUS" \
+cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log /tmp/rebuild.status \
+   /tmp/run-start.txt "$STATUS" \
    "scratch/lane-run-$RUN/" 2>&1 | tee -a "scratch/lane-run-$RUN/retention-errors.txt"
 { echo "=== free space ==="; scripts/check-free-space.sh
   echo "=== stale sessions ==="; scripts/check-stale-test-sessions.sh

@@ -180,6 +180,11 @@ freshness check.
 
 ```bash
 . /tmp/lane-env.sh ; : "${RUN:?run §0b first}" "${LOG:?run §0b first}" "${STATUS:?run §0b first}"
+# D0A-R36-04: A DISTINCT RUN-START EVENT, written once BEFORE the first producer.
+# `root-run.log` is APPENDED throughout, so its mtime is the run's LAST write — comparing
+# freshness against it lets a rebuild performed halfway through the lane read as "proven before
+# the run", and `cp -p` preserves that wrong boundary faithfully.
+date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/run-start.txt
 # D0A-R34: REFUSE ON UNSET VARIABLES. In a fresh shell `$LOG`/`$STATUS` are empty, so
 # `: > ""` fails with `bash: : No such file or directory` and the chain stops — while LOOKING
 # like the long-running loop it was supposed to start. Same shape as the §4b omission: a step
@@ -298,7 +303,7 @@ cp -p "$LOG" "scratch/lane-run-$RUN/root-run.log"   # the producer transcript, a
 # `-p` IS LOAD-BEARING: plain `cp` stamps the copy with the time of the copy, which destroys
 # the only evidence that freshness was proven BEFORE the run. `scripts/lane-accept.py` caught
 # exactly that on its first execution — against artifacts this session had just copied.
-cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log "$STATUS" \
+cp -p /tmp/hashes-before.txt /tmp/hashes-after.txt /tmp/rebuild.log /tmp/run-start.txt "$STATUS" \
    "scratch/lane-run-$RUN/" 2>&1 | tee -a "scratch/lane-run-$RUN/retention-errors.txt"
 { echo "=== free space ==="; scripts/check-free-space.sh
   echo "=== stale sessions ==="; scripts/check-stale-test-sessions.sh

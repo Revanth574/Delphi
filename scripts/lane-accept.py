@@ -54,6 +54,10 @@ FIRST_RUN_REQUIRING_NEGATIVE_CONTROL = 24
 # evidence. Keyed like the negative control so historical runs are not retroactively refused.
 FIRST_RUN_REQUIRING_REBUILD_STATUS = 26
 
+# D0A-R36-04: a distinct run-start event, so freshness is compared against the run's START
+# rather than its last append.
+FIRST_RUN_REQUIRING_RUN_START = 26
+
 
 class Refusal(Exception):
     """A named, specific reason this run cannot be certified."""
@@ -325,16 +329,33 @@ def check_ordering(d: pathlib.Path) -> list[str]:
     log = next((p.name for p in d.glob("root-run.log")), None)
     if log is None:
         raise Refusal("root-run.log is MISSING — there is no run transcript to order against")
+    # D0A-R36-04: `root-run.log` is APPENDED throughout, so its mtime is the run's LAST write,
+    # not its start. Comparing freshness against it lets a rebuild performed halfway through the
+    # lane qualify as "proven before the run" — and `cp -p` preserves that wrong boundary
+    # faithfully. `run-start.txt` is written once, before the first producer, and is the correct
+    # boundary. Keyed to the run number so historical runs are not retroactively refused; where
+    # it is absent the check falls back to the transcript and SAYS the boundary is the weak one.
+    run = _run_number(d)
+    start = "run-start.txt" if (d / "run-start.txt").exists() else None
+    if start is None and run is not None and run >= FIRST_RUN_REQUIRING_RUN_START:
+        raise Refusal("no run-start.txt — without a distinct start event, freshness can only be "
+                      "compared against the transcript's LAST write, which a mid-run rebuild "
+                      "also satisfies")
+    boundary = start or log
     pairs = [
         ("hashes-before.txt", "hashes-after.txt", "the freshness pair is inverted"),
-        ("hashes-after.txt", log, "FRESHNESS WAS PROVEN AFTER THE RUN, which proves nothing "
-                                  "about the binaries the run actually executed"),
+        ("hashes-after.txt", boundary,
+         "FRESHNESS WAS PROVEN AFTER THE RUN STARTED, which proves nothing about the binaries "
+         "the run actually executed"),
         (log, "membership.txt", "membership predates the run transcript it is computed from"),
     ]
+    if start:
+        pairs.append((start, log, "the run-start event is newer than the transcript it opens"))
     for earlier, later, why in pairs:
         if when(earlier) > when(later) + 1.0:      # 1s slack for same-second writes
             raise Refusal(f"MISORDERED: {earlier} is newer than {later} — {why}")
-    return ["ordering: freshness proven before the run; membership computed after it"]
+    where = "before the run STARTED" if start else "before the run's last write (WEAK boundary: no run-start.txt)"
+    return [f"ordering: freshness proven {where}; membership computed after it"]
 
 
 CHECKS = (

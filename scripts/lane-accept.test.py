@@ -272,6 +272,16 @@ def main() -> int:
     refuses(lambda d: os.utime(d / "membership.txt", (900_000, 900_000)),
             "membership computed BEFORE the run is refused", "MISORDERED")
 
+    # D0A-R36-04 — freshness must precede the run's START, not its last append. Without a
+    # distinct start event the only available boundary is the transcript's mtime, which a
+    # mid-run rebuild also satisfies.
+    def with_start(d: pathlib.Path, start_t: int, after_t: int) -> None:
+        (d / "run-start.txt").write_text("2026-01-01T00:00:00Z\n")
+        os.utime(d / "run-start.txt", (start_t, start_t))
+        os.utime(d / "hashes-after.txt", (after_t, after_t))
+    refuses(lambda d: with_start(d, 1_000_010, 1_000_050),
+            "a rebuild AFTER the run started is refused", "AFTER THE RUN STARTED")
+
     # D0A-R35 — THE NEGATIVE CONTROL, required from run 24. The fixture's directory name is
     # what carries the run number, so these use a named copy.
     def neg(verdict: str) -> str:

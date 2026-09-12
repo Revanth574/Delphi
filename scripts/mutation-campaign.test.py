@@ -53,7 +53,22 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 
 def fake_sh(out: str, err: str, rc: int):
-    return lambda cmd, **kw: types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+    """Answer the SUITE invocation only; delegate everything else to the real `sh`.
+
+    D0A-R36-06: this used to answer EVERY call, so the campaign's own free-space measurement —
+    taken to replace a forgeable text marker — was answered by the test's stub and returned the
+    stub's nonzero exit. A fake that intercepts more than it was written for makes the code
+    under test appear to behave in ways it does not, which is the harness misreporting the
+    subject (Iron Law 15 clause 5's own hazard).
+    """
+    real = mc.sh
+
+    def _sh(cmd, **kw):
+        if any("check-free-space" in str(c) or "check-stale" in str(c) for c in cmd):
+            return real(cmd, **kw)
+        return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+
+    return _sh
 
 
 def guard_classification() -> None:
@@ -536,9 +551,63 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
               f"classified {outcome} — a detection was discarded because of text a TEST "
               f"printed")
 
+    # D0A-R36-06 — THE TEXT CHANNEL IS CLOSED, not narrowed a fourth time. A REAL failing test
+    # that writes an infrastructure marker straight to stderr flipped CAUGHT to UNATTRIBUTED
+    # FAILURE. stdout and stderr are INPUTS FROM THE SUBJECT; matching on them is the same shape
+    # as trusting a self-report.
+    outcome, ev = classify(transcript("x"), 101, stderr="Killed\n")
+    check("markers: a failing test writing `Killed` to STDERR is still CAUGHT",
+          outcome == "CAUGHT",
+          f"classified {outcome} — stderr is an input from the subject under test")
+    check("markers: the forged marker is RETAINED for a human even though it decides nothing",
+          "Killed" in ev.get("markers_seen_as_data", []), f"{ev.get('markers_seen_as_data')}")
+    outcome, _ = classify(transcript("x"), 101,
+                          stderr="error: No space left on device\nerror: could not compile\n")
+    check("markers: TWO forged markers on stderr are still CAUGHT", outcome == "CAUGHT", outcome)
+
+    # D0A-R36-06 — THE AMBIGUOUS BRANCH: nonzero exit, tests reported, NO named failure. This
+    # is the only place the campaign consults its own free-space measurement, and closing the
+    # text channel would otherwise have deleted disk-exhaustion detection outright. Exercised by
+    # faking BOTH answers, because the real check passes on this box and the branch would
+    # otherwise have no discriminating case at all (the D0A-R36-11 lesson).
+    real_sh = mc.sh
+    try:
+        def short_disk(cmd, **kw):
+            if any("check-free-space" in str(c) for c in cmd):
+                return types.SimpleNamespace(
+                    returncode=1, stdout="/tmp  10M  512M  *** SHORT ***\n", stderr="")
+            return types.SimpleNamespace(
+                returncode=101, stdout="test result: FAILED. 1 failed\n", stderr="")
+        mc.sh = short_disk
+        outcome, ev = mc.run_suite()
+        check("space: an unattributable failure WITH a short disk is INFRASTRUCTURE",
+              outcome == "INFRASTRUCTURE", outcome)
+        check("space: ...and the campaign's own measurement is retained as the reason",
+              "SHORT" in ev.get("free_space", ""), f"{ev.get('free_space')!r}")
+
+        def ample_disk(cmd, **kw):
+            if any("check-free-space" in str(c) for c in cmd):
+                return types.SimpleNamespace(returncode=0, stdout="all above floors\n", stderr="")
+            return types.SimpleNamespace(
+                returncode=101, stdout="test result: FAILED. 1 failed\n", stderr="")
+        mc.sh = ample_disk
+        outcome, _ = mc.run_suite()
+        check("space: the SAME failure with an ample disk stays UNATTRIBUTED",
+              outcome == "UNATTRIBUTED FAILURE",
+              f"{outcome} — if the disk does not change the verdict, the measurement is inert")
+    finally:
+        mc.sh = real_sh
+
     # The genuine events must still be detected, or this is a deletion rather than a narrowing.
+    # A run that produced NO test results is INFRASTRUCTURE BY STRUCTURE, not by matching
+    # cargo's words: a test can ADD output but cannot remove the libtest summary that proves
+    # tests ran. Asserted with marker text and without it, so the structural path is the one
+    # being tested.
     outcome, _ = classify("", 101, stderr="error: could not compile `delphi-runtime`\n")
-    check("markers: a PRODUCER stderr compile failure is still INFRASTRUCTURE",
+    check("markers: a run with NO test results is INFRASTRUCTURE (marker present)",
+          outcome == "INFRASTRUCTURE", outcome)
+    outcome, _ = classify("", 101, stderr="")
+    check("markers: ...and with NO marker text at all — purely structural",
           outcome == "INFRASTRUCTURE", outcome)
     outcome, _ = classify(transcript("x"), -9)
     check("markers: death by SIGNAL is INFRASTRUCTURE, unfakeable from output",

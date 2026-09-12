@@ -487,34 +487,29 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
         re.findall(r"^\s{4}(\S+)$", p.stdout[p.stdout.find("failures:"):], re.M)
     )) if "failures:" in p.stdout else []
 
-    # D0A-R35-03: THE PARSER IS GONE. Round 34 separated producer output from libtest's
-    # per-test sections and anchored the precondition token to a line start. Both remained
-    # controllable by what a test PRINTS: `running user command` was accepted as a section
-    # boundary, so a test could push its own text into the "producer" region and make a
-    # detection read as INFRASTRUCTURE; and any line beginning with the token — including one a
-    # test simply printed — read as PRECONDITION FAILURE.
+    # D0A-R36-06: THE TEXT CHANNEL IS CLOSED, NOT NARROWED AGAIN.
     #
-    # Cause is now read from facts BOUND TO THE INVOCATION, never from text a test can emit:
+    # Three rounds narrowed it and each left one hole open: a section parser (R35-03), then
+    # line-anchoring (R36-06's predecessor), then "stderr is the producer's" — and a real
+    # failing test still flipped CAUGHT to UNATTRIBUTED FAILURE by writing `Killed` straight to
+    # stderr. The pattern is the finding: a channel this process does not control was being
+    # narrowed repeatedly instead of closed.
     #
-    #   * signal death        -> `returncode < 0`, which no test output can fabricate;
-    #   * producer diagnostics-> the process's OWN stderr. Under libtest capture a test's
-    #     output goes to STDOUT (inside `---- name stdout ----`), so cargo/linker/kernel
-    #     messages on stderr are the producer speaking, by construction rather than by parsing;
-    #   * preconditions       -> a SIDE-CHANNEL FILE the helper writes, whose path this process
-    #     chooses per invocation. A test cannot write to a path it was never told.
-    ev["markers_seen_as_data"] = [m for m in INFRA_MARKERS if m in p.stdout]
+    # **stdout and stderr are INPUTS FROM THE SUBJECT UNDER TEST.** Classifying on their text is
+    # the same shape as trusting a self-report. The campaign can attest only to how it INVOKED
+    # something, so cause is now read from four facts a test cannot forge:
+    #
+    #   1. the BUILD invocation's own exit status  — a separate `--no-run` run, below
+    #   2. this process's death by signal          — `returncode < 0`
+    #   3. the side-channel file this process named per invocation
+    #   4. the campaign's OWN free-space measurement, taken by the campaign
+    #
+    # Text is still RETAINED whole and reported as `markers_seen_as_data`, because a human
+    # reading an artifact should see what was said. It decides nothing.
+    ev["markers_seen_as_data"] = [m for m in INFRA_MARKERS if m in p.stdout + p.stderr]
 
     if p.returncode < 0:
         ev["infra_markers"] = [f"killed by signal {-p.returncode}"]
-        return "INFRASTRUCTURE", ev
-
-    infra = [m for m in INFRA_MARKERS if m in p.stderr]
-    if infra and ev["failing_tests"]:
-        # Provenance conflicts: neither cause is established, so neither is claimed.
-        ev["infra_markers"] = infra
-        return "UNATTRIBUTED FAILURE", ev
-    if infra:
-        ev["infra_markers"] = infra
         return "INFRASTRUCTURE", ev
 
     if precondition_report and os.path.exists(precondition_report):
@@ -529,6 +524,17 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     if p.returncode == 0:
         return "NOT CAUGHT", ev
     if not ev["failing_tests"]:
+        # (4) THE CAMPAIGN'S OWN OBSERVATION, replacing the "No space left on device" marker,
+        # and ONLY here. This is the ambiguous case: the suite exited nonzero, tests reported
+        # results, and none is named as failing. Gating EVERY nonzero exit on free space would
+        # reclassify real detections as INFRASTRUCTURE whenever the disk was tight — discarding
+        # a detection, which is the worse direction. Closing the text channel would otherwise
+        # delete disk-exhaustion detection entirely; this measures instead of reading (D0A-R36-06).
+        space = sh([str(pathlib.Path(__file__).resolve().parent / "check-free-space.sh")])
+        if space.returncode != 0:
+            ev["infra_markers"] = ["the campaign's own free-space check failed after this run"]
+            ev["free_space"] = space.stdout + space.stderr
+            return "INFRASTRUCTURE", ev
         # Nonzero, tests ran, but no named failure — a crash or signal. It MAY be
         # mutation-induced; it is not a test detecting the mutation, and it needs attribution.
         return "UNATTRIBUTED FAILURE", ev
@@ -677,7 +683,17 @@ def _main() -> int:
                 rec["applied_diff"] = sh(["git", "diff", "--", rel], cwd=work).stdout
                 build = sh(suite_cmd(no_run=True), cwd=work)
                 if build.returncode != 0:
-                    rec["outcome"] = "INVALID: mutant does not compile"
+                    # D0A-R36-06: a build can fail for reasons that are not the mutant. The
+                    # campaign measures rather than reading cargo's text, for the same reason
+                    # the suite classifier stopped: the only party that can attest to the
+                    # environment is the one that invoked the build.
+                    space = sh([str(pathlib.Path(__file__).resolve().parent
+                                    / "check-free-space.sh")])
+                    if space.returncode != 0:
+                        rec["outcome"] = "INFRASTRUCTURE: build failed with the disk short"
+                        rec["free_space"] = space.stdout + space.stderr
+                    else:
+                        rec["outcome"] = "INVALID: mutant does not compile"
                     (out / "logs" / f"{i:02d}.build.stderr").write_text(build.stderr)
                     (out / "logs" / f"{i:02d}.build.stdout").write_text(build.stdout)
                     rec["compile_stderr_head"] = build.stderr[:1200]

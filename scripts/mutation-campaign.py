@@ -523,6 +523,34 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
         return "INFRASTRUCTURE", ev
     if p.returncode == 0:
         return "NOT CAUGHT", ev
+    # D0A-R37-03: FAILURE-NAME PARSING STILL CONTROLLED ATTRIBUTION. A real aborting cargo test
+    # moved from UNATTRIBUTED FAILURE to CAUGHT by PRINTING a `failures:` block naming a test
+    # that does not exist. The names come from stdout, which the subject writes — the same
+    # channel closed for markers, still open for attribution.
+    #
+    # The campaign asks the binary ITSELF which tests exist, in its own invocation, and requires
+    # every named failure to be one of them AND the count to match libtest's own summary. A test
+    # can still print a name that happens to exist, so this NARROWS rather than closes: a
+    # fabricated failure must now impersonate a real test and get the arithmetic right.
+    if ev["failing_tests"]:
+        listing = sh(suite_cmd(no_run=False) + ["--", "--list"], cwd=cwd, env=env)
+        # `l.split(":")[0]` truncates at the FIRST colon, and libtest names contain `::` —
+        # so `genuine::test: test` became `genuine` and every real failure looked fabricated.
+        # Caught by the guard asserting a REAL failure stays CAUGHT, which is why that guard
+        # exists: a narrowing that deletes detection fails in the direction nobody looks.
+        known = {l[: -len(": test")] for l in listing.stdout.splitlines()
+                 if l.endswith(": test")}
+        if known:
+            unknown = sorted(set(ev["failing_tests"]) - known)
+            if unknown:
+                ev["unknown_failure_names"] = unknown
+                return "UNATTRIBUTED FAILURE", ev
+        m = re.search(r"^test result: \w+\. \d+ passed; (\d+) failed", p.stdout, re.M)
+        if m and int(m.group(1)) != len(ev["failing_tests"]):
+            ev["failure_count_mismatch"] = {
+                "summary_says": int(m.group(1)), "names_found": len(ev["failing_tests"])}
+            return "UNATTRIBUTED FAILURE", ev
+
     if not ev["failing_tests"]:
         # (4) THE CAMPAIGN'S OWN OBSERVATION, replacing the "No space left on device" marker,
         # and ONLY here. This is the ambiguous case: the suite exited nonzero, tests reported

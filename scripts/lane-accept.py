@@ -58,6 +58,9 @@ FIRST_RUN_REQUIRING_REBUILD_STATUS = 26
 # rather than its last append.
 FIRST_RUN_REQUIRING_RUN_START = 26
 
+# D0A-R37-02: each control's invocation status, retained beside its transcript.
+FIRST_RUN_REQUIRING_CONTROL_STATUS = 26
+
 
 class Refusal(Exception):
     """A named, specific reason this run cannot be certified."""
@@ -215,6 +218,12 @@ def check_membership(d: pathlib.Path) -> list[str]:
         if m and target:
             root_counter[f"{target}::{m.group(1)}"] = root_counter.get(
                 f"{target}::{m.group(1)}", 0) + 1
+    failed_summaries = [l for l in _read(d, "root-run.log").splitlines()
+                        if l.startswith("test result: FAILED")]
+    if failed_summaries:
+        raise Refusal(f"the retained transcript contains {len(failed_summaries)} FAILED "
+                      f"summary line(s) — producer exit codes said every target succeeded, and "
+                      f"the transcript says otherwise: {failed_summaries[:2]}")
     if not root_counter:
         raise Refusal("the retained transcript contains NO test lines, so the identity files "
                       "cannot be checked against anything — an empty log is not a run")
@@ -230,7 +239,24 @@ def check_membership(d: pathlib.Path) -> list[str]:
                       f"({len(recorded)} vs {len(root_counter)} identities). "
                       f"in-file-only: {only_file}; in-log-only: {only_log}")
 
-    n_unpriv = sum(int(l.split("\t", 1)[0]) for l in unpriv.strip().splitlines() if l.strip())
+    # D0A-R37-01: THE UNPRIVILEGED SIDE WAS REDUCED TO A TOTAL, so changing one identity while
+    # preserving the count still certified — reproduced against run 23's artifacts. It cannot be
+    # re-derived from the retained evidence (it came from `--list` at run time), but it does not
+    # need to be: `membership.txt` asserts ZERO difference in both directions, and two multisets
+    # with no difference either way are IDENTICAL. That is checkable from the files alone.
+    unpriv_counter: dict[str, int] = {}
+    for line in unpriv.strip().splitlines():
+        c, ident = line.split("\t", 1)
+        unpriv_counter[ident.strip()] = int(c)
+    if unpriv_counter != recorded:
+        only_root = sorted(set(recorded) - set(unpriv_counter))[:3]
+        only_unpriv = sorted(set(unpriv_counter) - set(recorded))[:3]
+        raise Refusal(
+            f"membership.txt claims ZERO difference in both directions, but the two identity "
+            f"files are not the same multiset. root-only: {only_root}; unpriv-only: "
+            f"{only_unpriv} — equal TOTALS are exactly what an identity comparison exists to "
+            f"go beyond")
+    n_unpriv = sum(unpriv_counter.values())
     m = re.search(r"^root (\d+) / unpriv (\d+)$", text, re.M)
     if m is None:
         raise Refusal("membership.txt has no `root N / unpriv N` line to check the files against")
@@ -275,6 +301,20 @@ def _check_control_transcript(d: pathlib.Path, name: str) -> str:
     if outcome != "ok" or passed != 1 or failed != 0:
         raise Refusal(f"the {what} reported `{outcome}. {passed} passed; {failed} failed` — its "
                       f"verdict line says nothing about a test that did not pass")
+
+    # D0A-R37-02: THE EXIT-STATUS FILES WERE NEVER READ. A control whose invocation exited 101
+    # still certified, because the transcript's own summary was the only thing consulted — and a
+    # transcript is written by the thing being judged. The status is the campaign's record of
+    # how the invocation ENDED.
+    status = d / (name.replace(".txt", ".status"))
+    if status.exists():
+        rc = status.read_text().strip()
+        if rc != "0":
+            raise Refusal(f"the {what}'s invocation exited {rc}; its transcript says the test "
+                          f"passed, and the two disagree. Neither is evidence while they do")
+    elif not _is_historical(d, FIRST_RUN_REQUIRING_CONTROL_STATUS):
+        raise Refusal(f"no {status.name} — the transcript is written by the subject; the exit "
+                      f"status is how the invocation actually ended")
 
     mv = re.search(r"verdict: (\w+)", text)
     if mv is None:

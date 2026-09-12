@@ -598,6 +598,46 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
     finally:
         mc.sh = real_sh
 
+    # D0A-R37-03 — ATTRIBUTION was the last thing the subject's own text controlled. A real
+    # aborting test moved UNATTRIBUTED -> CAUGHT by printing a `failures:` block naming a test
+    # that does not exist.
+    real_sh = mc.sh
+    try:
+        def with_listing(known: str, stdout: str):
+            def _sh(cmd, **kw):
+                if "--list" in cmd:
+                    return types.SimpleNamespace(returncode=0, stdout=known, stderr="")
+                return types.SimpleNamespace(returncode=101, stdout=stdout, stderr="")
+            return _sh
+
+        mc.sh = with_listing("genuine::test: test\n",
+                             "test result: FAILED. 0 passed; 1 failed\n"
+                             "failures:\n    fabricated_name\n")
+        outcome, ev = mc.run_suite()
+        check("attribution: a FABRICATED failure name is UNATTRIBUTED, not CAUGHT",
+              outcome == "UNATTRIBUTED FAILURE", outcome)
+        check("attribution: ...and the unknown name is retained as the reason",
+              ev.get("unknown_failure_names") == ["fabricated_name"],
+              f"{ev.get('unknown_failure_names')}")
+
+        mc.sh = with_listing("genuine::test: test\n",
+                             "test result: FAILED. 0 passed; 1 failed\n"
+                             "failures:\n    genuine::test\n")
+        outcome, _ = mc.run_suite()
+        check("attribution: a REAL failure naming a KNOWN test is still CAUGHT",
+              outcome == "CAUGHT",
+              f"{outcome} — narrowing that deletes real detection is not a fix")
+
+        mc.sh = with_listing("a::t: test\nb::t: test\n",
+                             "test result: FAILED. 0 passed; 2 failed\n"
+                             "failures:\n    a::t\n")
+        outcome, ev = mc.run_suite()
+        check("attribution: a count that disagrees with the summary is UNATTRIBUTED",
+              outcome == "UNATTRIBUTED FAILURE",
+              f"{outcome} — libtest said 2 failed and one name was produced")
+    finally:
+        mc.sh = real_sh
+
     # The genuine events must still be detected, or this is a deletion rather than a narrowing.
     # A run that produced NO test results is INFRASTRUCTURE BY STRUCTURE, not by matching
     # cargo's words: a test can ADD output but cannot remove the libtest summary that proves

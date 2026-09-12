@@ -82,6 +82,8 @@ def fixture() -> pathlib.Path:
         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out\n")
     # A CURRENT run carries both controls (D0A-R35). The base fixture is a current run, so a
     # missing negative control must be introduced deliberately by a guard, never be the default.
+    (d / "part-b-control.status").write_text("0\n")
+    (d / "part-b-negative-control.status").write_text("0\n")
     (d / "part-b-negative-control.txt").write_text(
         "test the_control_reports_topology_when_the_daemons_child_leaves_its_group ... \n"
         "NEGATIVE CONTROL: verdict: Topology, from 1 distinct record(s)\nok\n\n"
@@ -95,8 +97,9 @@ def fixture() -> pathlib.Path:
                               "root-run.log", "root-run7.status", "rebuild.status",
                               "membership.txt",
                               "root-identities.txt", "unpriv-identities.txt",
-                              "part-b-control.txt", "part-b-negative-control.txt",
-                              "hygiene.txt"]):
+                              "part-b-control.txt", "part-b-control.status",
+                              "part-b-negative-control.txt",
+                              "part-b-negative-control.status", "hygiene.txt"]):
         os.utime(d / name, (base + i * 10, base + i * 10))
     return d
 
@@ -308,6 +311,24 @@ def main() -> int:
             "a current run with no rebuild.status is refused", "no rebuild.status")
     refuses(lambda d: (d / "run-start.txt").unlink(),
             "a current run with no run-start.txt is refused", "no run-start.txt")
+
+    # D0A-R37-01 — the unprivileged side is a MULTISET, not a total. Changing one identity while
+    # preserving the count certified, because only the sum was checked.
+    def swap_identity(d: pathlib.Path) -> None:
+        ls = (d / "unpriv-identities.txt").read_text().splitlines()
+        ls[0] = ls[0].split("\t")[0] + "\texe::DIFFERENT_TEST"
+        (d / "unpriv-identities.txt").write_text("\n".join(ls) + "\n")
+    refuses(swap_identity, "a CHANGED unprivileged identity is refused despite an equal total",
+            "not the same multiset")
+
+    # D0A-R37-02 — the control's invocation status, and the transcript's own summaries.
+    refuses(lambda d: (d / "part-b-control.status").write_text("101\n"),
+            "a control whose INVOCATION exited nonzero is refused", "invocation exited 101")
+    refuses(lambda d: (d / "part-b-control.status").unlink(),
+            "a current run with no control status is refused", "how the invocation actually ended")
+    refuses(lambda d: (d / "root-run.log").write_text(
+                (d / "root-run.log").read_text() + "test result: FAILED. 0 passed; 1 failed\n"),
+            "a transcript reporting a FAILED summary is refused", "FAILED summary line")
 
     # D0A-R37-05 — an UNKNOWN run identity must be treated as CURRENT, not waived. Renaming a
     # refused directory used to make it accept.

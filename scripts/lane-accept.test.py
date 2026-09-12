@@ -279,8 +279,15 @@ def main() -> int:
         (d / "run-start.txt").write_text("2026-01-01T00:00:00Z\n")
         os.utime(d / "run-start.txt", (start_t, start_t))
         os.utime(d / "hashes-after.txt", (after_t, after_t))
-    refuses(lambda d: with_start(d, 1_000_010, 1_000_050),
-            "a rebuild AFTER the run started is refused", "AFTER THE RUN STARTED")
+    # THE DISCRIMINATING CASE, and the first attempt was not one: it put hashes-after LATER
+    # than the transcript too, so the OLD last-write boundary refused it as well — same
+    # verdict, same message, PASS/PASS (Iron Law 15 clause 2). The rebuild must land AFTER the
+    # start and BEFORE the transcript's last write, which is precisely the window the old
+    # boundary could not see.
+    #   run-start 1_000_005  <  hashes-after 1_000_020  <  root-run.log 1_000_030
+    refuses(lambda d: with_start(d, 1_000_005, 1_000_020),
+            "a rebuild after the START but before the run's last write is refused",
+            "AFTER THE RUN STARTED")
 
     # D0A-R35 — THE NEGATIVE CONTROL, required from run 24. The fixture's directory name is
     # what carries the run number, so these use a named copy.

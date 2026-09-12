@@ -3167,3 +3167,37 @@ not*, and a double that cannot tell the difference is too coarse for the seam it
 logic cannot produce. Before suspecting the subject, ask what else reaches the seam the double
 occupies (Iron Law 15 clause 5 — but note the asymmetry still binds: the harness is guilty only
 when SHOWN to be, and here it was shown by reading which call returned the stub's value).
+
+## 58. THE HARNESS ARRANGED A CONDITION IT DID NOT VERIFY HAD BEEN ARRANGED  *(new — D0A-R37, three instances in one session from three different mechanisms)*
+
+**The class.** A test sets up a condition, then asserts an outcome under it. **The assertion is
+correct and the setup silently failed**, so the test passes while measuring nothing. Both halves
+look fine in isolation: the assertion is exactly right about the property, and the setup code
+contains no error visible from reading it — the failure is that the arrangement did not take
+effect where the subject could see it.
+
+**This is NOT the empty-filter shape (class 50's extension).** There a result was produced and
+misread. Here **no result was ever produced**, and the pass is the absence of a measurement
+rather than the misreading of one.
+
+**Three instances, one session, three unrelated mechanisms:**
+
+| instance | what was arranged | why it did not take effect |
+|---|---|---|
+| the re-verification clock (D0A-R37-10) | `time.strftime` patched to a fixed value | the subject ran via `subprocess.run`, so the child used the REAL clock and got distinct names for free — the same-second collision was never tested |
+| the acceptance fixture (D0A-R37-11/05) | a run directory the strict checks would apply to | the directory had no run number, so every modern requirement was WAIVED and the fixture exercised the lenient path |
+| the ordering weaken (D0A-R36-04) | a rebuild landing after the run started | the same stamp also landed after the transcript, so an ADJACENT check refused first and the targeted one was never reached |
+
+**The foreclosing discipline: ASSERT THE PRECONDITION WAS ESTABLISHED, not only the outcome
+under it.** Each instance had a cheap available check nobody wrote — that the child observed
+the frozen clock, that `_run_number` returned what the fixture intended, that the refusal named
+the predicate under test.
+
+**The RED-proof shape, and it is recursive:** weaken the SETUP, not the subject, and require
+the test to fail. A setup that can be broken without the test noticing is not a setup, it is a
+comment. (The instances above were found the other way — by weakening the subject and seeing
+nothing happen — which works but costs a round.)
+
+**The tell:** a weaken that produces no change in outcome. That is either a check nobody needs
+or a condition that was never arranged, and the two are indistinguishable until the setup is
+checked. Suspect the arrangement before concluding the check is redundant.

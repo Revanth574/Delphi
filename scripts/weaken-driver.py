@@ -15,21 +15,43 @@ Each was a reading rule failing. A fourth reading rule is not the answer: the fi
 the same empty string for success, for absence, and for malformed input (`DEFECT_CLASSES` 50).
 
 **This driver never greps.** The failing guard identifies itself through a SIDE CHANNEL — the
-suite's `check()` writes its label to a file whose path this process chooses per invocation —
-and the driver compares labels. Everything else it decides from exit statuses and file
-digests.
+suite's `check()` writes its label to a file this process names PER INVOCATION — and the driver
+compares labels. Everything else it decides from recorded observations.
+
+# The record is primary; the verdicts are a derived view (D0A-R38)
+
+The first version made the nine verdicts the design. That was wrong, and three defects had one
+cause: FIVE independent facts were being inferred from ONE exit code and ONE report file.
+
+  * **phase** — which stage produced the terminal state
+  * **execution outcome** — `exited` / `signalled` / `timed-out` / `launch-failed`, kept apart,
+    because a process killed by SIGHUP has returncode -1 and that was read as the timeout
+    sentinel
+  * **validity** — whether the mutant LOADS, measured against the same command run on the
+    unmutated target, because `compile()` proves syntax and a `NameError` at import is an
+    invalid experiment rather than a detection
+  * **guard observation** — labels from a report path allocated per invocation, because a
+    process left behind by the baseline could otherwise write into the mutant's window
+  * **restoration** — bytes back, verified on every terminal path, and the suite green again
+
+Each is observed on its own terms and recorded; the verdict is read off the record afterwards.
 
 # What it proves, and what it does not
 
-It proves a weaken made the INTENDED guard fail, that the mutation was applied and buildable,
+It proves a weaken made the INTENDED guard fail, that the mutation was applied and loadable,
 and that restoration returned the tree byte-for-byte. **It does not prove the guard is
 well-chosen.** `NOT_CAUGHT` remains ambiguous between "this check is redundant" and
-`DEFECT_CLASSES` 58's "the condition was never arranged", and the driver reports that
-ambiguity rather than resolving it — naming it is the most it can honestly do.
+`DEFECT_CLASSES` 58's "the condition was never arranged", and the driver reports that ambiguity
+rather than resolving it.
+
+**And the side channel is a report channel for TRUSTED HELPERS, not unforgeable evidence.** The
+path is inherited by the whole subject process tree; anything in it can write any label. What
+per-invocation allocation buys is that a label cannot arrive from a stale file, a previous run,
+a hardcoded path, or an EARLIER STAGE OF THIS RUN. It buys nothing against a hostile subject.
 
 # The refusal that makes it different from a convention
 
-`RED_PROVEN` requires the side-channel report to exist and to name the expected guard. If the
+`RED_PROVEN` requires this invocation's report to exist and to name the expected guard. If the
 report is missing, the verdict is `UNVERIFIABLE` — never `RED_PROVEN` — because the only
 remaining way to identify the failure would be to read text, which is the thing this replaces.
 """
@@ -43,6 +65,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import typing
 
 # Every way the chain can break, each a distinct verdict. Collapsing any two of these is how a
 # non-measurement becomes a proof.
@@ -56,6 +79,25 @@ TIMEOUT = "TIMEOUT"
 RESTORE_FAILED = "RESTORE_FAILED"              # the tree did not come back byte-identical
 RED_PROVEN = "RED_PROVEN"                      # and only here
 
+# D0A-R38-01/03/09: THE VERDICTS ARE A DERIVED VIEW, NOT THE RECORD. Five independent facts
+# were being inferred from one exit code and one report file, which is why three separate
+# defects had one cause. Each is now OBSERVED and recorded on its own terms, and the verdict is
+# read off the record afterwards.
+EXITED, SIGNALLED, TIMED_OUT, LAUNCH_FAILED = "exited", "signalled", "timed-out", "launch-failed"
+
+
+class Invocation(typing.NamedTuple):
+    """One run of the suite: how it ended, and what it reported, kept apart."""
+    outcome: str
+    code: int | None = None        # set when EXITED
+    signal: int | None = None      # set when SIGNALLED — never folded into `code`
+    labels: list[str] = []
+    report: str = ""
+
+    @property
+    def green(self) -> bool:
+        return self.outcome == EXITED and self.code == 0
+
 
 def _digest_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -65,29 +107,71 @@ def _digest(p: pathlib.Path) -> str:
     return _digest_bytes(p.read_bytes())
 
 
-def _run(cmd: list[str], report: pathlib.Path | None, timeout: int) -> tuple[int, list[str]]:
-    """Run a suite; return its exit status and the labels its failing checks reported."""
+def _run(cmd: list[str], report_dir: pathlib.Path, tag: str, timeout: int) -> Invocation:
+    """Run a suite once, into a report path of its OWN.
+
+    D0A-R38-01: the three stages shared one path. `unlink` cannot revoke a descriptor or a
+    pathname from a child that outlived an earlier stage, so a process left behind by the
+    BASELINE could write the expected label during the MUTANT's window and the driver credited
+    it — RED_PROVEN from a suite that reported nothing. A path allocated per invocation cannot
+    be written by an invocation that was never told it.
+    """
+    report = report_dir / f"labels-{tag}.txt"
     env = dict(os.environ)
-    if report is not None:
-        report.unlink(missing_ok=True)
-        env["DELPHI_GUARD_FAILURE_REPORT"] = str(report)
+    env["DELPHI_GUARD_FAILURE_REPORT"] = str(report)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
-        return -1, []
+        return Invocation(TIMED_OUT, report=str(report))
+    except OSError as e:
+        return Invocation(LAUNCH_FAILED, code=e.errno, report=str(report))
     labels = []
-    if report is not None and report.exists():
+    if report.exists():
         labels = [l.strip() for l in report.read_text().splitlines() if l.strip()]
-    return p.returncode, labels
+    # D0A-R38-09: a process killed by signal N has returncode -N, and SIGHUP is 1 — the same
+    # value the timeout sentinel used, so a self-SIGHUP was classified TIMEOUT. Death by signal
+    # is its own observation and is never an exit code.
+    if p.returncode < 0:
+        return Invocation(SIGNALLED, signal=-p.returncode, labels=labels, report=str(report))
+    return Invocation(EXITED, code=p.returncode, labels=labels, report=str(report))
+
+
+def _validation_cmd(target: pathlib.Path) -> list[str] | None:
+    """How to establish that the target can actually LOAD, not merely parse.
+
+    D0A-R38-03: `compile()` proves syntax and nothing else. `FLAG = MISSING_NAME` compiles,
+    raises `NameError` at import, and a suite whose guard checks command success then reported
+    that guard — so an INVALID experiment was credited as RED_PROVEN, which is precisely the
+    R36-06 misreading this driver exists to foreclose.
+    """
+    if target.suffix != ".py":
+        return None
+    return [sys.executable, "-c",
+            "import importlib.util,sys\n"
+            "spec = importlib.util.spec_from_file_location('_subject', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n", str(target)]
+
+
+def _loads(cmd: list[str] | None, timeout: int) -> tuple[bool, str]:
+    """Run a validation command. Returns (loaded, detail)."""
+    if cmd is None:
+        return True, "no validation command for this target type"
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"validation could not be run: {e}"
+    return p.returncode == 0, (p.stderr or p.stdout).strip()[-400:]
 
 
 def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, anchor: bytes,
-                       replacement: bytes, suite: list[str], report: pathlib.Path, expect: str,
-                       timeout: int, ev: dict) -> str:
+                       replacement: bytes, suite: list[str], report_dir: pathlib.Path,
+                       expect: str, timeout: int, validate: list[str] | None, ev: dict) -> str:
     """Stages 2-5, with the target MUTATED throughout. The caller restores unconditionally."""
     # 2. APPLY, and VERIFY IT APPLIED. `bytes.replace` with a missing anchor returns the input
     # unchanged and raises nothing — the silent no-op that has shipped twice here. Which of the
     # two predicates fired is RECORDED, because that is what makes the first one testable.
+    ev["phase"] = "mutate"
     if anchor not in original:
         ev["reason"] = "the anchor does not occur in the target"
         ev["not_applied_because"] = "anchor-absent"
@@ -99,43 +183,56 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
         return MUTATION_NOT_APPLIED
     ev["digest_weakened"] = _digest(target)
 
-    # 3. BUILDABLE. A mutation that does not parse fails for its own reason, which is the
-    # INVALID vs NOT CAUGHT distinction the mutation harness itself draws.
-    if target.suffix == ".py":
-        try:
-            compile(target.read_bytes(), str(target), "exec")
-        except SyntaxError as e:
-            ev["reason"] = f"the weakened source does not parse: {e}"
-            return MUTATION_INVALID
+    # 3. VALID. Syntax is not validity: the mutant must LOAD. Measured against the same command
+    # that loaded the ORIGINAL, so a target that never loads is the experiment's fault and not
+    # the mutation's (that control runs in `drive`, before anything is written).
+    ev["phase"] = "validate"
+    loaded, detail = _loads(validate, timeout)
+    ev["mutant_loads"] = loaded
+    if not loaded:
+        ev["reason"] = f"the weakened target does not load: {detail}"
+        return MUTATION_INVALID
 
     # 4. RUN UNDER THE WEAKEN.
-    rc, labels = _run(suite, report, timeout)
-    ev["weakened_exit"] = rc
-    ev["failing_guards"] = labels
-    if rc == -1:
+    ev["phase"] = "observe"
+    run = _run(suite, report_dir, "weakened", timeout)
+    ev["weakened"] = run._asdict()
+    ev["weakened_exit"] = run.code
+    ev["failing_guards"] = run.labels
+    if run.outcome == TIMED_OUT:
         return TIMEOUT
-    if rc == 0:
+    if run.outcome == LAUNCH_FAILED:
+        ev["reason"] = "the suite could not be launched under the weaken"
+        return UNVERIFIABLE
+    if run.outcome == SIGNALLED:
+        # Not a guard failing, and not a hang. Whatever the report holds, the run did not
+        # finish judging, so it attributes nothing (D0A-R38-09).
+        ev["reason"] = (f"the suite was killed by signal {run.signal}; it did not finish "
+                        f"judging, so nothing here attributes a failure to the weaken")
+        return UNVERIFIABLE
+    if run.code == 0:
         ev["reason"] = ("the suite still passed. Either the check is redundant, or the "
                         "condition it needs was never arranged (DEFECT_CLASSES 58) — "
                         "this driver cannot tell those apart")
         return NOT_CAUGHT
 
-    # 5. ATTRIBUTE — structurally. No text is read.
-    if not labels:
+    # 5. ATTRIBUTE — structurally, from THIS invocation's own report. No text is read.
+    if not run.labels:
         ev["reason"] = ("the suite failed but reported no guard label. Without the side "
                         "channel the only way to attribute this is to read text, which is "
                         "what this driver exists to replace")
         return UNVERIFIABLE
-    if expect not in labels:
-        ev["reason"] = f"failed on {labels}, not on the expected guard"
+    if expect not in run.labels:
+        ev["reason"] = f"failed on {run.labels}, not on the expected guard"
         return WRONG_GUARD
     return RED_PROVEN
 
 
 def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
-          expect: str, timeout: int = 900, *, _restore=None) -> tuple[str, dict]:
-    """The six-stage chain. Returns (verdict, evidence)."""
-    ev: dict = {"target": str(target), "expect": expect}
+          expect: str, timeout: int = 900, *, validate: list[str] | None = None,
+          _restore=None) -> tuple[str, dict]:
+    """The chain. Returns (verdict, evidence); the verdict is DERIVED from the record."""
+    ev: dict = {"target": str(target), "expect": expect, "phase": "baseline"}
     # D0A-R38-06: BYTES, NOT TEXT. `read_text`/`write_text` translate newlines, so on a CRLF
     # target the restore wrote LF back and the driver CORRUPTED the tree it was measuring —
     # reporting MUTATION_NOT_APPLIED while doing it. Nothing here may round-trip through str.
@@ -146,23 +243,32 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     # Test seam, keyword-only: the ONE fault this models is a restore write that reports
     # success without landing, which is the condition the digest check exists for.
     restore = _restore if _restore is not None else target.write_bytes
-    report = pathlib.Path(tempfile.mkdtemp(prefix="weaken-report-")) / "labels.txt"
+    report_dir = pathlib.Path(tempfile.mkdtemp(prefix="weaken-report-"))
+    if validate is None:
+        validate = _validation_cmd(target)
 
-    # 1. BASELINE. A suite that is already red cannot attribute anything to a weaken. Nothing
-    # has been written yet, so these two exits owe no restoration.
-    rc, labels = _run(suite, report, timeout)
-    ev["baseline_exit"] = rc
-    if rc == -1:
+    # 1. BASELINE, both halves: the target must LOAD and the suite must be green. Nothing has
+    # been written yet, so every exit here owes no restoration.
+    loaded, detail = _loads(validate, timeout)
+    ev["original_loads"] = loaded
+    if not loaded:
+        ev["reason"] = f"the UNMUTATED target does not load: {detail}"
+        return BASELINE_NOT_GREEN, ev
+    base = _run(suite, report_dir, "baseline", timeout)
+    ev["baseline"] = base._asdict()
+    ev["baseline_exit"] = base.code
+    if base.outcome == TIMED_OUT:
         return TIMEOUT, ev
-    if rc != 0:
-        ev["baseline_failing_guards"] = labels
+    if not base.green:
+        ev["baseline_failing_guards"] = base.labels
         return BASELINE_NOT_GREEN, ev
 
     try:
-        verdict = _apply_and_observe(target, original, before, anchor_b, repl_b, suite, report,
-                                     expect, timeout, ev)
+        verdict = _apply_and_observe(target, original, before, anchor_b, repl_b, suite,
+                                     report_dir, expect, timeout, validate, ev)
     finally:
-        # 6. RESTORE, and VERIFY the restore — against the digest, not the write's return.
+        # RESTORE, and VERIFY the restore — against the digest, not the write's return.
+        ev["phase"] = "restore"
         restore(original)
         ev["digest_restored"] = _digest(target)
 
@@ -174,9 +280,10 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
         return RESTORE_FAILED, ev
     if verdict != RED_PROVEN:
         return verdict, ev
-    rc, _ = _run(suite, report, timeout)
-    ev["restored_exit"] = rc
-    if rc != 0:
+    back = _run(suite, report_dir, "restored", timeout)
+    ev["restored"] = back._asdict()
+    ev["restored_exit"] = back.code
+    if not back.green:
         ev["reason"] = "the suite is not green again after restoration"
         return RESTORE_FAILED, ev
     return RED_PROVEN, ev

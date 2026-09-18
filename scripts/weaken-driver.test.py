@@ -298,6 +298,99 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # ── D0A-R38-09 ──────────────────────────────────────────────────────────────────────
+    # Death by signal is its own observation. SIGHUP is signal 1, and a process killed by it
+    # has returncode -1 — the value the timeout sentinel used.
+    d, subject, suite = fixture()
+    try:
+        (d / "suite.py").write_text(
+            "import os,sys,signal,importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "if m.verdict(2) != 'REFUSE':\n"
+            "    os.kill(os.getpid(), signal.SIGHUP)\n")
+        v, ev = drive(subject, suite, '    if n != 1:', '    if False:')
+        check("a suite killed by SIGHUP is not TIMEOUT", v != wd.TIMEOUT, v)
+        check("...it is UNVERIFIABLE, because a killed run judged nothing",
+              v == wd.UNVERIFIABLE, v)
+        check("...and the signal is recorded as a signal, not as an exit code",
+              ev["weakened"]["outcome"] == wd.SIGNALLED and ev["weakened"]["signal"] == 1,
+              f"{ev['weakened']}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ── D0A-R38-03 ──────────────────────────────────────────────────────────────────────
+    # `compile()` proves syntax. A mutant that compiles and dies at import is an INVALID
+    # experiment; crediting its fallout is the R36-06 misreading this driver forecloses.
+    d = pathlib.Path(tempfile.mkdtemp(prefix="weaken-driver-loadfail-"))
+    try:
+        subject = d / "subject.py"
+        subject.write_text("FLAG = True\n")
+        runner = d / "run_subject.py"
+        runner.write_text("import importlib.util,sys\n"
+                          "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+                          "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n")
+        suite_py = d / "suite.py"
+        # The guard checks COMMAND SUCCESS — the shape that made the NameError look like a
+        # detection, because a guard did fail and did report itself.
+        suite_py.write_text(
+            "import os,subprocess,sys\n"
+            "def check(label, cond):\n"
+            "    if not cond:\n"
+            "        r = os.environ.get('DELPHI_GUARD_FAILURE_REPORT')\n"
+            "        if r: open(r,'a').write(label + chr(10))\n"
+            "        sys.exit(1)\n"
+            f"p = subprocess.run([sys.executable, r'{runner}', r'{subject}'], capture_output=True)\n"
+            "check('subject-imports-clean', p.returncode == 0)\n")
+        suite = [sys.executable, str(suite_py)]
+        v, ev = wd.drive(subject, "True", "MISSING_NAME", suite, "subject-imports-clean",
+                         timeout=60)
+        check("a mutant that COMPILES but fails to import is MUTATION_INVALID",
+              v == wd.MUTATION_INVALID, f"{v}: {ev.get('reason')}")
+        check("...never RED_PROVEN, however loudly a guard reported itself",
+              v != wd.RED_PROVEN, v)
+        check("...and the ORIGINAL loading is the control that makes that attributable",
+              ev["original_loads"] is True and ev["mutant_loads"] is False)
+        # ...and the control has teeth: a target that does not load UNMUTATED is a broken
+        # experiment, not a finding about the mutation.
+        subject.write_text("BROKEN = ALSO_MISSING\n")
+        v, ev = wd.drive(subject, "BROKEN", "X", suite, "subject-imports-clean", timeout=60)
+        check("a target that does not load unmutated is BASELINE_NOT_GREEN",
+              v == wd.BASELINE_NOT_GREEN and ev["original_loads"] is False, v)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ── D0A-R38-01 ──────────────────────────────────────────────────────────────────────
+    # The three stages shared one report path. A process left behind by the BASELINE wrote the
+    # expected label during the MUTANT's window and the driver credited it — RED_PROVEN from a
+    # suite that reported nothing of its own.
+    d, subject, suite = fixture()
+    try:
+        (d / "suite.py").write_text(
+            "import os,sys,time,subprocess,importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "r = os.environ['DELPHI_GUARD_FAILURE_REPORT']\n"
+            "if m.verdict(2) == 'REFUSE':\n"
+            # Detached stdio, so the parent's capture pipes do not hold this run open: the
+            # child genuinely outlives the baseline stage.
+            "    subprocess.Popen([sys.executable,'-c','import time,sys;time.sleep(1.5);"
+            "open(sys.argv[1],\"a\").write(\"a nonconforming value is REFUSED\" + chr(10))', r],"
+            " start_new_session=True, stdin=subprocess.DEVNULL,"
+            " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "    sys.exit(0)\n"
+            "time.sleep(3.0)\n"
+            "sys.exit(1)\n")
+        v, ev = drive(subject, suite, '    if n != 1:', '    if False:')
+        check("a label from a SURVIVING baseline child is not the mutant's report",
+              v != wd.RED_PROVEN, f"{v}: {ev.get('failing_guards')}")
+        check("...the honest verdict is UNVERIFIABLE", v == wd.UNVERIFIABLE, v)
+        check("...and each invocation was given a report path of its own",
+              ev["baseline"]["report"] != ev["weakened"]["report"],
+              f"{ev['baseline']['report']} vs {ev['weakened']['report']}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     print(f"\n{PASSED} guards held")
     return 0
 

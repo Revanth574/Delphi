@@ -14,6 +14,7 @@ happen to contain today.
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import shutil
 import sys
@@ -29,7 +30,14 @@ PASSED = 0
 
 def check(label: str, condition: bool, detail: str = "") -> None:
     global PASSED
-    assert condition, f"GUARD FAILED: {label}{(' — ' + detail) if detail else ''}"
+    if not condition:
+        # Report to the side channel, like every other suite here, so THIS suite can be
+        # driven by the driver it guards (D0A-R38-06's weaken proofs are run that way).
+        report = os.environ.get("DELPHI_GUARD_FAILURE_REPORT")
+        if report:
+            with open(report, "a") as f:
+                f.write(label + "\n")
+        raise AssertionError(f"GUARD FAILED: {label}{(' — ' + detail) if detail else ''}")
     print(f"  [OK ] {label}")
     PASSED += 1
 
@@ -71,6 +79,14 @@ def fixture() -> tuple[pathlib.Path, pathlib.Path, list[str]]:
     suite_py = d / "suite.py"
     suite_py.write_text(SUITE.replace("SUBJECT_PATH", str(subject)))
     return d, subject, [sys.executable, str(suite_py), str(subject)]
+
+
+def crlf_fixture() -> tuple[pathlib.Path, pathlib.Path, list[str]]:
+    """The same fixture with CRLF line endings. D0A-R38-06: the driver used to read and write
+    this through `str`, which translates newlines, so it rewrote the target as LF."""
+    d, subject, suite = fixture()
+    subject.write_bytes(SUBJECT.replace("\n", "\r\n").encode())
+    return d, subject, suite
 
 
 def drive(subject: pathlib.Path, suite: list[str], anchor: str, repl: str,
@@ -209,6 +225,76 @@ def main() -> int:
                         [sys.executable, str(d / "suite.py")],
                         "a nonconforming value is REFUSED", timeout=2)
         check("a hanging suite is TIMEOUT, not a pass or a failure", v == wd.TIMEOUT, v)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ── D0A-R38-06 ──────────────────────────────────────────────────────────────────────
+    # Both checks below were committed with a written argument for why they needed no test:
+    # the anchor check "redundant with the digest comparison", the restore-digest check
+    # "unreachable". BOTH WERE FALSE and the round-38 review demonstrated both. The argument
+    # is not replaced with a better argument; it is replaced with these guards.
+
+    # A CRLF target must survive the whole chain byte-for-byte.
+    d, subject, suite = crlf_fixture()
+    try:
+        raw = subject.read_bytes()
+        v, ev = drive(subject, suite, '    if n != 1:', '    if False:')
+        check("a CRLF target still reaches RED_PROVEN", v == wd.RED_PROVEN, f"{v}: {ev}")
+        check("...and comes back byte-identical, CRLF intact",
+              subject.read_bytes() == raw and b"\r\n" in subject.read_bytes())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ...and a path that mutates NOTHING must not rewrite it either. This returned
+    # MUTATION_NOT_APPLIED while silently converting the file to LF (class 16).
+    d, subject, suite = crlf_fixture()
+    try:
+        raw = subject.read_bytes()
+        v, ev = drive(subject, suite, 'ANCHOR THAT DOES NOT OCCUR', 'x')
+        check("a refusing path leaves a CRLF target untouched", subject.read_bytes() == raw,
+              f"{v}: {subject.read_bytes()[:40]!r}")
+        check("...and the restore digest it recorded actually matches",
+              ev["digest_restored"] == ev["digest_before"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # The anchor predicate's OWN discriminating case: it is the thing that attributes the
+    # no-op to the anchor. Delete it and the cause recorded changes.
+    d, subject, suite = fixture()
+    try:
+        _, ev = drive(subject, suite, 'ANCHOR THAT DOES NOT OCCUR', 'x')
+        check("a missing anchor is attributed to the ANCHOR, not to unchanged bytes",
+              ev["not_applied_because"] == "anchor-absent", str(ev.get("not_applied_because")))
+        _, ev = drive(subject, suite, '    if n != 1:', '    if n != 1:')
+        check("a replacement equal to the anchor is attributed to unchanged BYTES",
+              ev["not_applied_because"] == "bytes-unchanged", str(ev.get("not_applied_because")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # RESTORE_FAILED's digest path, reachable through the one fault it models: a restore
+    # write that reports success without landing.
+    d, subject, suite = fixture()
+    try:
+        v, ev = wd.drive(subject, '    if n != 1:', '    if False:', suite,
+                         "a nonconforming value is REFUSED", timeout=60,
+                         _restore=lambda b: subject.write_bytes(b + b"# not the original\n"))
+        check("a restore that does not land is RESTORE_FAILED, not RED_PROVEN",
+              v == wd.RESTORE_FAILED, f"{v}: {ev}")
+        check("...and it says what the verdict would otherwise have been",
+              ev["verdict_before_restore_check"] == wd.RED_PROVEN)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ...and the same check runs on a path that never reached the success branch at all.
+    d, subject, suite = fixture()
+    try:
+        v, ev = wd.drive(subject, 'ANCHOR THAT DOES NOT OCCUR', 'x', suite,
+                         "a nonconforming value is REFUSED", timeout=60,
+                         _restore=lambda b: subject.write_bytes(b + b"# not the original\n"))
+        check("restoration is verified on EVERY terminal path, not just the proven one",
+              v == wd.RESTORE_FAILED, f"{v}: {ev}")
+        check("...and the refused verdict it replaced is retained",
+              ev["verdict_before_restore_check"] == wd.MUTATION_NOT_APPLIED)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

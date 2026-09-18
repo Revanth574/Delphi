@@ -57,8 +57,12 @@ RESTORE_FAILED = "RESTORE_FAILED"              # the tree did not come back byte
 RED_PROVEN = "RED_PROVEN"                      # and only here
 
 
+def _digest_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
 def _digest(p: pathlib.Path) -> str:
-    return hashlib.sha256(p.read_bytes()).hexdigest()
+    return _digest_bytes(p.read_bytes())
 
 
 def _run(cmd: list[str], report: pathlib.Path | None, timeout: int) -> tuple[int, list[str]]:
@@ -77,16 +81,75 @@ def _run(cmd: list[str], report: pathlib.Path | None, timeout: int) -> tuple[int
     return p.returncode, labels
 
 
+def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, anchor: bytes,
+                       replacement: bytes, suite: list[str], report: pathlib.Path, expect: str,
+                       timeout: int, ev: dict) -> str:
+    """Stages 2-5, with the target MUTATED throughout. The caller restores unconditionally."""
+    # 2. APPLY, and VERIFY IT APPLIED. `bytes.replace` with a missing anchor returns the input
+    # unchanged and raises nothing — the silent no-op that has shipped twice here. Which of the
+    # two predicates fired is RECORDED, because that is what makes the first one testable.
+    if anchor not in original:
+        ev["reason"] = "the anchor does not occur in the target"
+        ev["not_applied_because"] = "anchor-absent"
+        return MUTATION_NOT_APPLIED
+    target.write_bytes(original.replace(anchor, replacement, 1))
+    if _digest(target) == before:
+        ev["reason"] = "the file is byte-identical after the replacement"
+        ev["not_applied_because"] = "bytes-unchanged"
+        return MUTATION_NOT_APPLIED
+    ev["digest_weakened"] = _digest(target)
+
+    # 3. BUILDABLE. A mutation that does not parse fails for its own reason, which is the
+    # INVALID vs NOT CAUGHT distinction the mutation harness itself draws.
+    if target.suffix == ".py":
+        try:
+            compile(target.read_bytes(), str(target), "exec")
+        except SyntaxError as e:
+            ev["reason"] = f"the weakened source does not parse: {e}"
+            return MUTATION_INVALID
+
+    # 4. RUN UNDER THE WEAKEN.
+    rc, labels = _run(suite, report, timeout)
+    ev["weakened_exit"] = rc
+    ev["failing_guards"] = labels
+    if rc == -1:
+        return TIMEOUT
+    if rc == 0:
+        ev["reason"] = ("the suite still passed. Either the check is redundant, or the "
+                        "condition it needs was never arranged (DEFECT_CLASSES 58) — "
+                        "this driver cannot tell those apart")
+        return NOT_CAUGHT
+
+    # 5. ATTRIBUTE — structurally. No text is read.
+    if not labels:
+        ev["reason"] = ("the suite failed but reported no guard label. Without the side "
+                        "channel the only way to attribute this is to read text, which is "
+                        "what this driver exists to replace")
+        return UNVERIFIABLE
+    if expect not in labels:
+        ev["reason"] = f"failed on {labels}, not on the expected guard"
+        return WRONG_GUARD
+    return RED_PROVEN
+
+
 def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
-          expect: str, timeout: int = 900) -> tuple[str, dict]:
+          expect: str, timeout: int = 900, *, _restore=None) -> tuple[str, dict]:
     """The six-stage chain. Returns (verdict, evidence)."""
     ev: dict = {"target": str(target), "expect": expect}
-    original = target.read_text()
-    before = _digest(target)
+    # D0A-R38-06: BYTES, NOT TEXT. `read_text`/`write_text` translate newlines, so on a CRLF
+    # target the restore wrote LF back and the driver CORRUPTED the tree it was measuring —
+    # reporting MUTATION_NOT_APPLIED while doing it. Nothing here may round-trip through str.
+    original = target.read_bytes()
+    before = _digest_bytes(original)
     ev["digest_before"] = before
+    anchor_b, repl_b = anchor.encode(), replacement.encode()
+    # Test seam, keyword-only: the ONE fault this models is a restore write that reports
+    # success without landing, which is the condition the digest check exists for.
+    restore = _restore if _restore is not None else target.write_bytes
     report = pathlib.Path(tempfile.mkdtemp(prefix="weaken-report-")) / "labels.txt"
 
-    # 1. BASELINE. A suite that is already red cannot attribute anything to a weaken.
+    # 1. BASELINE. A suite that is already red cannot attribute anything to a weaken. Nothing
+    # has been written yet, so these two exits owe no restoration.
     rc, labels = _run(suite, report, timeout)
     ev["baseline_exit"] = rc
     if rc == -1:
@@ -96,65 +159,21 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
         return BASELINE_NOT_GREEN, ev
 
     try:
-        # 2. APPLY, and VERIFY IT APPLIED. `str.replace` with a missing anchor returns the
-        # string unchanged and raises nothing — the silent no-op that has shipped twice here.
-        # NOT WEAKEN-PROVEN, AND SAID SO RATHER THAN CLAIMED. Removing this check changes no
-        # outcome, because the digest comparison below catches a missing anchor too — a no-op
-        # replacement leaves the file byte-identical. It is kept for its MESSAGE (it names the
-        # anchor as the cause, where the digest can only say "nothing changed"), and it is
-        # DEFENCE IN DEPTH by §6's own definition. "Every check weaken-proven" has been a false
-        # claim twice in this arc; this comment is what prevents a third.
-        if anchor not in original:
-            ev["reason"] = "the anchor does not occur in the target"
-            return MUTATION_NOT_APPLIED, ev
-        target.write_text(original.replace(anchor, replacement, 1))
-        if _digest(target) == before:
-            ev["reason"] = "the file is byte-identical after the replacement"
-            return MUTATION_NOT_APPLIED, ev
-        ev["digest_weakened"] = _digest(target)
-
-        # 3. BUILDABLE. A mutation that does not parse fails for its own reason, which is the
-        # INVALID vs NOT CAUGHT distinction the mutation harness itself draws.
-        if target.suffix == ".py":
-            try:
-                compile(target.read_text(), str(target), "exec")
-            except SyntaxError as e:
-                ev["reason"] = f"the weakened source does not parse: {e}"
-                return MUTATION_INVALID, ev
-
-        # 4. RUN UNDER THE WEAKEN.
-        rc, labels = _run(suite, report, timeout)
-        ev["weakened_exit"] = rc
-        ev["failing_guards"] = labels
-        if rc == -1:
-            return TIMEOUT, ev
-        if rc == 0:
-            ev["reason"] = ("the suite still passed. Either the check is redundant, or the "
-                            "condition it needs was never arranged (DEFECT_CLASSES 58) — "
-                            "this driver cannot tell those apart")
-            return NOT_CAUGHT, ev
-
-        # 5. ATTRIBUTE — structurally. No text is read.
-        if not labels:
-            ev["reason"] = ("the suite failed but reported no guard label. Without the side "
-                            "channel the only way to attribute this is to read text, which is "
-                            "what this driver exists to replace")
-            return UNVERIFIABLE, ev
-        if expect not in labels:
-            ev["reason"] = f"failed on {labels}, not on the expected guard"
-            return WRONG_GUARD, ev
+        verdict = _apply_and_observe(target, original, before, anchor_b, repl_b, suite, report,
+                                     expect, timeout, ev)
     finally:
         # 6. RESTORE, and VERIFY the restore — against the digest, not the write's return.
-        target.write_text(original)
+        restore(original)
         ev["digest_restored"] = _digest(target)
 
-    # ALSO NOT WEAKEN-PROVEN, and for a stronger reason: it is UNREACHABLE as written. The
-    # restore writes `original`, so the digest necessarily matches; this fires only if the
-    # filesystem returned success on a write that did not land. No discriminating case can be
-    # constructed without faking the filesystem, so it is carried as an assertion about a
-    # condition that should be impossible rather than as a checked predicate.
+    # D0A-R38-06: ON EVERY TERMINAL PATH. This check used to sit below the success path only,
+    # so each early return jumped past it and a corrupted tree was reported as a clean refusal.
     if ev["digest_restored"] != before:
+        ev["verdict_before_restore_check"] = verdict
+        ev["reason"] = "the target did not come back byte-identical"
         return RESTORE_FAILED, ev
+    if verdict != RED_PROVEN:
+        return verdict, ev
     rc, _ = _run(suite, report, timeout)
     ev["restored_exit"] = rc
     if rc != 0:

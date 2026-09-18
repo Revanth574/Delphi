@@ -91,6 +91,50 @@ finding's fix gets — name the exact predicate, run the weaken against *that* p
 the assertion it fails on. "I checked and it is two, not three" is a claim, and this project's
 standing rule is that a claim without its measurement attached is decoration.
 
+### BOTH WRITTEN EXEMPTIONS FROM WEAKEN-PROOF WERE FALSE — D0A-R38-06
+
+The sibling of the section above, and the reason it is here: the previous entry is about a
+correction that was ratified without being checked. This one is about an **exemption** that was.
+
+`scripts/weaken-driver.py` shipped at `aa0d0e1` with two checks carrying a written argument for
+why neither needed a discriminating case. Both arguments were stated in the source, at the
+check, deliberately — the disposition the operator endorsed at the time, on the reasoning that
+labelling an exemption where a reader meets it stops the claim reforming. **Labelling it did not
+make it true.**
+
+| check | the argument shipped | what round 38 demonstrated |
+|---|---|---|
+| the anchor predicate | "removing it changes no outcome — the digest comparison below catches a missing anchor too" | **False.** `read_text`/`write_text` translated newlines, so on a CRLF target a no-op replacement did NOT leave the bytes unchanged. Deleting the predicate changed the verdict from `MUTATION_NOT_APPLIED` to `NOT_CAUGHT` |
+| the restore-digest predicate | "unreachable as written — the restore writes `original`, so the digest necessarily matches" | **False.** The same translation meant the restore wrote LF back to a CRLF target. `RESTORE_FAILED` was reachable with no filesystem mock at all |
+
+Deleting **either** predicate left all 17 guards green — which the round-38 prompt predicted as
+the finding it most expected, and then did not act on.
+
+**The third thing, worse than either, and not the finding's headline.** On a missing anchor the
+`finally` rewrote the target CRLF→LF, recorded a `digest_restored` that did not match
+`digest_before`, returned `MUTATION_NOT_APPLIED`, and never compared them — because the
+comparison sat below the success path and every early return jumped past it. **A tool that
+corrupts the working tree and reports a clean refusal is `DEFECT_CLASSES` 16**, listed as
+unforeclosed in this driver's own review prompt.
+
+**What was wrong with the reasoning, generalised.** Both arguments reasoned about `str.replace`
+and about `original` — values in memory — and neither reasoned about the **round-trip through
+the filesystem**, which is where both were false. An argument that a check is redundant is an
+argument about *two code paths agreeing*, and it is only as good as the model of what sits
+between them.
+
+**What replaces it: not a better argument.** Bytes are never routed through `str`; restoration
+is verified on every terminal path; the driver records *which* predicate produced
+`MUTATION_NOT_APPLIED`, which is what gives the anchor check a discriminating case at last; and a
+keyword-only restore seam models the one fault the digest check exists for. Both predicates are
+now RED-proven — **driven by the driver itself against its own source**, verdict `RED_PROVEN`,
+each failing on the named guard through the side channel.
+
+**The standing rule this settles.** "Every check weaken-proven" has now been false three times
+(D0A-R36-11, D0A-R37-11, here). A written explanation for why a check needs no test is not a
+weaker form of evidence — it is not evidence. Where a discriminating case genuinely cannot be
+constructed, the check needs a **seam** that makes one constructible, not a paragraph.
+
 ### D0A-R28-02 — §4 "an untrusted peer cannot pin the boundary": **CLOSED on boundedness**
 
 **One authoritative account (D0A-R34-04).** This row was corrected in rounds 31, 32, 33 and 34;

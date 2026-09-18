@@ -189,6 +189,36 @@ def check_producers(d: pathlib.Path) -> list[str]:
             f"matching the hashed set"]
 
 
+def _parse_identities(text: str, name: str) -> dict[str, int]:
+    """Parse a `count<TAB>identity` file as a MULTISET, strictly, on both sides.
+
+    D0A-R38-08: both sides were parsed with `d[ident] = int(c)`, so a duplicate row overwrote
+    its twin instead of adding to it. Appending one duplicate to the unprivileged file made six
+    rows compare equal to five, and acceptance reported "5 unprivileged, zero either way" — a
+    false count AND a false zero-difference, which is the defect R37-01 was supposed to close,
+    one layer down. A dict is not a multiset.
+    """
+    counts: dict[str, int] = {}
+    for n, line in enumerate(text.strip().splitlines(), 1):
+        if "\t" not in line:
+            raise Refusal(f"{name} line {n} has no TAB separator: {line!r}")
+        c, ident = line.split("\t", 1)
+        ident = ident.strip()
+        try:
+            count = int(c)
+        except ValueError:
+            raise Refusal(f"{name} line {n} has a non-numeric count: {line!r}") from None
+        if count <= 0:
+            raise Refusal(f"{name} line {n} claims {count} occurrences of {ident!r}; an "
+                          f"identity present zero or fewer times is not evidence")
+        if ident in counts:
+            raise Refusal(f"{name} names {ident!r} on more than one line. This file serialises "
+                          f"a multiset, so a repeated identity is malformed evidence — and "
+                          f"parsed as a dict it silently REPLACED its twin, hiding a row")
+        counts[ident] = count
+    return counts
+
+
 def check_membership(d: pathlib.Path) -> list[str]:
     text = _read(d, "membership.txt")
     for side in ("IN ROOT NOT UNPRIV", "IN UNPRIV NOT ROOT"):
@@ -228,10 +258,7 @@ def check_membership(d: pathlib.Path) -> list[str]:
         raise Refusal("the retained transcript contains NO test lines, so the identity files "
                       "cannot be checked against anything — an empty log is not a run")
 
-    recorded: dict[str, int] = {}
-    for line in root.strip().splitlines():
-        c, ident = line.split("\t", 1)
-        recorded[ident.strip()] = int(c)
+    recorded = _parse_identities(root, "root-identities.txt")
     if recorded != root_counter:
         only_file = sorted(set(recorded) - set(root_counter))[:3]
         only_log = sorted(set(root_counter) - set(recorded))[:3]
@@ -244,10 +271,7 @@ def check_membership(d: pathlib.Path) -> list[str]:
     # re-derived from the retained evidence (it came from `--list` at run time), but it does not
     # need to be: `membership.txt` asserts ZERO difference in both directions, and two multisets
     # with no difference either way are IDENTICAL. That is checkable from the files alone.
-    unpriv_counter: dict[str, int] = {}
-    for line in unpriv.strip().splitlines():
-        c, ident = line.split("\t", 1)
-        unpriv_counter[ident.strip()] = int(c)
+    unpriv_counter = _parse_identities(unpriv, "unpriv-identities.txt")
     if unpriv_counter != recorded:
         only_root = sorted(set(recorded) - set(unpriv_counter))[:3]
         only_unpriv = sorted(set(unpriv_counter) - set(recorded))[:3]

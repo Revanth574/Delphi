@@ -524,6 +524,45 @@ def main() -> int:
 
     guard_the_procedure_produces_what_the_verifier_requires()
 
+    # ── D0A-R38-08 ──────────────────────────────────────────────────────────────────────
+    # Both identity files were parsed with `d[ident] = int(c)`. A duplicate row overwrote its
+    # twin, so six unprivileged rows compared equal to five root rows and acceptance printed
+    # "5 unprivileged, zero either way" — a false count and a false zero-difference, in the
+    # check R37-01 added to stop exactly that.
+    for side in ("unpriv-identities.txt", "root-identities.txt"):
+        d = fixture()
+        try:
+            f = d / side
+            rows = f.read_text().rstrip("\n").splitlines()
+            ok, _ = la.accept(d)
+            check(f"membership: the fixture is ACCEPTED before {side} is touched", ok)
+            f.write_text("\n".join(rows + [rows[0]]) + "\n")
+            ok, notes = la.accept(d)
+            check(f"membership: a duplicate row in {side} is REFUSED",
+                  not ok, f"{len(rows) + 1} rows accepted as {len(rows)}")
+            check(f"membership: ...and the refusal names the repeated identity in {side}",
+                  any("more than one line" in n for n in notes), str(notes[-1])[:120])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # A count that cannot be a multiplicity is malformed evidence too.
+    d = fixture()
+    try:
+        f = d / "unpriv-identities.txt"
+        rows = f.read_text().rstrip("\n").splitlines()
+        _, ident = rows[0].split("\t", 1)
+        f.write_text("\n".join([f"0\t{ident}"] + rows[1:]) + "\n")
+        ok, notes = la.accept(d)
+        check("membership: a zero multiplicity is REFUSED", not ok,
+              "an identity present zero times was accepted as evidence")
+        # The multiset comparison ALSO refuses this, so "it was refused" does not discriminate
+        # the multiplicity check — driving that weaken returned NOT_CAUGHT. What the check
+        # actually owns is the REASON the operator reads, so that is what is asserted.
+        check("membership: ...naming the multiplicity, not a generic multiset mismatch",
+              any("zero or fewer times" in n for n in notes), str(notes[-1])[:140])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     print(f"\n{PASSED} guards held")
     return 0
 

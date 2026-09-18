@@ -62,6 +62,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,7 @@ class Invocation(typing.NamedTuple):
     signal: int | None = None      # set when SIGNALLED — never folded into `code`
     labels: list[str] = []
     report: str = ""
+    survivors: bool = False        # anything still alive in the group when the stage ended
 
     @property
     def green(self) -> bool:
@@ -120,20 +122,70 @@ def _run(cmd: list[str], report_dir: pathlib.Path, tag: str, timeout: int) -> In
     env = dict(os.environ)
     env["DELPHI_GUARD_FAILURE_REPORT"] = str(report)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        return Invocation(TIMED_OUT, report=str(report))
+        # D0A-R38-02: OWN PROCESS GROUP. `subprocess.run` kills the direct child on timeout and
+        # nothing else, so a detached grandchild outlived the run and rewrote the target AFTER
+        # restoration had been verified. `start_new_session` makes the child a group leader, so
+        # `pgid == pid` and the whole tree can be collected.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True)
     except OSError as e:
         return Invocation(LAUNCH_FAILED, code=e.errno, report=str(report))
+    timed_out = False
+    try:
+        proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _collect_group(proc.pid)
+        proc.communicate()
+    survivors = _collect_group(proc.pid)
+    if timed_out:
+        return Invocation(TIMED_OUT, report=str(report))
     labels = []
     if report.exists():
         labels = [l.strip() for l in report.read_text().splitlines() if l.strip()]
     # D0A-R38-09: a process killed by signal N has returncode -N, and SIGHUP is 1 — the same
     # value the timeout sentinel used, so a self-SIGHUP was classified TIMEOUT. Death by signal
     # is its own observation and is never an exit code.
-    if p.returncode < 0:
-        return Invocation(SIGNALLED, signal=-p.returncode, labels=labels, report=str(report))
-    return Invocation(EXITED, code=p.returncode, labels=labels, report=str(report))
+    if proc.returncode < 0:
+        return Invocation(SIGNALLED, signal=-proc.returncode, labels=labels,
+                          report=str(report), survivors=survivors)
+    return Invocation(EXITED, code=proc.returncode, labels=labels, report=str(report),
+                      survivors=survivors)
+
+
+def _collect_group(pgid: int) -> bool:
+    """SIGKILL everything left in the group. True if anything was there to kill."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+class Refusal(Exception):
+    """The experiment cannot be run at all — not an outcome of running it."""
+
+
+def _backup_path(target: pathlib.Path) -> pathlib.Path:
+    return target.with_name(target.name + ".weaken-backup")
+
+
+def _open_backup(target: pathlib.Path, original: bytes) -> pathlib.Path:
+    """Put the original bytes somewhere a CRASH cannot take with it.
+
+    D0A-R38-02: signal handlers cannot cover SIGKILL or power loss, and this repository lost a
+    commit to the latter mid-session. A handler makes the catchable cases clean; this file makes
+    the uncatchable ones VISIBLE and reversible — it sits beside the target, so `git status`
+    reports it, which is the external check that has caught what self-checks did not.
+    """
+    backup = _backup_path(target)
+    if backup.exists():
+        raise Refusal(
+            f"{backup} already exists: a previous run died with {target} possibly mutated. "
+            f"Compare the two and restore before running another weaken — this driver will not "
+            f"overwrite a record of an unfinished experiment")
+    backup.write_bytes(original)
+    return backup
 
 
 def _validation_cmd(target: pathlib.Path) -> list[str] | None:
@@ -263,6 +315,19 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
         ev["baseline_failing_guards"] = base.labels
         return BASELINE_NOT_GREEN, ev
 
+    # D0A-R38-02: from here the target may be mutated, so the original is parked where a crash
+    # cannot take it, and the catchable signals restore before dying.
+    backup = _open_backup(target, original)
+    previous = {}
+
+    def _on_signal(signum, _frame):
+        restore(original)
+        backup.unlink(missing_ok=True)
+        signal.signal(signum, previous.get(signum, signal.SIG_DFL))
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        previous[sig] = signal.signal(sig, _on_signal)
     try:
         verdict = _apply_and_observe(target, original, before, anchor_b, repl_b, suite,
                                      report_dir, expect, timeout, validate, ev)
@@ -271,6 +336,12 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
         ev["phase"] = "restore"
         restore(original)
         ev["digest_restored"] = _digest(target)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if ev["digest_restored"] == before:
+            backup.unlink(missing_ok=True)
+        else:
+            ev["backup_retained"] = str(backup)
 
     # D0A-R38-06: ON EVERY TERMINAL PATH. This check used to sit below the success path only,
     # so each early return jumped past it and a corrupted tree was reported as a clean refusal.
@@ -299,8 +370,12 @@ def main() -> int:
     ap.add_argument("suite", nargs="+")
     a = ap.parse_args()
 
-    verdict, ev = drive(pathlib.Path(a.target), a.anchor, a.replacement, a.suite, a.expect,
-                        a.timeout)
+    try:
+        verdict, ev = drive(pathlib.Path(a.target), a.anchor, a.replacement, a.suite, a.expect,
+                            a.timeout)
+    except Refusal as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 2
     print(f"VERDICT: {verdict}")
     for k, v in ev.items():
         print(f"  {k}: {v}")

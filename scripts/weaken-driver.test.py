@@ -17,7 +17,9 @@ import importlib.util
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
+import time
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -388,6 +390,115 @@ def main() -> int:
         check("...and each invocation was given a report path of its own",
               ev["baseline"]["report"] != ev["weakened"]["report"],
               f"{ev['baseline']['report']} vs {ev['weakened']['report']}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ── D0A-R38-02 ──────────────────────────────────────────────────────────────────────
+    # A tool that mutates the tree owes the tree its lifetime, and the `finally` alone does not
+    # provide it: SIGTERM does not raise, and a detached grandchild outlives a timeout.
+
+    # (a) A REAL SIGTERM during the window in which the target is mutated.
+    d, subject, suite = fixture()
+    try:
+        (d / "suite.py").write_text(
+            "import sys,time,importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "if m.verdict(2) != 'REFUSE':\n"
+            "    time.sleep(30)   # slow ONLY under the weaken\n")
+        raw = subject.read_bytes()
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO / "scripts" / "weaken-driver.py"),
+             "--target", str(subject), "--anchor", "    if n != 1:",
+             "--replacement", "    if False:", "--expect", "x",
+             sys.executable, str(d / "suite.py"), str(subject)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3.0)          # inside the mutant window
+        mutated = subject.read_bytes() != raw
+        proc.terminate()
+        proc.wait(timeout=20)
+        check("the target IS mutated while the suite runs (the window is real)", mutated)
+        check("a SIGTERM'd driver still restores the target", subject.read_bytes() == raw,
+              subject.read_bytes().decode()[:60])
+        check("...and removes its backup on the way out",
+              not (d / "subject.py.weaken-backup").exists())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # (b) A grandchild that outlives a TIMEOUT must not come back and rewrite the target.
+    d, subject, suite = fixture()
+    try:
+        (d / "suite.py").write_text(
+            "import os,subprocess,sys,time,importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "if m.verdict(2) != 'REFUSE':\n"
+            # Detached STDIO so it does not hold the parent's capture pipes open, but NOT a new
+            # session: it stays in the suite's process group, which is the ordinary shape of a
+            # leftover.
+            "    subprocess.Popen([sys.executable,'-c','import time,sys;time.sleep(3);"
+            "open(sys.argv[1],\"w\").write(\"CLOBBERED\")', sys.argv[1]],"
+            " stdin=subprocess.DEVNULL,"
+            " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "    time.sleep(60)\n")
+        raw = subject.read_bytes()
+        v, ev = wd.drive(subject, '    if n != 1:', '    if False:',
+                         [sys.executable, str(d / "suite.py"), str(subject)], "x", timeout=2)
+        check("a hanging suite is still TIMEOUT", v == wd.TIMEOUT, v)
+        time.sleep(4.0)          # past the moment the grandchild would have woken
+        check("a grandchild that outlived the timeout was collected with the group",
+              subject.read_bytes() == raw, subject.read_bytes().decode()[:40])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # (b2) THE LIMIT, PINNED RATHER THAN CLAIMED CLOSED. A descendant that calls `setsid`
+    # leaves the group, and no `killpg` can reach it. Process-group management is not a
+    # guarantee about the tree; it is a guarantee about the group. This guard asserts the hole
+    # so that closing it later FAILS here and forces the record to be updated.
+    d, subject, suite = fixture()
+    try:
+        (d / "suite.py").write_text(
+            "import os,subprocess,sys,time,importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "if m.verdict(2) != 'REFUSE':\n"
+            "    subprocess.Popen([sys.executable,'-c','import time,sys;time.sleep(3);"
+            "open(sys.argv[1],\"w\").write(\"CLOBBERED\")', sys.argv[1]],"
+            " start_new_session=True, stdin=subprocess.DEVNULL,"
+            " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "    time.sleep(60)\n")
+        raw = subject.read_bytes()
+        wd.drive(subject, '    if n != 1:', '    if False:',
+                 [sys.executable, str(d / "suite.py"), str(subject)], "x", timeout=2)
+        time.sleep(4.0)
+        check("KNOWN LIMIT: a descendant that calls setsid escapes the group and can still "
+              "write the target",
+              subject.read_bytes() != raw,
+              "the escape was closed — update the register and delete this guard")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # (c) The backup is a REFUSAL, not a convenience: one left behind means an experiment
+    # ended without restoring, and the next run must not overwrite that record.
+    d, subject, suite = fixture()
+    try:
+        (d / "subject.py.weaken-backup").write_bytes(b"an earlier run's original\n")
+        try:
+            drive(subject, suite, '    if n != 1:', '    if False:')
+            check("a stale backup refuses the run", False, "no Refusal was raised")
+        except wd.Refusal as e:
+            check("a stale backup refuses the run", "weaken-backup" in str(e), str(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # (d) ...and a restore that did not land RETAINS it, because that is when it is needed.
+    d, subject, suite = fixture()
+    try:
+        v, ev = wd.drive(subject, '    if n != 1:', '    if False:', suite, "x", timeout=60,
+                         _restore=lambda b: subject.write_bytes(b + b"# not the original\n"))
+        check("a failed restore retains the backup", v == wd.RESTORE_FAILED
+              and pathlib.Path(ev["backup_retained"]).read_bytes() == SUBJECT.encode(),
+              f"{v}: {ev.get('backup_retained')}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

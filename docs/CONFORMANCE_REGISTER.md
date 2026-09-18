@@ -135,6 +135,35 @@ each failing on the named guard through the side channel.
 weaker form of evidence — it is not evidence. Where a discriminating case genuinely cannot be
 constructed, the check needs a **seam** that makes one constructible, not a paragraph.
 
+### A TOOL THAT MUTATES THE TREE OWES IT A LIFETIME — D0A-R38-02, partly closed, limit MEASURED
+
+`scripts/weaken-driver.py` writes to the working tree. Two interruptions left it mutated:
+**SIGTERM does not raise**, so the `finally` never ran (driver exit −15, target left weakened);
+and a **detached grandchild outlived a timeout** and rewrote the target *after* the driver had
+recorded matching restoration digests — a guarantee about one instant, not about the tree.
+
+**Closed:** the suite runs in its own process group and the group is collected after every
+invocation; SIGTERM/SIGINT/SIGHUP restore and re-raise; and the original bytes are parked in a
+visible `<target>.weaken-backup` before the first write, whose presence REFUSES a later run
+until someone reconciles it. All three are RED-proven.
+
+**NOT closed, and pinned rather than claimed:** a descendant that calls `setsid` leaves the
+group, and no `killpg` can reach it. **Process-group management is a guarantee about the group,
+not about the tree.** A guard asserts the escape still works, so closing it later fails that
+guard and forces this entry to be updated rather than letting the claim quietly widen.
+
+**Not done:** the reviewer's recommended **isolated checkout**, which would prevent rather than
+recover. The driver cannot generically make an arbitrary suite argv execute against a copy, and
+a whole-tree copy per weaken is a different tool — the campaign already has one. This is a
+deferral with a reason, not a closure.
+
+**A note the crash earned.** Signal handlers cannot cover SIGKILL or power loss. This repository
+lost a commit to power loss mid-session (four zero-byte objects, a NUL-padded reflog tail), and
+the working tree survived only because the campaign's and the driver's restores had already
+landed. The backup file exists for the cases a handler cannot reach: it does not prevent the
+damage, it makes it **visible to `git status`**, which is the external-check discipline this
+project relies on.
+
 ### D0A-R28-02 — §4 "an untrusted peer cannot pin the boundary": **CLOSED on boundedness**
 
 **One authoritative account (D0A-R34-04).** This row was corrected in rounds 31, 32, 33 and 34;

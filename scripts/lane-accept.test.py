@@ -563,6 +563,22 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # ── D0A-R38-07 ──────────────────────────────────────────────────────────────────────
+    # The Drop-time failure capture needs DELPHI_FAILURE_SNAPSHOT_DIR, `$SNAPDIR` is exported
+    # in §0b, and sudo's env_reset drops it — so the variable was arranged and never arrived
+    # (DEFECT_CLASSES 58), in the fix for a class-58 instance. Every ELEVATED invocation of a
+    # test binary must carry it explicitly, and this guard reads the procedure to say so.
+    proc = (REPO / "scratch" / "lane-run-7-procedure.md").read_text()
+    elevated = [l.strip() for l in proc.splitlines()
+                if re.match(r'^\s*sudo\b', l) and ('"$b"' in l or '"$B"' in l)]
+    check("procedure: the elevated test-binary invocations are still found",
+          len(elevated) == 3, f"{len(elevated)}: {elevated}")
+    naked = [l for l in elevated if "DELPHI_FAILURE_SNAPSHOT_DIR=" not in l]
+    check("procedure: every elevated invocation passes the snapshot directory",
+          not naked, f"{naked}")
+    check("procedure: ...through `sudo env`, because plain sudo and `-E` both drop it",
+          all(l.startswith("sudo env ") for l in elevated), f"{elevated}")
+
     print(f"\n{PASSED} guards held")
     return 0
 

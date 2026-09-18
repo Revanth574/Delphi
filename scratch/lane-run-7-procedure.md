@@ -218,9 +218,15 @@ date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/run-start.txt
 # that appears to run and does not. `${VAR:?}` names the missing variable instead.
 : "${RUN:?set RUN first (§0b)}" "${LOG:?LOG unset — re-run §0b}" "${STATUS:?STATUS unset — re-run §0b}"
 : > "$LOG" ; : > "$STATUS"
+# D0A-R38-07: `$SNAPDIR` is exported in §0b and sudo's env_reset DROPS IT, so the Drop-time
+# capture never fired under the documented invocation — the variable was arranged and never
+# arrived (DEFECT_CLASSES 58). `sudo -E` is refused by this sudoers, recorded above. `env` is a
+# PROGRAM, so it sets the variable in the child regardless of what sudo forwards. Measured on
+# the same-user passwordless path: plain `sudo` -> <ABSENT>, `sudo env VAR=...` -> the value.
+: "${SNAPDIR:?SNAPDIR unset — re-run §0b}"
 while read -r b; do
   echo "### $b" >> "$LOG"
-  sudo "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
+  sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAPDIR" "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
   rc=$?
   printf '%s\t%s\n' "$rc" "$b" >> "$STATUS"   # D0A-R18-04
   # D0A-R36-09: AT THE FAILURE, before the next target runs and before any cleanup. An
@@ -381,11 +387,13 @@ for l in sys.stdin:
 B=$(cat /tmp/b1-seams.txt)
 
 # B1 — the POSITIVE control.
-sudo "$B" b1_daemon_bounds_an_ai --nocapture --test-threads=1 2>&1 | tee "$D/part-b-control.txt"
+sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAPDIR" "$B" b1_daemon_bounds_an_ai \
+  --nocapture --test-threads=1 2>&1 | tee "$D/part-b-control.txt"
 echo "${PIPESTATUS[0]}" > "$D/part-b-control.status"
 
 # B2 — the NEGATIVE control. Required from run 24; its verdict must be Topology.
-sudo "$B" the_control_reports_topology --nocapture --test-threads=1 2>&1 \
+sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAPDIR" "$B" the_control_reports_topology \
+  --nocapture --test-threads=1 2>&1 \
   | tee "$D/part-b-negative-control.txt"
 echo "${PIPESTATUS[0]}" > "$D/part-b-negative-control.status"
 

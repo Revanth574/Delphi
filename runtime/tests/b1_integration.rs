@@ -165,13 +165,25 @@ impl Drop for Setup {
         //
         // Only on the panicking path, so a passing run pays nothing. Best-effort and silent on
         // error: a capture that could fail the test would make the diagnostic a hazard.
-        if std::thread::panicking()
-            && let Ok(dir) = std::env::var("DELPHI_FAILURE_SNAPSHOT_DIR")
-        {
-            let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/session-state.sh");
-            let path = format!("{dir}/at-failure-{}-{}.txt", self.user, std::process::id());
-            if let Ok(f) = std::fs::File::create(&path) {
-                let _ = Command::new(script).stdout(f).status();
+        if std::thread::panicking() {
+            match std::env::var("DELPHI_FAILURE_SNAPSHOT_DIR") {
+                Ok(dir) => {
+                    let script =
+                        concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/session-state.sh");
+                    let path =
+                        format!("{dir}/at-failure-{}-{}.txt", self.user, std::process::id());
+                    if let Ok(f) = std::fs::File::create(&path) {
+                        let _ = Command::new(script).stdout(f).status();
+                    }
+                }
+                // D0A-R38-07: sudo's env_reset drops this variable, and this sudoers refuses
+                // `sudo -E` (the procedure records that). The capture then did not happen and
+                // nothing said so — DEFECT_CLASSES 49. The transcript carries the reason now.
+                Err(_) => eprintln!(
+                    "FAILURE SNAPSHOT NOT TAKEN: DELPHI_FAILURE_SNAPSHOT_DIR is unset in \
+                     this process. An elevated run must pass it explicitly, as `sudo env \
+                     DELPHI_FAILURE_SNAPSHOT_DIR=<dir> <binary>`; plain `sudo` strips it."
+                ),
             }
         }
         // Remove ONLY a file this test created; an operator-installed stack is left alone.

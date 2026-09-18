@@ -1,0 +1,18 @@
+{
+  "verdict": "NOT_CAUGHT",
+  "evidence": {
+    "target": "/tmp/r38-anchor-25h9m7s6/subject.py",
+    "expect": "expected",
+    "digest_before": "99d74e6a5daec9ba33878c1aff287c23663cde796bfafb27c5d0369456f1c1bf",
+    "baseline_exit": 0,
+    "digest_weakened": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302",
+    "weakened_exit": 0,
+    "failing_guards": [],
+    "reason": "the suite still passed. Either the check is redundant, or the condition it needs was never arranged (DEFECT_CLASSES 58) \u2014 this driver cannot tell those apart",
+    "digest_restored": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302"
+  },
+  "after": "b'FLAG = True\\n'",
+  "guards_exit": 0,
+  "guards_stdout": "  [OK ] a chain that HOLDS is RED_PROVEN\n  [OK ] ...and the target is restored byte-identical\n  [OK ] ...and the suite is green again afterwards\n  [OK ] ...and the failing guard is named from the SIDE CHANNEL, not from text\n  [OK ] a missing anchor is MUTATION_NOT_APPLIED, never RED_PROVEN\n  [OK ] a replacement identical to the anchor is MUTATION_NOT_APPLIED\n  [OK ] a weaken that does not parse is MUTATION_INVALID, not RED_PROVEN\n  [OK ] a weaken that changes nothing is NOT_CAUGHT\n  [OK ] ...and it says the ambiguity rather than resolving it\n  [OK ] a weaken failing a DIFFERENT guard is WRONG_GUARD\n  [OK ] ...and it names what actually failed\n  [OK ] a suite that fails BEFORE the weaken is BASELINE_NOT_GREEN\n  [OK ] a failure with NO structured label is UNVERIFIABLE, never RED_PROVEN\n  [OK ] ...and the refusal says why text is not an acceptable substitute\n  [OK ] a suite still red AFTER restoration is RESTORE_FAILED, not RED_PROVEN\n  [OK ] ...and the restore digest still matches, so the file came back\n  [OK ] a hanging suite is TIMEOUT, not a pass or a failure\n\n17 guards held\n",
+  "guards_stderr": ""
+}

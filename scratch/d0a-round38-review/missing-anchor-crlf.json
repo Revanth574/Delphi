@@ -1,0 +1,12 @@
+{
+  "verdict": "MUTATION_NOT_APPLIED",
+  "evidence": {
+    "target": "/tmp/d0a-r38-yyksxym0/missing-anchor-crlf/subject.py",
+    "expect": "expected",
+    "digest_before": "99d74e6a5daec9ba33878c1aff287c23663cde796bfafb27c5d0369456f1c1bf",
+    "baseline_exit": 0,
+    "reason": "the anchor does not occur in the target",
+    "digest_restored": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302"
+  },
+  "after": "b'FLAG = True\\n'"
+}

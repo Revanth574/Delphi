@@ -1,0 +1,9 @@
+{
+  "verdict": "TIMEOUT",
+  "evidence": {
+    "target": "/tmp/d0a-r38-yyksxym0/sighup/subject.py",
+    "expect": "expected",
+    "digest_before": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302",
+    "baseline_exit": -1
+  }
+}

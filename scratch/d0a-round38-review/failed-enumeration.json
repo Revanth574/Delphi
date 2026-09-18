@@ -1,0 +1,13 @@
+{
+  "outcome": "CAUGHT",
+  "evidence": {
+    "exit": 1,
+    "stdout": "\nrunning 1 test\n\ntest result: FAILED. 0 passed; 1 failed\nfailures:\n    fabricated_name\n",
+    "stderr": "   Compiling delphi-runtime v0.0.0 (/tmp/d0a-r38-yyksxym0/crate)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s\n     Running unittests src/lib.rs (target/debug/deps/delphi_runtime-9418289ff01e77c8)\nerror: test failed, to rerun pass `-p delphi-runtime --lib`\n\nCaused by:\n  process didn't exit successfully: `/tmp/d0a-r38-yyksxym0/crate/target/debug/deps/delphi_runtime-9418289ff01e77c8` (exit status: 1)\nnote: test exited abnormally; to see the full output pass --no-capture to the harness.\n",
+    "result_lines": 1,
+    "failing_tests": [
+      "fabricated_name"
+    ],
+    "markers_seen_as_data": []
+  }
+}

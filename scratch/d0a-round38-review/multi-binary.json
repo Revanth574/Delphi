@@ -1,0 +1,17 @@
+{
+  "outcome": "UNATTRIBUTED FAILURE",
+  "evidence": {
+    "exit": 101,
+    "stdout": "\nrunning 1 test\ntest library_passes ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\ntest actual_failure ... FAILED\n\nfailures:\n\n---- actual_failure stdout ----\n\nthread 'actual_failure' (11104) panicked at tests/fail.rs:1:31:\nassertion failed: false\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    actual_failure\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+    "stderr": "   Compiling delphi-runtime v0.0.0 (/tmp/d0a-r38-yyksxym0/crate)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s\n     Running unittests src/lib.rs (target/debug/deps/delphi_runtime-9418289ff01e77c8)\n     Running tests/fail.rs (target/debug/deps/fail-8c7b3bd994707ad2)\nerror: test failed, to rerun pass `-p delphi-runtime --test fail`\n",
+    "result_lines": 2,
+    "failing_tests": [
+      "actual_failure"
+    ],
+    "markers_seen_as_data": [],
+    "failure_count_mismatch": {
+      "summary_says": 0,
+      "names_found": 1
+    }
+  }
+}

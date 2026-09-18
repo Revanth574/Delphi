@@ -1,0 +1,17 @@
+{
+  "verdict": "RESTORE_FAILED",
+  "evidence": {
+    "target": "/tmp/d0a-r38-yyksxym0/crlf/subject.py",
+    "expect": "expected",
+    "digest_before": "99d74e6a5daec9ba33878c1aff287c23663cde796bfafb27c5d0369456f1c1bf",
+    "baseline_exit": 0,
+    "digest_weakened": "a38cec26b31a9375af38afd68cabcb789b3b2d553890116a16647383ab5555b6",
+    "weakened_exit": 1,
+    "failing_guards": [
+      "expected"
+    ],
+    "digest_restored": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302"
+  },
+  "before": "b'FLAG = True\\r\\n'",
+  "after": "b'FLAG = True\\n'"
+}

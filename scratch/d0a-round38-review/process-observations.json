@@ -1,0 +1,167 @@
+[
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/crlf/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "guard passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/crlf/suite.py"
+    ],
+    "exit": 1,
+    "stdout": "actual expected guard failed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/missing-anchor-crlf/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "guard passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/mutant-repo/scripts/weaken-driver.test.py"
+    ],
+    "exit": 0,
+    "stdout": "  [OK ] a chain that HOLDS is RED_PROVEN\n  [OK ] ...and the target is restored byte-identical\n  [OK ] ...and the suite is green again afterwards\n  [OK ] ...and the failing guard is named from the SIDE CHANNEL, not from text\n  [OK ] a missing anchor is MUTATION_NOT_APPLIED, never RED_PROVEN\n  [OK ] a replacement identical to the anchor is MUTATION_NOT_APPLIED\n  [OK ] a weaken that does not parse is MUTATION_INVALID, not RED_PROVEN\n  [OK ] a weaken that changes nothing is NOT_CAUGHT\n  [OK ] ...and it says the ambiguity rather than resolving it\n  [OK ] a weaken failing a DIFFERENT guard is WRONG_GUARD\n  [OK ] ...and it names what actually failed\n  [OK ] a suite that fails BEFORE the weaken is BASELINE_NOT_GREEN\n  [OK ] a failure with NO structured label is UNVERIFIABLE, never RED_PROVEN\n  [OK ] ...and the refusal says why text is not an acceptable substitute\n  [OK ] a suite still red AFTER restoration is RESTORE_FAILED, not RED_PROVEN\n  [OK ] ...and the restore digest still matches, so the file came back\n  [OK ] a hanging suite is TIMEOUT, not a pass or a failure\n\n17 guards held\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/mutant-crlf/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "guard passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/mutant-crlf/suite.py"
+    ],
+    "exit": 1,
+    "stdout": "actual expected guard failed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/mutant-crlf/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "guard passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/late-report/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "baseline/restored parent passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/late-report/suite.py"
+    ],
+    "exit": 1,
+    "stdout": "mutant failed WITHOUT reporting any guard\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/late-report/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "baseline/restored parent passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/timeout-child/suite.py"
+    ],
+    "exit": 0,
+    "stdout": "baseline passed\n",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/timeout-child/suite.py"
+    ],
+    "timeout": 1,
+    "stdout": "b'mutant started writer child\\n'",
+    "stderr": "None"
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/sighup/suite.py"
+    ],
+    "exit": -1,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "cmd": [
+      "cargo",
+      "test",
+      "-p",
+      "delphi-runtime",
+      "--lib",
+      "--tests"
+    ],
+    "exit": 101,
+    "stdout": "\nrunning 1 test\ntest library_passes ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\ntest actual_failure ... FAILED\n\nfailures:\n\n---- actual_failure stdout ----\n\nthread 'actual_failure' (11104) panicked at tests/fail.rs:1:31:\nassertion failed: false\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    actual_failure\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+    "stderr": "   Compiling delphi-runtime v0.0.0 (/tmp/d0a-r38-yyksxym0/crate)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s\n     Running unittests src/lib.rs (target/debug/deps/delphi_runtime-9418289ff01e77c8)\n     Running tests/fail.rs (target/debug/deps/fail-8c7b3bd994707ad2)\nerror: test failed, to rerun pass `-p delphi-runtime --test fail`\n"
+  },
+  {
+    "cmd": [
+      "cargo",
+      "test",
+      "-p",
+      "delphi-runtime",
+      "--lib",
+      "--tests",
+      "--",
+      "--list"
+    ],
+    "exit": 0,
+    "stdout": "library_passes: test\n\n1 test, 0 benchmarks\nactual_failure: test\n\n1 test, 0 benchmarks\n",
+    "stderr": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s\n     Running unittests src/lib.rs (target/debug/deps/delphi_runtime-9418289ff01e77c8)\n     Running tests/fail.rs (target/debug/deps/fail-8c7b3bd994707ad2)\n"
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/crate/cargo_wrapper.py"
+    ],
+    "exit": 1,
+    "stdout": "\nrunning 1 test\n\ntest result: FAILED. 0 passed; 1 failed\nfailures:\n    fabricated_name\n",
+    "stderr": "   Compiling delphi-runtime v0.0.0 (/tmp/d0a-r38-yyksxym0/crate)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s\n     Running unittests src/lib.rs (target/debug/deps/delphi_runtime-9418289ff01e77c8)\nerror: test failed, to rerun pass `-p delphi-runtime --lib`\n\nCaused by:\n  process didn't exit successfully: `/tmp/d0a-r38-yyksxym0/crate/target/debug/deps/delphi_runtime-9418289ff01e77c8` (exit status: 1)\nnote: test exited abnormally; to see the full output pass --no-capture to the harness.\n"
+  },
+  {
+    "cmd": [
+      "/usr/bin/python3",
+      "/tmp/d0a-r38-yyksxym0/crate/cargo_wrapper.py",
+      "--",
+      "--list"
+    ],
+    "exit": -15,
+    "stdout": "",
+    "stderr": ""
+  }
+]

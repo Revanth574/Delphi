@@ -1,0 +1,14 @@
+{
+  "baseline": true,
+  "accepted": true,
+  "report": [
+    "  [OK ] hygiene: helper digest aba0f0ea14b751aa\u2026 installed == staged",
+    "  [OK ] freshness: freshness: 17 executables identical across a rebuild that exited 0",
+    "  [OK ] producers: producers: 17/17 distinct, all exited 0, matching the hashed set",
+    "  [OK ] membership: membership: 5 identities RE-DERIVED from the transcript and matching the retained file, 5 unprivileged, zero either way",
+    "  [OK ] control: positive control: Reached, from a completed passing run of its named test",
+    "  [OK ] control: negative control: Topology, from a completed passing run \u2014 the control DISCRIMINATES, so a `Reached` means something",
+    "  [OK ] ordering: ordering: freshness proven before the run STARTED; membership computed after it"
+  ],
+  "unpriv": "1\texe::test_0\n1\texe::test_1\n1\texe::test_2\n1\texe::test_3\n1\texe::test_4\n1\texe::test_0\n"
+}

@@ -1,0 +1,19 @@
+  [OK ] a chain that HOLDS is RED_PROVEN
+  [OK ] ...and the target is restored byte-identical
+  [OK ] ...and the suite is green again afterwards
+  [OK ] ...and the failing guard is named from the SIDE CHANNEL, not from text
+  [OK ] a missing anchor is MUTATION_NOT_APPLIED, never RED_PROVEN
+  [OK ] a replacement identical to the anchor is MUTATION_NOT_APPLIED
+  [OK ] a weaken that does not parse is MUTATION_INVALID, not RED_PROVEN
+  [OK ] a weaken that changes nothing is NOT_CAUGHT
+  [OK ] ...and it says the ambiguity rather than resolving it
+  [OK ] a weaken failing a DIFFERENT guard is WRONG_GUARD
+  [OK ] ...and it names what actually failed
+  [OK ] a suite that fails BEFORE the weaken is BASELINE_NOT_GREEN
+  [OK ] a failure with NO structured label is UNVERIFIABLE, never RED_PROVEN
+  [OK ] ...and the refusal says why text is not an acceptable substitute
+  [OK ] a suite still red AFTER restoration is RESTORE_FAILED, not RED_PROVEN
+  [OK ] ...and the restore digest still matches, so the file came back
+  [OK ] a hanging suite is TIMEOUT, not a pass or a failure
+
+17 guards held

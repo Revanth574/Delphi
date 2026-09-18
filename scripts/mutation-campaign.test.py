@@ -64,20 +64,30 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     print(f"  [OK ] {label}")
 
 
-def fake_sh(out: str, err: str, rc: int):
-    """Answer the SUITE invocation only; delegate everything else to the real `sh`.
+def fake_sh(out: str, err: str, rc: int, listing: str | None = None, listing_rc: int = 0):
+    """Answer the SUITE invocation, and the ENUMERATION separately; delegate the rest.
 
     D0A-R36-06: this used to answer EVERY call, so the campaign's own free-space measurement —
     taken to replace a forgeable text marker — was answered by the test's stub and returned the
     stub's nonzero exit. A fake that intercepts more than it was written for makes the code
     under test appear to behave in ways it does not, which is the harness misreporting the
     subject (Iron Law 15 clause 5's own hazard).
+
+    D0A-R38-05: the same shape, one collaborator further on. `cargo test -- --list` is a
+    DIFFERENT invocation with its own exit status, and answering it with the suite's output
+    made every fixture's enumeration look like a crashed one. `listing` defaults to declaring
+    exactly the tests the suite's own output names, which is what a real binary would say.
     """
     real = mc.sh
+    if listing is None:
+        named = sorted({n for seg in mc._segments(out) for n in seg[0]})
+        listing = "".join(f"{n}: test\n" for n in named)
 
     def _sh(cmd, **kw):
         if any("check-free-space" in str(c) or "check-stale" in str(c) for c in cmd):
             return real(cmd, **kw)
+        if "--list" in cmd:
+            return types.SimpleNamespace(returncode=listing_rc, stdout=listing, stderr="")
         return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
     return _sh
@@ -98,27 +108,27 @@ def guard_classification() -> None:
             # the genuine precondition path is asserted through the SIDE CHANNEL in
             # `guard_markers_in_assertion_data_do_not_decide_cause`.
             "precondition token as text is NOT a precondition report": (
-                "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
+                "failures:\n    some::test\n\ntest result: FAILED. 0 passed; 1 failed\n",
                 "PRECONDITION FAILED before this test ran — a session is live on tty1",
                 101, "CAUGHT"),
             # Same inversion, same reason: the legacy phrasing is text too.
             "legacy stale-session phrasing as text is NOT a report": (
-                "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
+                "failures:\n    some::test\n\ntest result: FAILED. 0 passed; 1 failed\n",
                 "STALE SESSION FROM A PREVIOUS RUN — a PRECONDITION failure, not a code regression.",
                 101, "CAUGHT"),
             # D0A-R31-06: the reviewer's case — the checker could not be LAUNCHED, so the
             # environment is UNKNOWN. It has a named failing test and no infra substring, and
             # was therefore scored CAUGHT: an infrastructure failure credited to the mutation.
             "checker-launch text is NOT a report either": (
-                "test result: FAILED. 1 failed\nfailures:\n    some::test\n",
+                "failures:\n    some::test\n\ntest result: FAILED. 0 passed; 1 failed\n",
                 "DELPHI_PRECONDITION_FAILED: could not run scripts/check-stale-test-sessions.sh: "
                 "Permission denied (os error 13) — the environment is UNKNOWN, not clean",
                 101, "CAUGHT"),
-            "crash, no named test": ("test result: FAILED. 1 failed\n", "", 101,
+            "crash, no named test": ("test result: FAILED. 0 passed; 1 failed\n", "", 101,
                                      "UNATTRIBUTED FAILURE"),
             "real detection": (
-                "test result: FAILED. 1 failed\nfailures:\n    some::test\n", "", 101, "CAUGHT"),
-            "clean green": ("test result: ok. 5 passed\n", "", 0, "NOT CAUGHT"),
+                "failures:\n    some::test\n\ntest result: FAILED. 0 passed; 1 failed\n", "", 101, "CAUGHT"),
+            "clean green": ("test result: ok. 5 passed; 0 failed\n", "", 0, "NOT CAUGHT"),
         }
         for name, (out, err, rc, want) in cases.items():
             mc.sh = fake_sh(out, err, rc)
@@ -531,7 +541,15 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
         prev = os.environ.get("DELPHI_MUTATION_TEST_CMD")
         # A stub that writes the given streams — and, when asked, writes the SIDE-CHANNEL file
         # the campaign named, which is what a real helper does and what test text cannot.
-        body = (f"import os,sys; sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); ")
+        # D0A-R38-05: the stub must answer the ENUMERATION too. `cargo test -- --list` is a
+        # separate invocation; a stub that replays the run transcript for it declares no tests,
+        # which is indistinguishable from an enumeration that died.
+        listing = "".join(f"{n}: test\n"
+                          for n in sorted({n for seg in mc._segments(stdout) for n in seg[0]}))
+        body = (f"import os,sys\n"
+                f"if '--list' in sys.argv:\n"
+                f"    sys.stdout.write({listing!r}); sys.exit(0)\n"
+                f"sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); ")
         if precondition is not None:
             body += ("open(os.environ['DELPHI_PRECONDITION_REPORT'],'a')"
                      f".write({precondition!r} + chr(10)); ")
@@ -589,7 +607,7 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
                 return types.SimpleNamespace(
                     returncode=1, stdout="/tmp  10M  512M  *** SHORT ***\n", stderr="")
             return types.SimpleNamespace(
-                returncode=101, stdout="test result: FAILED. 1 failed\n", stderr="")
+                returncode=101, stdout="test result: FAILED. 0 passed; 1 failed\n", stderr="")
         mc.sh = short_disk
         outcome, ev = mc.run_suite()
         check("space: an unattributable failure WITH a short disk is INFRASTRUCTURE",
@@ -601,7 +619,7 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
             if any("check-free-space" in str(c) for c in cmd):
                 return types.SimpleNamespace(returncode=0, stdout="all above floors\n", stderr="")
             return types.SimpleNamespace(
-                returncode=101, stdout="test result: FAILED. 1 failed\n", stderr="")
+                returncode=101, stdout="test result: FAILED. 0 passed; 1 failed\n", stderr="")
         mc.sh = ample_disk
         outcome, _ = mc.run_suite()
         check("space: the SAME failure with an ample disk stays UNATTRIBUTED",
@@ -623,8 +641,8 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
             return _sh
 
         mc.sh = with_listing("genuine::test: test\n",
-                             "test result: FAILED. 0 passed; 1 failed\n"
-                             "failures:\n    fabricated_name\n")
+                             "failures:\n    fabricated_name\n\n"
+                             "test result: FAILED. 0 passed; 1 failed\n")
         outcome, ev = mc.run_suite()
         check("attribution: a FABRICATED failure name is UNATTRIBUTED, not CAUGHT",
               outcome == "UNATTRIBUTED FAILURE", outcome)
@@ -633,20 +651,92 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
               f"{ev.get('unknown_failure_names')}")
 
         mc.sh = with_listing("genuine::test: test\n",
-                             "test result: FAILED. 0 passed; 1 failed\n"
-                             "failures:\n    genuine::test\n")
+                             "failures:\n    genuine::test\n\n"
+                             "test result: FAILED. 0 passed; 1 failed\n")
         outcome, _ = mc.run_suite()
         check("attribution: a REAL failure naming a KNOWN test is still CAUGHT",
               outcome == "CAUGHT",
               f"{outcome} — narrowing that deletes real detection is not a fix")
 
         mc.sh = with_listing("a::t: test\nb::t: test\n",
-                             "test result: FAILED. 0 passed; 2 failed\n"
-                             "failures:\n    a::t\n")
+                             "failures:\n    a::t\n\n"
+                             "test result: FAILED. 0 passed; 2 failed\n")
         outcome, ev = mc.run_suite()
         check("attribution: a count that disagrees with the summary is UNATTRIBUTED",
               outcome == "UNATTRIBUTED FAILURE",
               f"{outcome} — libtest said 2 failed and one name was produced")
+
+        # ── D0A-R38-04 ──────────────────────────────────────────────────────────────────
+        # A REAL cargo run of a package with a passing lib test and a failing integration
+        # test. Cargo concatenates both binaries' output; the lib's summary comes first. The
+        # single `re.search` found `0 failed` there and compared it against the integration
+        # binary's one name, so a GENUINE detection came back UNATTRIBUTED — a narrowing that
+        # deletes detection, for the second time in the same fix (cf. `split(":")[0]`).
+        two_binaries = ("\nrunning 1 test\ntest lib_passes ... ok\n\n"
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+                        "\nrunning 1 test\ntest genuine_guard ... FAILED\n\n"
+                        "failures:\n\n---- genuine_guard stdout ----\npanicked\n\n"
+                        "failures:\n    genuine_guard\n\n"
+                        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n")
+        mc.sh = with_listing("lib_passes: test\ngenuine_guard: test\n", two_binaries)
+        outcome, ev = mc.run_suite()
+        check("attribution: a real detection in the SECOND binary is still CAUGHT",
+              outcome == "CAUGHT",
+              f"{outcome} — the lib's `0 failed` is not the integration binary's count")
+        check("attribution: ...and each binary is segmented separately",
+              [(s_["names"], s_["failed"]) for s_ in ev["segments"]]
+              == [([], 0), (["genuine_guard"], 1)], f"{ev['segments']}")
+
+        # ...and the boundary still holds in the direction that matters: a name in one binary
+        # cannot borrow a DIFFERENT binary's count to make its arithmetic work.
+        borrowed = ("\nrunning 1 test\n\nfailures:\n    fabricated\n\n"
+                    "test result: FAILED. 0 passed; 0 failed; 0 ignored; 0 measured\n"
+                    "\nrunning 1 test\ntest genuine_guard ... FAILED\n\n"
+                    "failures:\n    genuine_guard\n\n"
+                    "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n")
+        mc.sh = with_listing("fabricated: test\ngenuine_guard: test\n", borrowed)
+        outcome, ev = mc.run_suite()
+        check("attribution: a name cannot borrow another binary's failure count",
+              outcome == "UNATTRIBUTED FAILURE",
+              f"{outcome} — binary 0 named one failure and reported zero")
+
+        # ── D0A-R38-05 ──────────────────────────────────────────────────────────────────
+        # The enumeration is a SEPARATE invocation with its own exit status. Ignoring it, then
+        # skipping the membership check whenever the listing came back empty, was fail-open on
+        # the one check that stops a fabricated name.
+        def listing_fails(rc: int, known: str):
+            def _sh(cmd, **kw):
+                if "--list" in cmd:
+                    return types.SimpleNamespace(returncode=rc, stdout=known, stderr="died")
+                return types.SimpleNamespace(
+                    returncode=101, stdout="failures:\n    fabricated_name\n\n"
+                    "test result: FAILED. 0 passed; 1 failed\n", stderr="")
+            return _sh
+
+        # The DISCRIMINATING case for the exit-status check is a PARTIAL listing: an
+        # enumeration that dies after printing enough to name the failure. An EMPTY listing is
+        # also caught by the `not known` refusal below, so it cannot prove this check — aiming
+        # the weaken there returned WRONG_GUARD, which is what that verdict is for. This case
+        # runs FIRST so the weaken fails on the BEHAVIOUR, not on the bookkeeping.
+        mc.sh = listing_fails(-15, "fabricated_name: test\n")
+        outcome, ev = mc.run_suite()
+        check("enumeration: a PARTIAL listing from a dying enumeration refuses attribution",
+              outcome == "UNATTRIBUTED FAILURE",
+              f"{outcome} — the name is present, so only the exit status can refuse")
+
+        mc.sh = listing_fails(-15, "")
+        outcome, ev = mc.run_suite()
+        check("enumeration: a DEAD enumeration refuses attribution, never CAUGHT",
+              outcome == "UNATTRIBUTED FAILURE", outcome)
+        check("enumeration: ...and its exit status is retained as the reason",
+              ev.get("enumeration_failed", {}).get("exit") == -15,
+              f"{ev.get('enumeration_failed')}")
+
+        mc.sh = listing_fails(0, "")
+        outcome, ev = mc.run_suite()
+        check("enumeration: a SUCCESSFUL enumeration naming no tests also refuses",
+              outcome == "UNATTRIBUTED FAILURE" and ev.get("enumeration_empty") is True,
+              f"{outcome} {ev.get('enumeration_empty')}")
     finally:
         mc.sh = real_sh
 

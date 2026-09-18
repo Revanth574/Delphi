@@ -454,6 +454,74 @@ def file_matches_commit(sha: str, rel: str) -> bool:
               ).returncode == 0
 
 
+SUMMARY_RE = re.compile(r"^test result: (\w+)\.(.*)$", re.M)
+FAILED_RE = re.compile(r"(\d+) failed")
+
+
+def _segments(stdout: str) -> list[tuple[list[str], int | None]]:
+    """One (named failures, failed count) per test BINARY, in order.
+
+    Cargo concatenates each libtest binary's output, and each ends in its own `test result:`
+    line — so the text between two summaries belongs to exactly one binary. Attributing a name
+    from one binary to another binary's count is D0A-R38-04.
+    """
+    out, pos = [], 0
+    for m in SUMMARY_RE.finditer(stdout):
+        body = stdout[pos:m.start()]
+        # The LAST `failures:` in a body is the name list; the first heads the captured-output
+        # section, whose text the subject controls and which can itself contain `failures:`.
+        names = sorted(set(re.findall(r"^\s{4}(\S+)$", body[body.rfind("failures:"):], re.M))) \
+            if "failures:" in body else []
+        count = FAILED_RE.search(m.group(2))
+        # An unparseable summary is recorded as None, not skipped: skipping would merge this
+        # binary's body into the next one's count, which is the very confusion R38-04 names.
+        out.append((names, int(count.group(1)) if count else None))
+        pos = m.end()
+    return out
+
+
+def _check_attribution(p, ev: dict, cwd: pathlib.Path | None, env: dict) -> str | None:
+    """Return an outcome to REFUSE with, or None if the named failures stand as attribution.
+
+    D0A-R37-03 closed the marker channel but left failure NAMES coming from subject stdout. The
+    binary is asked which tests it has, in its own invocation, and every named failure must be
+    one of them with the arithmetic matching. A test can still print a name that exists, so this
+    NARROWS rather than closes.
+    """
+    if not ev["failing_tests"]:
+        # Nothing is being attributed, so nothing here applies. The caller's no-names branch
+        # owns this outcome — including the disk-exhaustion measurement, which this check
+        # preempted when it ran first.
+        return None
+    for i, seg in enumerate(ev["segments"]):
+        # A crashed or incomplete producer cannot support attribution even when ANOTHER binary
+        # in the same run named a real failure.
+        if seg["failed"] is None or len(seg["names"]) != seg["failed"]:
+            ev["failure_count_mismatch"] = {
+                "binary_index": i, "summary_says": seg["failed"],
+                "names_found": len(seg["names"])}
+            return "UNATTRIBUTED FAILURE"
+    listing = sh(suite_cmd(no_run=False) + ["--", "--list"], cwd=cwd, env=env)
+    # D0A-R38-05: THE ENUMERATION'S OWN STATUS. It was ignored, and an enumeration that died
+    # left `known` empty — which a bare `if known:` treated as "skip the membership check",
+    # fail-open on the single check that stops a fabricated name.
+    if listing.returncode != 0:
+        ev["enumeration_failed"] = {"exit": listing.returncode, "stderr": listing.stderr[-400:]}
+        return "UNATTRIBUTED FAILURE"
+    # `l.split(":")[0]` truncates at the FIRST colon and libtest names contain `::`, so
+    # `genuine::test: test` became `genuine` and every real failure looked fabricated.
+    known = {l[: -len(": test")] for l in listing.stdout.splitlines() if l.endswith(": test")}
+    ev["known_tests"] = len(known)
+    if not known:
+        ev["enumeration_empty"] = True
+        return "UNATTRIBUTED FAILURE"
+    unknown = sorted(set(ev["failing_tests"]) - known)
+    if unknown:
+        ev["unknown_failure_names"] = unknown
+        return "UNATTRIBUTED FAILURE"
+    return None
+
+
 def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
     """Run the suite and CLASSIFY the outcome (D0A-R29-02).
 
@@ -481,11 +549,12 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
         "stdout": p.stdout,           # RETAINED WHOLE — the previous version kept a filtered
         "stderr": p.stderr,           # excerpt and experiment 9's came out empty.
     }
-    result_lines = re.findall(r"^test result: (\w+)\.", p.stdout, re.M)
-    ev["result_lines"] = len(result_lines)
-    ev["failing_tests"] = sorted(set(
-        re.findall(r"^\s{4}(\S+)$", p.stdout[p.stdout.find("failures:"):], re.M)
-    )) if "failures:" in p.stdout else []
+    # D0A-R38-04: SEGMENT PER TEST BINARY. Cargo concatenates every libtest binary's output,
+    # so a single `re.search` for the summary found the FIRST one — the lib's `0 failed` — and
+    # compared it against names a LATER binary reported.
+    ev["segments"] = [{"names": n, "failed": f} for n, f in _segments(p.stdout)]
+    ev["result_lines"] = len(ev["segments"])
+    ev["failing_tests"] = sorted({n for s in ev["segments"] for n in s["names"]})
 
     # D0A-R36-06: THE TEXT CHANNEL IS CLOSED, NOT NARROWED AGAIN.
     #
@@ -523,33 +592,11 @@ def run_suite(cwd: pathlib.Path | None = None) -> tuple[str, dict]:
         return "INFRASTRUCTURE", ev
     if p.returncode == 0:
         return "NOT CAUGHT", ev
-    # D0A-R37-03: FAILURE-NAME PARSING STILL CONTROLLED ATTRIBUTION. A real aborting cargo test
-    # moved from UNATTRIBUTED FAILURE to CAUGHT by PRINTING a `failures:` block naming a test
-    # that does not exist. The names come from stdout, which the subject writes — the same
-    # channel closed for markers, still open for attribution.
-    #
-    # The campaign asks the binary ITSELF which tests exist, in its own invocation, and requires
-    # every named failure to be one of them AND the count to match libtest's own summary. A test
-    # can still print a name that happens to exist, so this NARROWS rather than closes: a
-    # fabricated failure must now impersonate a real test and get the arithmetic right.
-    if ev["failing_tests"]:
-        listing = sh(suite_cmd(no_run=False) + ["--", "--list"], cwd=cwd, env=env)
-        # `l.split(":")[0]` truncates at the FIRST colon, and libtest names contain `::` —
-        # so `genuine::test: test` became `genuine` and every real failure looked fabricated.
-        # Caught by the guard asserting a REAL failure stays CAUGHT, which is why that guard
-        # exists: a narrowing that deletes detection fails in the direction nobody looks.
-        known = {l[: -len(": test")] for l in listing.stdout.splitlines()
-                 if l.endswith(": test")}
-        if known:
-            unknown = sorted(set(ev["failing_tests"]) - known)
-            if unknown:
-                ev["unknown_failure_names"] = unknown
-                return "UNATTRIBUTED FAILURE", ev
-        m = re.search(r"^test result: \w+\. \d+ passed; (\d+) failed", p.stdout, re.M)
-        if m and int(m.group(1)) != len(ev["failing_tests"]):
-            ev["failure_count_mismatch"] = {
-                "summary_says": int(m.group(1)), "names_found": len(ev["failing_tests"])}
-            return "UNATTRIBUTED FAILURE", ev
+    # Attribution is bound to the binary that reported it (D0A-R38-04) and to a SUCCESSFUL
+    # enumeration (D0A-R38-05). Both live in `_check_attribution`.
+    refusal = _check_attribution(p, ev, cwd, env)
+    if refusal:
+        return refusal, ev
 
     if not ev["failing_tests"]:
         # (4) THE CAMPAIGN'S OWN OBSERVATION, replacing the "No space left on device" marker,

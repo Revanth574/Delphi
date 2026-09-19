@@ -188,32 +188,79 @@ def _open_backup(target: pathlib.Path, original: bytes) -> pathlib.Path:
     return backup
 
 
-def _validation_cmd(target: pathlib.Path) -> list[str] | None:
-    """How to establish that the target can actually LOAD, not merely parse.
+_MISMATCH_SENTINEL = "DELPHI-VALIDATION-DIGEST-MISMATCH"
+_MISMATCH_EXIT = 97
 
-    D0A-R38-03: `compile()` proves syntax and nothing else. `FLAG = MISSING_NAME` compiles,
-    raises `NameError` at import, and a suite whose guard checks command success then reported
-    that guard — so an INVALID experiment was credited as RED_PROVEN, which is precisely the
-    R36-06 misreading this driver exists to foreclose.
+# Validity is bound to the BYTES ON DISK. Nothing here imports, so `__pycache__` is never
+# consulted — see `_validation_cmd`.
+_VALIDATE_SRC = """\
+import hashlib, pathlib, sys
+path, want = sys.argv[1], sys.argv[2]
+raw = pathlib.Path(path).read_bytes()
+got = hashlib.sha256(raw).hexdigest()
+if got != want:
+    sys.stderr.write("%s: validated %s, measured %s\\n" % (sys.argv[3], got, want))
+    raise SystemExit(__MISMATCH_EXIT__)
+sys.path.insert(0, str(pathlib.Path(path).parent))
+exec(compile(raw, path, "exec"), {"__name__": "__delphi_validation__", "__file__": path})
+""".replace("__MISMATCH_EXIT__", str(_MISMATCH_EXIT))
+
+LOADED, LOAD_FAILED, DIGEST_MISMATCH = "loaded", "load-failed", "digest-mismatch"
+
+
+def _validation_cmd(target: pathlib.Path, digest: str) -> list[str] | None:
+    """How to establish that the target's CURRENT BYTES can run.
+
+    D0A-R38-03: `compile()` proves syntax and nothing else, so a `NameError` at import read as
+    a detection. D0A-R39-01: the import that replaced it consults `__pycache__`, whose header
+    records source mtime truncated to SECONDS plus size — a same-size edit inside one second
+    leaves the cache valid, so validation executed the ORIGINAL's bytecode and certified an
+    invalid mutant. Reproduced as RED_PROVEN from a target raising `NameError`.
+
+    Three rounds, three proxies for "the mutant is valid": text, then compilation, now an
+    import that can resolve elsewhere. This one reads the bytes, checks their digest against
+    what the driver measured, and `exec`s them. There is no cache in that path to be stale.
     """
     if target.suffix != ".py":
         return None
-    return [sys.executable, "-c",
-            "import importlib.util,sys\n"
-            "spec = importlib.util.spec_from_file_location('_subject', sys.argv[1])\n"
-            "m = importlib.util.module_from_spec(spec)\n"
-            "spec.loader.exec_module(m)\n", str(target)]
+    return [sys.executable, "-B", "-c", _VALIDATE_SRC, str(target), digest, _MISMATCH_SENTINEL]
 
 
-def _loads(cmd: list[str] | None, timeout: int) -> tuple[bool, str]:
-    """Run a validation command. Returns (loaded, detail)."""
+def _validate_for(target: pathlib.Path, digest: str,
+                  custom: list[str] | None) -> list[str] | None:
+    """A caller-supplied command cannot be digest-bound; the default one always is."""
+    return custom if custom is not None else _validation_cmd(target, digest)
+
+
+def _loads(cmd: list[str] | None, timeout: int) -> tuple[str, str]:
+    """Run a validation command. Returns (status, detail)."""
     if cmd is None:
-        return True, "no validation command for this target type"
+        return LOADED, "no validation command for this target type"
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
-        return False, f"validation could not be run: {e}"
-    return p.returncode == 0, (p.stderr or p.stdout).strip()[-400:]
+        return LOAD_FAILED, f"validation could not be run: {e}"
+    detail = (p.stderr or p.stdout).strip()[-400:]
+    # Both halves required: a target is free to exit 97 on its own.
+    if p.returncode == _MISMATCH_EXIT and _MISMATCH_SENTINEL in (p.stderr or ""):
+        return DIGEST_MISMATCH, detail
+    return (LOADED if p.returncode == 0 else LOAD_FAILED), detail
+
+
+def _purge_bytecode(target: pathlib.Path) -> None:
+    """Drop compiled forms of the target after every write.
+
+    The driver's own validation no longer imports, but the SUITE may — and a suite that
+    imported a stale cache would judge the ORIGINAL while the mutant sat on disk, reporting
+    NOT_CAUGHT for a weaken that would have bitten.
+    """
+    if target.suffix != ".py":
+        return
+    cache = target.parent / "__pycache__"
+    if cache.is_dir():
+        for stale in cache.glob(f"{target.stem}.*.pyc"):
+            stale.unlink(missing_ok=True)
+    (target.parent / f"{target.stem}.pyc").unlink(missing_ok=True)
 
 
 def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, anchor: bytes,
@@ -229,6 +276,7 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
         ev["not_applied_because"] = "anchor-absent"
         return MUTATION_NOT_APPLIED
     target.write_bytes(original.replace(anchor, replacement, 1))
+    _purge_bytecode(target)
     if _digest(target) == before:
         ev["reason"] = "the file is byte-identical after the replacement"
         ev["not_applied_because"] = "bytes-unchanged"
@@ -239,9 +287,15 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
     # that loaded the ORIGINAL, so a target that never loads is the experiment's fault and not
     # the mutation's (that control runs in `drive`, before anything is written).
     ev["phase"] = "validate"
-    loaded, detail = _loads(validate, timeout)
-    ev["mutant_loads"] = loaded
-    if not loaded:
+    status, detail = _loads(_validate_for(target, ev["digest_weakened"], validate), timeout)
+    ev["mutant_validation"] = status
+    ev["mutant_loads"] = status == LOADED
+    if status == DIGEST_MISMATCH:
+        # Something else wrote the target. That is a broken experiment, not a verdict about
+        # the mutation, and it must never read as either INVALID or CAUGHT.
+        ev["reason"] = f"the bytes validated are not the bytes measured: {detail}"
+        return UNVERIFIABLE
+    if status != LOADED:
         ev["reason"] = f"the weakened target does not load: {detail}"
         return MUTATION_INVALID
 
@@ -296,14 +350,16 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     # success without landing, which is the condition the digest check exists for.
     restore = _restore if _restore is not None else target.write_bytes
     report_dir = pathlib.Path(tempfile.mkdtemp(prefix="weaken-report-"))
-    if validate is None:
-        validate = _validation_cmd(target)
 
     # 1. BASELINE, both halves: the target must LOAD and the suite must be green. Nothing has
     # been written yet, so every exit here owes no restoration.
-    loaded, detail = _loads(validate, timeout)
-    ev["original_loads"] = loaded
-    if not loaded:
+    status, detail = _loads(_validate_for(target, before, validate), timeout)
+    ev["original_validation"] = status
+    ev["original_loads"] = status == LOADED
+    if status == DIGEST_MISMATCH:
+        ev["reason"] = f"the bytes validated are not the bytes measured: {detail}"
+        return UNVERIFIABLE, ev
+    if status != LOADED:
         ev["reason"] = f"the UNMUTATED target does not load: {detail}"
         return BASELINE_NOT_GREEN, ev
     base = _run(suite, report_dir, "baseline", timeout)
@@ -335,6 +391,7 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
         # RESTORE, and VERIFY the restore — against the digest, not the write's return.
         ev["phase"] = "restore"
         restore(original)
+        _purge_bytecode(target)
         ev["digest_restored"] = _digest(target)
         for sig, handler in previous.items():
             signal.signal(sig, handler)

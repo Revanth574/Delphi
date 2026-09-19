@@ -502,6 +502,104 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # ── D0A-R39-01 ──────────────────────────────────────────────────────────────────────
+    # THREE ROUNDS, THREE PROXIES FOR "the mutant is valid": text (R36-06), compilation
+    # (R38-03), an import that can resolve elsewhere (R39-01). Validity is now bound to the
+    # bytes on disk, and these guards construct the cache deterministically with `os.utime`
+    # rather than racing a timestamp second.
+    d = pathlib.Path(tempfile.mkdtemp(prefix="weaken-driver-cache-"))
+    try:
+        tgt = d / "subject.py"
+        VALID, INVALID = b"FLAG = 1\n", b"FLAG = (\n"      # same size, second is a SyntaxError
+        check("the cache fixture's two bodies are the same size", len(VALID) == len(INVALID))
+        tgt.write_bytes(VALID)
+        # Create a real bytecode cache for the VALID bytes...
+        subprocess.run([sys.executable, "-c",
+                        "import importlib.util,sys\n"
+                        "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+                        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n",
+                        str(tgt)], capture_output=True)
+        pycs = list((d / "__pycache__").glob("subject.*.pyc")) if (d / "__pycache__").is_dir() else []
+        check("the cache fixture actually produced a .pyc", len(pycs) == 1, str(pycs))
+        mtime = tgt.stat().st_mtime
+        # ...then swap in the INVALID bytes and restore the mtime. The pyc header records the
+        # source mtime truncated to SECONDS and its size, so the cache is now live for bytes
+        # that do not compile.
+        tgt.write_bytes(INVALID)
+        os.utime(tgt, (mtime, mtime))
+        probe = subprocess.run([sys.executable, "-c",
+                                "import importlib.util,sys\n"
+                                "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+                                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n",
+                                str(tgt)], capture_output=True)
+        check("CONTROL: an IMPORT of the invalid bytes succeeds from the stale cache",
+              probe.returncode == 0,
+              "the cache was not live, so the guard below would prove nothing")
+        digest = wd._digest(tgt)
+        status, detail = wd._loads(wd._validation_cmd(tgt, digest), 60)
+        check("validation reads the BYTES, so the invalid mutant does not load",
+              status == wd.LOAD_FAILED, f"{status}: {detail}")
+
+        # ...and the digest binds validation to what the driver measured.
+        status, _ = wd._loads(wd._validation_cmd(tgt, "0" * 64), 60)
+        check("a target whose bytes are not the measured bytes is DIGEST_MISMATCH",
+              status == wd.DIGEST_MISMATCH, status)
+        tgt.write_bytes(VALID)
+        status, detail = wd._loads(wd._validation_cmd(tgt, wd._digest(tgt)), 60)
+        check("...and valid bytes with their own digest still load", status == wd.LOADED,
+              f"{status}: {detail}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # The SUITE may import the target even though validation does not, so a stale cache would
+    # let it judge the ORIGINAL while the mutant sat on disk — NOT_CAUGHT for a weaken that
+    # would have bitten. The mutant's compiled form must not outlive the write.
+    d = pathlib.Path(tempfile.mkdtemp(prefix="weaken-driver-purge-"))
+    try:
+        tgt = d / "subject.py"
+        tgt.write_bytes(b"FLAG = 1\n")
+        cache = d / "__pycache__"
+        cache.mkdir()
+        stale = cache / "subject.cpython-999.pyc"
+        stale.write_bytes(b"stale")
+        wd._purge_bytecode(tgt)
+        check("a stale compiled form of the target is purged", not stale.exists())
+        check("...and the cache directory itself is left alone", cache.is_dir())
+        suite_py = d / "suite.py"
+        suite_py.write_text(
+            "import importlib.util,os,sys\n"
+            "def check(label, cond):\n"
+            "    if not cond:\n"
+            "        r = os.environ.get('DELPHI_GUARD_FAILURE_REPORT')\n"
+            "        if r: open(r,'a').write(label + chr(10))\n"
+            "        sys.exit(1)\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "check('flag-is-one', m.FLAG == 1)\n")
+        v, ev = wd.drive(tgt, "1", "2", [sys.executable, str(suite_py), str(tgt)],
+                         "flag-is-one", timeout=60)
+        # REGRESSION GUARD, NOT THE DISCRIMINATING CASE, and said so because the difference
+        # matters. With the purge in place this is stable (5/5 RED_PROVEN); with the purge
+        # REMOVED it is intermittent (measured 4 NOT_CAUGHT / 1 RED_PROVEN in 5), because
+        # whether the stale cache stays valid depends on the run crossing a timestamp second.
+        # An intermittent discriminator is Iron Law 15 clause 2's third worthless case, so the
+        # purge is proven by the deterministic unit guard above, not by this one.
+        check("a same-size weaken is still CAUGHT by a suite that IMPORTS the target",
+              v == wd.RED_PROVEN, f"{v}: {ev.get('reason')}")
+        # A .pyc for the RESTORED bytes is expected — the post-restore green run imports the
+        # target again. What must not survive is a compiled form of the MUTANT, so the
+        # property is what a fresh import now observes.
+        after = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util,sys\n"
+             "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+             "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+             "print(m.FLAG)\n", str(tgt)], capture_output=True, text=True)
+        check("...and a fresh import afterwards observes the RESTORED value, not the mutant",
+              after.stdout.strip() == "1", f"{after.stdout.strip()!r} {after.stderr[-200:]}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     print(f"\n{PASSED} guards held")
     return 0
 

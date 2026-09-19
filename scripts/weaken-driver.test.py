@@ -705,6 +705,24 @@ def main() -> int:
               body["limits"] == wd.RECORD_LIMITS and len(body["limits"]) >= 5)
         check("the suite argv and cwd are recorded, so the run is reconstructable",
               body["suite"]["argv"] == suite and body["suite"]["cwd"])
+        # The comment above this field once read "retained whole" over a field that retained
+        # nothing. The streams are where a reader spots "it never reached the gate".
+        ran = [p for p in body["phases"] if "streams" in p]
+        check("the subject's own output is RETAINED on the phases that produced it",
+              len(ran) == 3, str([p["name"] for p in body["phases"]]))
+        check("...and it is the real output, not a placeholder",
+              any("guards held" in p["streams"]["stdout"] or p["streams"]["stdout"].strip()
+                  for p in ran), str(ran[0]["streams"])[:120])
+        big = wd._streams(wd.Invocation(wd.EXITED, stdout="x" * (wd.STREAM_CAP + 10)))
+        # `.get`, not `[...]`: indexing evaluates BEFORE `check` is called, so under a weaken
+        # that removes the key the guard raises KeyError and reports NOTHING — the driver
+        # returned UNVERIFIABLE for exactly that, which is the honest verdict for an assertion
+        # that cannot reach its own side channel.
+        check("a capped stream SAYS it was capped",
+              big.get("stdout_truncated_from") == wd.STREAM_CAP + 10
+              and len(big.get("stdout", "")) == wd.STREAM_CAP, str(list(big)))
+        check("...and an uncapped one carries no truncation marker",
+              "stdout_truncated_from" not in wd._streams(wd.Invocation(wd.EXITED, stdout="ok")))
     finally:
         shutil.rmtree(d, ignore_errors=True)
         shutil.rmtree(rec_dir, ignore_errors=True)

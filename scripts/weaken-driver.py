@@ -96,6 +96,8 @@ class Invocation(typing.NamedTuple):
     signal: int | None = None      # set when SIGNALLED — never folded into `code`
     labels: list[str] = []
     report: str = ""
+    stdout: str = ""
+    stderr: str = ""
     survivors: bool = False        # anything still alive in the group when the stage ended
 
     @property
@@ -127,7 +129,7 @@ class Invocation(typing.NamedTuple):
 # WHY EVERY RECORD CARRIES ITS OWN LIMITS. A claim that travels without them is what "unwired"
 # concealed: the register held the limits and the citation did not. Attached to the artifact,
 # they travel with every citation by construction.
-SCHEMA = "delphi.weaken-record/1"
+SCHEMA = "delphi.weaken-record/2"
 
 RECORD_LIMITS = [
     "does not establish that the weakened guard is well-chosen",
@@ -153,6 +155,28 @@ def canonical_body(body: dict) -> bytes:
 
 def record_id(body: dict) -> str:
     return hashlib.sha256(canonical_body(body)).hexdigest()[:16]
+
+
+STREAM_CAP = 64 * 1024
+
+
+def _streams(inv: Invocation) -> dict:
+    """The subject's own output, RETAINED — and a truncation that says it truncated.
+
+    D0A-R39: the first version of this record carried a comment reading "retained whole and
+    deciding nothing" above a field that retained NOTHING. The comment was a claim about the
+    code that the code did not honour, which is the R38-06 shape one level up. Streams are the
+    channel a human reads to spot "it never reached the gate", so the design test wants them
+    present; a SILENT cap would be the same defect again, so the cap announces itself.
+    """
+    out = {}
+    for name, text in (("stdout", inv.stdout), ("stderr", inv.stderr)):
+        if len(text) > STREAM_CAP:
+            out[name] = text[:STREAM_CAP]
+            out[f"{name}_truncated_from"] = len(text)
+        else:
+            out[name] = text
+    return out
 
 
 class _Phase:
@@ -288,9 +312,10 @@ def _run(cmd: list[str], report_dir: pathlib.Path, tag: str, timeout: int) -> In
     # is its own observation and is never an exit code.
     if done.returncode < 0:
         return Invocation(SIGNALLED, signal=-done.returncode, labels=labels,
-                          report=str(report), survivors=done.survivors)
+                          report=str(report), stdout=done.stdout, stderr=done.stderr,
+                          survivors=done.survivors)
     return Invocation(EXITED, code=done.returncode, labels=labels, report=str(report),
-                      survivors=done.survivors)
+                      stdout=done.stdout, stderr=done.stderr, survivors=done.survivors)
 
 
 _MISMATCH_SENTINEL = "DELPHI-VALIDATION-DIGEST-MISMATCH"
@@ -415,6 +440,7 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
     with _Phase(ev, "observe") as ph:
         run = _run(suite, report_dir, "weakened", timeout)
     ph["outcome"], ph["report"] = run.outcome, run.report
+    ph["streams"] = _streams(run)
     ev["weakened"] = run._asdict()
     ev["weakened_exit"] = run.code
     ev["failing_guards"] = run.labels
@@ -483,6 +509,7 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     with _Phase(ev, "baseline") as ph:
         base = _run(suite, report_dir, "baseline", timeout)
     ph["outcome"], ph["report"] = base.outcome, base.report
+    ph["streams"] = _streams(base)
     ev["baseline"] = base._asdict()
     ev["baseline_exit"] = base.code
     if base.outcome == TIMED_OUT:
@@ -542,6 +569,7 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     with _Phase(ev, "restored") as ph:
         back = _run(suite, report_dir, "restored", timeout)
     ph["outcome"], ph["report"] = back.outcome, back.report
+    ph["streams"] = _streams(back)
     ev["restored"] = back._asdict()
     ev["restored_exit"] = back.code
     if not back.green:
@@ -576,8 +604,11 @@ def build_record(target: pathlib.Path, anchor: str, replacement: str, suite: lis
             "failing_guards", "baseline_failing_guards", "not_applied_because",
             "groups_collected_at_restore", "verdict_before_restore_check", "reason")
             if k in ev},
-        # Retained whole and deciding nothing — the R36-06 disposition, one level up.
-        "diagnostics": {"note": "data for a human reader; no verdict is derived from it"},
+        # The R36-06 disposition one level up: retained, and deciding nothing. The streams
+        # live on their phases, where a reader meets them next to the outcome they explain.
+        "diagnostics": {"note": "the subject's own output, retained on each phase; data for a "
+                                "human reader, and no verdict is derived from it",
+                        "stream_cap_bytes": STREAM_CAP},
         "limits": RECORD_LIMITS,
     }
     return {"id": record_id(body), **body}

@@ -1445,6 +1445,34 @@ message, not the exit code. Shared process state — statics, `OnceLock`, env, t
 the usual reason the two diverge, and a weaken that introduces shared state is exactly the kind
 most likely to be read wrong.
 
+
+### THE LONGEST-RUNNING INSTANCE: validity by proxy, three rounds running *(D0A-R36-06 / R38-03 / R39-01)*
+
+The same question — **is this mutant a valid experiment?** — was answered by a PROXY three
+times, and each fix moved the hole instead of closing it:
+
+| round | how validity was established | how it failed |
+|---|---|---|
+| R36-06 | by TEXT — read the suite's output | a `NameError` in the weaken read as "no bite"; the experiment never ran |
+| R38-03 | by COMPILATION — `compile()` on the mutant | `FLAG = MISSING_NAME` compiles and dies at import; `RED_PROVEN` from an invalid mutant |
+| R39-01 | by IMPORT — `spec.loader.exec_module` | the import consults `__pycache__`, whose header records source mtime truncated to SECONDS plus size, so a same-size edit inside one second executes the ORIGINAL's bytecode; `RED_PROVEN` again, from a target raising `NameError` |
+
+**What the three share is not the mechanism; it is the SHAPE.** Each answer was about
+something *adjacent to* the bytes under test — output text, a compiler's opinion, a loader's
+resolution — and each adjacent thing could refer to something other than the mutant. A proxy
+is exactly an object that can disagree with the thing it stands for.
+
+**The rule that follows: bind the property to the BYTES, and check the binding.** The current
+validator reads the target's bytes, compares their digest against what the driver measured,
+and `exec`s `compile(raw)` in a fresh namespace — no import, so there is no cache in the path
+to be stale, and a mismatch between the bytes validated and the bytes measured is its own
+refusal rather than a verdict about the mutation.
+
+**And note the second-order instance:** the fix for a class-22 instance was itself class 22,
+twice in a row. That is what this class predicts, which is why the discipline is to re-apply
+the finding's own question to the remedy *before* declaring it closed — "what could this new
+check be reading instead of the mutant?" would have found R39-01 at design time.
+
 ## 23. Forecasting your own code instead of interrogating it  *(new — B2a composition)*
 
 **Description.** Asked where a defect is likely to be, an author predicts — and the

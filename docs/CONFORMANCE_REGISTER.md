@@ -91,6 +91,50 @@ finding's fix gets — name the exact predicate, run the weaken against *that* p
 the assertion it fails on. "I checked and it is two, not three" is a claim, and this project's
 standing rule is that a claim without its measurement attached is decoration.
 
+### AUTHORITATIVE PROOF CREDIT IS SUSPENDED — D0A-R39, effective now
+
+**What "unwired" was hiding.** Round 38's prompt described `scripts/weaken-driver.py` as
+deliberately not wired into anything and asked where the requirement should live. That
+conflated two separable authorities:
+
+| authority | status |
+|---|---|
+| **gating acceptance** — nothing refuses on its verdict | genuinely deferred, still is |
+| **deciding what counts as RED-proven** — every weaken claim since it was written is its output | **never deferred. Exercised informally from day one** |
+
+Only the first was ever deferred. The driver was the weaken mechanism for every fix in round
+38 — the round whose subject was its own five P1s — and for every fix in round 39.
+
+**The reviewer's ruling, adopted:** proof publication ALREADY HAS A CONSUMER — reviewers and
+commit readers granting credit to the phrase "RED-proven" — so the record is needed now,
+independently of any future lane-acceptance integration. Until a record exists that can be
+reopened:
+
+- **The tool may be used for exploration on disposable copies.** That is what it is for.
+- **The phrase "RED-proven" in a commit message carries no authority.** It cites nothing a
+  reader can re-open: the driver prints to stdout and exits, nothing is persisted, nothing has
+  an ID.
+- **Rounds 38 and 39's proof claims are explicitly UNVERIFIED** — not demonstrated false. The
+  instrument that produced them carried the defects those rounds were fixing: D0A-R39-01 could
+  certify an invalid mutant as loading, and D0A-R39-02/03 could let a process damage the target
+  after the driver's last observation. Neither is retroactive evidence that any particular claim
+  was wrong; both mean no particular claim can now be checked. **Quiet carry-forward is what is
+  refused here, not the claims themselves.**
+
+**What lifts the suspension:** a record produced by the driver carrying the expected guard
+(registered BEFORE execution), instrument and suite identities, target before/mutant/restored
+digests plus the patch, argv and cwd, phase outcomes, reports, full streams, restoration
+evidence, and a stable ID — plus the consumer that credits claims only through such records.
+Producer and consumer land together. That does not require waiting for lane integration.
+
+**And a correction to the claim that motivated the tool.** Round 39's prompt asserted that *no
+reading rule catches a weaken that invalidates its own experiment*. That is too strong: a
+disciplined human who preregisters the expected guard name and compares it against the observed
+one catches all three of this session's refused weakens. The sharper point is the reviewer's:
+**`--expect` is an ATTRIBUTION contract, not a VALIDITY contract** — D0A-R39-01 produced the
+exact expected label from an invalid mutant. Those are different properties, and calling the
+verdict structure "the design" conflated them.
+
 ### BOTH WRITTEN EXEMPTIONS FROM WEAKEN-PROOF WERE FALSE — D0A-R38-06
 
 The sibling of the section above, and the reason it is here: the previous entry is about a

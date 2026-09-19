@@ -551,16 +551,16 @@ def main() -> int:
               probe.returncode == 0,
               "the cache was not live, so the guard below would prove nothing")
         digest = wd._digest(tgt)
-        status, detail = wd._loads(wd._validation_cmd(tgt, digest), 60)
+        status, detail, _obs = wd._loads(wd._validation_cmd(tgt, digest), 60)
         check("validation reads the BYTES, so the invalid mutant does not load",
               status == wd.LOAD_FAILED, f"{status}: {detail}")
 
         # ...and the digest binds validation to what the driver measured.
-        status, _ = wd._loads(wd._validation_cmd(tgt, "0" * 64), 60)
+        status, _, _obs = wd._loads(wd._validation_cmd(tgt, "0" * 64), 60)
         check("a target whose bytes are not the measured bytes is DIGEST_MISMATCH",
               status == wd.DIGEST_MISMATCH, status)
         tgt.write_bytes(VALID)
-        status, detail = wd._loads(wd._validation_cmd(tgt, wd._digest(tgt)), 60)
+        status, detail, _obs = wd._loads(wd._validation_cmd(tgt, wd._digest(tgt)), 60)
         check("...and valid bytes with their own digest still load", status == wd.LOADED,
               f"{status}: {detail}")
     finally:
@@ -723,6 +723,55 @@ def main() -> int:
               and len(big.get("stdout", "")) == wd.STREAM_CAP, str(list(big)))
         check("...and an uncapped one carries no truncation marker",
               "stdout_truncated_from" not in wd._streams(wd.Invocation(wd.EXITED, stdout="ok")))
+
+        # ── D0A-R40-02 ──────────────────────────────────────────────────────────────────
+        # a7c6e196 and 7dc26d27 are identical in instrument, subject, suite and expectation
+        # and carry different verdicts, because the SUITE FILE's bytes decided and nothing
+        # recorded them. Binding argv binds nothing.
+        refs = {r["path"]: r for r in body["suite"]["sources"]}
+        suite_files = [a for a in suite if pathlib.Path(a).is_file()]
+        check("every suite argv element that is a file is bound by content",
+              set(refs) == set(suite_files), f"{sorted(refs)} vs {sorted(suite_files)}")
+        check("...by sha256, and by a git blob or the bytes themselves",
+              all(r.get("sha256") and (r.get("git_blob") or r.get("content") is not None)
+                  for r in refs.values()), str(list(refs.values()))[:200])
+        check("the subject's ORIGINAL bytes travel with the record",
+              body["inputs"]["subject_original"]["sha256"] == body["subject"]["digest_before"]
+              and body["inputs"]["subject_original"]["content"],
+              str(body["inputs"]["subject_original"])[:160])
+        check("the driver's working state stays out of the printed evidence",
+              all(not k.startswith("_") for k in body.get("observations", {})),
+              str([k for k in body.get("observations", {}) if k.startswith("_")]))
+        check("the execution settings that shaped the run are recorded",
+              body["execution"]["timeout_s"] and body["execution"]["interpreter"]
+              and body["execution"]["python"], str(body["execution"]))
+
+        # ── D0A-R40-03 ──────────────────────────────────────────────────────────────────
+        val = [p for p in body["phases"] if p["name"].startswith("validate-")]
+        check("validation phases carry a process observation, not only timing",
+              len(val) == 2 and all("validation" in p for p in val),
+              str([sorted(p) for p in val]))
+        check("...including exit, streams and the argv that produced them",
+              all(p["validation"].get("ran") and "streams" in p["validation"]
+                  and p["validation"].get("exit") == 0 and p["validation"].get("argv")
+                  for p in val), str(val[0]["validation"])[:200])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(rec_dir, ignore_errors=True)
+
+    # A TIMED-OUT invocation must not drop what `_managed_run` already collected.
+    d, subject, suite = fixture()
+    try:
+        (d / "suite.py").write_text(
+            "import sys,time\nprint('BEFORE THE HANG', flush=True)\n"
+            "sys.stderr.write('ON STDERR\\n'); sys.stderr.flush()\ntime.sleep(30)\n")
+        v, ev = wd.drive(subject, '    if n != 1:', '    if False:',
+                         [sys.executable, str(d / "suite.py")], "x", timeout=2)
+        check("a TIMEOUT is still a TIMEOUT", v == wd.TIMEOUT, v)
+        base = ev["baseline"]
+        check("...and it retains the streams the subject produced before hanging",
+              "BEFORE THE HANG" in base["stdout"] and "ON STDERR" in base["stderr"],
+              f"{base['stdout']!r} {base['stderr']!r}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
         shutil.rmtree(rec_dir, ignore_errors=True)

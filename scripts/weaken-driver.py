@@ -129,7 +129,7 @@ class Invocation(typing.NamedTuple):
 # WHY EVERY RECORD CARRIES ITS OWN LIMITS. A claim that travels without them is what "unwired"
 # concealed: the register held the limits and the citation did not. Attached to the artifact,
 # they travel with every citation by construction.
-SCHEMA = "delphi.weaken-record/2"
+SCHEMA = "delphi.weaken-record/3"
 
 RECORD_LIMITS = [
     "does not establish that the weakened guard is well-chosen",
@@ -160,7 +160,7 @@ def record_id(body: dict) -> str:
 STREAM_CAP = 64 * 1024
 
 
-def _streams(inv: Invocation) -> dict:
+def _streams(inv) -> dict:
     """The subject's own output, RETAINED — and a truncation that says it truncated.
 
     D0A-R39: the first version of this record carried a comment reading "retained whole and
@@ -170,13 +170,76 @@ def _streams(inv: Invocation) -> dict:
     present; a SILENT cap would be the same defect again, so the cap announces itself.
     """
     out = {}
-    for name, text in (("stdout", inv.stdout), ("stderr", inv.stderr)):
+    for name, text in (("stdout", inv.stdout or ""), ("stderr", inv.stderr or "")):
         if len(text) > STREAM_CAP:
             out[name] = text[:STREAM_CAP]
             out[f"{name}_truncated_from"] = len(text)
         else:
             out[name] = text
     return out
+
+
+SOURCE_CAP = 256 * 1024
+
+
+def _git_has_blob(digest_path: pathlib.Path) -> str | None:
+    """The git blob id for these exact bytes, if git already stores them."""
+    # Through the primitive like everything else. These are short reads that cannot touch the
+    # target, but "there is one way to start a process" is the property, and the structural
+    # guard caught these the moment they were added — which is what it is for.
+    out = _managed_run(["git", "hash-object", "--", str(digest_path)], None, 30)
+    if out.launch_error or out.timed_out or out.returncode != 0:
+        return None
+    blob = out.stdout.strip()
+    held = _managed_run(["git", "cat-file", "-e", blob], None, 30)
+    if held.launch_error or held.timed_out or held.returncode != 0:
+        return None
+    return blob
+
+
+def _source_ref_from_bytes(path: str, raw: bytes) -> dict:
+    """The subject's ORIGINAL bytes, which no later read can recover once it is restored."""
+    if not raw:
+        return {"path": path, "unavailable": "original bytes were not captured"}
+    ref: dict = {"path": path, "sha256": _digest_bytes(raw), "bytes": len(raw)}
+    text = raw.decode("utf-8", "replace")
+    if len(text) > SOURCE_CAP:
+        ref["content"] = text[:SOURCE_CAP]
+        ref["content_truncated_from"] = len(text)
+    else:
+        ref["content"] = text
+    return ref
+
+
+def _source_ref(path: pathlib.Path) -> dict:
+    """A RESOLVABLE reference to an input file, or the bytes themselves.
+
+    D0A-R40-02: the record bound the instrument by digest and the suite by ARGV ONLY. Two
+    records already in the ledger — a7c6e196 and 7dc26d27 — are identical in instrument,
+    subject, suite and expectation and carry UNVERIFIABLE and RED_PROVEN, because the input
+    that actually differed was the SUITE FILE'S BYTES, which nothing recorded. A reader could
+    not tell them apart, which is the design test failing on its own entries.
+
+    A digest alone does not recover an untracked or dirty file, so when git does not already
+    hold these bytes the content is embedded — with an announced cap, never a silent one.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        return {"path": str(path), "unreadable": str(e)}
+    ref: dict = {"path": str(path), "sha256": _digest_bytes(raw), "bytes": len(raw)}
+    blob = _git_has_blob(path)
+    if blob:
+        ref["git_blob"] = blob
+        return ref
+    # Not in git: the bytes travel with the record, because nothing else can supply them.
+    text = raw.decode("utf-8", "replace")
+    if len(text) > SOURCE_CAP:
+        ref["content"] = text[:SOURCE_CAP]
+        ref["content_truncated_from"] = len(text)
+    else:
+        ref["content"] = text
+    return ref
 
 
 class _Phase:
@@ -300,10 +363,14 @@ def _run(cmd: list[str], report_dir: pathlib.Path, tag: str, timeout: int) -> In
     env = dict(os.environ)
     env["DELPHI_GUARD_FAILURE_REPORT"] = str(report)
     done = _managed_run(cmd, env, timeout)
+    # D0A-R40-03: these two returns used to drop the streams `_managed_run` had already
+    # collected, so a reader could not tell silence from discarded diagnostics.
     if done.launch_error:
-        return Invocation(LAUNCH_FAILED, report=str(report))
+        return Invocation(LAUNCH_FAILED, report=str(report), stdout=done.stdout,
+                          stderr=done.stderr or done.launch_error)
     if done.timed_out:
-        return Invocation(TIMED_OUT, report=str(report))
+        return Invocation(TIMED_OUT, report=str(report), stdout=done.stdout,
+                          stderr=done.stderr)
     labels = []
     if report.exists():
         labels = [l.strip() for l in report.read_text().splitlines() if l.strip()]
@@ -362,23 +429,32 @@ def _validate_for(target: pathlib.Path, digest: str,
     return custom if custom is not None else _validation_cmd(target, digest)
 
 
-def _loads(cmd: list[str] | None, timeout: int) -> tuple[str, str]:
-    """Run a validation command. Returns (status, detail)."""
+def _loads(cmd: list[str] | None, timeout: int) -> tuple[str, str, dict]:
+    """Run a validation command. Returns (status, detail, observation).
+
+    D0A-R40-03: this used to return a status and a truncated string, so the validation
+    phases carried nothing but their timing and a reader could not examine the process
+    evidence behind the word "loaded".
+    """
     if cmd is None:
-        return LOADED, "no validation command for this target type"
+        return LOADED, "no validation command for this target type", {"ran": False}
     # D0A-R39-03: through the SAME primitive as the suite. This executes target code, so it
     # can leave children running; `subprocess.run` left them outside every group the driver
     # manages, and one wrote the target after restoration had been verified.
     done = _managed_run(cmd, None, timeout)
+    obs = {"ran": True, "argv": list(cmd), "exit": done.returncode,
+           "signal": -done.returncode if (done.returncode or 0) < 0 else None,
+           "timed_out": done.timed_out, "launch_error": done.launch_error,
+           "streams": _streams(done)}
     if done.launch_error:
-        return LOAD_FAILED, f"validation could not be run: {done.launch_error}"
+        return LOAD_FAILED, f"validation could not be run: {done.launch_error}", obs
     if done.timed_out:
-        return LOAD_FAILED, "validation timed out"
+        return LOAD_FAILED, "validation timed out", obs
     detail = (done.stderr or done.stdout).strip()[-400:]
     # Both halves required: a target is free to exit 97 on its own.
     if done.returncode == _MISMATCH_EXIT and _MISMATCH_SENTINEL in done.stderr:
-        return DIGEST_MISMATCH, detail
-    return (LOADED if done.returncode == 0 else LOAD_FAILED), detail
+        return DIGEST_MISMATCH, detail, obs
+    return (LOADED if done.returncode == 0 else LOAD_FAILED), detail, obs
 
 
 def _purge_bytecode(target: pathlib.Path) -> None:
@@ -422,8 +498,10 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
     # that loaded the ORIGINAL, so a target that never loads is the experiment's fault and not
     # the mutation's (that control runs in `drive`, before anything is written).
     ev["phase"] = "validate"
-    with _Phase(ev, "validate-mutant"):
-        status, detail = _loads(_validate_for(target, ev["digest_weakened"], validate), timeout)
+    with _Phase(ev, "validate-mutant") as ph:
+        status, detail, obs = _loads(
+            _validate_for(target, ev["digest_weakened"], validate), timeout)
+    ph["validation"] = obs
     ev["mutant_validation"] = status
     ev["mutant_loads"] = status == LOADED
     if status == DIGEST_MISMATCH:
@@ -488,6 +566,8 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     original = target.read_bytes()
     before = _digest_bytes(original)
     ev["digest_before"] = before
+    ev["_original_bytes"] = original
+    ev["timeout"] = timeout
     anchor_b, repl_b = anchor.encode(), replacement.encode()
     # Test seam, keyword-only: the ONE fault this models is a restore write that reports
     # success without landing, which is the condition the digest check exists for.
@@ -496,8 +576,9 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
 
     # 1. BASELINE, both halves: the target must LOAD and the suite must be green. Nothing has
     # been written yet, so every exit here owes no restoration.
-    with _Phase(ev, "validate-original"):
-        status, detail = _loads(_validate_for(target, before, validate), timeout)
+    with _Phase(ev, "validate-original") as ph:
+        status, detail, obs = _loads(_validate_for(target, before, validate), timeout)
+    ph["validation"] = obs
     ev["original_validation"] = status
     ev["original_loads"] = status == LOADED
     if status == DIGEST_MISMATCH:
@@ -597,7 +678,18 @@ def build_record(target: pathlib.Path, anchor: str, replacement: str, suite: lis
             "anchor": anchor,
             "replacement": replacement,
         },
-        "suite": {"argv": list(suite), "cwd": os.getcwd()},
+        "suite": {"argv": list(suite), "cwd": os.getcwd(),
+                  # Every argv element that names a real file, bound by content. The suite is
+                  # the input that decides the verdict; binding only its argv binds nothing.
+                  "sources": [_source_ref(pathlib.Path(a)) for a in suite
+                              if pathlib.Path(a).is_file()]},
+        "inputs": {"subject_original": _source_ref_from_bytes(
+            str(target), ev.get("_original_bytes", b"")),
+            "instrument": _source_ref(_INSTRUMENT_PATH)},
+        "execution": {"timeout_s": ev.get("timeout"),
+                      "interpreter": sys.executable,
+                      "python": sys.version.split()[0],
+                      "platform": sys.platform},
         "phases": ev.get("phases", []),
         "observations": {k: ev[k] for k in (
             "original_validation", "mutant_validation", "baseline", "weakened", "restored",
@@ -644,8 +736,11 @@ def main() -> int:
     path = write_record(pathlib.Path(a.record_dir), body)
     print(f"VERDICT: {verdict}")
     print(f"  record: {body['id']}  ({path})")
+    # Underscore keys are the driver's own working state (the timeline origin, the captured
+    # original bytes). They belong in the RECORD, shaped, not dumped to a terminal.
     for k, v in ev.items():
-        print(f"  {k}: {v}")
+        if not k.startswith("_"):
+            print(f"  {k}: {v}")
     if verdict != RED_PROVEN:
         print(f"\nNOT RED-PROVEN. `{verdict}` is not a weakness in the weaken's TARGET; it is a "
               f"statement about the experiment.", file=sys.stderr)

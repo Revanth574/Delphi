@@ -400,12 +400,19 @@ def main() -> int:
     # (a) A REAL SIGTERM during the window in which the target is mutated.
     d, subject, suite = fixture()
     try:
+        # D0A-R39-02: the suite WRITES THE TARGET a second after the driver is signalled. The
+        # first version of this guard observed only the immediate bytes, so it passed while the
+        # still-running suite overwrote the restore a second later — and the handler had
+        # already deleted the backup.
         (d / "suite.py").write_text(
-            "import sys,time,importlib.util\n"
+            "import sys,time,pathlib,importlib.util\n"
             "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
             "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
             "if m.verdict(2) != 'REFUSE':\n"
-            "    time.sleep(30)   # slow ONLY under the weaken\n")
+            f"    pathlib.Path(r'{d / 'ready'}').write_text('mutated')\n"
+            "    time.sleep(1.0)\n"
+            "    open(sys.argv[1],'w').write('CLOBBERED BY ACTIVE SUITE')\n"
+            "    time.sleep(30)\n")
         raw = subject.read_bytes()
         proc = subprocess.Popen(
             [sys.executable, str(REPO / "scripts" / "weaken-driver.py"),
@@ -413,15 +420,21 @@ def main() -> int:
              "--replacement", "    if False:", "--expect", "x",
              sys.executable, str(d / "suite.py"), str(subject)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(3.0)          # inside the mutant window
-        mutated = subject.read_bytes() != raw
+        ready = d / "ready"
+        for _ in range(300):
+            if ready.exists():
+                break
+            time.sleep(0.05)
+        check("the target IS mutated while the suite runs (the window is real)", ready.exists())
         proc.terminate()
         proc.wait(timeout=20)
-        check("the target IS mutated while the suite runs (the window is real)", mutated)
         check("a SIGTERM'd driver still restores the target", subject.read_bytes() == raw,
               subject.read_bytes().decode()[:60])
         check("...and removes its backup on the way out",
               not (d / "subject.py.weaken-backup").exists())
+        time.sleep(2.5)          # past the moment the suite would have written
+        check("...and the suite is collected, so it cannot overwrite the restore afterwards",
+              subject.read_bytes() == raw, subject.read_bytes().decode()[:60])
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -599,6 +612,48 @@ def main() -> int:
               after.stdout.strip() == "1", f"{after.stdout.strip()!r} {after.stderr[-200:]}")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+    # ── D0A-R39-03 ──────────────────────────────────────────────────────────────────────
+    # Validation EXECUTES target code, so it can leave children behind. It was added by
+    # R38-03's fix and ran through plain `subprocess.run`, outside every group R38-02's fix
+    # manages — two fixes from one round that did not compose.
+    d = pathlib.Path(tempfile.mkdtemp(prefix="weaken-driver-validchild-"))
+    try:
+        subject = d / "subject.py"
+        subject.write_bytes(b"MODE = 'plain'\n")
+        suite_py = d / "suite.py"
+        suite_py.write_text(
+            "import importlib.util,os,sys\n"
+            "def check(label, cond):\n"
+            "    if not cond:\n"
+            "        r = os.environ.get('DELPHI_GUARD_FAILURE_REPORT')\n"
+            "        if r: open(r,'a').write(label + chr(10))\n"
+            "        sys.exit(1)\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "check('mode-is-plain', m.MODE == 'plain')\n")
+        # A perfectly VALID mutant that spawns an ordinary child at import — no setsid, so
+        # this is not the pinned group escape; it was simply never in a managed group.
+        repl = ("'spawned'\nimport subprocess as _s, sys as _sys\n"
+                "_s.Popen([_sys.executable,'-c','import time,sys;time.sleep(1.0);"
+                "open(sys.argv[1],\"w\").write(\"CLOBBERED BY VALIDATION\")', __file__],"
+                " stdin=-3, stdout=-3, stderr=-3)\n")
+        raw = subject.read_bytes()
+        v, ev = wd.drive(subject, "'plain'", repl, [sys.executable, str(suite_py), str(subject)],
+                         "mode-is-plain", timeout=60)
+        check("a validation-phase child cannot outlive the run", v == wd.RED_PROVEN, str(v))
+        time.sleep(2.5)
+        check("...and the target still holds the restored bytes after its deadline",
+              subject.read_bytes() == raw, subject.read_bytes().decode()[:60])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # Structural: there is ONE way to start a process here. A second path is how validation
+    # ended up outside lifetime management in the first place.
+    src = (REPO / "scripts" / "weaken-driver.py").read_text().splitlines()
+    direct = [l.strip() for l in src
+              if "subprocess.run(" in l and not l.lstrip().startswith("#")]
+    check("every subprocess goes through the managed primitive", not direct, str(direct))
 
     print(f"\n{PASSED} guards held")
     return 0

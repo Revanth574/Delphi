@@ -147,6 +147,16 @@ invocation; SIGTERM/SIGINT/SIGHUP restore and re-raise; and the original bytes a
 visible `<target>.weaken-backup` before the first write, whose presence REFUSES a later run
 until someone reconciles it. All three are RED-proven.
 
+**THE "CLOSED" ABOVE WAS INCOMPLETE — D0A-R39-02/03 found two processes outside management.**
+The handler restored *while the suite was still running*, so the suite overwrote the restored
+bytes a second later — and because the handler deleted the backup first, it removed the recovery
+copy and then left the damage, which is **worse than before the fix**. And the VALIDATION phase,
+added by R38-03's fix in the same round, ran through plain `subprocess.run`, outside every group
+R38-02's fix manages: two fixes from one round that did not compose. Both now route through a
+single `_managed_run`; cancellation collects every owned group BEFORE restoring and keeps the
+backup when restoration does not verify. A guard asserts there is no second way to start a
+process, because a second path is how this happened.
+
 **NOT closed, and pinned rather than claimed:** a descendant that calls `setsid` leaves the
 group, and no `killpg` can reach it. **Process-group management is a guarantee about the group,
 not about the tree.** A guard asserts the escape still works, so closing it later fails that

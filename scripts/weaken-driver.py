@@ -109,57 +109,60 @@ def _digest(p: pathlib.Path) -> str:
     return _digest_bytes(p.read_bytes())
 
 
-def _run(cmd: list[str], report_dir: pathlib.Path, tag: str, timeout: int) -> Invocation:
-    """Run a suite once, into a report path of its OWN.
-
-    D0A-R38-01: the three stages shared one path. `unlink` cannot revoke a descriptor or a
-    pathname from a child that outlived an earlier stage, so a process left behind by the
-    BASELINE could write the expected label during the MUTANT's window and the driver credited
-    it — RED_PROVEN from a suite that reported nothing. A path allocated per invocation cannot
-    be written by an invocation that was never told it.
-    """
-    report = report_dir / f"labels-{tag}.txt"
-    env = dict(os.environ)
-    env["DELPHI_GUARD_FAILURE_REPORT"] = str(report)
-    try:
-        # D0A-R38-02: OWN PROCESS GROUP. `subprocess.run` kills the direct child on timeout and
-        # nothing else, so a detached grandchild outlived the run and rewrote the target AFTER
-        # restoration had been verified. `start_new_session` makes the child a group leader, so
-        # `pgid == pid` and the whole tree can be collected.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, env=env, start_new_session=True)
-    except OSError as e:
-        return Invocation(LAUNCH_FAILED, code=e.errno, report=str(report))
-    timed_out = False
-    try:
-        proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _collect_group(proc.pid)
-        proc.communicate()
-    survivors = _collect_group(proc.pid)
-    if timed_out:
-        return Invocation(TIMED_OUT, report=str(report))
-    labels = []
-    if report.exists():
-        labels = [l.strip() for l in report.read_text().splitlines() if l.strip()]
-    # D0A-R38-09: a process killed by signal N has returncode -N, and SIGHUP is 1 — the same
-    # value the timeout sentinel used, so a self-SIGHUP was classified TIMEOUT. Death by signal
-    # is its own observation and is never an exit code.
-    if proc.returncode < 0:
-        return Invocation(SIGNALLED, signal=-proc.returncode, labels=labels,
-                          report=str(report), survivors=survivors)
-    return Invocation(EXITED, code=proc.returncode, labels=labels, report=str(report),
-                      survivors=survivors)
+# D0A-R39-02/03: EVERY subprocess the driver starts goes through `_managed_run`, and every
+# group it creates is registered here until collected. The two findings were one defect — a
+# process outside managed lifetime, able to write the target after the driver's last
+# observation. Validation was a whole PHASE outside it: added by R38-03's fix, never joined to
+# R38-02's.
+_LIVE: set[int] = set()
 
 
 def _collect_group(pgid: int) -> bool:
     """SIGKILL everything left in the group. True if anything was there to kill."""
+    _LIVE.discard(pgid)
     try:
         os.killpg(pgid, signal.SIGKILL)
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _collect_all() -> int:
+    """Collect every group this driver still owns. Used on cancellation and before restoring."""
+    return sum(1 for pgid in list(_LIVE) if _collect_group(pgid))
+
+
+class Completed(typing.NamedTuple):
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    launch_error: str = ""
+    survivors: bool = False
+
+
+def _managed_run(cmd: list[str], env: dict | None, timeout: int) -> Completed:
+    """Run a command in its own process group, and collect that group afterwards.
+
+    `start_new_session` makes the child a group leader, so `pgid == pid`. Nothing in this
+    driver may call `subprocess.run` directly: that is precisely what left the validation
+    phase able to leave children running past restoration.
+    """
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True)
+    except OSError as e:
+        return Completed(None, launch_error=str(e))
+    _LIVE.add(proc.pid)
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _collect_group(proc.pid)
+        out, err = proc.communicate()
+    survivors = _collect_group(proc.pid)
+    return Completed(proc.returncode, out or "", err or "", timed_out, "", survivors)
 
 
 class Refusal(Exception):
@@ -174,9 +177,10 @@ def _open_backup(target: pathlib.Path, original: bytes) -> pathlib.Path:
     """Put the original bytes somewhere a CRASH cannot take with it.
 
     D0A-R38-02: signal handlers cannot cover SIGKILL or power loss, and this repository lost a
-    commit to the latter mid-session. A handler makes the catchable cases clean; this file makes
-    the uncatchable ones VISIBLE and reversible — it sits beside the target, so `git status`
-    reports it, which is the external check that has caught what self-checks did not.
+    commit to the latter mid-session. A handler makes the catchable cases clean; this file
+    makes the uncatchable ones VISIBLE and reversible — it sits beside the target, so
+    `git status` reports it, which is the external check that has caught what self-checks did
+    not.
     """
     backup = _backup_path(target)
     if backup.exists():
@@ -186,6 +190,36 @@ def _open_backup(target: pathlib.Path, original: bytes) -> pathlib.Path:
             f"overwrite a record of an unfinished experiment")
     backup.write_bytes(original)
     return backup
+
+
+def _run(cmd: list[str], report_dir: pathlib.Path, tag: str, timeout: int) -> Invocation:
+    """Run a suite once, into a report path of its OWN.
+
+    D0A-R38-01: the three stages shared one path. `unlink` cannot revoke a descriptor or a
+    pathname from a child that outlived an earlier stage, so a process left behind by the
+    BASELINE could write the expected label during the MUTANT's window and the driver credited
+    it — RED_PROVEN from a suite that reported nothing. A path allocated per invocation cannot
+    be written by an invocation that was never told it.
+    """
+    report = report_dir / f"labels-{tag}.txt"
+    env = dict(os.environ)
+    env["DELPHI_GUARD_FAILURE_REPORT"] = str(report)
+    done = _managed_run(cmd, env, timeout)
+    if done.launch_error:
+        return Invocation(LAUNCH_FAILED, report=str(report))
+    if done.timed_out:
+        return Invocation(TIMED_OUT, report=str(report))
+    labels = []
+    if report.exists():
+        labels = [l.strip() for l in report.read_text().splitlines() if l.strip()]
+    # D0A-R38-09: a process killed by signal N has returncode -N, and SIGHUP is 1 — the same
+    # value the timeout sentinel used, so a self-SIGHUP was classified TIMEOUT. Death by signal
+    # is its own observation and is never an exit code.
+    if done.returncode < 0:
+        return Invocation(SIGNALLED, signal=-done.returncode, labels=labels,
+                          report=str(report), survivors=done.survivors)
+    return Invocation(EXITED, code=done.returncode, labels=labels, report=str(report),
+                      survivors=done.survivors)
 
 
 _MISMATCH_SENTINEL = "DELPHI-VALIDATION-DIGEST-MISMATCH"
@@ -236,15 +270,19 @@ def _loads(cmd: list[str] | None, timeout: int) -> tuple[str, str]:
     """Run a validation command. Returns (status, detail)."""
     if cmd is None:
         return LOADED, "no validation command for this target type"
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return LOAD_FAILED, f"validation could not be run: {e}"
-    detail = (p.stderr or p.stdout).strip()[-400:]
+    # D0A-R39-03: through the SAME primitive as the suite. This executes target code, so it
+    # can leave children running; `subprocess.run` left them outside every group the driver
+    # manages, and one wrote the target after restoration had been verified.
+    done = _managed_run(cmd, None, timeout)
+    if done.launch_error:
+        return LOAD_FAILED, f"validation could not be run: {done.launch_error}"
+    if done.timed_out:
+        return LOAD_FAILED, "validation timed out"
+    detail = (done.stderr or done.stdout).strip()[-400:]
     # Both halves required: a target is free to exit 97 on its own.
-    if p.returncode == _MISMATCH_EXIT and _MISMATCH_SENTINEL in (p.stderr or ""):
+    if done.returncode == _MISMATCH_EXIT and _MISMATCH_SENTINEL in done.stderr:
         return DIGEST_MISMATCH, detail
-    return (LOADED if p.returncode == 0 else LOAD_FAILED), detail
+    return (LOADED if done.returncode == 0 else LOAD_FAILED), detail
 
 
 def _purge_bytecode(target: pathlib.Path) -> None:
@@ -377,8 +415,16 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     previous = {}
 
     def _on_signal(signum, _frame):
+        # D0A-R39-02: COLLECT FIRST. Restoring while the suite was still running let it
+        # overwrite the restored bytes a second later — and the backup had already been
+        # deleted, so this handler removed the recovery copy and then left the damage.
+        _collect_all()
         restore(original)
-        backup.unlink(missing_ok=True)
+        if _digest(target) == before:
+            backup.unlink(missing_ok=True)
+        else:
+            sys.stderr.write(f"RESTORE FAILED under signal {signum}; the original bytes are "
+                             f"kept at {backup}\n")
         signal.signal(signum, previous.get(signum, signal.SIG_DFL))
         os.kill(os.getpid(), signum)
 
@@ -390,6 +436,7 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     finally:
         # RESTORE, and VERIFY the restore — against the digest, not the write's return.
         ev["phase"] = "restore"
+        ev["groups_collected_at_restore"] = _collect_all()
         restore(original)
         _purge_bytecode(target)
         ev["digest_restored"] = _digest(target)

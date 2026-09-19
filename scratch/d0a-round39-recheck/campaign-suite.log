@@ -1,0 +1,120 @@
+
+RESTORED /tmp/tmp5by68vme/victim.rs (isolated checkout) after test
+CLEANUP FAILED (`git worktree remove` said: ):
+  still on disk:
+    /tmp/delphi-mutation-wt-l9d98iv0
+CLEANUP FAILED (`git worktree remove` said: fatal: cannot remove a locked working tree;
+use 'remove -f -f' to override or unlock first):
+  still registered in `git worktree list`: /tmp/delphi-mutation-wt-4xm3o7us/tree
+    if it is locked, that is deliberate somewhere — inspect before `git worktree unlock /tmp/delphi-mutation-wt-4xm3o7us/tree && git worktree prune`
+mutation-campaign harness guards
+  [OK ] classify: disk full -> INFRASTRUCTURE
+  [OK ] classify: disk full retains full output
+  [OK ] classify: build failure -> INFRASTRUCTURE
+  [OK ] classify: build failure retains full output
+  [OK ] classify: no result lines -> INFRASTRUCTURE
+  [OK ] classify: no result lines retains full output
+  [OK ] classify: precondition token as text is NOT a precondition report -> CAUGHT
+  [OK ] classify: precondition token as text is NOT a precondition report retains full output
+  [OK ] classify: legacy stale-session phrasing as text is NOT a report -> CAUGHT
+  [OK ] classify: legacy stale-session phrasing as text is NOT a report retains full output
+  [OK ] classify: checker-launch text is NOT a report either -> CAUGHT
+  [OK ] classify: checker-launch text is NOT a report either retains full output
+  [OK ] classify: crash, no named test -> UNATTRIBUTED FAILURE
+  [OK ] classify: crash, no named test retains full output
+  [OK ] classify: real detection -> CAUGHT
+  [OK ] classify: real detection retains full output
+  [OK ] classify: clean green -> NOT CAUGHT
+  [OK ] classify: clean green retains full output
+  [OK ] restore: a clean file matches the captured commit
+  [OK ] restore: a TAMPERED file does NOT match (a partial restore is caught)
+  [OK ] restore: the restored file matches again
+  [OK ] restore: verification is against a SHA, not mutable HEAD
+  [OK ] signal: the mutant is present before the handler runs
+  [OK ] signal: the handler RESTORES the mutated file
+  [OK ] signal: in-flight state is cleared afterwards
+  [OK ] inputs: installer/pam/delphi-runtime is watched
+  [OK ] inputs: scripts/check-stale-test-sessions.sh is watched
+  [OK ] inputs: scripts/mutation-campaign.py is watched
+  [OK ] inputs: Cargo.lock is watched
+  [OK ] signal: the journal records a mutation IN PROGRESS before the signal
+  [OK ] signal: the campaign publishes the live worker's identity
+  [OK ] signal: the WORKER's group is alive before cancellation
+  [OK ] signal: the WORKER's group dies PROMPTLY, before the campaign is waited on
+  [OK ] signal: the campaign exits non-zero after SIGTERM
+  [OK ] signal: the WORKING TREE source is untouched
+  [OK ] signal: the working tree still matches the commit
+  [OK ] signal: the WORKER's group is still gone once the campaign has exited
+  [OK ] signal: nothing survives in the campaign's own group either
+  [OK ] signal: no isolated checkout is left behind
+  [OK ] signal: no mkdtemp parent is left behind either
+  [OK ] precondition: the runtime defines the token
+  [OK ] precondition: the checker-LAUNCH failure carries it
+  [OK ] precondition: the live-session failure carries it
+  [OK ] precondition: the shell checker carries it
+  [OK ] isolation: the checkout exists and has the source
+  [OK ] isolation: it is of the SHA, not a copy of the dirty working tree
+  [OK ] isolation: mutating the checkout leaves the working tree unchanged
+  [OK ] isolation: the checkout is collected afterwards
+  [OK ] isolation: the working tree is restored by this guard
+  [OK ] sigkill: the mutant is in the ISOLATED checkout
+  [OK ] sigkill: the WORKING TREE is untouched
+  [OK ] sigkill: the working tree still matches the commit
+  [OK ] cancel: the live child is registered
+  [OK ] cancel: the child leads its own session with a descendant in it
+  [OK ] cancel: the WHOLE group is gone, grandchild included
+  [OK ] dirty: a modified installer fixture makes inputs UNCLEAN
+  [OK ] dirty: the refusal names the offending path
+  [OK ] dirty: the restored fixture is no longer listed as dirty
+  [OK ] instrument: a dirty harness is REFUSED, not warned about
+  [OK ] instrument: the campaign BODY never ran (no lane.json was written)
+  [OK ] instrument: no isolated checkout was even created
+  [OK ] instrument: the refusal names the harness
+  [OK ] instrument: the refusal explains that the checkout does not cover it
+  [OK ] instrument: a refused run leaves no checkout behind
+  [OK ] instrument: the recorded digest is of the executing bytes
+  [OK ] markers: printed 'ordinary payload' is still CAUGHT
+  [OK ] markers: printed 'Killed' is still CAUGHT
+  [OK ] markers: printed 'DELPHI_PRECONDITION_FAILED' is still CAUGHT
+  [OK ] markers: printed 'running user command' is still CAUGHT
+  [OK ] markers: printed '' is still CAUGHT
+  [OK ] markers: a failing test writing `Killed` to STDERR is still CAUGHT
+  [OK ] markers: the forged marker is RETAINED for a human even though it decides nothing
+  [OK ] markers: TWO forged markers on stderr are still CAUGHT
+  [OK ] space: an unattributable failure WITH a short disk is INFRASTRUCTURE
+  [OK ] space: ...and the campaign's own measurement is retained as the reason
+  [OK ] space: the SAME failure with an ample disk stays UNATTRIBUTED
+  [OK ] attribution: a FABRICATED failure name is UNATTRIBUTED, not CAUGHT
+  [OK ] attribution: ...and the unknown name is retained as the reason
+  [OK ] attribution: a REAL failure naming a KNOWN test is still CAUGHT
+  [OK ] attribution: a count that disagrees with the summary is UNATTRIBUTED
+  [OK ] attribution: a real detection in the SECOND binary is still CAUGHT
+  [OK ] attribution: ...and each binary is segmented separately
+  [OK ] attribution: a name cannot borrow another binary's failure count
+  [OK ] enumeration: a PARTIAL listing from a dying enumeration refuses attribution
+  [OK ] enumeration: a DEAD enumeration refuses attribution, never CAUGHT
+  [OK ] enumeration: ...and its exit status is retained as the reason
+  [OK ] enumeration: a SUCCESSFUL enumeration naming no tests also refuses
+  [OK ] markers: a run with NO test results is INFRASTRUCTURE (marker present)
+  [OK ] markers: ...and with NO marker text at all — purely structural
+  [OK ] markers: death by SIGNAL is INFRASTRUCTURE, unfakeable from output
+  [OK ] markers: a SIDE-CHANNEL report is PRECONDITION FAILURE
+  [OK ] markers: and it carries the reported reason
+  [OK ] cleanup: an undeletable checkout is reported as FAILED
+  [OK ] cleanup: the directory really is still there
+  [OK ] cleanup: OWNERSHIP IS RETAINED so a retry is possible
+  [OK ] cleanup: the retry succeeds once the obstruction is gone
+  [OK ] cleanup: and the directory is actually gone
+  [OK ] cleanup: ownership is released only after success
+  [OK ] registration: a LOCKED entry makes cleanup report FAILURE
+  [OK ] registration: and the entry really is still there
+  [OK ] registration: ownership is retained for the retry
+  [OK ] registration: the guard leaves nothing of its own behind
+  [OK ] lifetime: a red baseline refuses
+  [OK ] lifetime: the baseline refusal leaves no mkdtemp parent
+  [OK ] lifetime: the baseline refusal leaves no registered worktree
+  [OK ] lifetime: the exception propagates (it is not swallowed)
+  [OK ] lifetime: an ORDINARY EXCEPTION still collects the mkdtemp parent
+  [OK ] lifetime: an ORDINARY EXCEPTION still collects the worktree
+
+108 guards held

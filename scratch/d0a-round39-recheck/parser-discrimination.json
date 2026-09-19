@@ -1,0 +1,54 @@
+{
+  "rust_source": "#[test]\nfn genuine_guard() {\n    println!(\"failures:\\n    fabricated_name\");\n    panic!(\"actual guard failure\");\n}\n",
+  "command": "cargo test --offline --manifest-path /tmp/d0a-r39-guards-kpg7gbsk/crate/Cargo.toml",
+  "pinned": {
+    "outcome": "CAUGHT",
+    "evidence": {
+      "exit": 101,
+      "stdout": "\nrunning 1 test\ntest genuine_guard ... FAILED\n\nfailures:\n\n---- genuine_guard stdout ----\nfailures:\n    fabricated_name\n\nthread 'genuine_guard' (9126) panicked at src/lib.rs:4:5:\nactual guard failure\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    genuine_guard\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling r39-probe v0.1.0 (/tmp/d0a-r39-guards-kpg7gbsk/crate)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s\n     Running unittests src/lib.rs (/tmp/d0a-r39-guards-kpg7gbsk/target/debug/deps/r39_probe-9dabd9a6df74d10b)\nerror: test failed, to rerun pass `--lib`\n",
+      "segments": [
+        {
+          "names": [
+            "genuine_guard"
+          ],
+          "failed": 1
+        }
+      ],
+      "result_lines": 1,
+      "failing_tests": [
+        "genuine_guard"
+      ],
+      "markers_seen_as_data": [],
+      "known_tests": 1
+    }
+  },
+  "weakened": {
+    "outcome": "UNATTRIBUTED FAILURE",
+    "evidence": {
+      "exit": 101,
+      "stdout": "\nrunning 1 test\ntest genuine_guard ... FAILED\n\nfailures:\n\n---- genuine_guard stdout ----\nfailures:\n    fabricated_name\n\nthread 'genuine_guard' (9151) panicked at src/lib.rs:4:5:\nactual guard failure\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    genuine_guard\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s\n     Running unittests src/lib.rs (/tmp/d0a-r39-guards-kpg7gbsk/target/debug/deps/r39_probe-9dabd9a6df74d10b)\nerror: test failed, to rerun pass `--lib`\n",
+      "segments": [
+        {
+          "names": [
+            "fabricated_name",
+            "genuine_guard"
+          ],
+          "failed": 1
+        }
+      ],
+      "result_lines": 1,
+      "failing_tests": [
+        "fabricated_name",
+        "genuine_guard"
+      ],
+      "markers_seen_as_data": [],
+      "failure_count_mismatch": {
+        "binary_index": 0,
+        "summary_says": 1,
+        "names_found": 2
+      }
+    }
+  }
+}

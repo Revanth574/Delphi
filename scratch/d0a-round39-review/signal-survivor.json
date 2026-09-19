@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/usr/bin/python3",
+    "/tmp/d0a-r39-gnt9qph7/weaken-driver.py",
+    "--target",
+    "/tmp/d0a-r39-gnt9qph7/signal-survivor/subject.py",
+    "--anchor",
+    "True",
+    "--replacement",
+    "False",
+    "--expect",
+    "x",
+    "/usr/bin/python3",
+    "/tmp/d0a-r39-gnt9qph7/signal-survivor/suite.py",
+    "/tmp/d0a-r39-gnt9qph7/signal-survivor/subject.py"
+  ],
+  "driver_exit": -15,
+  "stdout": "",
+  "stderr": "",
+  "child_pid": 21733,
+  "child_pgid": 21733,
+  "immediate": "FLAG = True\n",
+  "later": "CLOBBERED BY ACTIVE SUITE\n",
+  "backup_exists": false
+}

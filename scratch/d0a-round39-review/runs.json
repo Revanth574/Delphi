@@ -1,0 +1,40 @@
+{
+  "pin": "c560cae",
+  "base": "715248a",
+  "instrument_and_suite_sha256": {
+    "scripts/weaken-driver.py": "be8ec75b77e16d07f5c4dde5906b6c6c5286b18c1024af44bacdd321eebabbb6",
+    "scripts/weaken-driver.test.py": "02eb2d25e64748dc0f8ee45fc63bff61a820f8d64a4ca2a27c2813e6b251fc44",
+    "scripts/lane-accept.py": "dc29e979e85148e39ec09e90e6682b43694720643c1e1108b7878d187871e229",
+    "scripts/lane-accept.test.py": "f399ff6b7551989d97a9962b6427fc7cbda3f32a9a2f37396fd5fd97705e8a2e",
+    "scripts/mutation-campaign.py": "15ecbb35919f61529fc5caf544a5c2c63f45a1f580642718840d49fe9279e180",
+    "scripts/mutation-campaign.test.py": "6c1e9c340320fb03e58e0b6190a07c982dfaa6cfa5eb60dd05e87d6c0335b2ed",
+    "scratch/lane-run-7-procedure.md": "9d591c8df051865d3d0068008b02c7c6b87ca91829f354b6f64c216e6823e6ad"
+  },
+  "runs": [
+    {
+      "log": "weaken-suite.log",
+      "exit": 0,
+      "guards": 45
+    },
+    {
+      "log": "lane-suite.log",
+      "exit": 0,
+      "guards": 112
+    },
+    {
+      "log": "campaign-suite.log",
+      "exit": 0,
+      "guards": 108
+    },
+    {
+      "log": "lane-weakened.log",
+      "exit": 0,
+      "guards": 112
+    },
+    {
+      "log": "campaign-weakened.log",
+      "exit": 0,
+      "guards": 108
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+diff --git a/scratch/lane-run-7-procedure.md b/scratch/lane-run-7-procedure.md
+index f0a06ef..cc2563e 100644
+--- a/scratch/lane-run-7-procedure.md
++++ b/scratch/lane-run-7-procedure.md
+@@ -226,7 +226,7 @@ date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/run-start.txt
+ : "${SNAPDIR:?SNAPDIR unset — re-run §0b}"
+ while read -r b; do
+   echo "### $b" >> "$LOG"
+-  sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAPDIR" "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
++  sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAP" "$b" --nocapture --test-threads=1 >> "$LOG" 2>&1
+   rc=$?
+   printf '%s\t%s\n' "$rc" "$b" >> "$STATUS"   # D0A-R18-04
+   # D0A-R36-09: AT THE FAILURE, before the next target runs and before any cleanup. An
+@@ -387,12 +387,12 @@ for l in sys.stdin:
+ B=$(cat /tmp/b1-seams.txt)
+ 
+ # B1 — the POSITIVE control.
+-sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAPDIR" "$B" b1_daemon_bounds_an_ai \
++sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAP" "$B" b1_daemon_bounds_an_ai \
+   --nocapture --test-threads=1 2>&1 | tee "$D/part-b-control.txt"
+ echo "${PIPESTATUS[0]}" > "$D/part-b-control.status"
+ 
+ # B2 — the NEGATIVE control. Required from run 24; its verdict must be Topology.
+-sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAPDIR" "$B" the_control_reports_topology \
++sudo env DELPHI_FAILURE_SNAPSHOT_DIR="$SNAP" "$B" the_control_reports_topology \
+   --nocapture --test-threads=1 2>&1 \
+   | tee "$D/part-b-negative-control.txt"
+ echo "${PIPESTATUS[0]}" > "$D/part-b-negative-control.status"
+diff --git a/scripts/mutation-campaign.py b/scripts/mutation-campaign.py
+index 65c72c0..3483aa4 100755
+--- a/scripts/mutation-campaign.py
++++ b/scripts/mutation-campaign.py
+@@ -470,7 +470,7 @@ def _segments(stdout: str) -> list[tuple[list[str], int | None]]:
+         body = stdout[pos:m.start()]
+         # The LAST `failures:` in a body is the name list; the first heads the captured-output
+         # section, whose text the subject controls and which can itself contain `failures:`.
+-        names = sorted(set(re.findall(r"^\s{4}(\S+)$", body[body.rfind("failures:"):], re.M))) \
++        names = sorted(set(re.findall(r"^\s{4}(\S+)$", body[body.find("failures:"):], re.M))) \
+             if "failures:" in body else []
+         count = FAILED_RE.search(m.group(2))
+         # An unparseable summary is recorded as None, not skipped: skipping would merge this

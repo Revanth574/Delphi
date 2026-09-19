@@ -1,0 +1,49 @@
+{
+  "verdict": "RED_PROVEN",
+  "evidence": {
+    "target": "/tmp/d0a-r39-143mk9cm/validation-survivor/subject.py",
+    "expect": "flag-must-be-true",
+    "phase": "restore",
+    "digest_before": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302",
+    "original_loads": true,
+    "baseline": {
+      "outcome": "exited",
+      "code": 0,
+      "signal": null,
+      "labels": [],
+      "report": "/tmp/weaken-report-9hr_m5w6/labels-baseline.txt",
+      "survivors": false
+    },
+    "baseline_exit": 0,
+    "digest_weakened": "cb57f1f31ca2fb62bf4787f544947eac83d9c1fceb7b85aaaf45c61b60f899f1",
+    "mutant_loads": true,
+    "weakened": {
+      "outcome": "exited",
+      "code": 1,
+      "signal": null,
+      "labels": [
+        "flag-must-be-true"
+      ],
+      "report": "/tmp/weaken-report-9hr_m5w6/labels-weakened.txt",
+      "survivors": false
+    },
+    "weakened_exit": 1,
+    "failing_guards": [
+      "flag-must-be-true"
+    ],
+    "digest_restored": "cd09dc6a96ef641e966b34b086fe631c41dbfb8542639d47d787580a41a57302",
+    "restored": {
+      "outcome": "exited",
+      "code": 0,
+      "signal": null,
+      "labels": [],
+      "report": "/tmp/weaken-report-9hr_m5w6/labels-restored.txt",
+      "survivors": false
+    },
+    "restored_exit": 0
+  },
+  "immediate": "FLAG = True\n",
+  "later": "CLOBBERED BY VALIDATION\n",
+  "backup_exists": false,
+  "replacement": "FLAG = False\nimport subprocess,sys\nsubprocess.Popen([sys.executable, '-c', \"import pathlib,sys,time;time.sleep(1);pathlib.Path(sys.argv[1]).write_text('CLOBBERED BY VALIDATION\\\\n')\", __file__], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+}

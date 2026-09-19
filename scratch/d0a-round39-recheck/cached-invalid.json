@@ -1,0 +1,48 @@
+{
+  "verdict": "RED_PROVEN",
+  "evidence": {
+    "target": "/tmp/d0a-r39-143mk9cm/cached-invalid/subject.py",
+    "expect": "subject-imports-clean",
+    "phase": "restore",
+    "digest_before": "4a824bfb06445009bb2c9a61fd7f610b49667b862f4b54484dfa15990928d113",
+    "original_loads": true,
+    "baseline": {
+      "outcome": "exited",
+      "code": 0,
+      "signal": null,
+      "labels": [],
+      "report": "/tmp/weaken-report-l4h82tkx/labels-baseline.txt",
+      "survivors": false
+    },
+    "baseline_exit": 0,
+    "digest_weakened": "c1371478716e2a8fbebd81e2d16c37836e7c4d0a1380e5413a02757c7bf94921",
+    "mutant_loads": true,
+    "weakened": {
+      "outcome": "exited",
+      "code": 1,
+      "signal": null,
+      "labels": [
+        "subject-imports-clean"
+      ],
+      "report": "/tmp/weaken-report-l4h82tkx/labels-weakened.txt",
+      "survivors": false
+    },
+    "weakened_exit": 1,
+    "failing_guards": [
+      "subject-imports-clean"
+    ],
+    "digest_restored": "4a824bfb06445009bb2c9a61fd7f610b49667b862f4b54484dfa15990928d113",
+    "restored": {
+      "outcome": "exited",
+      "code": 0,
+      "signal": null,
+      "labels": [],
+      "report": "/tmp/weaken-report-l4h82tkx/labels-restored.txt",
+      "survivors": false
+    },
+    "restored_exit": 0
+  },
+  "duration": 0.5196831226348877,
+  "direct_mutant_exit": 1,
+  "direct_mutant_stderr": "Traceback (most recent call last):\n  File \"/tmp/d0a-r39-143mk9cm/cached-invalid/subject.py\", line 1, in <module>\n    FLAG = X\n           ^\nNameError: name 'X' is not defined\n"
+}

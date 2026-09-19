@@ -1,0 +1,47 @@
+  [OK ] a chain that HOLDS is RED_PROVEN
+  [OK ] ...and the target is restored byte-identical
+  [OK ] ...and the suite is green again afterwards
+  [OK ] ...and the failing guard is named from the SIDE CHANNEL, not from text
+  [OK ] a missing anchor is MUTATION_NOT_APPLIED, never RED_PROVEN
+  [OK ] a replacement identical to the anchor is MUTATION_NOT_APPLIED
+  [OK ] a weaken that does not parse is MUTATION_INVALID, not RED_PROVEN
+  [OK ] a weaken that changes nothing is NOT_CAUGHT
+  [OK ] ...and it says the ambiguity rather than resolving it
+  [OK ] a weaken failing a DIFFERENT guard is WRONG_GUARD
+  [OK ] ...and it names what actually failed
+  [OK ] a suite that fails BEFORE the weaken is BASELINE_NOT_GREEN
+  [OK ] a failure with NO structured label is UNVERIFIABLE, never RED_PROVEN
+  [OK ] ...and the refusal says why text is not an acceptable substitute
+  [OK ] a suite still red AFTER restoration is RESTORE_FAILED, not RED_PROVEN
+  [OK ] ...and the restore digest still matches, so the file came back
+  [OK ] a hanging suite is TIMEOUT, not a pass or a failure
+  [OK ] a CRLF target still reaches RED_PROVEN
+  [OK ] ...and comes back byte-identical, CRLF intact
+  [OK ] a refusing path leaves a CRLF target untouched
+  [OK ] ...and the restore digest it recorded actually matches
+  [OK ] a missing anchor is attributed to the ANCHOR, not to unchanged bytes
+  [OK ] a replacement equal to the anchor is attributed to unchanged BYTES
+  [OK ] a restore that does not land is RESTORE_FAILED, not RED_PROVEN
+  [OK ] ...and it says what the verdict would otherwise have been
+  [OK ] restoration is verified on EVERY terminal path, not just the proven one
+  [OK ] ...and the refused verdict it replaced is retained
+  [OK ] a suite killed by SIGHUP is not TIMEOUT
+  [OK ] ...it is UNVERIFIABLE, because a killed run judged nothing
+  [OK ] ...and the signal is recorded as a signal, not as an exit code
+  [OK ] a mutant that COMPILES but fails to import is MUTATION_INVALID
+  [OK ] ...never RED_PROVEN, however loudly a guard reported itself
+  [OK ] ...and the ORIGINAL loading is the control that makes that attributable
+  [OK ] a target that does not load unmutated is BASELINE_NOT_GREEN
+  [OK ] a label from a SURVIVING baseline child is not the mutant's report
+  [OK ] ...the honest verdict is UNVERIFIABLE
+  [OK ] ...and each invocation was given a report path of its own
+  [OK ] the target IS mutated while the suite runs (the window is real)
+  [OK ] a SIGTERM'd driver still restores the target
+  [OK ] ...and removes its backup on the way out
+  [OK ] a hanging suite is still TIMEOUT
+  [OK ] a grandchild that outlived the timeout was collected with the group
+  [OK ] KNOWN LIMIT: a descendant that calls setsid escapes the group and can still write the target
+  [OK ] a stale backup refuses the run
+  [OK ] a failed restore retains the backup
+
+45 guards held

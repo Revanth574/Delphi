@@ -1,0 +1,165 @@
+  [OK ] a COMPLETE run directory is ACCEPTED
+  [OK ] a MISSING artifact is refused
+  [OK ] a MISSING artifact is refused — the refusal says why
+  [OK ] missing hygiene evidence is refused
+  [OK ] missing hygiene evidence is refused — the refusal says why
+  [OK ] a NONZERO producer exit is refused
+  [OK ] a NONZERO producer exit is refused — the refusal says why
+  [OK ] a SUBSET of producers is refused
+  [OK ] a SUBSET of producers is refused — the refusal says why
+  [OK ] a CHANGED executable set is refused
+  [OK ] a CHANGED executable set is refused — the refusal says why
+  [OK ] a SUBSET of hashes is refused
+  [OK ] a SUBSET of hashes is refused — the refusal says why
+  [OK ] MISMATCHED helper digests are refused
+  [OK ] MISMATCHED helper digests are refused — the refusal says why
+  [OK ] an OVERRIDDEN free-space refusal is refused
+  [OK ] an OVERRIDDEN free-space refusal is refused — the refusal says why
+  [OK ] a CHANGED PAM stack is refused
+  [OK ] a CHANGED PAM stack is refused — the refusal says why
+  [OK ] a DIRTY tree at run time is refused
+  [OK ] a DIRTY tree at run time is refused — the refusal says why
+  [OK ] a commit section without a SHA is refused
+  [OK ] a commit section without a SHA is refused — the refusal says why
+  [OK ] the run's OWN artifact directory is not a dirty tree
+  [OK ] ...but a REAL modification alongside it still refuses
+  [OK ] ...and the refusal names only the real one
+  [OK ] identities without COUNTS are refused
+  [OK ] identities without COUNTS are refused — the refusal says why
+  [OK ] a NONZERO identity difference is refused
+  [OK ] a NONZERO identity difference is refused — the refusal says why
+  [OK ] a control with NO VERDICT is refused
+  [OK ] a control with NO VERDICT is refused — the refusal says why
+  [OK ] a control whose verdict is followed by FAILURE is refused
+  [OK ] a control whose verdict is followed by FAILURE is refused — the refusal says why
+  [OK ] a control that SKIPPED is refused
+  [OK ] a control that SKIPPED is refused — the refusal says why
+  [OK ] a control naming the WRONG test is refused
+  [OK ] a control naming the WRONG test is refused — the refusal says why
+  [OK ] a POSITIVE control returning Topology is refused
+  [OK ] a POSITIVE control returning Topology is refused — the refusal says why
+  [OK ] an EMPTY identity file is refused
+  [OK ] an EMPTY identity file is refused — the refusal says why
+  [OK ] an EMPTY transcript is refused
+  [OK ] an EMPTY transcript is refused — the refusal says why
+  [OK ] 17 copies of ONE producer are refused
+  [OK ] 17 copies of ONE producer are refused — the refusal says why
+  [OK ] producers that are not the HASHED set are refused
+  [OK ] producers that are not the HASHED set are refused — the refusal says why
+  [OK ] a membership total contradicting the files is refused
+  [OK ] a membership total contradicting the files is refused — the refusal says why
+  [OK ] a FAILED rebuild is refused despite identical hashes
+  [OK ] a FAILED rebuild is refused despite identical hashes — the refusal says why
+  [OK ] a missing rebuild artifact is refused
+  [OK ] a missing rebuild artifact is refused — the refusal says why
+  [OK ] membership computed BEFORE the run is refused
+  [OK ] membership computed BEFORE the run is refused — the refusal says why
+  [OK ] an INVERTED freshness pair is refused
+  [OK ] an INVERTED freshness pair is refused — the refusal says why
+  [OK ] a current run with no rebuild.status is refused
+  [OK ] a current run with no rebuild.status is refused — the refusal says why
+  [OK ] a current run with no run-start.txt is refused
+  [OK ] a current run with no run-start.txt is refused — the refusal says why
+  [OK ] a CHANGED unprivileged identity is refused despite an equal total
+  [OK ] a CHANGED unprivileged identity is refused despite an equal total — the refusal says why
+  [OK ] a control whose INVOCATION exited nonzero is refused
+  [OK ] a control whose INVOCATION exited nonzero is refused — the refusal says why
+  [OK ] a current run with no control status is refused
+  [OK ] a current run with no control status is refused — the refusal says why
+  [OK ] a transcript reporting a FAILED summary is refused
+  [OK ] a transcript reporting a FAILED summary is refused — the refusal says why
+  [OK ] an UNNAMED directory is treated as CURRENT, not waived
+  [OK ] ...but a run DECLARING what it predates is waived explicitly
+  [OK ] a rebuild after the START but before the run's last write is refused
+  [OK ] a rebuild after the START but before the run's last write is refused — the refusal says why
+  [OK ] run 23 is still ACCEPTED without a negative control
+  [OK ] run 24 WITHOUT a negative control is REFUSED
+  [OK ] ...and the refusal names it
+  [OK ] a negative control returning `Reached` is REFUSED
+  [OK ] ...and the refusal says what Reached means here
+  [OK ] a negative control returning `Unresolved` is REFUSED
+  [OK ] a negative control returning `Topology` is ACCEPTED
+  [OK ] freshness proven AFTER the run is refused
+  [OK ] freshness proven AFTER the run is refused — the refusal says why
+  [OK ] the verifier CAPTURES its own verdict
+  [OK ] the captured verdict matches what it printed
+  [OK ] re-verification does NOT overwrite the run's captured verdict
+  [OK ] ...and the re-verification is retained beside it
+lane acceptance for /tmp/tmps62v4jnu/lane-run-27
+  [OK ] hygiene: helper digest aba0f0ea14b751aa… installed == staged
+  [OK ] freshness: freshness: 17 executables identical across a rebuild that exited 0
+  [OK ] producers: producers: 17/17 distinct, all exited 0, matching the hashed set
+  [OK ] membership: membership: 5 identities RE-DERIVED from the transcript and matching the retained file, 5 unprivileged, zero either way
+  [OK ] control: positive control: Reached, from a completed passing run of its named test
+  [OK ] control: negative control: Topology, from a completed passing run — the control DISCRIMINATES, so a `Reached` means something
+  [OK ] ordering: ordering: freshness proven before the run STARTED; membership computed after it
+
+VERDICT: ACCEPTED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.
+
+NOTE: /tmp/tmps62v4jnu/lane-run-27/acceptance.txt already exists and is the RUN's verdict. This re-verification is written beside it, not over it.
+
+verdict captured in /tmp/tmps62v4jnu/lane-run-27/acceptance-reverified-FROZEN.txt
+lane acceptance for /tmp/tmps62v4jnu/lane-run-27
+  [OK ] hygiene: helper digest aba0f0ea14b751aa… installed == staged
+  [OK ] freshness: freshness: 17 executables identical across a rebuild that exited 0
+  [OK ] producers: producers: 17/17 distinct, all exited 0, matching the hashed set
+  [OK ] membership: membership: 5 identities RE-DERIVED from the transcript and matching the retained file, 5 unprivileged, zero either way
+  [OK ] control: positive control: Reached, from a completed passing run of its named test
+  [OK ] control: negative control: Topology, from a completed passing run — the control DISCRIMINATES, so a `Reached` means something
+  [OK ] ordering: ordering: freshness proven before the run STARTED; membership computed after it
+
+VERDICT: ACCEPTED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.
+
+NOTE: /tmp/tmps62v4jnu/lane-run-27/acceptance.txt already exists and is the RUN's verdict. This re-verification is written beside it, not over it.
+
+verdict captured in /tmp/tmps62v4jnu/lane-run-27/acceptance-reverified-FROZEN-1.txt
+lane acceptance for /tmp/tmps62v4jnu/lane-run-27
+  [OK ] hygiene: helper digest aba0f0ea14b751aa… installed == staged
+  [OK ] freshness: freshness: 17 executables identical across a rebuild that exited 0
+  [OK ] producers: producers: 17/17 distinct, all exited 0, matching the hashed set
+  [OK ] membership: membership: 5 identities RE-DERIVED from the transcript and matching the retained file, 5 unprivileged, zero either way
+  [OK ] control: positive control: Reached, from a completed passing run of its named test
+  [OK ] control: negative control: Topology, from a completed passing run — the control DISCRIMINATES, so a `Reached` means something
+  [OK ] ordering: ordering: freshness proven before the run STARTED; membership computed after it
+
+VERDICT: ACCEPTED
+
+This verdict covers the retained evidence only. Nothing here binds these artifacts to a commit;
+the run record carries the SHA and a reader must still check it.
+
+NOTE: /tmp/tmps62v4jnu/lane-run-27/acceptance.txt already exists and is the RUN's verdict. This re-verification is written beside it, not over it.
+
+verdict captured in /tmp/tmps62v4jnu/lane-run-27/acceptance-reverified-FROZEN-2.txt
+  [OK ] re-verification: every same-clock invocation SUCCEEDED
+  [OK ] re-verification: same-second captures do not overwrite each other
+  [OK ] re-verification: the RUN's verdict is still the one it wrote
+  [OK ] a verdict it cannot capture is a REFUSAL, not a pass
+  [OK ] contract: the verifier's required inputs were extracted
+  [OK ] contract: every artifact the gate REQUIRES is produced by the procedure
+  [OK ] contract: the procedure produces something matching 'root-run*.status'
+  [OK ] contract: the procedure produces something matching 'root-run.log'
+  [OK ] contract: acceptance is invoked at all
+  [OK ] contract: part-b-control.txt is produced BEFORE acceptance is invoked
+  [OK ] contract: part-b-negative-control.txt is produced BEFORE acceptance is invoked
+  [OK ] contract: hygiene.txt is produced BEFORE acceptance is invoked
+  [OK ] contract: hygiene is captured AFTER part-b-control.txt
+  [OK ] contract: hygiene is captured AFTER part-b-negative-control.txt
+  [OK ] membership: the fixture is ACCEPTED before unpriv-identities.txt is touched
+  [OK ] membership: a duplicate row in unpriv-identities.txt is REFUSED
+  [OK ] membership: ...and the refusal names the repeated identity in unpriv-identities.txt
+  [OK ] membership: the fixture is ACCEPTED before root-identities.txt is touched
+  [OK ] membership: a duplicate row in root-identities.txt is REFUSED
+  [OK ] membership: ...and the refusal names the repeated identity in root-identities.txt
+  [OK ] membership: a zero multiplicity is REFUSED
+  [OK ] membership: ...naming the multiplicity, not a generic multiset mismatch
+  [OK ] procedure: the elevated test-binary invocations are still found
+  [OK ] procedure: every elevated invocation passes the snapshot directory
+  [OK ] procedure: ...through `sudo env`, because plain sudo and `-E` both drop it
+
+112 guards held

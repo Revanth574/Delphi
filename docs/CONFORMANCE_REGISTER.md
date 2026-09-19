@@ -121,6 +121,22 @@ reopened:
   was wrong; both mean no particular claim can now be checked. **Quiet carry-forward is what is
   refused here, not the claims themselves.**
 
+**Quarantine is not disposition (D0A-R40 ruling).** The note above holds the line; it does not
+dispose of anything. `docs/PROOF_CLAIM_INVENTORY.md` enumerates every claim in
+`aa0d0e1..3f5ac55` by commit and by the guard it named — **21 withdrawn, 3 with records, 4
+narrative** — and a guard in `scripts/weaken-driver.test.py` joins that table to `git log`, so a
+claim-bearing commit absent from it fails a suite rather than reading as complete. A withdrawn
+claim is uncheckable, not refuted, and a rerun would establish evidence for its own recorded
+inputs rather than verifying the historical execution.
+
+**One non-weaken claim went with them: "the gate refused its own introducing commit."** It was
+asserted in `41300be` and repeated in round 40's prompt as that build's strongest evidence. A
+rejected commit leaves no object, so git history cannot verify it — a story about a mechanism
+working, offered as an artifact. Same class as the rows in the inventory: *a claim about a
+mechanism, unaccompanied by the artifact that would let someone check it.* The design failure
+was not asking **what artifact does this claim produce?**, which is the question that would have
+caught it before it was written.
+
 **What lifts the suspension:** a record produced by the driver carrying the expected guard
 (registered BEFORE execution), instrument and suite identities, target before/mutant/restored
 digests plus the patch, argv and cwd, phase outcomes, reports, full streams, restoration

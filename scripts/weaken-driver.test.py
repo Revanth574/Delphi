@@ -735,6 +735,46 @@ def main() -> int:
     check("...and the EXECUTING digest is still reported separately from the subject's",
           body["instrument"]["digest_executing"] != body["subject"]["digest_before"])
 
+    # ── D0A-R40: THE CLAIM INVENTORY IS CHECKED, NOT READ ───────────────────────────────
+    # A register note is quarantine, not disposition. The failure mode of a prose inventory is
+    # that it reads as complete when it is not, so the inventory is joined to `git log` here:
+    # a commit in the covered range that carries a RED-proof claim and is absent from the
+    # table fails this guard.
+    inv = (REPO / "docs" / "PROOF_CLAIM_INVENTORY.md").read_text()
+    m = re.search(r"\*\*Covered range:\*\* `([0-9a-f]+)\.\.([0-9a-f]+)`", inv)
+    check("the inventory declares its covered range", m is not None)
+    rows = re.findall(r"^\| `([0-9a-f]{7,40})` \| (.+?) \| `([^`]+)` \|$", inv, re.M)
+    check("the inventory has rows", len(rows) >= 20, str(len(rows)))
+    allowed = {"withdrawn", "narrative"}
+    bad = [d for _, _, d in rows if d not in allowed and not d.startswith("record:")]
+    check("every row carries one of the three dispositions", not bad, str(bad))
+
+    ledger = REPO / "scratch" / "weaken-records"
+    missing = [d.split(":", 1)[1] for _, _, d in rows if d.startswith("record:")
+               if not (ledger / f"{d.split(':', 1)[1]}.json").exists()]
+    check("every cited record resolves in the ledger", not missing, str(missing))
+
+    rng = subprocess.run(["git", "-C", str(REPO), "log", "--format=%h %H",
+                          f"{m.group(1)}..{m.group(2)}"], capture_output=True, text=True)
+    check("the covered range resolves in git", rng.returncode == 0, rng.stderr[-200:])
+    claiming = []
+    for line in rng.stdout.split("\n"):
+        if not line.strip():
+            continue
+        short, full = line.split()
+        body = subprocess.run(["git", "-C", str(REPO), "log", "-1", "--format=%B", full],
+                              capture_output=True, text=True).stdout
+        if re.search(r"RED[-_ ]?PROV", body, re.I):
+            claiming.append(short)
+    listed = {sha for sha, _, _ in rows}
+    unlisted = [c for c in claiming
+                if not any(c.startswith(l) or l.startswith(c) for l in listed)]
+    check("every commit in range that claims RED-proof appears in the inventory",
+          not unlisted, f"absent: {unlisted}")
+    check("...and the range's endpoint commit is covered too",
+          any(l.startswith(m.group(2)[:7]) or m.group(2).startswith(l) for l in listed),
+          m.group(2))
+
     print(f"\n{PASSED} guards held")
     return 0
 

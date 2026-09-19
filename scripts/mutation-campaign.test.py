@@ -700,6 +700,51 @@ def guard_markers_in_assertion_data_do_not_decide_cause() -> None:
               outcome == "UNATTRIBUTED FAILURE",
               f"{outcome} — binary 0 named one failure and reported zero")
 
+        # ── D0A-R39-04 ──────────────────────────────────────────────────────────────────
+        # The two-binary fixture above has both `failures:` headers but NO name-shaped line
+        # between them, so `find` and `rfind` return the same names and it cannot discriminate
+        # the captured-output exclusion — replacing `rfind` with `find` left all 108 guards
+        # green. THIS transcript is a verbatim capture from a real two-crate cargo run whose
+        # failing test prints `failures:` and `    fabricated_name` to stdout, so the subject's
+        # own captured text is name-shaped. `find` starts at the section HEADER and harvests
+        # the fabricated name; `rfind` starts at the real list.
+        captured_output_transcript = (
+            '\n'
+            'running 1 test\n'
+            '.\n'
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+            '\n'
+            '\n'
+            'running 1 test\n'
+            'genuine_guard --- FAILED\n'
+            '\n'
+            'failures:\n'
+            '\n'
+            '---- genuine_guard stdout ----\n'
+            'failures:\n'
+            '    fabricated_name\n'
+            '\n'
+            "thread 'genuine_guard' (15299) panicked at tests/integration.rs:6:5:\n"
+            'the real detection\n'
+            'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n'
+            '\n'
+            '\n'
+            'failures:\n'
+            '    genuine_guard\n'
+            '\n'
+            'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+            '\n'
+        )
+        mc.sh = with_listing("lib_passes: test\ngenuine_guard: test\n",
+                             captured_output_transcript)
+        outcome, ev = mc.run_suite()
+        check("attribution: a name-shaped line in CAPTURED OUTPUT is not a failure name",
+              [s_["names"] for s_ in ev["segments"]] == [[], ["genuine_guard"]],
+              f"{[s_['names'] for s_ in ev['segments']]}")
+        check("attribution: ...so the genuine detection survives the subject's decoy",
+              outcome == "CAUGHT",
+              f"{outcome} — the decoy would make 2 names against a summary of 1")
+
         # ── D0A-R38-05 ──────────────────────────────────────────────────────────────────
         # The enumeration is a SEPARATE invocation with its own exit status. Ignoring it, then
         # skipping the membership check whenever the listing came back empty, was fail-open on

@@ -563,21 +563,64 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-    # ── D0A-R38-07 ──────────────────────────────────────────────────────────────────────
+    # ── D0A-R38-07 / D0A-R39-05 ─────────────────────────────────────────────────────────
     # The Drop-time failure capture needs DELPHI_FAILURE_SNAPSHOT_DIR, `$SNAPDIR` is exported
     # in §0b, and sudo's env_reset drops it — so the variable was arranged and never arrived
-    # (DEFECT_CLASSES 58), in the fix for a class-58 instance. Every ELEVATED invocation of a
-    # test binary must carry it explicitly, and this guard reads the procedure to say so.
+    # (DEFECT_CLASSES 58). The first version of this guard checked that the ASSIGNMENT TOKEN
+    # appeared on each line, which accepted `DELPHI_FAILURE_SNAPSHOT_DIR="$SNAP"` with `$SNAP`
+    # unset: the exact near-miss the round reported, passing its own guard. The value is what
+    # matters, so the value is what is now observed — by RUNNING each invocation.
     proc = (REPO / "scratch" / "lane-run-7-procedure.md").read_text()
-    elevated = [l.strip() for l in proc.splitlines()
+    joined, buf = [], ""
+    for line in proc.splitlines():
+        buf += line
+        if line.rstrip().endswith("\\"):
+            buf = buf.rstrip()[:-1] + " "
+            continue
+        joined.append(buf)
+        buf = ""
+    elevated = [l.strip() for l in joined
                 if re.match(r'^\s*sudo\b', l) and ('"$b"' in l or '"$B"' in l)]
     check("procedure: the elevated test-binary invocations are still found",
           len(elevated) == 3, f"{len(elevated)}: {elevated}")
-    naked = [l for l in elevated if "DELPHI_FAILURE_SNAPSHOT_DIR=" not in l]
-    check("procedure: every elevated invocation passes the snapshot directory",
-          not naked, f"{naked}")
-    check("procedure: ...through `sudo env`, because plain sudo and `-E` both drop it",
+    check("procedure: every elevated invocation goes through `sudo env`",
           all(l.startswith("sudo env ") for l in elevated), f"{elevated}")
+
+    # An argv-preserving stand-in for `sudo` plus a receiver that reports what it was given.
+    # This checks SHELL EXPANSION only; it does not prove real root environment delivery,
+    # which remains explicitly unverified (root is password-gated here).
+    d = pathlib.Path(tempfile.mkdtemp(prefix="lane-snapshot-value-"))
+    try:
+        binv = d / "bin"; binv.mkdir()
+        (binv / "sudo").write_text("#!/bin/sh\nexec \"$@\"\n")
+        (binv / "sudo").chmod(0o755)
+        seen = d / "seen.txt"
+        recv = d / "receiver"
+        recv.write_text("#!/bin/sh\n"
+                        f'printf "%s\\n" "${{DELPHI_FAILURE_SNAPSHOT_DIR-<ABSENT>}}" >> "{seen}"\n')
+        recv.chmod(0o755)
+        want = str(d / "snapshots")
+        for i, cmd in enumerate(elevated):
+            env = dict(os.environ)
+            env["PATH"] = f"{binv}:{env['PATH']}"
+            # SNAPDIR is set; every other candidate name is deliberately absent, so a line
+            # naming the wrong variable delivers an empty string rather than the directory.
+            for stray in ("SNAP", "SNAPSHOTS", "SNAPSHOT_DIR"):
+                env.pop(stray, None)
+            script = (f'SNAPDIR={want}; b={recv}; B={recv}; '
+                      f'LOG={d}/log-{i}; D={d}; mkdir -p "$D"; ' + cmd)
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+            check(f"procedure: invocation {i} ran under the stand-in", r.returncode == 0,
+                  r.stderr[-200:])
+        # `.split()` DROPS empty strings, which is exactly the value an unset variable
+        # delivers — the empty-filter shape (DEFECT_CLASSES 50) inside the guard written to
+        # catch it. `.splitlines()` keeps the empty delivery visible.
+        got = seen.read_text().splitlines() if seen.exists() else []
+        check("procedure: all three invocations reached the receiver", len(got) == 3, str(got))
+        check("procedure: every one DELIVERED the snapshot directory, not an empty string",
+              got == [want] * 3, f"{got} != {[want] * 3}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
     print(f"\n{PASSED} guards held")
     return 0

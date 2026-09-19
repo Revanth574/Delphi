@@ -14,8 +14,10 @@ happen to contain today.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -654,6 +656,66 @@ def main() -> int:
     direct = [l.strip() for l in src
               if "subprocess.run(" in l and not l.lstrip().startswith("#")]
     check("every subprocess goes through the managed primitive", not direct, str(direct))
+
+    # ── D0A-R39: THE RECORD ─────────────────────────────────────────────────────────────
+    # The ID is content-addressed, so the canonical body must EXCLUDE the id itself. A
+    # self-referential hash that works on the first record and breaks on the second is the
+    # kind of thing that ships.
+    base = {"schema": wd.SCHEMA, "verdict": "RED_PROVEN", "expectation": {"guard": "g"},
+            "limits": wd.RECORD_LIMITS}
+    rid = wd.record_id(base)
+    check("the id is stable when the body is unchanged", wd.record_id(base) == rid)
+    check("...and an id already present does not feed its own hash",
+          wd.record_id({**base, "id": rid}) == rid and
+          wd.record_id({**base, "id": "0" * 16}) == rid)
+    check("...and a different body gives a different id",
+          wd.record_id({**base, "verdict": "NOT_CAUGHT"}) != rid)
+    check("the id is 16 hex characters", re.fullmatch(r"[0-9a-f]{16}", rid) is not None, rid)
+
+    d, subject, suite = fixture()
+    rec_dir = pathlib.Path(tempfile.mkdtemp(prefix="weaken-records-"))
+    try:
+        v, ev = drive(subject, suite, '    if n != 1:', '    if False:')
+        body = wd.build_record(subject, '    if n != 1:', '    if False:', suite,
+                               "a nonconforming value is REFUSED", v, ev)
+        path = wd.write_record(rec_dir, body)
+        on_disk = json.loads(path.read_text())
+        check("a record written by the driver verifies against its own bytes",
+              wd.record_id(on_disk) == on_disk["id"] == body["id"], str(body["id"]))
+        check("the record names the file it was filed under", path.name == body["id"] + ".json")
+
+        # The disagreement test: could a reader re-open this?
+        check("the expectation is registered BEFORE any invocation",
+              body["expectation"]["registered_at"] == 0.0
+              and all(p["started_at"] >= 0.0 for p in body["phases"]))
+        check("every phase carries a duration, not only an outcome",
+              all("duration_s" in p for p in body["phases"]),
+              str([p["name"] for p in body["phases"] if "duration_s" not in p]))
+        check("the phases cover baseline, validation, observation and restoration",
+              {"validate-original", "baseline", "validate-mutant", "observe", "restore",
+               "restored"} <= {p["name"] for p in body["phases"]},
+              str([p["name"] for p in body["phases"]]))
+        check("the instrument and the subject are DISTINCT fields",
+              body["instrument"]["digest_executing"] != body["subject"]["digest_before"]
+              and body["subject"]["is_the_instrument_file"] is False)
+        check("...and the subject's three digests are all recorded",
+              all(body["subject"][k] for k in
+                  ("digest_before", "digest_mutant", "digest_restored")))
+        check("the record carries its own limits, so a citation cannot shed them",
+              body["limits"] == wd.RECORD_LIMITS and len(body["limits"]) >= 5)
+        check("the suite argv and cwd are recorded, so the run is reconstructable",
+              body["suite"]["argv"] == suite and body["suite"]["cwd"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(rec_dir, ignore_errors=True)
+
+    # And the self-weaken case the record exists for: when the driver is its OWN subject,
+    # the executing bytes and the mutated bytes are different things.
+    body = wd.build_record(pathlib.Path(wd.__file__), "a", "b", ["x"], "g", "RED_PROVEN",
+                           {"digest_before": "deadbeef"})
+    check("a self-weaken is marked as one", body["subject"]["is_the_instrument_file"] is True)
+    check("...and the EXECUTING digest is still reported separately from the subject's",
+          body["instrument"]["digest_executing"] != body["subject"]["digest_before"])
 
     print(f"\n{PASSED} guards held")
     return 0

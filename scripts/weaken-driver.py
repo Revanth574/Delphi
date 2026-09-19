@@ -60,12 +60,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import pathlib
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import typing
 
 # Every way the chain can break, each a distinct verdict. Collapsing any two of these is how a
@@ -99,6 +101,75 @@ class Invocation(typing.NamedTuple):
     @property
     def green(self) -> bool:
         return self.outcome == EXITED and self.code == 0
+
+
+# ── THE RECORD (D0A-R39, the placement question settled BEFORE this was built) ────────────
+#
+# WHAT THE RECORD IS FOR. Not "what happened" — **re-openability**. The test for every field
+# is whether a reader who was not here could reconstruct the experiment well enough to
+# DISAGREE with its verdict. A field that does not serve that is decoration; a missing field
+# that does is a gap.
+#
+# WHY `duration_s` IS IN HERE, and the reasoning the next person adding a field needs:
+# every other field is a CONTENT fact (which bytes, which label, which exit). The sharpest
+# refusal this tool has produced was a TIMING fact — deleting a `killpg` made the driver hang
+# for the suite's full timeout, so its restore landed AFTER a grandchild's write and masked
+# the defect the weaken targeted. A record of what happened that cannot show WHEN it happened
+# cannot surface a self-invalidating experiment, which is the category this tool exists to
+# catch and the one that produced three refusals in a single session.
+#
+# WHY THE INSTRUMENT AND THE SUBJECT ARE TWO FIELDS. This driver's own rounds were the driver
+# making claims about the driver: it runs from memory while mutating its own source on disk.
+# "instrument digest: X" is ambiguous exactly when X is also the mutated target, which is the
+# case needing the MOST scrutiny. `digest_executing` is captured at import, before anything
+# can be written.
+#
+# WHY EVERY RECORD CARRIES ITS OWN LIMITS. A claim that travels without them is what "unwired"
+# concealed: the register held the limits and the citation did not. Attached to the artifact,
+# they travel with every citation by construction.
+SCHEMA = "delphi.weaken-record/1"
+
+RECORD_LIMITS = [
+    "does not establish that the weakened guard is well-chosen",
+    "NOT_CAUGHT does not separate a redundant check from a condition never arranged "
+    "(DEFECT_CLASSES 58)",
+    "the guard-label side channel is a report channel for TRUSTED HELPERS; it is not evidence "
+    "against a hostile subject",
+    "a descendant that calls setsid escapes process-group collection (D0A-R38-02, pinned)",
+    "content-addressing prevents POST-HOC EDITING of this record, not fabrication of one",
+]
+
+# Captured at import, before this process can write anything — so for a self-weaken it is the
+# EXECUTING bytes, not whatever is on disk when the record is written.
+_INSTRUMENT_PATH = pathlib.Path(__file__).resolve()
+_INSTRUMENT_DIGEST = hashlib.sha256(_INSTRUMENT_PATH.read_bytes()).hexdigest()
+
+
+def canonical_body(body: dict) -> bytes:
+    """The bytes an ID is computed over. `id` is NEVER part of its own input."""
+    return json.dumps({k: v for k, v in body.items() if k != "id"},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def record_id(body: dict) -> str:
+    return hashlib.sha256(canonical_body(body)).hexdigest()[:16]
+
+
+class _Phase:
+    """Time one phase into the evidence, in order."""
+
+    def __init__(self, ev: dict, name: str):
+        self.ev, self.name = ev, name
+
+    def __enter__(self) -> dict:
+        self.t0 = time.monotonic()
+        self.entry = {"name": self.name, "started_at": round(self.t0 - self.ev["_t0"], 3)}
+        self.ev.setdefault("phases", []).append(self.entry)
+        return self.entry
+
+    def __exit__(self, *_exc) -> bool:
+        self.entry["duration_s"] = round(time.monotonic() - self.t0, 3)
+        return False
 
 
 def _digest_bytes(b: bytes) -> str:
@@ -309,6 +380,7 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
     # unchanged and raises nothing — the silent no-op that has shipped twice here. Which of the
     # two predicates fired is RECORDED, because that is what makes the first one testable.
     ev["phase"] = "mutate"
+    _Phase(ev, "mutate").__enter__()["duration_s"] = 0.0
     if anchor not in original:
         ev["reason"] = "the anchor does not occur in the target"
         ev["not_applied_because"] = "anchor-absent"
@@ -325,7 +397,8 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
     # that loaded the ORIGINAL, so a target that never loads is the experiment's fault and not
     # the mutation's (that control runs in `drive`, before anything is written).
     ev["phase"] = "validate"
-    status, detail = _loads(_validate_for(target, ev["digest_weakened"], validate), timeout)
+    with _Phase(ev, "validate-mutant"):
+        status, detail = _loads(_validate_for(target, ev["digest_weakened"], validate), timeout)
     ev["mutant_validation"] = status
     ev["mutant_loads"] = status == LOADED
     if status == DIGEST_MISMATCH:
@@ -339,7 +412,9 @@ def _apply_and_observe(target: pathlib.Path, original: bytes, before: str, ancho
 
     # 4. RUN UNDER THE WEAKEN.
     ev["phase"] = "observe"
-    run = _run(suite, report_dir, "weakened", timeout)
+    with _Phase(ev, "observe") as ph:
+        run = _run(suite, report_dir, "weakened", timeout)
+    ph["outcome"], ph["report"] = run.outcome, run.report
     ev["weakened"] = run._asdict()
     ev["weakened_exit"] = run.code
     ev["failing_guards"] = run.labels
@@ -376,7 +451,11 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
           expect: str, timeout: int = 900, *, validate: list[str] | None = None,
           _restore=None) -> tuple[str, dict]:
     """The chain. Returns (verdict, evidence); the verdict is DERIVED from the record."""
-    ev: dict = {"target": str(target), "expect": expect, "phase": "baseline"}
+    ev: dict = {"target": str(target), "expect": expect, "phase": "baseline",
+                "_t0": time.monotonic()}
+    # The expectation is registered at offset 0.0 — BEFORE any invocation. That ordering is
+    # what makes a mis-aimed weaken visible as WRONG_GUARD rather than as a red suite.
+    ev["expectation_registered_at"] = 0.0
     # D0A-R38-06: BYTES, NOT TEXT. `read_text`/`write_text` translate newlines, so on a CRLF
     # target the restore wrote LF back and the driver CORRUPTED the tree it was measuring —
     # reporting MUTATION_NOT_APPLIED while doing it. Nothing here may round-trip through str.
@@ -391,7 +470,8 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
 
     # 1. BASELINE, both halves: the target must LOAD and the suite must be green. Nothing has
     # been written yet, so every exit here owes no restoration.
-    status, detail = _loads(_validate_for(target, before, validate), timeout)
+    with _Phase(ev, "validate-original"):
+        status, detail = _loads(_validate_for(target, before, validate), timeout)
     ev["original_validation"] = status
     ev["original_loads"] = status == LOADED
     if status == DIGEST_MISMATCH:
@@ -400,7 +480,9 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     if status != LOADED:
         ev["reason"] = f"the UNMUTATED target does not load: {detail}"
         return BASELINE_NOT_GREEN, ev
-    base = _run(suite, report_dir, "baseline", timeout)
+    with _Phase(ev, "baseline") as ph:
+        base = _run(suite, report_dir, "baseline", timeout)
+    ph["outcome"], ph["report"] = base.outcome, base.report
     ev["baseline"] = base._asdict()
     ev["baseline_exit"] = base.code
     if base.outcome == TIMED_OUT:
@@ -436,6 +518,7 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
     finally:
         # RESTORE, and VERIFY the restore — against the digest, not the write's return.
         ev["phase"] = "restore"
+        _rp = _Phase(ev, "restore"); _rp.__enter__()
         ev["groups_collected_at_restore"] = _collect_all()
         restore(original)
         _purge_bytecode(target)
@@ -446,6 +529,7 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
             backup.unlink(missing_ok=True)
         else:
             ev["backup_retained"] = str(backup)
+        _rp.__exit__()
 
     # D0A-R38-06: ON EVERY TERMINAL PATH. This check used to sit below the success path only,
     # so each early return jumped past it and a corrupted tree was reported as a clean refusal.
@@ -455,13 +539,55 @@ def drive(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
         return RESTORE_FAILED, ev
     if verdict != RED_PROVEN:
         return verdict, ev
-    back = _run(suite, report_dir, "restored", timeout)
+    with _Phase(ev, "restored") as ph:
+        back = _run(suite, report_dir, "restored", timeout)
+    ph["outcome"], ph["report"] = back.outcome, back.report
     ev["restored"] = back._asdict()
     ev["restored_exit"] = back.code
     if not back.green:
         ev["reason"] = "the suite is not green again after restoration"
         return RESTORE_FAILED, ev
     return RED_PROVEN, ev
+
+
+def build_record(target: pathlib.Path, anchor: str, replacement: str, suite: list[str],
+                 expect: str, verdict: str, ev: dict) -> dict:
+    """Assemble the record. Everything here is CAPTURED by this process — nothing is typed."""
+    body = {
+        "schema": SCHEMA,
+        "verdict": verdict,
+        "expectation": {"guard": expect, "registered_at": ev.get("expectation_registered_at")},
+        "instrument": {"path": str(_INSTRUMENT_PATH), "digest_executing": _INSTRUMENT_DIGEST},
+        "subject": {
+            "path": str(target),
+            # The one that matters when the driver weakens itself: the file on disk that was
+            # mutated may be the very file this process is running from.
+            "is_the_instrument_file": target.resolve() == _INSTRUMENT_PATH,
+            "digest_before": ev.get("digest_before"),
+            "digest_mutant": ev.get("digest_weakened"),
+            "digest_restored": ev.get("digest_restored"),
+            "anchor": anchor,
+            "replacement": replacement,
+        },
+        "suite": {"argv": list(suite), "cwd": os.getcwd()},
+        "phases": ev.get("phases", []),
+        "observations": {k: ev[k] for k in (
+            "original_validation", "mutant_validation", "baseline", "weakened", "restored",
+            "failing_guards", "baseline_failing_guards", "not_applied_because",
+            "groups_collected_at_restore", "verdict_before_restore_check", "reason")
+            if k in ev},
+        # Retained whole and deciding nothing — the R36-06 disposition, one level up.
+        "diagnostics": {"note": "data for a human reader; no verdict is derived from it"},
+        "limits": RECORD_LIMITS,
+    }
+    return {"id": record_id(body), **body}
+
+
+def write_record(record_dir: pathlib.Path, body: dict) -> pathlib.Path:
+    record_dir.mkdir(parents=True, exist_ok=True)
+    path = record_dir / f"{body['id']}.json"
+    path.write_text(json.dumps(body, sort_keys=True, indent=2, ensure_ascii=False) + "\n")
+    return path
 
 
 def main() -> int:
@@ -471,6 +597,8 @@ def main() -> int:
     ap.add_argument("--replacement", default="")
     ap.add_argument("--expect", required=True, help="the guard label the weaken must fail on")
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--record-dir", default="scratch/weaken-records",
+                    help="where the proof record is written (the ledger this repo cites)")
     ap.add_argument("suite", nargs="+")
     a = ap.parse_args()
 
@@ -480,7 +608,11 @@ def main() -> int:
     except Refusal as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
+    body = build_record(pathlib.Path(a.target), a.anchor, a.replacement, a.suite, a.expect,
+                        verdict, ev)
+    path = write_record(pathlib.Path(a.record_dir), body)
     print(f"VERDICT: {verdict}")
+    print(f"  record: {body['id']}  ({path})")
     for k, v in ev.items():
         print(f"  {k}: {v}")
     if verdict != RED_PROVEN:

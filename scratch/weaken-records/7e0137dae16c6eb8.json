@@ -1,0 +1,116 @@
+{
+  "diagnostics": {
+    "note": "data for a human reader; no verdict is derived from it"
+  },
+  "expectation": {
+    "guard": "...and an id already present does not feed its own hash",
+    "registered_at": 0.0
+  },
+  "id": "7e0137dae16c6eb8",
+  "instrument": {
+    "digest_executing": "a7e63d12064bfd7655271c35a14e447e9319b1e500c7ac7a90d5e3913c9d91c3",
+    "path": "/home/revanth-aditya/Delphi/scripts/weaken-driver.py"
+  },
+  "limits": [
+    "does not establish that the weakened guard is well-chosen",
+    "NOT_CAUGHT does not separate a redundant check from a condition never arranged (DEFECT_CLASSES 58)",
+    "the guard-label side channel is a report channel for TRUSTED HELPERS; it is not evidence against a hostile subject",
+    "a descendant that calls setsid escapes process-group collection (D0A-R38-02, pinned)",
+    "content-addressing prevents POST-HOC EDITING of this record, not fabrication of one"
+  ],
+  "observations": {
+    "baseline": {
+      "code": 0,
+      "labels": [],
+      "outcome": "exited",
+      "report": "/tmp/weaken-report-b63bcyt0/labels-baseline.txt",
+      "signal": null,
+      "survivors": false
+    },
+    "failing_guards": [
+      "...and an id already present does not feed its own hash"
+    ],
+    "groups_collected_at_restore": 0,
+    "mutant_validation": "loaded",
+    "original_validation": "loaded",
+    "restored": {
+      "code": 0,
+      "labels": [],
+      "outcome": "exited",
+      "report": "/tmp/weaken-report-b63bcyt0/labels-restored.txt",
+      "signal": null,
+      "survivors": false
+    },
+    "weakened": {
+      "code": 1,
+      "labels": [
+        "...and an id already present does not feed its own hash"
+      ],
+      "outcome": "exited",
+      "report": "/tmp/weaken-report-b63bcyt0/labels-weakened.txt",
+      "signal": null,
+      "survivors": false
+    }
+  },
+  "phases": [
+    {
+      "duration_s": 0.095,
+      "name": "validate-original",
+      "started_at": 0.0
+    },
+    {
+      "duration_s": 28.075,
+      "name": "baseline",
+      "outcome": "exited",
+      "report": "/tmp/weaken-report-b63bcyt0/labels-baseline.txt",
+      "started_at": 0.096
+    },
+    {
+      "duration_s": 0.0,
+      "name": "mutate",
+      "started_at": 28.171
+    },
+    {
+      "duration_s": 0.101,
+      "name": "validate-mutant",
+      "started_at": 28.172
+    },
+    {
+      "duration_s": 27.749,
+      "name": "observe",
+      "outcome": "exited",
+      "report": "/tmp/weaken-report-b63bcyt0/labels-weakened.txt",
+      "started_at": 28.273
+    },
+    {
+      "duration_s": 0.001,
+      "name": "restore",
+      "started_at": 56.023
+    },
+    {
+      "duration_s": 28.238,
+      "name": "restored",
+      "outcome": "exited",
+      "report": "/tmp/weaken-report-b63bcyt0/labels-restored.txt",
+      "started_at": 56.023
+    }
+  ],
+  "schema": "delphi.weaken-record/1",
+  "subject": {
+    "anchor": "    return json.dumps({k: v for k, v in body.items() if k != \"id\"},",
+    "digest_before": "a7e63d12064bfd7655271c35a14e447e9319b1e500c7ac7a90d5e3913c9d91c3",
+    "digest_mutant": "f8c9e3f674eb32f012140d4d6c04f33a820e88cb2bacbb7a17d9e16a17f5f15a",
+    "digest_restored": "a7e63d12064bfd7655271c35a14e447e9319b1e500c7ac7a90d5e3913c9d91c3",
+    "is_the_instrument_file": true,
+    "path": "scripts/weaken-driver.py",
+    "replacement": "    return json.dumps(body,"
+  },
+  "suite": {
+    "argv": [
+      "python3",
+      "scripts/weaken-driver.test.py"
+    ],
+    "cwd": "/home/revanth-aditya/Delphi"
+  },
+  "verdict": "RED_PROVEN"
+}

@@ -787,51 +787,66 @@ def main() -> int:
             check(f"RED_PROVEN is rejected when {label}", wd.validate_record(bad),
                   "the contract accepted a verdict its own record does not support")
 
-        # ── D0A-R41-01 ──────────────────────────────────────────────────────────────────
-        # The contract required CONTAINERS. Dropping baseline/weakened/restored from the
-        # producer's whitelist left every guard passing and produced records with no
-        # invocation results at all, which the validator accepted as RED_PROVEN. Requiring
-        # `observations` to be non-empty is not requiring evidence.
-        for name in ("baseline", "weakened", "restored"):
+        # ── D0A-R41-01 / D0A-R42-01 / D0A-R42-04 ────────────────────────────────────────
+        # THREE ITERATIONS OF ONE MISTAKE, each a level down: R40-01 required no evidence,
+        # R41-01 required containers, R42-01 required containers whose contents could
+        # CONTRADICT the claim. And R42-04 is the same defect on this side — my fixture
+        # deleted `outcome` and `streams` TOGETHER, so neither was individually load-bearing,
+        # and I tested only ABSENT invocations, never invalid ones. Three weakens of the
+        # contract survived with all 141 guards passing.
+        #
+        # So: ONE MUTATION PER OBLIGATION, varying one field at a time. A fixture that moves
+        # several things at once cannot discriminate any of them.
+        def mangled(fn):
             bad = json.loads(json.dumps(on_disk))
-            bad["observations"].pop(name, None)
+            fn(bad)
             bad["id"] = wd.record_id(bad)
-            check(f"RED_PROVEN without the {name} invocation's result is rejected",
-                  wd.validate_record(bad), f"accepted a record with no {name} result")
+            return bad
 
-        for name in wd.INVOCATION_PHASES:
-            bad = json.loads(json.dumps(on_disk))
-            for ph in bad["phases"]:
-                if ph["name"] == name:
-                    ph.pop("outcome", None), ph.pop("streams", None)
-            bad["id"] = wd.record_id(bad)
-            check(f"phase {name!r} stripped to its timing is rejected", wd.validate_record(bad),
-                  "a phase with only a duration was accepted as evidence")
+        def phase(rec, name):
+            return next(p for p in rec["phases"] if p["name"] == name)
 
-        for name in wd.VALIDATION_PHASES:
-            bad = json.loads(json.dumps(on_disk))
-            for ph in bad["phases"]:
-                if ph["name"] == name:
-                    ph.pop("validation", None)
-            bad["id"] = wd.record_id(bad)
-            check(f"phase {name!r} without its validation evidence is rejected",
-                  wd.validate_record(bad), "validation with only a duration was accepted")
-            # ...but a target with NO validation command is a real case, not a defect: a
-            # shell script or a markdown file has none. `ran: False` is the observation.
-            ok = json.loads(json.dumps(on_disk))
-            for ph in ok["phases"]:
-                if ph["name"] == name:
-                    ph["validation"] = {"ran": False, "reason": "no validation command"}
-            ok["id"] = wd.record_id(ok)
-            check(f"...and {name!r} saying validation did not run is ACCEPTED",
+        for name, key, want_green in wd._INVOCATIONS:
+            obligations = [
+                (f"phase {name!r} without its outcome",
+                 lambda b, n=name: phase(b, n).pop("outcome", None)),
+                (f"phase {name!r} without its streams",
+                 lambda b, n=name: phase(b, n).pop("streams", None)),
+                (f"phase {name!r} disagreeing with the summary that cites it",
+                 lambda b, n=name: phase(b, n).update(outcome="signalled")),
+                (f"the {key} invocation absent",
+                 lambda b, k=key: b["observations"].pop(k, None)),
+                (f"the {key} invocation not having EXITED",
+                 lambda b, k=key: b["observations"][k].update(outcome="timed-out")),
+                (f"the {key} invocation's exit code contradicting RED_PROVEN",
+                 lambda b, k=key, g=want_green: b["observations"][k].update(
+                     code=(7 if g else 0))),
+            ]
+            for label, fn in obligations:
+                check(f"rejected: {label}", wd.validate_record(mangled(fn)),
+                      "this obligation has no mutation that fails it alone")
+
+        for name, key in wd._VALIDATIONS:
+            obligations = [
+                (f"phase {name!r} without any validation evidence",
+                 lambda b, n=name: phase(b, n).pop("validation", None)),
+                (f"phase {name!r} running validation but recording no argv",
+                 lambda b, n=name: phase(b, n)["validation"].pop("argv", None)),
+                (f"phase {name!r} running validation but recording no exit",
+                 lambda b, n=name: phase(b, n)["validation"].pop("exit", None)),
+                (f"phase {name!r} exiting nonzero while {key} says it loaded",
+                 lambda b, n=name: phase(b, n)["validation"].update(exit=1)),
+                (f"phase {name!r} not saying whether validation ran",
+                 lambda b, n=name: phase(b, n).update(validation={"reason": "silent"})),
+            ]
+            for label, fn in obligations:
+                check(f"rejected: {label}", wd.validate_record(mangled(fn)),
+                      "this obligation has no mutation that fails it alone")
+            # ...and a target with NO validation command is a real case, not a defect.
+            ok = mangled(lambda b, n=name: phase(b, n).update(
+                validation={"ran": False, "reason": "no validation command"}))
+            check(f"accepted: {name!r} saying validation did not run",
                   not wd.validate_record(ok), str(wd.validate_record(ok)[:2]))
-            worse = json.loads(json.dumps(on_disk))
-            for ph in worse["phases"]:
-                if ph["name"] == name:
-                    ph["validation"] = {"reason": "silent"}
-            worse["id"] = wd.record_id(worse)
-            check(f"...while {name!r} not saying WHETHER it ran is rejected",
-                  wd.validate_record(worse), "a validation that says nothing was accepted")
 
         # A reference that NAMES bytes is not a reference that BINDS them.
         for where, mangle in (
@@ -839,11 +854,13 @@ def main() -> int:
             ("inputs.instrument", lambda r: r["inputs"].update(instrument={"path": "x"})),
             ("suite.sources[0]", lambda r: r["suite"]["sources"].__setitem__(0, {"path": "x"})),
         ):
-            bad = json.loads(json.dumps(on_disk))
-            mangle(bad)
-            bad["id"] = wd.record_id(bad)
-            check(f"a path-only placeholder at {where} is rejected", wd.validate_record(bad),
-                  "a placeholder satisfied the contract")
+            check(f"a path-only placeholder at {where} is rejected",
+                  wd.validate_record(mangled(mangle)), "a placeholder satisfied the contract")
+
+        # The summary is not the observation.
+        check("the weakened invocation's OWN report must name the expected guard",
+              wd.validate_record(mangled(lambda b: b["observations"]["weakened"].update(labels=[]))),
+              "`failing_guards` alone satisfied a claim about what the run observed")
 
         # `{"path": ...}` fails BOTH halves of a source reference, so it cannot discriminate
         # either — weakening the sha256 requirement against it returned NOT_CAUGHT. Each half
@@ -1042,7 +1059,7 @@ def main() -> int:
     ld = importlib.util.module_from_spec(spec_ld)
     spec_ld.loader.exec_module(ld)
     base = json.loads((REPO / "scratch" / "weaken-records" /
-                       "099cacdad546769e.json").read_text())
+                       "445b1fb1e289af02.json").read_text())
     check("the comparator sees a record as identical to itself",
           ld.inputs(base) == ld.inputs(json.loads(json.dumps(base))))
 
@@ -1056,9 +1073,16 @@ def main() -> int:
         ("the timeout", lambda r: r["execution"].update(timeout_s=1)),
         ("the subject's original bytes",
          lambda r: r["inputs"]["subject_original"].update(sha256="x")),
-        ("a VALIDATION COMMAND", lambda r: [p.setdefault("validation", {}).update(
-            argv=["different-validator"]) for p in r["phases"]
-            if p["name"].startswith("validate-")]),
+        # D0A-R42-05: these used to move BOTH validation commands at once, so the
+        # original-phase difference concealed blindness to the mutant phase — excluding
+        # `validate-mutant` from the comparator still left every guard passing. One phase
+        # at a time, for the same reason the contract's obligations get one mutation each.
+        ("the VALIDATION COMMAND of validate-original",
+         lambda r: [p.setdefault("validation", {}).update(argv=["other-validator"])
+                    for p in r["phases"] if p["name"] == "validate-original"]),
+        ("the VALIDATION COMMAND of validate-mutant",
+         lambda r: [p.setdefault("validation", {}).update(argv=["other-validator"])
+                    for p in r["phases"] if p["name"] == "validate-mutant"]),
     ):
         other = json.loads(json.dumps(base))
         mangle(other)

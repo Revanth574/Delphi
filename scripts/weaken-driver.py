@@ -179,6 +179,14 @@ RED_PROVEN_PHASES = ("validate-original", "baseline", "validate-mutant", "observ
 INVOCATION_PHASES = ("baseline", "observe", "restored")
 VALIDATION_PHASES = ("validate-original", "validate-mutant")
 
+# (phase name, the observation that summarises it, must the run be GREEN)
+_INVOCATIONS = (("baseline", "baseline", True),
+                ("observe", "weakened", False),
+                ("restored", "restored", True))
+# (phase name, the observation that summarises it)
+_VALIDATIONS = (("validate-original", "original_validation"),
+                ("validate-mutant", "mutant_validation"))
+
 
 def _check_source_ref(ref, where: str, problems: list[str]) -> None:
     """A reference is recoverable or it is a placeholder. `{"path": "x"}` is a placeholder."""
@@ -192,45 +200,73 @@ def _check_source_ref(ref, where: str, problems: list[str]) -> None:
 
 
 def _check_red_proven_evidence(body: dict, problems: list[str]) -> None:
-    """The observations a RED_PROVEN claim rests on, checked as observations."""
+    """The observations a RED_PROVEN claim rests on, checked as observations.
+
+    D0A-R42-01, and this is the THIRD iteration of one mistake, each a level down:
+
+      * R40-01 — the consumer required NO evidence. `{"id": …, "verdict": …}` was accepted.
+      * R41-01 — it required CONTAINERS. Records with no invocation results were accepted.
+      * R42-01 — it required containers whose CONTENTS MAY CONTRADICT THE CLAIM. A
+        `validate-mutant` phase with `exit: 1` beside `mutant_validation: loaded`, a baseline
+        phase marked `timed-out` beside a summary saying it exited 0 — all accepted.
+
+    Each fix moved one level down and stopped. So the eligibility is now DERIVED from the
+    typed per-phase outcomes and the summary must AGREE with them; a disagreement is a
+    refusal rather than a preference for one side.
+
+    THE PREDICTION THIS MAKES, recorded so the next round confirms or refutes it: the level
+    below is evidence that agrees with the claim but was produced by a process that did not
+    do what the phase names say — a `baseline` phase whose argv is not the suite, a
+    `validate-mutant` that validated the original. Nothing here checks that a phase's
+    recorded invocation is the invocation its name claims.
+    """
     phases = {p.get("name"): p for p in body["phases"] if isinstance(p, dict)}
     absent = [p for p in RED_PROVEN_PHASES if p not in phases]
     if absent:
         problems.append(f"RED_PROVEN without the phases that would show it: {absent}")
         return
-    for name in INVOCATION_PHASES:
-        if "outcome" not in phases[name] or "streams" not in phases[name]:
-            problems.append(f"phase {name!r} records no process evidence, only its timing")
-    for name in VALIDATION_PHASES:
-        val = phases[name].get("validation")
+    obs = body.get("observations") or {}
+
+    for name, key, want_green in _INVOCATIONS:
+        phase, inv = phases[name], obs.get(key)
+        if "outcome" not in phase:
+            problems.append(f"phase {name!r} records no outcome, only its timing")
+        if "streams" not in phase:
+            problems.append(f"phase {name!r} records no streams, only its timing")
+        if not isinstance(inv, dict) or "outcome" not in inv:
+            problems.append(f"RED_PROVEN without the {key} invocation's result")
+            continue
+        if "outcome" in phase and phase["outcome"] != inv["outcome"]:
+            problems.append(f"phase {name!r} says {phase['outcome']!r} while {key} says "
+                            f"{inv['outcome']!r}; the record contradicts itself")
+        if inv["outcome"] != EXITED:
+            problems.append(f"the {key} invocation did not exit ({inv['outcome']}), so it "
+                            f"cannot support a verdict about a guard")
+        elif want_green and inv.get("code") != 0:
+            problems.append(f"the {key} invocation exited {inv.get('code')}; RED_PROVEN needs "
+                            f"it green")
+        elif not want_green and inv.get("code") in (0, None):
+            problems.append("the weakened invocation did not fail, so nothing bit")
+
+    for name, key in _VALIDATIONS:
+        val, status = phases[name].get("validation"), obs.get(key)
         if not isinstance(val, dict):
             problems.append(f"phase {name!r} records no validation evidence, only its timing")
-        elif val.get("ran"):
-            if not val.get("argv") or "exit" not in val:
-                problems.append(f"phase {name!r} ran validation but recorded neither its argv "
-                                f"nor its exit")
+            continue
+        if val.get("ran"):
+            if not val.get("argv"):
+                problems.append(f"phase {name!r} ran validation but recorded no argv")
+            if "exit" not in val:
+                problems.append(f"phase {name!r} ran validation but recorded no exit status")
+            elif status == LOADED and val["exit"] != 0:
+                problems.append(f"{key} says {LOADED!r} while phase {name!r} exited "
+                                f"{val['exit']}; the record contradicts itself")
         elif "ran" not in val:
             # Not every target HAS a validation command — a shell script or a markdown file
-            # has none, and `ran: False` is itself the observation. Requiring a prose reason
-            # beside it was gold-plating that would have invalidated five already-cited
-            # records for no gain; the reason is still emitted, just not demanded.
+            # has none, and `ran: False` is itself the observation.
             problems.append(f"phase {name!r} does not say whether validation ran")
 
-    obs = body.get("observations") or {}
-    expected = ((body.get("expectation") or {}).get("guard"))
-    for name, want_zero in (("baseline", True), ("weakened", False), ("restored", True)):
-        inv = obs.get(name)
-        if not isinstance(inv, dict) or "outcome" not in inv:
-            problems.append(f"RED_PROVEN without the {name} invocation's result")
-            continue
-        if inv["outcome"] != EXITED:
-            problems.append(f"the {name} invocation did not exit ({inv['outcome']}), so it "
-                            f"cannot support a verdict about a guard")
-        elif want_zero and inv.get("code") != 0:
-            problems.append(f"the {name} invocation exited {inv.get('code')}; RED_PROVEN needs "
-                            f"it green")
-        elif not want_zero and inv.get("code") in (0, None):
-            problems.append("the weakened invocation did not fail, so nothing bit")
+    expected = (body.get("expectation") or {}).get("guard")
     weakened = obs.get("weakened")
     if isinstance(weakened, dict) and expected not in (weakened.get("labels") or []):
         problems.append(f"the weakened invocation's OWN report does not name {expected!r}; "

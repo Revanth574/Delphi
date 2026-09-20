@@ -122,10 +122,15 @@ reopened:
   refused here, not the claims themselves.**
 
 **Quarantine is not disposition (D0A-R40 ruling).** The note above holds the line; it does not
-dispose of anything. `docs/PROOF_CLAIM_INVENTORY.md` enumerates every claim in
-`aa0d0e1..3f5ac55` by commit and by the guard it named — **21 withdrawn, 3 with records, 4
-narrative** — and a guard in `scripts/weaken-driver.test.py` joins that table to `git log`, so a
-claim-bearing commit absent from it fails a suite rather than reading as complete. A withdrawn
+dispose of anything. `docs/PROOF_CLAIM_INVENTORY.md` enumerates every claim by commit
+and by the guard it named, **and carries its own counts and covered range** — D0A-R41-08: this
+paragraph used to duplicate them and then contradicted the inventory, saying "21 withdrawn, 3
+with records" against its "24 withdrawn, 0 with records". A disposition that disagrees with
+itself across two current documents is worse than one stated in a single place, so the numbers
+live there and this entry points at them. A guard in `scripts/weaken-driver.test.py` joins that table to `git log`, so a
+claim-bearing commit absent from it fails a suite rather than reading as complete. **What that
+guard establishes is regex-selected commit coverage and internal consistency, not claim-level
+completeness** (D0A-R41-05) — the inventory states the limit and what closing it would require. A withdrawn
 claim is uncheckable, not refuted, and a rerun would establish evidence for its own recorded
 inputs rather than verifying the historical execution.
 

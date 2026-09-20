@@ -6,10 +6,39 @@ mode of a prose inventory is that it reads as complete when it is not, so every 
 checkable against `git log` mechanically, and a guard in `scripts/weaken-driver.test.py`
 refuses if a commit in the covered range carries a claim and is absent here.
 
-**Covered range:** `aa0d0e1..3f5ac55` — from the commit that introduced
-`scripts/weaken-driver.py` to the head of round 40's subject. Claims made **before** `aa0d0e1`
+**Covered range:** `aa0d0e1..13a950a` — from the commit that introduced
+`scripts/weaken-driver.py` **through the contract cutover and past it**, to the head of round
+41's remediation.
+
+**D0A-R41-06: the endpoint used to stop at `3f5ac55`, which preceded the contract.** That left
+a live transition gap — `11ddd0c` claims RED-proof and cites `ffa773f3`, a schema `/2` record
+failing six contract checks, and no later mechanism revisited it. A historical/going-forward
+division is only sound once the seam between them is disposed of, so the range now runs through
+it and the claim is withdrawn below.
+
+**The prospective boundary, stated because a fixed endpoint is where claims accumulate just
+past it:** commits after the endpoint are gated by `.githooks/commit-msg` at the moment they
+are made. That is not the same guarantee — each round has found defects in the gate as it then
+stood — so **the endpoint moves forward with each remediation, and every claim in the newly
+covered span is disposed of when it does.** The completeness guard fails if one is missed. Claims made **before** `aa0d0e1`
 were produced by reading a suite's output, not by an instrument; they are a larger and
 different category, out of scope here, and are not thereby endorsed.
+
+**WHAT THE GUARD ESTABLISHES, AND WHAT IT DOES NOT — D0A-R41-05, D0A-R41 ruling.** It
+establishes **regex-selected commit coverage and internal consistency**: every commit in range
+whose message matches `RED[-_ ]?PROV` has at least one row, every row carries a valid
+disposition, every cited record resolves, and the stated counts match the rows. It does **not**
+establish claim-level completeness, in two distinct ways:
+
+- a claim phrased differently — "verified to bite", "proven against the pre-fix code" — is
+  invisible to the selector, and no regex can establish that arbitrary prose contains no other
+  proof claim;
+- **even within a matching commit, individual claims can vanish.** The join reduces rows to
+  commit ids, so deleting one of `466c97f`'s two rows and decrementing the total leaves every
+  guard passing. Internal consistency cannot detect a coordinated edit — which is precisely why
+  claim-level completeness would need **an independently reviewed claim manifest**, checked
+  against these dispositions rather than derived from them. There is no such manifest, and this
+  file does not claim its absence is harmless.
 
 **Dispositions, and there are only three:**
 
@@ -59,8 +88,26 @@ unrecorded historical execution (D0A-R40 ruling).
 | `41300be` | ...and an id already present does not feed its own hash | `withdrawn` |
 | `41300be` | every phase carries a duration, not only an outcome | `withdrawn` |
 | `3f5ac55` | a capped stream SAYS it was capped | `withdrawn` |
+| `11ddd0c` | every commit in range that claims RED-proof appears in the inventory | `withdrawn` |
+| `1c7363b` | every suite argv element that is a file is bound by content | `record:17417a78a0e4d491` |
+| `1c7363b` | ...and it retains the streams the subject produced before hanging | `record:599cb956926fa1d8` |
+| `1c7363b` | validation phases carry a process observation, not only timing | `record:3206aa331acdfe28` |
+| `8bb34a0` | removing ANY required field is rejected | `record:41b48fe285e32510` |
+| `8bb34a0` | a record that hashes correctly but holds no experiment is REFUSED | `record:b4651ba1fb9a1e66` |
+| `8bb34a0` | an unresolved SECOND citation is REFUSED | `record:3e41bdf11cbbe48e` |
+| `8bb34a0` | a RED-proof claim with no record is REFUSED | `record:b31df4dc91bbb222` |
+| `311599c` | a claim in a COMMENT line is still a claim | `record:60fec18648c716eb` |
+| `61ce08f` | an unresolved SECOND citation is REFUSED | `record:b0a8b69e74ab8200` |
+| `9035f1e` | RED_PROVEN without the baseline invocation's result is rejected | `record:445b1fb1e289af02` |
+| `9035f1e` | phase 'baseline' stripped to its timing is rejected | `record:22b28b46c7b02434` |
+| `9035f1e` | a reference carrying content but NO sha256 is rejected | `record:4e222211d49265dd` |
+| `e14ad02` | ...and any git_blob it records holds exactly those bytes | `record:d154df965ddc9a90` |
+| `2c5293d` | a claim below an AUTHOR-written scissors line is REFUSED | `record:6905527e44611399` |
+| `2c5293d` | a BACKTICKED token is narrative, not an assertion | `record:0de66a864daadfec` |
+| `13a950a` | matrix: unreadable in the FIRST citation is REFUSED | `record:e93f8efa6bb7ef49` |
+| `13a950a` | matrix: missing in the SECOND citation is REFUSED | `record:099cacdad546769e` |
 
-**24 withdrawn, 0 with records, 4 narrative.**
+**25 withdrawn, 17 with records, 4 narrative.**
 
 The last three of those — `41300be`'s two and `3f5ac55`'s one — were briefly written as
 `record:<id>`, and the notes explaining why sat *inside* the disposition cell. That made three
@@ -75,10 +122,15 @@ no `suite.sources`, no `inputs.subject_original`, no `execution`. A record that 
 would refuse is not evidence, and listing it as evidence would be the same move this inventory
 exists to stop. They remain in the ledger as history.
 
-**Nothing in the covered range now carries proof credit.** That is the honest state: the
-suspension began because the instrument was defective, and the records produced before the
-evidence contract cannot discharge it. `record:<id>` remains a disposition for future use —
-`scripts/weaken-driver.test.py` enforces that any record cited here resolves in the ledger.
+**Seventeen claims now carry records that satisfy the current contract; twenty-five do not.**
+The withdrawn twenty-five are the pre-contract ones — claims from the suspended instrument, plus
+`11ddd0c`'s, whose record is schema `/2`. A withdrawn claim is uncheckable, not refuted.
+
+**That is not the same as lifting the suspension.** Those seventeen records satisfy the contract
+*as it stands after this round's findings*, and every round so far has found defects in the
+version before it. `scripts/weaken-driver.test.py` enforces that each cited record resolves and
+that the dispositions are internally consistent; it does not and cannot certify that the
+contract is now correct.
 
 ---
 

@@ -981,6 +981,23 @@ def main() -> int:
                if not (ledger / f"{d.split(':', 1)[1]}.json").exists()]
     check("every cited record resolves in the ledger", not missing, str(missing))
 
+    # A `record:` disposition that points at a record the CONSUMER would refuse is not a
+    # disposition. This is no longer vacuous — 17 rows cite one.
+    cited_ids = [d.split(":", 1)[1] for _, _, d in rows if d.startswith("record:")]
+    check("the inventory cites records at all, so the checks below are not empty",
+          len(cited_ids) >= 1, "no row cites a record")
+    invalid = []
+    for rid in cited_ids:
+        path = ledger / f"{rid}.json"
+        if path.exists() and wd.validate_record(json.loads(path.read_text())):
+            invalid.append(rid)
+    check("every record cited as a disposition satisfies the evidence contract",
+          not invalid, f"cited but would be refused: {invalid}")
+    # ...and a withdrawn row must NOT be silently backed by a valid record either: the
+    # historical ones are withdrawn because their records predate the contract.
+    check("the inventory's own guard set covers both dispositions",
+          any(d == "withdrawn" for _, _, d in rows) and cited_ids)
+
     # The guard above is VACUOUS while no row cites a record — it passes because there is
     # nothing to check, which is DEFECT_CLASSES 50's shape. This one never is: the table's
     # own summary line has to match the table.

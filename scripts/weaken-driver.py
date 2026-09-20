@@ -82,6 +82,10 @@ TIMEOUT = "TIMEOUT"
 RESTORE_FAILED = "RESTORE_FAILED"              # the tree did not come back byte-identical
 RED_PROVEN = "RED_PROVEN"                      # and only here
 
+_ALL_VERDICTS = frozenset({BASELINE_NOT_GREEN, MUTATION_NOT_APPLIED, MUTATION_INVALID,
+                           NOT_CAUGHT, WRONG_GUARD, UNVERIFIABLE, TIMEOUT, RESTORE_FAILED,
+                           RED_PROVEN})
+
 # D0A-R38-01/03/09: THE VERDICTS ARE A DERIVED VIEW, NOT THE RECORD. Five independent facts
 # were being inferred from one exit code and one report file, which is why three separate
 # defects had one cause. Each is now OBSERVED and recorded on its own terms, and the verdict is
@@ -145,6 +149,76 @@ RECORD_LIMITS = [
 # EXECUTING bytes, not whatever is on disk when the record is written.
 _INSTRUMENT_PATH = pathlib.Path(__file__).resolve()
 _INSTRUMENT_DIGEST = hashlib.sha256(_INSTRUMENT_PATH.read_bytes()).hexdigest()
+
+
+# D0A-R40-01: THE EVIDENCE CONTRACT, SHARED. The consumer checked a hash and a declared
+# verdict and nothing else — `{"id": ..., "verdict": "RED_PROVEN"}` was accepted and a commit
+# claiming RED-proof succeeded. There was no experiment to re-open. Gutting the producer's
+# observation whitelist to `if False` also left all guards passing and produced records the
+# hook accepted. Both sides now answer to ONE list, here, so neither can drift from it.
+REQUIRED_PATHS = [
+    "schema", "id", "verdict",
+    "expectation.guard", "expectation.registered_at",
+    "instrument.path", "instrument.digest_executing",
+    "subject.path", "subject.digest_before", "subject.is_the_instrument_file",
+    "suite.argv", "suite.cwd", "suite.sources",
+    "inputs.subject_original", "inputs.instrument",
+    "execution.timeout_s", "execution.interpreter",
+    "phases", "observations", "limits",
+]
+
+# What a RED_PROVEN record must ALSO carry. A verdict is a claim about an experiment; these
+# are the observations that experiment must have produced for the claim to be re-openable.
+RED_PROVEN_PHASES = ("validate-original", "baseline", "validate-mutant", "observe", "restore",
+                     "restored")
+
+
+def _at(body: dict, path: str):
+    node = body
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def validate_record(body: dict) -> list[str]:
+    """Every reason this record fails the evidence contract. Empty means it holds."""
+    problems = []
+    for path in REQUIRED_PATHS:
+        value = _at(body, path)
+        if value is None or value == "" or value == [] or value == {}:
+            problems.append(f"missing or empty: {path}")
+    if body.get("schema") not in (None, SCHEMA):
+        problems.append(f"schema {body['schema']!r} is not {SCHEMA!r}; this record predates "
+                        f"the evidence contract and carries no credit under it")
+    if body.get("id") and record_id(body) != body["id"]:
+        problems.append("the body does not hash to its own id")
+    if body.get("verdict") not in _ALL_VERDICTS:
+        problems.append(f"unknown verdict: {body.get('verdict')!r}")
+    if problems:
+        return problems
+
+    phases = {p.get("name") for p in body["phases"] if isinstance(p, dict)}
+    if any("duration_s" not in p for p in body["phases"] if isinstance(p, dict)):
+        problems.append("a phase carries no duration")
+
+    if body["verdict"] == RED_PROVEN:
+        absent = [p for p in RED_PROVEN_PHASES if p not in phases]
+        if absent:
+            problems.append(f"RED_PROVEN without the phases that would show it: {absent}")
+        named = _at(body, "observations.failing_guards") or []
+        if _at(body, "expectation.guard") not in named:
+            problems.append(f"RED_PROVEN, but the expected guard is not among the observed "
+                            f"failures {named!r} — the verdict is not supported by the record")
+        if _at(body, "observations.mutant_validation") != LOADED:
+            problems.append("RED_PROVEN without a mutant that loaded; an invalid experiment "
+                            "cannot prove a guard bites")
+        if not _at(body, "subject.digest_mutant"):
+            problems.append("RED_PROVEN without a recorded mutant digest")
+        if _at(body, "subject.digest_restored") != _at(body, "subject.digest_before"):
+            problems.append("RED_PROVEN without a verified restoration")
+    return problems
 
 
 def canonical_body(body: dict) -> bytes:
@@ -707,6 +781,13 @@ def build_record(target: pathlib.Path, anchor: str, replacement: str, suite: lis
 
 
 def write_record(record_dir: pathlib.Path, body: dict) -> pathlib.Path:
+    # The producer answers to the same contract as the consumer. A record that cannot be
+    # accepted should never have been written — finding that out at commit time is finding it
+    # out too late to re-run cheaply.
+    failures = validate_record(body)
+    if failures:
+        raise Refusal("this run produced a record that fails the evidence contract, which is "
+                      "a defect in the driver rather than in the weaken: " + "; ".join(failures))
     record_dir.mkdir(parents=True, exist_ok=True)
     path = record_dir / f"{body['id']}.json"
     path.write_text(json.dumps(body, sort_keys=True, indent=2, ensure_ascii=False) + "\n")

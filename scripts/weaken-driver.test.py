@@ -701,6 +701,56 @@ def main() -> int:
         check("...and the subject's three digests are all recorded",
               all(body["subject"][k] for k in
                   ("digest_before", "digest_mutant", "digest_restored")))
+        # ── D0A-R40-01: THE EVIDENCE CONTRACT ───────────────────────────────────────────
+        # The consumer checked a hash and a declared verdict, so a record with no experiment
+        # in it was accepted. Both sides now answer to REQUIRED_PATHS, and this iterates that
+        # same list against a REAL producer record — so a path added to the contract is
+        # covered here without anyone remembering to add a case.
+        check("a real producer record satisfies the contract",
+              wd.validate_record(on_disk) == [], str(wd.validate_record(on_disk)))
+        survived = []
+        for path in wd.REQUIRED_PATHS:
+            maimed = json.loads(json.dumps(on_disk))
+            node, *rest = path.split(".")
+            if rest:
+                maimed.get(node, {}).pop(rest[0], None)
+            else:
+                maimed.pop(node, None)
+            # Re-seal so the ONLY defect is the missing field — except when the missing
+            # field IS the id, where re-sealing would put it back.
+            if path != "id":
+                maimed["id"] = wd.record_id(maimed)
+            if not wd.validate_record(maimed):
+                survived.append(path)
+        check("removing ANY required field is rejected", not survived, str(survived))
+
+        # A verdict is a claim about an experiment; these are the observations it needs.
+        for label, mangle in (
+            ("the expected guard is not among the observed failures",
+             lambda r: r["observations"].update(failing_guards=["something else"])),
+            ("the mutant never loaded",
+             lambda r: r["observations"].update(mutant_validation="load-failed")),
+            ("restoration was not verified",
+             lambda r: r["subject"].update(digest_restored="0" * 64)),
+            ("a phase that would show it is absent",
+             lambda r: r.update(phases=[p for p in r["phases"] if p["name"] != "observe"])),
+        ):
+            bad = json.loads(json.dumps(on_disk))
+            mangle(bad)
+            bad["id"] = wd.record_id(bad)
+            check(f"RED_PROVEN is rejected when {label}", wd.validate_record(bad),
+                  "the contract accepted a verdict its own record does not support")
+
+        # The producer answers to the contract too: a record that could not be accepted
+        # should never be written.
+        try:
+            wd.write_record(rec_dir, {"id": "x", "verdict": "RED_PROVEN"})
+            check("the producer refuses to write a record that fails the contract", False,
+                  "it wrote one")
+        except wd.Refusal as e:
+            check("the producer refuses to write a record that fails the contract",
+                  "evidence contract" in str(e), str(e)[:120])
+
         check("the record carries its own limits, so a citation cannot shed them",
               body["limits"] == wd.RECORD_LIMITS and len(body["limits"]) >= 5)
         check("the suite argv and cwd are recorded, so the run is reconstructable",
@@ -802,6 +852,20 @@ def main() -> int:
     missing = [d.split(":", 1)[1] for _, _, d in rows if d.startswith("record:")
                if not (ledger / f"{d.split(':', 1)[1]}.json").exists()]
     check("every cited record resolves in the ledger", not missing, str(missing))
+
+    # The guard above is VACUOUS while no row cites a record — it passes because there is
+    # nothing to check, which is DEFECT_CLASSES 50's shape. This one never is: the table's
+    # own summary line has to match the table.
+    tally = {"withdrawn": 0, "narrative": 0, "record": 0}
+    for _, _, d in rows:
+        tally["record" if d.startswith("record:") else d] += 1
+    claimed = re.search(r"\*\*(\d+) withdrawn, (\d+) with records?, (\d+) narrative\.\*\*", inv)
+    check("the inventory states its own counts", claimed is not None)
+    check("...and the stated counts match the rows",
+          (int(claimed.group(1)), int(claimed.group(2)), int(claimed.group(3)))
+          == (tally["withdrawn"], tally["record"], tally["narrative"]),
+          f"stated {claimed.groups()} vs counted "
+          f"{(tally['withdrawn'], tally['record'], tally['narrative'])}")
 
     rng = subprocess.run(["git", "-C", str(REPO), "log", "--format=%h %H",
                           f"{m.group(1)}..{m.group(2)}"], capture_output=True, text=True)

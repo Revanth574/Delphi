@@ -41,6 +41,23 @@ Class 22's longest-running instance — validity established by *proxy*, three r
 each time and by nobody here. **An instrument's own claims about itself are exactly what needs
 to be independently re-openable.**
 
+## The evidence contract
+
+`scripts/weaken-driver.py` holds `REQUIRED_PATHS` and `validate_record`, and **both sides
+answer to them**: the producer refuses to write a record that fails, and `.githooks/commit-msg`
+imports the same function and refuses to accept one. A second implementation would be
+`DEFECT_CLASSES` 55 by construction.
+
+The contract is not a field checklist. A `RED_PROVEN` record must additionally carry the
+phases that would show it, name its expected guard among the observed failures, record a
+mutant that loaded, and show a restoration whose digest matches the original — because
+**a verdict is a claim about an experiment, and these are the observations that experiment had
+to produce for the claim to be re-openable.**
+
+D0A-R40-01 is why: the consumer checked a hash and a declared verdict, so
+`{"id": ..., "verdict": "RED_PROVEN"}` was accepted and a real commit claiming RED-proof
+succeeded. There was no experiment in it.
+
 ## What a record does NOT establish
 
 Every record carries its own `limits` array, so a citation cannot shed them. In summary: the

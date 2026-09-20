@@ -56,16 +56,29 @@ unrecorded historical execution (D0A-R40 ruling).
 | `fd1bc49` | procedure: every one DELIVERED the snapshot directory, not an empty string | `withdrawn` |
 | `709e9b9` | attribution: a name-shaped line in CAPTURED OUTPUT is not a failure name | `withdrawn` |
 | `f2e11dc` | — (records the suspension itself) | `narrative` |
-| `41300be` | ...and an id already present does not feed its own hash | `record:7e0137dae16c6eb8` |
-| `41300be` | every phase carries a duration, not only an outcome | `record:af42ed54be4fde07` |
-| `3f5ac55` | a capped stream SAYS it was capped | `record:7dc26d277ff82b0e` |
+| `41300be` | ...and an id already present does not feed its own hash | `withdrawn` |
+| `41300be` | every phase carries a duration, not only an outcome | `withdrawn` |
+| `3f5ac55` | a capped stream SAYS it was capped | `withdrawn` |
 
-**21 withdrawn, 3 with records, 4 narrative.**
+**24 withdrawn, 0 with records, 4 narrative.**
 
-The three records above are **not** exempt from round 40's findings. D0A-R40-01 shows the
-consumer requires no evidence, and D0A-R40-02 shows two of the four ledger records are
-indistinguishable in every recorded field while carrying different verdicts. They are cited
-here because they exist, not because they are sufficient.
+The last three of those — `41300be`'s two and `3f5ac55`'s one — were briefly written as
+`record:<id>`, and the notes explaining why sat *inside* the disposition cell. That made three
+rows unparseable, the completeness guard stopped counting them as listed, and it failed. The
+disposition cell is a single backticked token because this table is **parsed**, not read; an
+annotation belongs here, in prose, where it cannot break the parse.
+
+**The three rows that briefly said `record:` now say `withdrawn`, and that is D0A-R40-01
+applied to this file.** Records `7e0137da`, `af42ed54` and `7dc26d27` exist and describe real
+runs, but they are schema `/1` and `/2` and each fails the evidence contract on six counts —
+no `suite.sources`, no `inputs.subject_original`, no `execution`. A record that the consumer
+would refuse is not evidence, and listing it as evidence would be the same move this inventory
+exists to stop. They remain in the ledger as history.
+
+**Nothing in the covered range now carries proof credit.** That is the honest state: the
+suspension began because the instrument was defective, and the records produced before the
+evidence contract cannot discharge it. `record:<id>` remains a disposition for future use —
+`scripts/weaken-driver.test.py` enforces that any record cited here resolves in the ledger.
 
 ---
 

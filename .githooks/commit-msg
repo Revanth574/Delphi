@@ -104,6 +104,17 @@ def main() -> int:
                 f"{rec.get('verdict')!r}.\n"
                 "    That verdict is a statement about the EXPERIMENT, not a weakness in the\n"
                 "    target. Cite it for what it says, or re-run the weaken.")
+            continue
+        # D0A-R40-01: THE EVIDENCE CONTRACT. Checking the hash and the declared verdict
+        # accepted `{"id": ..., "verdict": "RED_PROVEN"}` — a record with no experiment in it.
+        # The contract lives in the producer and is imported, never restated here.
+        failures = wd.validate_record(rec)
+        if failures:
+            listed = "\n".join(f"      - {f}" for f in failures[:8])
+            problems.append(
+                f"record {rid} does not satisfy the evidence contract:\n{listed}\n"
+                "    A verdict without the observations that produced it is the prose this\n"
+                "    trailer exists to replace. Re-run the weaken with a current driver.")
 
     if not problems:
         return 0

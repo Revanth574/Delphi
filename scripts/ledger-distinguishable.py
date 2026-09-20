@@ -24,6 +24,26 @@ import sys
 LEDGER = pathlib.Path(__file__).resolve().parent.parent / "scratch" / "weaken-records"
 
 
+def validation_config(body: dict) -> list:
+    """The validation COMMANDS, without their results.
+
+    D0A-R41-07: these were omitted, so two real experiments differing only in their custom
+    validator — one RED_PROVEN, one MUTATION_INVALID — were reported as sharing every recorded
+    input. The tool said evidence was missing when the evidence was present and unread, which
+    is the diagnostic making the error it exists to find.
+
+    `argv` is configuration and belongs in the comparison. `exit`, `streams` and `ran` are
+    RESULTS and stay out, for the same reason `digest_restored` does: comparing outcomes would
+    make every pair look distinct and the tool vacuous.
+    """
+    out = []
+    for phase in body.get("phases") or []:
+        val = (phase or {}).get("validation")
+        if isinstance(val, dict):
+            out.append([phase.get("name"), val.get("argv")])
+    return sorted(out, key=lambda e: str(e[0]))
+
+
 def inputs(body: dict) -> str:
     return json.dumps({
         "instrument": body.get("instrument"),
@@ -34,6 +54,7 @@ def inputs(body: dict) -> str:
         "expectation": (body.get("expectation") or {}).get("guard"),
         "execution": body.get("execution"),
         "inputs": body.get("inputs"),
+        "validation": validation_config(body),
     }, sort_keys=True)
 
 

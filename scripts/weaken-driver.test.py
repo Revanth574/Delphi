@@ -1033,6 +1033,53 @@ def main() -> int:
           any(l.startswith(m.group(2)[:7]) or m.group(2).startswith(l) for l in listed),
           m.group(2))
 
+    # ── D0A-R41-07: THE COMPARATOR'S SENSITIVITY ────────────────────────────────────────
+    # A blanket "no two records collide" assertion passes near-vacuously on a small ledger
+    # and says nothing about WHICH differences the tool can see — the D0A-R41 ruling asks for
+    # sensitivity instead. Each relevant input is changed on its own; the tool must notice.
+    spec_ld = importlib.util.spec_from_file_location(
+        "ld", REPO / "scripts" / "ledger-distinguishable.py")
+    ld = importlib.util.module_from_spec(spec_ld)
+    spec_ld.loader.exec_module(ld)
+    base = json.loads((REPO / "scratch" / "weaken-records" /
+                       "099cacdad546769e.json").read_text())
+    check("the comparator sees a record as identical to itself",
+          ld.inputs(base) == ld.inputs(json.loads(json.dumps(base))))
+
+    for label, mangle in (
+        ("the instrument digest", lambda r: r["instrument"].update(digest_executing="x")),
+        ("the subject's before-digest", lambda r: r["subject"].update(digest_before="x")),
+        ("the mutation", lambda r: r["subject"].update(replacement="something else")),
+        ("the suite argv", lambda r: r["suite"]["argv"].append("--extra")),
+        ("a suite source's bytes", lambda r: r["suite"]["sources"][0].update(sha256="x")),
+        ("the expected guard", lambda r: r["expectation"].update(guard="another guard")),
+        ("the timeout", lambda r: r["execution"].update(timeout_s=1)),
+        ("the subject's original bytes",
+         lambda r: r["inputs"]["subject_original"].update(sha256="x")),
+        ("a VALIDATION COMMAND", lambda r: [p.setdefault("validation", {}).update(
+            argv=["different-validator"]) for p in r["phases"]
+            if p["name"].startswith("validate-")]),
+    ):
+        other = json.loads(json.dumps(base))
+        mangle(other)
+        check(f"...and distinguishes two records differing in {label}",
+              ld.inputs(base) != ld.inputs(other),
+              "a relevant input change was invisible to the comparator")
+
+    # ...while still EXCLUDING results and timings, or every pair looks distinct and the tool
+    # reports nothing. That exclusion is what makes a collision meaningful.
+    for label, mangle in (
+        ("phase durations", lambda r: [p.update(duration_s=99.9) for p in r["phases"]]),
+        ("the restored digest", lambda r: r["subject"].update(digest_restored="x")),
+        ("a validation RESULT", lambda r: [p["validation"].update(exit=7) for p in r["phases"]
+                                           if "validation" in p]),
+    ):
+        other = json.loads(json.dumps(base))
+        mangle(other)
+        check(f"...and ignores {label}, which is an outcome rather than an input",
+              ld.inputs(base) == ld.inputs(other),
+              "an outcome leaked into the input projection, making every pair look distinct")
+
     print(f"\n{PASSED} guards held")
     return 0
 

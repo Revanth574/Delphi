@@ -113,66 +113,83 @@ printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' "$GOOD"
   > "$work/ok2"
 check "...and so is a message citing TWO records" accept "$work/ok2"
 
-# ── D0A-R40-05 ──────────────────────────────────────────────────────────────────────────
-# Distinct ids fixed the collision but both records were ACCEPTABLE, so `for rid in cited[:1]`
-# still passed every case. Each citation POSITION must independently cause refusal, or the
-# loop is untested past its first iteration.
-printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: 0123456789abcdef\n' \
-  "$GOOD" > "$work/second-unresolved"
-check "an unresolved SECOND citation is REFUSED" refuse "$work/second-unresolved" \
-  "neither staged nor committed"
-
-printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
-  "$GOOD" "$NOTCAUGHT" > "$work/second-wrong-verdict"
-check "a wrong-verdict SECOND citation is REFUSED" refuse "$work/second-wrong-verdict" \
-  "its verdict is 'NOT_CAUGHT'"
-
-printf 'fix: x\n\nRED-proven.\n\nweaken-record: 0123456789abcdef\nweaken-record: %s\n' \
-  "$GOOD" > "$work/first-unresolved"
-check "an unresolved FIRST citation is REFUSED" refuse "$work/first-unresolved" \
-  "neither staged nor committed"
-
-# The hook distinguishes FIVE refusals, and a position is only proven for the kinds tested
-# AT it. Missing and wrong-verdict are covered above; these two are the rest.
-CORRUPT=$(mint RED_PROVEN four)
-python3 - "$work/repo" "$CORRUPT" <<'PY2'
+# ── D0A-R40-05 / D0A-R41-04: THE REFUSAL-KIND x CITATION-POSITION MATRIX ────────────────
+#
+# PROVENANCE, because the discipline's whole value is in it and it is invisible afterwards:
+#
+#   * the KINDS come from D0A-R41-04's own wording — it names "missing, wrong-verdict,
+#     corrupted-hash, and contract-invalid" as covered and "unreadable JSON" as omitted.
+#     Five. Read from the FINDING, never from the hook, because a matrix derived from the
+#     implementation reproduces the implementation's omissions;
+#   * the POSITIONS come from the loop's STRUCTURE — `for rid in cited` has a first
+#     iteration and a subsequent one, and `cited[:1]` passing proved the second was never
+#     load-bearing. Two.
+#
+# Taking the kinds from the code is what produced the first gap. Taking the positions from
+# the finding would have been impossible: it does not know the loop's shape.
+mint_bad() {  # mint_bad <kind> -> prints an id that the hook must refuse
+  case "$1" in
+    missing)   echo "0123456789abcdef" ;;                       # never staged
+    wrong-verdict) mint NOT_CAUGHT "wv-$2" ;;
+    corrupted)
+      local rid; rid=$(mint RED_PROVEN "cor-$2")
+      python3 - "$work/repo" "$rid" <<'PY2'
 import json, pathlib, subprocess, sys
 root, rid = pathlib.Path(sys.argv[1]), sys.argv[2]
 p = root / "scratch" / "weaken-records" / f"{rid}.json"
-b = json.loads(p.read_text())
-b["execution"]["timeout_s"] = 4242            # bytes change; the id it is filed under does not
+b = json.loads(p.read_text()); b["execution"]["timeout_s"] = 4242   # bytes move, filename does not
 p.write_text(json.dumps(b, sort_keys=True, indent=2) + "\n")
 subprocess.run(["git", "-C", str(root), "add", str(p)], check=True)
 PY2
-printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
-  "$GOOD" "$CORRUPT" > "$work/second-corrupt"
-check "a CORRUPTED second citation is REFUSED" refuse "$work/second-corrupt" \
-  "does not hash to its own contents"
-
-# ── D0A-R40-01 at the hook ───────────────────────────────────────────────────────────────
-# `{"id": ..., "verdict": "RED_PROVEN"}` hashed correctly and was ACCEPTED: a record with no
-# experiment in it. The hook now imports the producer's contract.
-STUB=$(python3 - "$work/repo" <<'PY2'
+      echo "$rid" ;;
+    contract-invalid)
+      python3 - "$work/repo" "$2" <<'PY2'
 import importlib.util, json, pathlib, subprocess, sys
 root = pathlib.Path(sys.argv[1])
 spec = importlib.util.spec_from_file_location("wd", root / "scripts" / "weaken-driver.py")
 wd = importlib.util.module_from_spec(spec); spec.loader.exec_module(wd)
-body = {"verdict": "RED_PROVEN"}
+body = {"verdict": "RED_PROVEN", "note": sys.argv[2]}
 body = {"id": wd.record_id(body), **body}
 p = root / "scratch" / "weaken-records" / f"{body['id']}.json"
 p.write_text(json.dumps(body, sort_keys=True, indent=2) + "\n")
 subprocess.run(["git", "-C", str(root), "add", str(p)], check=True)
 print(body["id"])
 PY2
-)
-printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\n' "$STUB" > "$work/stub"
-check "a record that hashes correctly but holds no experiment is REFUSED" refuse \
-  "$work/stub" "does not satisfy the evidence contract"
+      ;;
+    unreadable)
+      # Exactly 16 hex: a shorter id is not even a CITATION, so the hook would never look
+      # at the file and the case would prove nothing. The first draft used 14 and both
+      # positions "failed" for that reason instead of the intended one.
+      local rid; rid=$(printf 'deadbeef%08x' "$3")
+      printf 'this is not JSON at all\n' > "$work/repo/scratch/weaken-records/$rid.json"
+      ( cd "$work/repo" && git add "scratch/weaken-records/$rid.json" )
+      echo "$rid" ;;
+  esac
+}
 
-printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
-  "$GOOD" "$STUB" > "$work/second-stub"
-check "a contract-failing SECOND citation is REFUSED" refuse "$work/second-stub" \
-  "does not satisfy the evidence contract"
+expected_for() {
+  case "$1" in
+    missing)          echo "neither staged nor committed" ;;
+    wrong-verdict)    echo "its verdict is" ;;
+    corrupted)        echo "does not hash to its own contents" ;;
+    contract-invalid) echo "does not satisfy the evidence contract" ;;
+    unreadable)       echo "is not readable JSON" ;;
+  esac
+}
+
+n=0
+for kind in missing wrong-verdict corrupted contract-invalid unreadable; do
+  n=$((n+1))
+  want=$(expected_for "$kind")
+  bad_first=$(mint_bad "$kind" "a$n" "$((n * 2))")
+  printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
+    "$bad_first" "$GOOD" > "$work/m-$kind-1"
+  check "matrix: $kind in the FIRST citation is REFUSED" refuse "$work/m-$kind-1" "$want"
+  bad_second=$(mint_bad "$kind" "b$n" "$((n * 2 + 1))")
+  printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
+    "$GOOD" "$bad_second" > "$work/m-$kind-2"
+  check "matrix: $kind in the SECOND citation is REFUSED" refuse "$work/m-$kind-2" "$want"
+done
 
 # ── D0A-R40-04 ──────────────────────────────────────────────────────────────────────────
 # Git's `default` cleanup strips `#` lines only when the message is EDITED. With -F or -m it

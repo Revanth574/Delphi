@@ -53,10 +53,27 @@ def _blob(root: pathlib.Path, rel: str) -> bytes | None:
 
 def main() -> int:
     message = pathlib.Path(sys.argv[1]).read_text()
-    # Comment lines are not part of the message git will store.
-    body = "\n".join(l for l in message.splitlines() if not l.startswith("#"))
-    cited = [m.group(1).lower() for m in CITATION.finditer(body)]
-    claims = bool(CLAIM.search(re.sub(CITATION, "", body)))
+    # D0A-R40-04: `#` LINES ARE NOT RELIABLY DISCARDED. Git's `default` cleanup strips
+    # commentary only when the message is EDITED; with `-F` or `-m` it keeps every `#` line
+    # verbatim. Stripping them unconditionally hid a real claim: `# RED-proven` with no record
+    # was published by git and invisible here.
+    #
+    # So the two halves are read from DIFFERENT text, and each choice fails closed:
+    #   * a CLAIM is looked for in every line, comments included — if git might publish it,
+    #     this hook must see it;
+    #   * a CITATION counts only from a non-comment line — if git might strip it, it cannot
+    #     be what discharges a claim.
+    # Everything from the scissors line on is removed by git in every mode that produces one,
+    # and under `--verbose` it holds the diff, which would otherwise supply false claims.
+    lines = message.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("# ---") and ">8" in line:
+            lines = lines[:i]
+            break
+    claim_text = "\n".join(lines)
+    citable = "\n".join(l for l in lines if not l.startswith("#"))
+    cited = [m.group(1).lower() for m in CITATION.finditer(citable)]
+    claims = bool(CLAIM.search(re.sub(CITATION, "", claim_text)))
 
     if not claims and not cited:
         return 0

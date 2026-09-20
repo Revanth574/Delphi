@@ -46,7 +46,8 @@ mkdir -p "$work/repo/.githooks" "$work/repo/scripts" "$work/repo/scratch/weaken-
 ln -s "$REPO/.githooks/commit-msg" "$work/repo/.githooks/commit-msg"
 ln -s "$REPO/scripts/weaken-driver.py" "$work/repo/scripts/weaken-driver.py"
 ( cd "$work/repo" && git init -q && git config user.email t@t && git config user.name t \
-    && git add -A && git commit -qm init )
+    && git add -A && git commit -qm init \
+    && git config core.hooksPath .githooks )   # so the REAL-commit cases below run the hook
 
 mint() {  # mint <verdict> <discriminator> -> prints the id, writes+stages the record
   python3 - "$work/repo" "$1" "$2" "$REPO" <<'PY'
@@ -150,6 +151,41 @@ PY2
 printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\n' "$STUB" > "$work/stub"
 check "a record that hashes correctly but holds no experiment is REFUSED" refuse \
   "$work/stub" "does not satisfy the evidence contract"
+
+# ── D0A-R40-04 ──────────────────────────────────────────────────────────────────────────
+# Git's `default` cleanup strips `#` lines only when the message is EDITED. With -F or -m it
+# publishes them verbatim, so a claim in a comment was published by git and invisible to a
+# hook that discarded every `#` line. Verified against REAL commits below, not just the hook.
+printf 'chore: probe\n# RED-proven with no record\n' > "$work/hash-claim"
+check "a claim in a COMMENT line is still a claim" refuse "$work/hash-claim" "cites no record"
+
+# ...and the converse fails closed too: a citation git might strip cannot discharge a claim.
+printf 'fix: x\n\nRED-proven.\n# weaken-record: %s\n' "$GOOD" > "$work/hash-cite"
+check "a citation in a COMMENT line does NOT discharge a claim" refuse "$work/hash-cite" \
+  "cites no record"
+
+# Under --verbose git appends the diff below a scissors line and removes it. Scanning it
+# would let the diff's own text supply claims the author never made.
+printf 'chore: probe\n\n# ------------------------ >8 ------------------------\n%s\n' \
+  'diff --git a/x b/x   this line mentions RED-proven inside a diff' > "$work/scissors"
+check "text below the scissors line supplies no claim" accept "$work/scissors"
+
+# REAL commits, because the hook's view and git's stored message must agree.
+real_commit() {  # real_commit <file> -> prints "exit=N stored=<yes|no>"
+  local rc out
+  out=$(cd "$work/repo" && git commit --allow-empty -q -F "$1" 2>&1); rc=$?
+  local stored=no
+  if [ $rc -eq 0 ] && (cd "$work/repo" && git log -1 --format=%B | grep -q 'RED-proven'); then
+    stored=yes
+  fi
+  echo "exit=$rc stored=$stored"
+}
+res=$(real_commit "$work/hash-claim")
+if [ "$res" = "exit=1 stored=no" ]; then
+  echo "  [OK ] a REAL commit with a commented claim is refused, not published"; pass=$((pass+1))
+else
+  fail_guard "a REAL commit with a commented claim is refused, not published"; echo "         $res"
+fi
 
 # Edit the record after the fact. The bytes no longer hash to the id it is filed under.
 python3 - "$work/repo" "$GOOD" <<'PY'

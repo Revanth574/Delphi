@@ -169,8 +169,67 @@ REQUIRED_PATHS = [
 
 # What a RED_PROVEN record must ALSO carry. A verdict is a claim about an experiment; these
 # are the observations that experiment must have produced for the claim to be re-openable.
+#
+# D0A-R41-01: the first version required these CONTAINERS and stopped. Dropping `baseline`,
+# `weakened` and `restored` from the producer's whitelist left every guard passing and produced
+# records — with no invocation results in them at all — that the validator ACCEPTED as
+# RED_PROVEN. Requiring `observations` to be non-empty is not requiring evidence.
 RED_PROVEN_PHASES = ("validate-original", "baseline", "validate-mutant", "observe", "restore",
                      "restored")
+INVOCATION_PHASES = ("baseline", "observe", "restored")
+VALIDATION_PHASES = ("validate-original", "validate-mutant")
+
+
+def _check_source_ref(ref, where: str, problems: list[str]) -> None:
+    """A reference is recoverable or it is a placeholder. `{"path": "x"}` is a placeholder."""
+    if not isinstance(ref, dict):
+        problems.append(f"{where} is not a source reference")
+        return
+    if not ref.get("sha256"):
+        problems.append(f"{where} carries no sha256, so it names bytes rather than binding them")
+    if not ref.get("git_blob") and ref.get("content") is None:
+        problems.append(f"{where} is neither resolvable from git nor carries its content")
+
+
+def _check_red_proven_evidence(body: dict, problems: list[str]) -> None:
+    """The observations a RED_PROVEN claim rests on, checked as observations."""
+    phases = {p.get("name"): p for p in body["phases"] if isinstance(p, dict)}
+    absent = [p for p in RED_PROVEN_PHASES if p not in phases]
+    if absent:
+        problems.append(f"RED_PROVEN without the phases that would show it: {absent}")
+        return
+    for name in INVOCATION_PHASES:
+        if "outcome" not in phases[name] or "streams" not in phases[name]:
+            problems.append(f"phase {name!r} records no process evidence, only its timing")
+    for name in VALIDATION_PHASES:
+        val = phases[name].get("validation")
+        if not isinstance(val, dict) or not val.get("argv") or "exit" not in val:
+            problems.append(f"phase {name!r} records no validation evidence, only its timing")
+
+    obs = body.get("observations") or {}
+    expected = ((body.get("expectation") or {}).get("guard"))
+    for name, want_zero in (("baseline", True), ("weakened", False), ("restored", True)):
+        inv = obs.get(name)
+        if not isinstance(inv, dict) or "outcome" not in inv:
+            problems.append(f"RED_PROVEN without the {name} invocation's result")
+            continue
+        if inv["outcome"] != EXITED:
+            problems.append(f"the {name} invocation did not exit ({inv['outcome']}), so it "
+                            f"cannot support a verdict about a guard")
+        elif want_zero and inv.get("code") != 0:
+            problems.append(f"the {name} invocation exited {inv.get('code')}; RED_PROVEN needs "
+                            f"it green")
+        elif not want_zero and inv.get("code") in (0, None):
+            problems.append("the weakened invocation did not fail, so nothing bit")
+    weakened = obs.get("weakened")
+    if isinstance(weakened, dict) and expected not in (weakened.get("labels") or []):
+        problems.append(f"the weakened invocation's OWN report does not name {expected!r}; "
+                        f"`observations.failing_guards` is a summary, not the observation")
+
+    _check_source_ref(_at(body, "inputs.subject_original"), "inputs.subject_original", problems)
+    _check_source_ref(_at(body, "inputs.instrument"), "inputs.instrument", problems)
+    for i, ref in enumerate(_at(body, "suite.sources") or []):
+        _check_source_ref(ref, f"suite.sources[{i}]", problems)
 
 
 def _at(body: dict, path: str):
@@ -204,9 +263,6 @@ def validate_record(body: dict) -> list[str]:
         problems.append("a phase carries no duration")
 
     if body["verdict"] == RED_PROVEN:
-        absent = [p for p in RED_PROVEN_PHASES if p not in phases]
-        if absent:
-            problems.append(f"RED_PROVEN without the phases that would show it: {absent}")
         named = _at(body, "observations.failing_guards") or []
         if _at(body, "expectation.guard") not in named:
             problems.append(f"RED_PROVEN, but the expected guard is not among the observed "
@@ -218,6 +274,7 @@ def validate_record(body: dict) -> list[str]:
             problems.append("RED_PROVEN without a recorded mutant digest")
         if _at(body, "subject.digest_restored") != _at(body, "subject.digest_before"):
             problems.append("RED_PROVEN without a verified restoration")
+        _check_red_proven_evidence(body, problems)
     return problems
 
 

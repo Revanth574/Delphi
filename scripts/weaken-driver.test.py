@@ -741,6 +741,72 @@ def main() -> int:
             check(f"RED_PROVEN is rejected when {label}", wd.validate_record(bad),
                   "the contract accepted a verdict its own record does not support")
 
+        # ── D0A-R41-01 ──────────────────────────────────────────────────────────────────
+        # The contract required CONTAINERS. Dropping baseline/weakened/restored from the
+        # producer's whitelist left every guard passing and produced records with no
+        # invocation results at all, which the validator accepted as RED_PROVEN. Requiring
+        # `observations` to be non-empty is not requiring evidence.
+        for name in ("baseline", "weakened", "restored"):
+            bad = json.loads(json.dumps(on_disk))
+            bad["observations"].pop(name, None)
+            bad["id"] = wd.record_id(bad)
+            check(f"RED_PROVEN without the {name} invocation's result is rejected",
+                  wd.validate_record(bad), f"accepted a record with no {name} result")
+
+        for name in wd.INVOCATION_PHASES:
+            bad = json.loads(json.dumps(on_disk))
+            for ph in bad["phases"]:
+                if ph["name"] == name:
+                    ph.pop("outcome", None), ph.pop("streams", None)
+            bad["id"] = wd.record_id(bad)
+            check(f"phase {name!r} stripped to its timing is rejected", wd.validate_record(bad),
+                  "a phase with only a duration was accepted as evidence")
+
+        for name in wd.VALIDATION_PHASES:
+            bad = json.loads(json.dumps(on_disk))
+            for ph in bad["phases"]:
+                if ph["name"] == name:
+                    ph.pop("validation", None)
+            bad["id"] = wd.record_id(bad)
+            check(f"phase {name!r} without its validation evidence is rejected",
+                  wd.validate_record(bad), "validation with only a duration was accepted")
+
+        # A reference that NAMES bytes is not a reference that BINDS them.
+        for where, mangle in (
+            ("inputs.subject_original", lambda r: r["inputs"].update(subject_original={"path": "x"})),
+            ("inputs.instrument", lambda r: r["inputs"].update(instrument={"path": "x"})),
+            ("suite.sources[0]", lambda r: r["suite"]["sources"].__setitem__(0, {"path": "x"})),
+        ):
+            bad = json.loads(json.dumps(on_disk))
+            mangle(bad)
+            bad["id"] = wd.record_id(bad)
+            check(f"a path-only placeholder at {where} is rejected", wd.validate_record(bad),
+                  "a placeholder satisfied the contract")
+
+        # `{"path": ...}` fails BOTH halves of a source reference, so it cannot discriminate
+        # either — weakening the sha256 requirement against it returned NOT_CAUGHT. Each half
+        # needs a case only IT refuses.
+        bad = json.loads(json.dumps(on_disk))
+        ref = dict(bad["inputs"]["subject_original"]); ref.pop("sha256")
+        bad["inputs"]["subject_original"] = ref
+        bad["id"] = wd.record_id(bad)
+        check("a reference carrying content but NO sha256 is rejected", wd.validate_record(bad),
+              "content without a digest binds nothing: the bytes name themselves")
+        bad = json.loads(json.dumps(on_disk))
+        ref = dict(bad["inputs"]["subject_original"]); ref.pop("content")
+        bad["inputs"]["subject_original"] = ref
+        bad["id"] = wd.record_id(bad)
+        check("a reference carrying a sha256 but NOTHING to resolve it is rejected",
+              wd.validate_record(bad), "a digest alone cannot recover an untracked file")
+
+        # The summary is not the observation.
+        bad = json.loads(json.dumps(on_disk))
+        bad["observations"]["weakened"]["labels"] = []
+        bad["id"] = wd.record_id(bad)
+        check("the weakened invocation's OWN report must name the expected guard",
+              wd.validate_record(bad),
+              "`failing_guards` alone satisfied a claim about what the run observed")
+
         # The producer answers to the contract too: a record that could not be accepted
         # should never be written.
         try:

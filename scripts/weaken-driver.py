@@ -203,8 +203,18 @@ def _check_red_proven_evidence(body: dict, problems: list[str]) -> None:
             problems.append(f"phase {name!r} records no process evidence, only its timing")
     for name in VALIDATION_PHASES:
         val = phases[name].get("validation")
-        if not isinstance(val, dict) or not val.get("argv") or "exit" not in val:
+        if not isinstance(val, dict):
             problems.append(f"phase {name!r} records no validation evidence, only its timing")
+        elif val.get("ran"):
+            if not val.get("argv") or "exit" not in val:
+                problems.append(f"phase {name!r} ran validation but recorded neither its argv "
+                                f"nor its exit")
+        elif "ran" not in val:
+            # Not every target HAS a validation command — a shell script or a markdown file
+            # has none, and `ran: False` is itself the observation. Requiring a prose reason
+            # beside it was gold-plating that would have invalidated five already-cited
+            # records for no gain; the reason is still emitted, just not demanded.
+            problems.append(f"phase {name!r} does not say whether validation ran")
 
     obs = body.get("observations") or {}
     expected = ((body.get("expectation") or {}).get("guard"))
@@ -582,7 +592,8 @@ def _loads(cmd: list[str] | None, timeout: int) -> tuple[str, str, dict]:
     evidence behind the word "loaded".
     """
     if cmd is None:
-        return LOADED, "no validation command for this target type", {"ran": False}
+        return (LOADED, "no validation command for this target type",
+                {"ran": False, "reason": "no validation command for this target type"})
     # D0A-R39-03: through the SAME primitive as the suite. This executes target code, so it
     # can leave children running; `subprocess.run` left them outside every group the driver
     # manages, and one wrote the target after restoration had been verified.

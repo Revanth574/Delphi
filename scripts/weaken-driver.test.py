@@ -816,6 +816,22 @@ def main() -> int:
             bad["id"] = wd.record_id(bad)
             check(f"phase {name!r} without its validation evidence is rejected",
                   wd.validate_record(bad), "validation with only a duration was accepted")
+            # ...but a target with NO validation command is a real case, not a defect: a
+            # shell script or a markdown file has none. `ran: False` is the observation.
+            ok = json.loads(json.dumps(on_disk))
+            for ph in ok["phases"]:
+                if ph["name"] == name:
+                    ph["validation"] = {"ran": False, "reason": "no validation command"}
+            ok["id"] = wd.record_id(ok)
+            check(f"...and {name!r} saying validation did not run is ACCEPTED",
+                  not wd.validate_record(ok), str(wd.validate_record(ok)[:2]))
+            worse = json.loads(json.dumps(on_disk))
+            for ph in worse["phases"]:
+                if ph["name"] == name:
+                    ph["validation"] = {"reason": "silent"}
+            worse["id"] = wd.record_id(worse)
+            check(f"...while {name!r} not saying WHETHER it ran is rejected",
+                  wd.validate_record(worse), "a validation that says nothing was accepted")
 
         # A reference that NAMES bytes is not a reference that BINDS them.
         for where, mangle in (

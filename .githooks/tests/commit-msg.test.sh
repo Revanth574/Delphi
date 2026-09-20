@@ -186,11 +186,32 @@ printf 'fix: x\n\nRED-proven.\n# weaken-record: %s\n' "$GOOD" > "$work/hash-cite
 check "a citation in a COMMENT line does NOT discharge a claim" refuse "$work/hash-cite" \
   "cites no record"
 
-# Under --verbose git appends the diff below a scissors line and removes it. Scanning it
-# would let the diff's own text supply claims the author never made.
-printf 'chore: probe\n\n# ------------------------ >8 ------------------------\n%s\n' \
-  'diff --git a/x b/x   this line mentions RED-proven inside a diff' > "$work/scissors"
-check "text below the scissors line supplies no claim" accept "$work/scissors"
+# ── D0A-R41-03 ──────────────────────────────────────────────────────────────────────────
+# THE GUARD THAT USED TO SIT HERE ASSERTED THE HOLE. It claimed text below any scissors-looking
+# line supplies no claim, and git keeps that text verbatim under -F in EVERY cleanup mode,
+# `scissors` included — truncation happens only when the message is EDITED. So the R40-04 fix
+# for a cleanup mismatch encoded a new cleanup mismatch as an invariant, which is worse than
+# leaving it untested: a wrong guard defends the defect against the next person who notices.
+printf 'chore: probe\n\n# ------------------------ >8 ------------------------\nRED-proven with no citation\n' \
+  > "$work/author-scissors"
+check "a claim below an AUTHOR-written scissors line is REFUSED" refuse \
+  "$work/author-scissors" "cites no record"
+
+# ...and git's OWN block, which it writes only in the editor path and then removes, is trimmed
+# — otherwise a --verbose diff would supply claims nobody made. The hook sees that text.
+printf 'chore: probe\n\n# ------------------------ >8 ------------------------\n# Do not modify or remove the line above.\n# Everything below it will be ignored.\ndiff --git a/x b/x\n+this line mentions RED-proven in a diff\n' \
+  > "$work/git-scissors"
+check "git's own scissors block is trimmed, so a diff supplies no claim" accept \
+  "$work/git-scissors"
+
+# An explicit format beats a regex pretending to understand assertions: a BACKTICKED token is
+# a narrative reference and asks for no credit.
+printf 'chore: probe\n\nThe record carried `RED_PROVEN` and the other carried `UNVERIFIABLE`.\n' \
+  > "$work/backticked"
+check "a BACKTICKED token is narrative, not an assertion" accept "$work/backticked"
+printf 'chore: probe\n\nThis change is RED-proven.\n' > "$work/unbackticked"
+check "...and an unbackticked one still asserts and must cite" refuse "$work/unbackticked" \
+  "wrap it in backticks"
 
 # REAL commits, because the hook's view and git's stored message must agree.
 real_commit() {  # real_commit <file> -> prints "exit=N stored=<yes|no>"

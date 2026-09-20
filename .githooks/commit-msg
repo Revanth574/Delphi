@@ -32,6 +32,7 @@ import subprocess
 import sys
 
 CLAIM = re.compile(r"RED[-_ ]?PROVEN", re.I)
+BACKTICKED = re.compile(r"`[^`]*`")
 CITATION = re.compile(r"^\s*weaken-record:\s*([0-9a-f]{16})\s*$", re.I | re.M)
 RECORD_DIR = "scratch/weaken-records"
 
@@ -53,24 +54,34 @@ def _blob(root: pathlib.Path, rel: str) -> bytes | None:
 
 def main() -> int:
     message = pathlib.Path(sys.argv[1]).read_text()
-    # D0A-R40-04: `#` LINES ARE NOT RELIABLY DISCARDED. Git's `default` cleanup strips
-    # commentary only when the message is EDITED; with `-F` or `-m` it keeps every `#` line
-    # verbatim. Stripping them unconditionally hid a real claim: `# RED-proven` with no record
-    # was published by git and invisible here.
-    #
-    # So the two halves are read from DIFFERENT text, and each choice fails closed:
-    #   * a CLAIM is looked for in every line, comments included — if git might publish it,
-    #     this hook must see it;
-    #   * a CITATION counts only from a non-comment line — if git might strip it, it cannot
-    #     be what discharges a claim.
-    # Everything from the scissors line on is removed by git in every mode that produces one,
-    # and under `--verbose` it holds the diff, which would otherwise supply false claims.
     lines = message.splitlines()
+
+    # D0A-R41-03: ONLY DISCARD WHAT GIT IS ESTABLISHED TO REMOVE. The previous version cut at
+    # any scissors-looking line. Measured: git truncates at scissors ONLY when the message is
+    # to be edited — with `-F` or `-m` every cleanup mode, `scissors` included, keeps that text
+    # verbatim, so `# RED-proven` below a hand-written scissors line was published and invisible
+    # here. The guard that asserted otherwise asserted the hole.
+    #
+    # In the EDITOR path git writes its own block and then removes everything below it, and the
+    # hook does see that text (a `--verbose` diff would otherwise supply claims nobody made).
+    # That block is git's verbatim output, not authored prose, so matching it is reading a
+    # known producer rather than guessing intent. If git ever changes the wording this hook
+    # stops trimming and refuses MORE, which is the safe direction for drift.
+    cut = len(lines)
     for i, line in enumerate(lines):
-        if line.startswith("# ---") and ">8" in line:
-            lines = lines[:i]
+        if (line.startswith("# ---") and ">8" in line
+                and i + 1 < len(lines)
+                and lines[i + 1].startswith("# Do not modify or remove the line above")):
+            cut = i
             break
-    claim_text = "\n".join(lines)
+    lines = lines[:cut]
+
+    # D0A-R41-03 (second half): AN EXPLICIT FORMAT, rather than a regex pretending to
+    # understand assertions. A BACKTICKED token is a narrative reference — naming the constant,
+    # quoting a historical verdict — and asks for no credit. An unbackticked one asserts proof
+    # and must cite a record. Fail closed WITHIN that format; the format itself is a convention
+    # the author controls, which is what stopped a correct commit message needing awkward prose.
+    claim_text = BACKTICKED.sub(" ", "\n".join(lines))
     citable = "\n".join(l for l in lines if not l.startswith("#"))
     cited = [m.group(1).lower() for m in CITATION.finditer(citable)]
     claims = bool(CLAIM.search(re.sub(CITATION, "", claim_text)))
@@ -91,7 +102,9 @@ def main() -> int:
             "    A reader cannot re-open the experiment from prose. Run the weaken through\n"
             "    scripts/weaken-driver.py, stage the record it writes under\n"
             f"    {RECORD_DIR}/, and add a trailer:\n"
-            "        weaken-record: <16-hex id>")
+            "        weaken-record: <16-hex id>\n"
+            "    If the mention is NARRATIVE — naming the constant, quoting a past verdict —\n"
+            "    wrap it in backticks: a backticked token asks for no proof credit.")
 
     for rid in cited:
         rel = f"{RECORD_DIR}/{rid}.json"

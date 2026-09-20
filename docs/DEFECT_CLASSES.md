@@ -1780,6 +1780,41 @@ seam mechanically — extract the window between the two fixes and assert the in
 
 ---
 
+
+### A SECOND INSTANCE, ACROSS ROUNDS RATHER THAN IN ONE MESSAGE *(D0A-R41-02)*
+
+The first instance was two fixes approved together. This one is **two rounds apart**, which is
+why nobody looked at the seam: there was no moment at which both were on the table.
+
+- **D0A-R38-06** made `scripts/weaken-driver.py` byte-exact on CRLF targets. Reading and
+  writing through `str` had been translating newlines, so the driver corrupted the tree it was
+  measuring. Correct, and still correct.
+- **D0A-R40-02** bound the record's input files by content, because argv bound nothing. It
+  obtained the git blob id with `git hash-object -- <path>` — **which applies filters**.
+  Correct against the finding it closed.
+
+**The seam:** a repository with `text`/`eol` attributes — which this one has, on the driver
+itself — makes `hash-object` return the id of the *normalised* bytes. The record then carried a
+sha256 of the real bytes and a `git_blob` pointing at different ones. **The guarantee R38-06
+established was silently withdrawn for the record**, in the one file whose CRLF handling had
+been the subject of its own finding.
+
+**Two exposure levels, and they are not the same claim.** The eol half was LIVE (attributes are
+configured). The arbitrary-code half — a clean filter is any command, and one was demonstrated
+rewriting the target *during* `hash-object`, after restoration had been verified — was LATENT
+here, because no filter is configured. Reporting either alone would have been wrong: the first
+overstates nothing but understates the hazard, the second inverts that.
+
+**What closed it: removing the collaborator, not constraining it.** The blob id is now computed
+from the bytes already in hand (`sha1("blob <len>\0" + raw)`), so no filter can run and the id
+matches the recorded content *by construction* — git object ids are content-addressed. `git
+cat-file -e` then asks only whether that object exists, which runs nothing.
+
+**The general lesson, and it is about where to look:** a fix that adds a COLLABORATOR — a tool,
+a service, a library call — inherits everything that collaborator does on its own initiative.
+`hash-object` is documented to apply filters; nothing about R40-02's reasoning was wrong except
+that it treated a git plumbing command as a pure function of its argument.
+
 ## 28. Re-deriving a mechanism the repo already documents  *(new — D0 / real_webkit_load)*
 
 **Description.** A mechanism is investigated from symptoms — hypotheses, probes, eliminations —

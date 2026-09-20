@@ -650,6 +650,52 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # ── D0A-R41-02 ──────────────────────────────────────────────────────────────────────
+    # `git hash-object -- <path>` applies filters. Two exposure levels, tested separately:
+    # eol normalisation (live in this repo, `.gitattributes` sets `text auto, eol lf`) and
+    # clean filters running arbitrary commands (latent — none configured here).
+    d = pathlib.Path(tempfile.mkdtemp(prefix="weaken-driver-filters-"))
+    try:
+        subprocess.run(["git", "init", "-q", str(d)], check=True, capture_output=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", str(d), "config", k, v], check=True)
+        (d / ".gitattributes").write_text("* text eol=lf\n")
+        crlf = d / "crlf.py"
+        crlf.write_bytes(b"x = 1\r\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "seed"], check=True,
+                       capture_output=True)
+        ref = wd._source_ref(crlf)
+        check("a CRLF source's digest is of its REAL bytes",
+              ref["sha256"] == wd._digest_bytes(crlf.read_bytes()))
+        if ref.get("git_blob"):
+            blob = subprocess.run(["git", "-C", str(d), "cat-file", "blob", ref["git_blob"]],
+                                  capture_output=True).stdout
+            check("...and any git_blob it records holds exactly those bytes",
+                  wd._digest_bytes(blob) == ref["sha256"],
+                  "the reference binds bytes that are not the bytes measured")
+        else:
+            check("...and with no matching object git_blob is not claimed, so content travels",
+                  ref.get("content") is not None)
+
+        # A clean filter is an arbitrary command. Binding a source must not run one.
+        sentinel = d / "FILTER-RAN"
+        subprocess.run(["git", "-C", str(d), "config", "filter.evil.clean",
+                        f"sh -c 'touch {sentinel}; cat'"], check=True)
+        (d / ".gitattributes").write_text("* filter=evil\n")
+        wd._source_ref(crlf)
+        check("binding a source runs NO clean filter", not sentinel.exists(),
+              "a filter executed against the working tree while recording evidence")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    src_now = (REPO / "scripts" / "weaken-driver.py").read_text().splitlines()
+    filtering = [l.strip() for l in src_now
+                 if "hash-object" in l and not l.lstrip().startswith("#")
+                 and not l.lstrip().startswith("*") and '"""' not in l
+                 and "D0A-R41-02" not in l and "the target during" not in l]
+    check("no code path invokes `git hash-object`", not filtering, str(filtering))
+
     # Structural: there is ONE way to start a process here. A second path is how validation
     # ended up outside lifetime management in the first place.
     src = (REPO / "scripts" / "weaken-driver.py").read_text().splitlines()

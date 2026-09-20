@@ -313,19 +313,33 @@ def _streams(inv) -> dict:
 SOURCE_CAP = 256 * 1024
 
 
-def _git_has_blob(digest_path: pathlib.Path) -> str | None:
-    """The git blob id for these exact bytes, if git already stores them."""
-    # Through the primitive like everything else. These are short reads that cannot touch the
-    # target, but "there is one way to start a process" is the property, and the structural
-    # guard caught these the moment they were added — which is what it is for.
-    out = _managed_run(["git", "hash-object", "--", str(digest_path)], None, 30)
-    if out.launch_error or out.timed_out or out.returncode != 0:
-        return None
-    blob = out.stdout.strip()
-    held = _managed_run(["git", "cat-file", "-e", blob], None, 30)
-    if held.launch_error or held.timed_out or held.returncode != 0:
-        return None
-    return blob
+def _git_blob_id(raw: bytes) -> str:
+    """The git object id for exactly these bytes, computed here.
+
+    D0A-R41-02: this used `git hash-object -- <path>`, which APPLIES FILTERS. Two consequences,
+    at different exposure levels, and collapsing them would overstate one and understate the
+    other:
+
+      * LIVE HERE — eol normalisation. This repo's `.gitattributes` sets `text auto, eol lf`,
+        so a CRLF source produced a blob whose content is NOT the bytes the record measured:
+        the reference bound the wrong content. That silently undoes D0A-R38-06, which exists
+        precisely to make this driver byte-exact on CRLF targets. Two fixes from different
+        rounds, each correct alone, composing into a false binding (`DEFECT_CLASSES` 27).
+      * LATENT HERE — a clean filter is an arbitrary command. One was demonstrated rewriting
+        the target during `hash-object`, i.e. AFTER restoration had been verified. This repo
+        configures no filters, so that half is unexposed rather than absent.
+
+    Computing the id from the bytes removes both: no filter can run, and the blob id matches
+    the recorded content by construction, because git object ids are content-addressed.
+    """
+    # sha1 as git's object-id function, not as a security primitive.
+    return hashlib.sha1(b"blob %d\0" % len(raw) + raw).hexdigest()
+
+
+def _git_holds(blob: str, near: pathlib.Path) -> bool:
+    """Does git already store this object? A read-only lookup that runs no filters."""
+    got = _managed_run(["git", "-C", str(near), "cat-file", "-e", blob], None, 30)
+    return not got.launch_error and not got.timed_out and got.returncode == 0
 
 
 def _source_ref_from_bytes(path: str, raw: bytes) -> dict:
@@ -359,8 +373,8 @@ def _source_ref(path: pathlib.Path) -> dict:
     except OSError as e:
         return {"path": str(path), "unreadable": str(e)}
     ref: dict = {"path": str(path), "sha256": _digest_bytes(raw), "bytes": len(raw)}
-    blob = _git_has_blob(path)
-    if blob:
+    blob = _git_blob_id(raw)
+    if _git_holds(blob, path.parent):
         ref["git_blob"] = blob
         return ref
     # Not in git: the bytes travel with the record, because nothing else can supply them.

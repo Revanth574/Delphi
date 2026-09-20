@@ -132,6 +132,23 @@ printf 'fix: x\n\nRED-proven.\n\nweaken-record: 0123456789abcdef\nweaken-record:
 check "an unresolved FIRST citation is REFUSED" refuse "$work/first-unresolved" \
   "neither staged nor committed"
 
+# The hook distinguishes FIVE refusals, and a position is only proven for the kinds tested
+# AT it. Missing and wrong-verdict are covered above; these two are the rest.
+CORRUPT=$(mint RED_PROVEN four)
+python3 - "$work/repo" "$CORRUPT" <<'PY2'
+import json, pathlib, subprocess, sys
+root, rid = pathlib.Path(sys.argv[1]), sys.argv[2]
+p = root / "scratch" / "weaken-records" / f"{rid}.json"
+b = json.loads(p.read_text())
+b["execution"]["timeout_s"] = 4242            # bytes change; the id it is filed under does not
+p.write_text(json.dumps(b, sort_keys=True, indent=2) + "\n")
+subprocess.run(["git", "-C", str(root), "add", str(p)], check=True)
+PY2
+printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
+  "$GOOD" "$CORRUPT" > "$work/second-corrupt"
+check "a CORRUPTED second citation is REFUSED" refuse "$work/second-corrupt" \
+  "does not hash to its own contents"
+
 # ── D0A-R40-01 at the hook ───────────────────────────────────────────────────────────────
 # `{"id": ..., "verdict": "RED_PROVEN"}` hashed correctly and was ACCEPTED: a record with no
 # experiment in it. The hook now imports the producer's contract.
@@ -151,6 +168,11 @@ PY2
 printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\n' "$STUB" > "$work/stub"
 check "a record that hashes correctly but holds no experiment is REFUSED" refuse \
   "$work/stub" "does not satisfy the evidence contract"
+
+printf 'fix: x\n\nRED-proven.\n\nweaken-record: %s\nweaken-record: %s\n' \
+  "$GOOD" "$STUB" > "$work/second-stub"
+check "a contract-failing SECOND citation is REFUSED" refuse "$work/second-stub" \
+  "does not satisfy the evidence contract"
 
 # ── D0A-R40-04 ──────────────────────────────────────────────────────────────────────────
 # Git's `default` cleanup strips `#` lines only when the message is EDITED. With -F or -m it

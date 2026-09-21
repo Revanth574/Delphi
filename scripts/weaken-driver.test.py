@@ -689,6 +689,38 @@ def main() -> int:
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # ── D0A-R42-03 ──────────────────────────────────────────────────────────────────────
+    # `git_blob` is only a resolvable reference relative to the repository that PRESERVES THE
+    # LEDGER. Asking the source file's own repository recorded a blob this repo does not hold,
+    # and dropped the content — so removing an external checkout loses the inputs entirely.
+    d = pathlib.Path(tempfile.mkdtemp(prefix="weaken-driver-extrepo-"))
+    try:
+        subprocess.run(["git", "init", "-q", str(d)], check=True, capture_output=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", str(d), "config", k, v], check=True)
+        outside = d / "suite.py"
+        outside.write_text("# a suite living in another repository\nFLAG = True\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "seed"], check=True,
+                       capture_output=True)
+        held_there = subprocess.run(["git", "-C", str(d), "cat-file", "-e",
+                                     wd._git_blob_id(outside.read_bytes())],
+                                    capture_output=True).returncode == 0
+        check("CONTROL: the external repository really does hold those bytes", held_there,
+              "the fixture is not a committed external source, so the guard proves nothing")
+        ref = wd._source_ref(outside)
+        check("a source from ANOTHER repository claims no git_blob here",
+              "git_blob" not in ref, str(ref.get("git_blob")))
+        check("...and its bytes travel with the record instead",
+              ref.get("content") == outside.read_text())
+        # ...while a file this repository does hold is still referenced rather than copied.
+        inrepo = wd._source_ref(REPO / "scripts" / "mutation-campaign.py")
+        check("a source this repository holds is referenced by blob, not embedded",
+              inrepo.get("git_blob") and inrepo.get("content") is None,
+              f"blob={inrepo.get('git_blob')} content={inrepo.get('content') is not None}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     src_now = (REPO / "scripts" / "weaken-driver.py").read_text().splitlines()
     filtering = [l.strip() for l in src_now
                  if "hash-object" in l and not l.lstrip().startswith("#")

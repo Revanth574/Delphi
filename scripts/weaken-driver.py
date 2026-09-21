@@ -148,6 +148,9 @@ RECORD_LIMITS = [
 # Captured at import, before this process can write anything — so for a self-weaken it is the
 # EXECUTING bytes, not whatever is on disk when the record is written.
 _INSTRUMENT_PATH = pathlib.Path(__file__).resolve()
+# The repository that preserves the ledger: the one this instrument lives in. A `git_blob` is
+# only a resolvable reference relative to it (D0A-R42-03).
+_LEDGER_ANCHOR = _INSTRUMENT_PATH.parent
 _INSTRUMENT_DIGEST = hashlib.sha256(_INSTRUMENT_PATH.read_bytes()).hexdigest()
 
 
@@ -382,9 +385,21 @@ def _git_blob_id(raw: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(raw) + raw).hexdigest()
 
 
-def _git_holds(blob: str, near: pathlib.Path) -> bool:
-    """Does git already store this object? A read-only lookup that runs no filters."""
-    got = _managed_run(["git", "-C", str(near), "cat-file", "-e", blob], None, 30)
+def _git_holds(blob: str) -> bool:
+    """Does the LEDGER's repository store this object? A read-only lookup, no filters.
+
+    D0A-R42-03: this asked the SOURCE file's repository. A suite living in an external
+    checkout therefore recorded a `git_blob` and omitted its content — and that blob is not in
+    the repository holding the record, so removing the external checkout loses the
+    experiment's inputs entirely. Measured against a committed miniature suite in a temporary
+    repo: RED_PROVEN, record accepted, `git cat-file -e` in this repo exited 1.
+
+    The `-C <source dir>` was added in D0A-R41-02 for correctness — the file might be in a
+    different repository — and that is exactly what broke the property that matters.
+    Recoverability is only meaningful relative to the repository that PRESERVES THE LEDGER,
+    so that is what is asked. Anything it does not hold travels as bytes.
+    """
+    got = _managed_run(["git", "-C", str(_LEDGER_ANCHOR), "cat-file", "-e", blob], None, 30)
     return not got.launch_error and not got.timed_out and got.returncode == 0
 
 
@@ -420,7 +435,7 @@ def _source_ref(path: pathlib.Path) -> dict:
         return {"path": str(path), "unreadable": str(e)}
     ref: dict = {"path": str(path), "sha256": _digest_bytes(raw), "bytes": len(raw)}
     blob = _git_blob_id(raw)
-    if _git_holds(blob, path.parent):
+    if _git_holds(blob):
         ref["git_blob"] = blob
         return ref
     # Not in git: the bytes travel with the record, because nothing else can supply them.

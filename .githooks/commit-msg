@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -35,6 +36,32 @@ CLAIM = re.compile(r"RED[-_ ]?PROVEN", re.I)
 BACKTICKED = re.compile(r"`[^`]*`")
 CITATION = re.compile(r"^\s*weaken-record:\s*([0-9a-f]{16})\s*$", re.I | re.M)
 RECORD_DIR = "scratch/weaken-records"
+
+
+def _message_will_be_edited() -> bool | None:
+    """Will git run an editor for this message? Read from the INVOCATION, never the message.
+
+    D0A-R42-02. Returns None when it cannot be established — and the caller then trims
+    NOTHING, because "I could not tell" must not license discarding text git may publish.
+    """
+    try:
+        raw = pathlib.Path(f"/proc/{os.getppid()}/cmdline").read_bytes()
+    except OSError:
+        return None
+    argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    if "commit" not in argv:
+        return None                       # not a shape this can reason about
+    if any(a in ("-e", "--edit") for a in argv):
+        return True
+    for a in argv:
+        if a in ("-m", "--message", "-F", "--file", "--no-edit"):
+            return False
+        if a.startswith(("--message=", "--file=")):
+            return False
+        # combined shorts such as `-qm` / `-qF`
+        if a.startswith("-") and not a.startswith("--") and ("m" in a[1:] or "F" in a[1:]):
+            return False
+    return True                           # a plain `git commit`: the editor runs
 
 
 def _root() -> pathlib.Path:
@@ -56,24 +83,25 @@ def main() -> int:
     message = pathlib.Path(sys.argv[1]).read_text()
     lines = message.splitlines()
 
-    # D0A-R41-03: ONLY DISCARD WHAT GIT IS ESTABLISHED TO REMOVE. The previous version cut at
-    # any scissors-looking line. Measured: git truncates at scissors ONLY when the message is
-    # to be edited — with `-F` or `-m` every cleanup mode, `scissors` included, keeps that text
-    # verbatim, so `# RED-proven` below a hand-written scissors line was published and invisible
-    # here. The guard that asserted otherwise asserted the hole.
+    # D0A-R42-02: ESTABLISH THE CLEANUP CONTEXT FROM THE INVOCATION, NOT FROM THE MESSAGE.
+    # R41-03 trimmed at git's own scissors block, reasoning that git writes that text and then
+    # removes it. **An author can paste the same text.** Measured: the block pasted into a
+    # `-F` message, with an uncited claim below it, committed successfully under `default`,
+    # `whitespace`, `strip`, `scissors` AND `verbatim`, storing the claim every time. The
+    # error was treating one of a collaborator's OUTPUTS as evidence about its BEHAVIOUR —
+    # the same shape as reading `git hash-object` as a pure function of its argument.
     #
-    # In the EDITOR path git writes its own block and then removes everything below it, and the
-    # hook does see that text (a `--verbose` diff would otherwise supply claims nobody made).
-    # That block is git's verbatim output, not authored prose, so matching it is reading a
-    # known producer rather than guessing intent. If git ever changes the wording this hook
-    # stops trimming and refuses MORE, which is the safe direction for drift.
+    # Whether git truncates depends on whether the message is EDITED, which the message cannot
+    # report. The parent process's argv can: hooks are run by `git commit` itself.
+    edited = _message_will_be_edited()
     cut = len(lines)
-    for i, line in enumerate(lines):
-        if (line.startswith("# ---") and ">8" in line
-                and i + 1 < len(lines)
-                and lines[i + 1].startswith("# Do not modify or remove the line above")):
-            cut = i
-            break
+    if edited:
+        # Only in this path does git remove the block — and only here does it insert a
+        # `--verbose` diff that would otherwise supply claims nobody made.
+        for i, line in enumerate(lines):
+            if line.startswith("# ---") and ">8" in line:
+                cut = i
+                break
     lines = lines[:cut]
 
     # D0A-R41-03 (second half): AN EXPLICIT FORMAT, rather than a regex pretending to

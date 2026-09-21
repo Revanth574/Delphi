@@ -214,12 +214,47 @@ printf 'chore: probe\n\n# ------------------------ >8 ------------------------\n
 check "a claim below an AUTHOR-written scissors line is REFUSED" refuse \
   "$work/author-scissors" "cites no record"
 
-# ...and git's OWN block, which it writes only in the editor path and then removes, is trimmed
-# — otherwise a --verbose diff would supply claims nobody made. The hook sees that text.
-printf 'chore: probe\n\n# ------------------------ >8 ------------------------\n# Do not modify or remove the line above.\n# Everything below it will be ignored.\ndiff --git a/x b/x\n+this line mentions RED-proven in a diff\n' \
-  > "$work/git-scissors"
-check "git's own scissors block is trimmed, so a diff supplies no claim" accept \
-  "$work/git-scissors"
+# ── D0A-R42-02 ──────────────────────────────────────────────────────────────────────────
+# THE FIXTURE THAT USED TO SIT HERE IS DELETED, NOT INVERTED. It asserted that git's own
+# scissors block is trimmed — and an author can PASTE that block, so the assertion licensed
+# exactly the hole it was written beside: pasted block plus an uncited claim committed under
+# default, whitespace, strip, scissors and verbatim, storing the claim every time.
+#
+# Inverting R41-03's fixture is what produced this one. An inverted assertion still encodes a
+# claim about a collaborator's behaviour; these cases encode none — they run REAL commits and
+# read what git stored.
+real_commit_stores_claim() {   # <msgfile> [extra git args...] -> "exit=N stored=yes|no"
+  local msg=$1; shift
+  local rc; ( cd "$work/repo" && git commit --allow-empty -q -F "$msg" "$@" ) >/dev/null 2>&1
+  rc=$?
+  local stored=no
+  if [ $rc -eq 0 ] && (cd "$work/repo" && git log -1 --format=%B | grep -q 'RED-proven'); then
+    stored=yes
+  fi
+  echo "exit=$rc stored=$stored"
+}
+
+printf 'chore: probe\n\n# ------------------------ >8 ------------------------\n# Do not modify or remove the line above.\n# Everything below it will be ignored.\nRED-proven with no citation\n' \
+  > "$work/pasted-block"
+for mode in default whitespace strip scissors verbatim; do
+  res=$(real_commit_stores_claim "$work/pasted-block" --cleanup=$mode)
+  if [ "$res" = "exit=1 stored=no" ]; then
+    echo "  [OK ] a PASTED scissors block cannot hide a claim (cleanup=$mode)"; pass=$((pass+1))
+  else
+    fail_guard "a PASTED scissors block cannot hide a claim (cleanup=$mode)"; echo "         $res"
+  fi
+done
+
+# ...and the editor path, where git DOES remove the block, must still commit: a --verbose
+# diff must not supply claims nobody made. Established from the invocation, not the text.
+printf 'chore: probe with a verbose diff\n' > "$work/verbose-msg"
+echo "touched" > "$work/repo/verbose-probe.txt"
+( cd "$work/repo" && git add verbose-probe.txt ) >/dev/null 2>&1
+if ( cd "$work/repo" && GIT_EDITOR=true git commit -q --verbose --edit -F "$work/verbose-msg" ) >/dev/null 2>&1; then
+  echo "  [OK ] an EDITED --verbose commit is not blocked by its own diff"; pass=$((pass+1))
+else
+  fail_guard "an EDITED --verbose commit is not blocked by its own diff"
+fi
 
 # An explicit format beats a regex pretending to understand assertions: a BACKTICKED token is
 # a narrative reference and asks for no credit.
